@@ -1,6 +1,6 @@
 import pg, { type Pool } from 'pg';
 import type { FastifyInstance } from 'fastify';
-import { Gateway } from './gateway.js';
+import { Gateway, type ReviewAdmission } from './gateway.js';
 import { PostgresIntentJournal } from './journal.js';
 import { openRouterTransport, type Step15Approval } from './openrouter.js';
 import { GatewayError, type ModelTransport } from './types.js';
@@ -15,17 +15,17 @@ export * from './types.js';
 type ManagedTransport = ModelTransport & { kind: 'managed' };
 
 export function createGateway(
-  db: Pool, options?: { journal: PostgresIntentJournal; transport?: ManagedTransport },
+  db: Pool, options?: { journal?: PostgresIntentJournal; transport?: ManagedTransport; reviewAdmission?: ReviewAdmission },
 ): Gateway {
   if (options?.transport && options.transport.kind !== 'managed') throw new GatewayError('managed_transport_required');
-  return new Gateway(db, options?.journal, options?.transport);
+  return new Gateway(db, options?.journal, options?.transport, options?.reviewAdmission);
 }
 
 export function createStep15Gateway(
-  db: Pool, journal: PostgresIntentJournal, approval: Step15Approval,
+  db: Pool, journal: PostgresIntentJournal, approval: Step15Approval, reviewAdmission?: ReviewAdmission,
 ): Gateway {
   if (process.env.FACADE_GATEWAY_LIVE_MODE !== 'step-15') throw new GatewayError('step15_approval_required');
-  return new Gateway(db, journal, openRouterTransport(approval));
+  return new Gateway(db, journal, openRouterTransport(approval), reviewAdmission);
 }
 
 export function journalFromEnv(env: NodeJS.ProcessEnv = process.env): { journal: PostgresIntentJournal; close: () => Promise<void> } | null {

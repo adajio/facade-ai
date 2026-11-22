@@ -96,7 +96,20 @@ export interface ScheduledResearchTask {
   job: ScheduledResearchJob;
 }
 
-export type ResearchTask = ScheduledResearchTask & { job: ResearchJob };
+export type ResearchTask = ScheduledResearchTask & { job: ResearchJob; earlyPair?: true };
+
+export const pairCriteria = ['variant', 'revision', 'applicability', 'comparability'] as const;
+const pairCheck = z.strictObject({
+  status: z.enum(['confirmed', 'unclear', 'incompatible']), reason: text,
+  sources: z.array(z.strictObject({ evidenceId: id, quote: text })).max(8),
+});
+export const pairChecksSchema = z.strictObject({
+  variant: pairCheck, revision: pairCheck, applicability: pairCheck, comparability: pairCheck,
+});
+export type PairChecks = z.infer<typeof pairChecksSchema>;
+export function pairConfirmed(checks: PairChecks | undefined): boolean {
+  return !!checks && pairCriteria.every((criterion) => checks[criterion].status === 'confirmed');
+}
 
 export interface Representation {
   evidenceId: string;
@@ -105,6 +118,7 @@ export interface Representation {
   sha256: string;
   mediaType: 'application/json' | 'text/plain' | 'image/png' | 'image/jpeg' | 'image/webp';
   bytes: Buffer;
+  support?: Branch;
   transform?: {
     width: number; height: number; pixelsPerPoint: number; pixelOriginX: number; pixelOriginY: number;
   };
@@ -146,7 +160,7 @@ export type ReadRequest =
 export interface ReaderPort {
   inventory(context: ReaderContext): Promise<unknown>;
   next?(context: ReaderContext): Promise<Place | null>;
-  contexts?(context: ReaderContext, offset: number): Promise<{ items: { id: string; place: Place; format: string }[]; nextOffset?: number }>;
+  contexts?(context: ReaderContext, offset: number): Promise<{ items: { id: string; place: Place; format: string; support?: Branch }[]; nextOffset?: number }>;
   openContext?(context: ReaderContext, id: string, representation: 'native' | 'ocr'): Promise<Representation>;
   read(context: ReaderContext, request: ReadRequest): Promise<Representation>;
   record(
@@ -167,8 +181,8 @@ export type ResearchOutcome =
   | { kind: 'covered'; observationIds: string[] }
   | { kind: 'reviewed_no_match'; evidenceIds: string[] }
   | { kind: 'final_refusal'; reason: string; evidenceIds: string[] }
-  | { kind: 'proposal'; aObservationId: string; bObservationId: string; explanation: string }
-  | { kind: 'verification'; verdict: 'supported' | 'unclear'; evidenceIds: string[]; explanation: string };
+  | { kind: 'proposal'; aObservationId: string; bObservationId: string; explanation: string; checks?: PairChecks; evidenceIds?: string[] }
+  | { kind: 'verification'; verdict: 'supported' | 'unclear'; evidenceIds: string[]; explanation: string; checks?: PairChecks };
 
 export interface ResearchSuspension {
   reason: string;

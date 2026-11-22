@@ -14,6 +14,7 @@ import type { ResearchTask } from './contracts.js';
 import { validateLivePolicy } from './live-policy.js';
 import { loadResearchProfile, profileHold, researchSlot, type ResearchProfile } from './profile.js';
 import { publication } from './publication.js';
+import { reviewPairAdmission } from './review-pair.js';
 import { connectReader } from './reader.js';
 import { executeResearch, researchKind, resumeInterruptedResearch } from './runner.js';
 import { managedTransport } from './transport.js';
@@ -32,7 +33,7 @@ function configuredApprovals(): OpenRouterProfile[] {
 
 function modelGateway(context: WorkerContext, external: ReturnType<typeof journalFromEnv>, profile: ResearchProfile) {
   const managed = process.env.FACADE_HARNESS_MANAGED_URL;
-  const localGateway = () => createGateway(context.db, external ? { journal: external.journal } : undefined);
+  const localGateway = () => createGateway(context.db, { journal: external?.journal, reviewAdmission: reviewPairAdmission });
   if (process.env.FACADE_GATEWAY_LIVE_MODE === 'step-15') {
     const apiKey = process.env.FACADE_GATEWAY_OPENROUTER_KEY;
     if (managed || !external || !apiKey?.trim()) return {
@@ -61,12 +62,12 @@ function modelGateway(context: WorkerContext, external: ReturnType<typeof journa
       }
     });
     const gateway = policy.approvals.length === 0 ? localGateway() :
-      createStep15Gateway(context.db, external.journal, { ...approval, profiles: policy.approvals });
+      createStep15Gateway(context.db, external.journal, { ...approval, profiles: policy.approvals }, reviewPairAdmission);
     return { gateway, admit: policy.hold, online: true, hasTransport: policy.approvals.length > 0 };
   }
   if (managed && !external) throw new Error('Managed gateway requires a separate intent journal');
   const gateway = managed && external
-    ? createGateway(context.db, { journal: external.journal, transport: managedTransport(managed) })
+    ? createGateway(context.db, { journal: external.journal, transport: managedTransport(managed), reviewAdmission: reviewPairAdmission })
     : localGateway();
   return {
     gateway, admit: (task: ResearchTask) => profileHold(profile, task),

@@ -133,7 +133,7 @@ export class PostgresIntentJournal {
     });
   }
 
-  async claim(id: string, route: RoutePolicy): Promise<'claimed' | string> {
+  async claim(id: string, route: RoutePolicy, earlyReview = false): Promise<'claimed' | string> {
     return transaction(this.pool, async tx => {
       const frozen = await this.bound(tx);
       const entry = await this.byId(tx, id);
@@ -154,7 +154,7 @@ export class PostgresIntentJournal {
         [route.id, entry.attempt.projectId, entry.attempt.generationId, route.minIntervalMs ?? 0, entry.attempt.jobId],
       );
       const gate = gates.rows[0];
-      if (entry.attempt.purpose === 'review' && gate.active_primary) return 'primary_barrier';
+      if (entry.attempt.purpose === 'review' && !earlyReview && gate.active_primary) return 'primary_barrier';
       if (gate.unresolved) return 'route_reconciliation';
       if (gate.route_busy) return 'route_busy';
       if (gate.rate_limited) return 'route_rate_limited';

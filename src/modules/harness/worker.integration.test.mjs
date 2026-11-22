@@ -28,15 +28,23 @@ function toolMessage(name, args) {
 }
 
 function syntheticPdf(...lines) {
-  const text = lines.map((line) => `(${line.replace(/[()]/g, '\\$&')}) Tj`).join(' 0 -24 Td ');
-  const stream = `BT /F1 14 Tf 30 140 Td ${text} ET`;
+  return syntheticPdfPages([lines]);
+}
+
+function syntheticPdfPages(pages) {
   const objects = [
     '<< /Type /Catalog /Pages 2 0 R >>',
-    '<< /Type /Pages /Kids [3 0 R] /Count 1 >>',
-    '<< /Type /Page /Parent 2 0 R /MediaBox [0 0 480 270] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>',
+    `<< /Type /Pages /Kids [${pages.map((_, i) => `${4 + i * 2} 0 R`).join(' ')}] /Count ${pages.length} >>`,
     '<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>',
-    `<< /Length ${Buffer.byteLength(stream)} >>\nstream\n${stream}\nendstream`,
   ];
+  for (const lines of pages) {
+    const text = lines.map((line) => `(${line.replace(/[()]/g, '\\$&')}) Tj`).join(' 0 -24 Td ');
+    const stream = `BT /F1 14 Tf 30 140 Td ${text} ET`;
+    objects.push(
+      `<< /Type /Page /Parent 2 0 R /MediaBox [0 0 480 270] /Resources << /Font << /F1 3 0 R >> >> /Contents ${objects.length + 2} 0 R >>`,
+      `<< /Length ${Buffer.byteLength(stream)} >>\nstream\n${stream}\nendstream`,
+    );
+  }
   let result = '%PDF-1.4\n';
   const offsets = [];
   for (const [index, object] of objects.entries()) {
@@ -155,6 +163,8 @@ test('ordinary upload runs two Mastra readers through PostgreSQL, the reader, qu
         !request.messages.some(({ role }) => role === 'tool')) {
         sentB.resolve();
         await releaseB.promise;
+        res.end(JSON.stringify({ receipt: { state: 'rejected', evidenceRef: 'fixture:primary-held', code: 'fixture_primary_held' } }));
+        return;
       }
       const completed = request.messages.filter(({ role }) => role === 'tool').map(({ content }) => JSON.parse(content));
       const completedTools = request.messages.flatMap(({ role, tool_calls }) =>
@@ -165,19 +175,36 @@ test('ordinary upload runs two Mastra readers through PostgreSQL, the reader, qu
         res.end(JSON.stringify({ receipt: { state: 'rejected', evidenceRef: 'fixture:429', code: 'http_429' } }));
         return;
       }
-      if (assignment.mode === 'lead') {
-        assert.equal(routeId, 'managed-lead');
-        output = toolMessage('propose_resolution', {
-          aObservationId: assignment.dispute.a.observationId, bObservationId: assignment.dispute.b.observationId,
-          explanation: 'Two distinct originals state incompatible values.',
-        });
-      } else if (assignment.mode === 'verify') {
-        assert.notEqual(routeId, 'managed-lead');
-        if (completedTools.length < 2) output = toolMessage('survey', { support: completedTools.length ? 'B' : 'A' });
-        else output = toolMessage('verify_resolution', {
-          verdict: 'supported', evidenceIds: completed.map((reply) => reply.evidence.evidenceId),
-          explanation: 'Verified both addressed originals.',
-        });
+      if (assignment.mode === 'lead' || assignment.mode === 'verify') {
+        assert.equal(routeId === 'managed-lead', assignment.mode === 'lead');
+        const count = completedTools.length;
+        if (count < 2) output = toolMessage('extract', { support: count ? 'B' : 'A' });
+        else if (count === 2) output = toolMessage('context_inventory', {});
+        else if (count === 3 || count === 4) {
+          const support = count === 3 ? 'A' : 'B';
+          const title = completed[2].items.find((item) => item.support === support && item.place.page === 2);
+          assert.ok(title);
+          assert.equal(title.place.source.versionId, assignment.dispute[support.toLowerCase()].place.source.versionId);
+          assert.ok(completed[2].items.every(({ place }) => [assignment.dispute.a, assignment.dispute.b]
+            .some((side) => side.place.source.versionId === place.source.versionId)));
+          output = toolMessage('open_context', { contextId: title.id });
+        } else {
+          const titleSources = completed.slice(3, 5).map((reply) => ({
+            evidenceId: reply.evidence.evidenceId,
+            quote: JSON.parse(reply.content).lines[0].text,
+          }));
+          assert.ok(titleSources.every(({ quote }) => /Revision R1/.test(quote)));
+          const check = { status: 'confirmed', reason: 'Both original title pages identify the same current assembly.', sources: titleSources };
+          const checks = { variant: check, revision: check, applicability: check, comparability: check };
+          const evidenceIds = completed.slice(0, 2).map((reply) => reply.evidence.evidenceId);
+          if (assignment.mode === 'lead') output = toolMessage('propose_resolution', {
+            aObservationId: assignment.dispute.a.observationId, bObservationId: assignment.dispute.b.observationId,
+            explanation: 'Two distinct originals state incompatible values.', evidenceIds, checks,
+          });
+          else output = toolMessage('verify_resolution', {
+            verdict: 'supported', evidenceIds, explanation: 'Verified both addressed originals.', checks,
+          });
+        }
       } else if (!completedTools.length) output = toolMessage('survey', {});
       else if (completedTools.length === 1) {
         const image = request.messages.flatMap(({ content }) => Array.isArray(content) ? content : [])
@@ -387,8 +414,8 @@ test('ordinary upload runs two Mastra readers through PostgreSQL, the reader, qu
     });
   }
   const incoming = (await command('POST', `/api/projects/${large.id}/receipts`, { source: 'upload' })).json();
-  const fillA = await attach(large.id, largeScope, incoming.receiptId, 'one.pdf', syntheticPdf('F-A R1 Thickness (mm) 2'));
-  const fillB = await attach(large.id, largeScope, incoming.receiptId, 'two.pdf', syntheticPdf('F-A R1 Thickness (mm) 3'));
+  const fillA = await attach(large.id, largeScope, incoming.receiptId, 'one.pdf', syntheticPdfPages([['F-A R1 Thickness (mm) 2'], ['Revision R1 F-A Variant A']]));
+  const fillB = await attach(large.id, largeScope, incoming.receiptId, 'two.pdf', syntheticPdfPages([['F-A R1 Thickness (mm) 3'], ['Revision R1 F-A Variant A']]));
   const remaining = syntheticPdf('F-A R1 Layout only');
   delayedSha = sha256(remaining);
   const fillRemaining = await attach(large.id, largeScope, incoming.receiptId, 'three.pdf', remaining);
@@ -397,50 +424,16 @@ test('ordinary upload runs two Mastra readers through PostgreSQL, the reader, qu
   const reviews = () => providerCalls.filter(({ attempt }) => attempt.projectId === large.id && attempt.purpose === 'review');
   const showCard = async () => (await command('GET',
     `/api/projects/${large.id}/assessments/current?scopeId=${largeScope}`)).json().questions[0].machine;
-  const early = await until(showCard, ({ limitations }) => limitations.includes('dispute_pending'), 'Early dispute card');
-  assert.equal(early.outcome, 'needs_review');
-  assert.equal(reviews().length, 0);
+  await until(reviews, (calls) => calls.some(({ routeId }) => routeId === 'managed-lead'),
+    'The saved pair reaches the lead with an open inventory');
   const blocked = (await fillRemaining()).json();
-  const pin = await app.db.connect();
-  let pinned = true;
-  const unlock = async () => {
-    if (!pinned) return;
-    pinned = false;
-    try {
-      await pin.query('SELECT pg_advisory_unlock(94009)');
-    } finally {
-      pin.release();
-    }
-  };
-  unblock = async () => {
-    releaseB.resolve();
-    await unlock();
-  };
-  await pin.query('SELECT pg_advisory_lock(94009)');
-  await app.db.query(`
-    CREATE TABLE harness_test_delay(version_id uuid PRIMARY KEY);
-    CREATE FUNCTION harness_test_pause_finalization() RETURNS trigger LANGUAGE plpgsql AS $$
-    BEGIN
-      IF NEW.branch='B' AND NEW.state <> OLD.state AND EXISTS(
-        SELECT 1 FROM gateway_jobs j JOIN harness_test_delay t ON t.version_id::text=j.subject_id
-        WHERE j.obligation_id=NEW.id AND j.generation_id=NEW.generation_id
-      ) THEN PERFORM pg_advisory_xact_lock(94009); END IF;
-      RETURN NEW;
-    END;
-    $$;
-    CREATE TRIGGER harness_test_pause_finish BEFORE UPDATE ON gateway_primary
-      FOR EACH ROW EXECUTE FUNCTION harness_test_pause_finalization();
-  `);
-  await app.db.query('INSERT INTO harness_test_delay(version_id) VALUES($1)', [blocked.versionId]);
   await command('POST', `/api/receipts/${incoming.receiptId}/seal`, {});
   await Promise.race([sentB.promise, delay(15_000, undefined, { ref: false }).then(() => assert.fail('B was not dispatched'))]);
-  assert.equal(reviews().length, 0);
-  assert.equal((await showCard()).outcome, 'needs_review');
+  assert.ok(reviews().some(({routeId}) => routeId === 'managed-lead'));
   releaseB.resolve();
   await until(async () => (await app.db.query(
-    "SELECT count(*)::int AS count FROM pg_locks WHERE locktype='advisory' AND objid=94009 AND NOT granted",
-  )).rows[0].count, (count) => count > 0, 'Result precedes B obligation commit');
-
+    `SELECT count(*)::int AS n FROM gateway_jobs WHERE subject_id=$1 AND purpose='primary_b' AND state='held'`, [blocked.versionId]
+  )).rows[0].n, (n) => n > 0, 'Unrelated primary remains held');
   const small = (await command('POST', '/api/projects', {
     name: 'Independent PDF', catalogVersionId: catalog.id, scopeName: 'F-A', stage: 'P',
   })).json();
@@ -456,14 +449,17 @@ test('ordinary upload runs two Mastra readers through PostgreSQL, the reader, qu
   await command('POST', `/api/receipts/${smallReceipt.receiptId}/seal`, {});
   await until(async () => (await command('GET', `/api/projects/${small.id}/assessments/current?scopeId=${smallScope}`)).json(),
     (card) => card.questions[0]?.machine.outcome === 'covered', 'Independent small project completes during B barrier');
-  assert.equal(reviews().length, 0);
-  await unlock();
   const resolved = await until(showCard, (machine) => machine.outcome === 'confirmed_conflict', 'Two rereads completed');
   assert.deepEqual(resolved.citations.map(({ value }) => value).sort(), ['2', '3']);
   assert.ok(reviews().some(({ routeId }) => routeId === 'managed-lead'));
   assert.ok(reviews().some(({ routeId }) => routeId === 'managed-a'));
   assert.ok(reviews().some(({ routeId }) => routeId === 'managed-b'));
-  assert.equal(reviews().length, 7);
+  assert.ok(resolved.limitations.includes('primary_coverage_pending'));
+  assert.equal(reviews().length, 18);
+  const { rows: [pending] } = await app.db.query(
+    `SELECT count(*)::int AS n FROM gateway_primary p JOIN gateway_generations g USING(generation_id)
+     WHERE g.project_id=$1 AND g.current AND p.state='pending'`, [large.id]);
+  assert.ok(pending.n > 0);
   assert.equal((await connection.journal.balance()).spentUsdNanos, 0);
 
   const assessLarge = async () =>
@@ -511,6 +507,12 @@ sys.stdout.write('\\n'.join(''.join(t.text or '' for t in p.findall('.//w:t', ns
       assert.equal(python.status, 0, python.stderr);
       assert.equal(python.stdout, fullText);
     }
+  }
+
+  if (process.env.FACADE_HARNESS_EARLY_PAIR_ONLY === '1') {
+    assert.deepEqual(providerErrors, []);
+    assert.deepEqual(warnings, []);
+    return;
   }
 
   const workDir = await mkdtemp(join(tmpdir(), 'harness-raster-'));

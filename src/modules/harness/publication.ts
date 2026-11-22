@@ -17,12 +17,20 @@ import type {
 import { occurrenceScope, occurrenceScopeJoin } from './occurrence-scope.js';
 import type { ResearchProfile } from './profile.js';
 import { researchKind } from './runner.js';
+import { pairConfirmed, pairCriteria } from './contracts.js';
 
 type Ref = Pick<ScheduledResearchTask, 'projectId' | 'scopeId' | 'generationId'>;
 
 type FindingRow = {
   finding: Finding; subjectVerified: boolean | null; revision: ObservationPublication['revision'];
   observation: Observation; content: string | null; scopeName: string;
+};
+
+type PairResultRow = {
+  a: string; b: string; independent: boolean;
+  lead: Extract<ResearchOutcome, { kind: 'proposal' }> | null;
+  left: Extract<ResearchOutcome, { kind: 'verification' }> | null;
+  right: Extract<ResearchOutcome, { kind: 'verification' }> | null;
 };
 
 function addressedSubject(target: TargetQuestion, observation: Observation, content: string | null, scopeName: string, aliases?: string[]): boolean {
@@ -151,35 +159,54 @@ async function updateQuestion(
      GROUP BY g.sealed,h.input_generation`,
     [ref.generationId, target.id, revision.source_token]);
   if (!coverage || coverage.input_generation !== gate.generation) return;
-  // The intake gate already protects the old decision while independent readers are still running.
   const heldDecision = question.decision && gate.holds.length > 0;
-  if (heldDecision && (!coverage.sealed || coverage.pending)) return;
   const all = await findingsFor(tx, ref, target, question.requirement);
   const findings = all.slice(0, 500);
   await scheduleDisputes(tx, ref, target, question.requirement, findings);
-  const { rows: [review] } = await tx.query<{ pending: boolean; unclear: boolean }>(
-    `SELECT EXISTS(
-       SELECT 1 FROM harness_disputes d
-       WHERE d.generation_id=$1 AND d.question_id=$2
-         AND d.a_observation_id=ANY($3::uuid[]) AND d.b_observation_id=ANY($3::uuid[]) AND (
-         NOT EXISTS (SELECT 1 FROM harness_review_results r WHERE r.generation_id=$1 AND r.dispute_id=d.id AND r.stage='A')
-         OR NOT EXISTS (SELECT 1 FROM harness_review_results r WHERE r.generation_id=$1 AND r.dispute_id=d.id AND r.stage='B')
-       )
-     ) AS pending, EXISTS(
-       SELECT 1 FROM harness_disputes d JOIN harness_review_results r ON r.dispute_id=d.id AND r.generation_id=d.generation_id
-       WHERE d.generation_id=$1 AND d.question_id=$2 AND r.result->>'verdict'='unclear'
-         AND d.a_observation_id=ANY($3::uuid[]) AND d.b_observation_id=ANY($3::uuid[])
-     ) AS unclear`, [ref.generationId, question.id, findings.map(({ citation }) => citation.observationId)]);
-  if (heldDecision && review.pending) return;
+  const { rows: pairs } = await tx.query<PairResultRow>(
+    `SELECT d.a_observation_id AS a,d.b_observation_id AS b,d.independent_sources AS independent,
+       lead.result AS lead, va.result AS left, vb.result AS right
+     FROM harness_live_review_pairs d
+     LEFT JOIN harness_review_results lead ON lead.generation_id=d.generation_id AND lead.dispute_id=d.id AND lead.stage='lead'
+     LEFT JOIN harness_review_results va ON va.generation_id=d.generation_id AND va.dispute_id=d.id AND va.stage='A'
+     LEFT JOIN harness_review_results vb ON vb.generation_id=d.generation_id AND vb.dispute_id=d.id AND vb.stage='B'
+     WHERE d.generation_id=$1 AND d.question_id=$2
+       AND d.a_observation_id=ANY($3::uuid[]) AND d.b_observation_id=ANY($3::uuid[])
+     ORDER BY d.id`, [ref.generationId, target.id, findings.map(({ citation }) => citation.observationId)]);
+  const activeValues = new Set(findings.filter(({ kind, applicability }) => kind === 'value' && applicability === 'active')
+    .map(({ citation }) => citation.observationId));
+  const confirmedPairs = pairs.filter(({ a, b, independent, lead, left, right }) =>
+    independent && activeValues.has(a) && activeValues.has(b) &&
+    lead?.kind === 'proposal' && lead.aObservationId === a && lead.bObservationId === b && pairConfirmed(lead.checks) &&
+    left?.kind === 'verification' && left.verdict === 'supported' && pairConfirmed(left.checks) &&
+    right?.kind === 'verification' && right.verdict === 'supported' && pairConfirmed(right.checks))
+    .map(({ a, b }) => ({ a, b }));
+  const pending = pairs.some(({ lead, left, right }) => !lead ||
+    ((!lead.checks || pairConfirmed(lead.checks)) && (!left || !right)));
+  const unclear = pairs.some(({ lead, left, right }) => lead?.checks && !pairConfirmed(lead.checks) ||
+    left?.verdict === 'unclear' || right?.verdict === 'unclear');
+  const pairLimits = new Set<string>();
+  for (const { lead, left, right } of pairs) {
+    for (const result of [lead, left, right]) {
+      if (!result?.checks) continue;
+      for (const criterion of pairCriteria) {
+        const { status } = result.checks[criterion];
+        if (status !== 'confirmed') pairLimits.add(`pair_${criterion}_${status}`);
+      }
+    }
+  }
+  if (heldDecision && (!coverage.sealed || coverage.pending || pending) && !confirmedPairs.length) return;
   const remaining = [
     ...(!coverage.sealed ? ['inventory_open'] : []),
     ...(coverage.pending ? ['primary_coverage_pending'] : []),
     ...(coverage.refused ? ['primary_place_unreadable'] : []),
-    ...(review.pending ? ['dispute_pending'] : []),
-    ...(review.unclear ? ['dispute_unresolved'] : []),
+    ...(pending ? ['dispute_pending'] : []),
+    ...(unclear ? ['dispute_unresolved'] : []),
+    ...[...pairLimits].sort(),
     ...(all.length > 500 ? ['review_finding_limit'] : []),
   ];
   if (question.review && canonicalJson(question.review.remaining) === canonicalJson(remaining) &&
+    canonicalJson(question.review.confirmedPairs ?? []) === canonicalJson(confirmedPairs) &&
     canonicalJson(question.review.findings.map(({ citation, applicability }) => [citation.observationId, applicability])) ===
       canonicalJson(findings.map(({ citation, applicability }) => [citation.observationId, applicability]))) return;
   const change: AssessmentChange = {
@@ -188,6 +215,7 @@ async function updateQuestion(
       inputGeneration: gate.generation,
       completenessChecked: remaining.length === 0,
       remaining,
+      ...(confirmedPairs.length ? { confirmedPairs } : {}),
       ...(findings.some(({ nonDelivery }) => nonDelivery) ? { researchGenerationId: ref.generationId } : {}),
       findings: findings.map(({ kind, sourceRole, comparisonKey, applicability, citation, nonDelivery }) => ({
         kind, sourceRole, comparisonKey, applicability, observationId: citation.observationId,
@@ -203,26 +231,33 @@ async function updateQuestion(
 export function publication(db: Pool, queue: WorkQueue, profile: ResearchProfile) {
   return {
     async readyReview(): Promise<boolean> {
+      const { rows: [parked] } = await db.query<{ id: string }>(
+        `SELECT j.id FROM gateway_jobs j JOIN harness_live_review_pairs d ON d.generation_id=j.generation_id
+           AND d.id::text=j.payload#>>'{dispute,id}' AND d.independent_sources
+         WHERE j.kind=$1 AND j.purpose='review' AND j.state='held' AND j.reason='primary_barrier'
+           AND NOT EXISTS (SELECT 1 FROM gateway_attempts a WHERE a.job_id=j.id AND a.state IN ('sending','unknown'))
+         ORDER BY j.created_at,j.id LIMIT 1`, [researchKind]);
+      if (parked && await queue.resume(parked.id, ['primary_barrier'])) return true;
       const { rows: [candidate] } = await db.query<{
         id: string; generationId: string; projectId: string; scopeId: string; questionId: string; a: Finding; b: Finding;
       }>(
-        `SELECT d.id,d.generation_id AS "generationId",g.project_id AS "projectId",g.scope_id AS "scopeId",
-           d.question_id AS "questionId",a.finding AS a,b.finding AS b
-         FROM harness_disputes d JOIN gateway_generations g ON g.generation_id=d.generation_id
-         JOIN harness_observations a ON a.generation_id=d.generation_id AND a.observation_id=d.a_observation_id
-         JOIN harness_observations b ON b.generation_id=d.generation_id AND b.observation_id=d.b_observation_id
-         WHERE g.current AND g.sealed
-           AND NOT EXISTS (SELECT 1 FROM gateway_primary p WHERE p.generation_id=g.generation_id AND p.state='pending')
+        `SELECT d.id,d.generation_id AS "generationId",d.project_id AS "projectId",d.scope_id AS "scopeId",
+           d.question_id AS "questionId",d.a,d.b
+         FROM harness_live_review_pairs d LEFT JOIN gateway_projects p ON p.project_id=d.project_id
+         WHERE (d.independent_sources OR (d.sealed
+           AND NOT EXISTS (SELECT 1 FROM gateway_primary p WHERE p.generation_id=d.generation_id AND p.state='pending')
            AND NOT EXISTS (
-             SELECT 1 FROM gateway_attempts r WHERE r.generation_id=g.generation_id
+             SELECT 1 FROM gateway_attempts r WHERE r.generation_id=d.generation_id
              AND r.purpose IN ('primary_a','primary_b') AND r.state IN ('reserved','prepared','sending','unknown')
-           )
-           AND NOT EXISTS (SELECT 1 FROM gateway_jobs j WHERE j.generation_id=g.generation_id AND j.job_key='lead:'||d.id)
-         ORDER BY g.project_id,d.id LIMIT 1`);
+           )))
+           AND NOT EXISTS (SELECT 1 FROM gateway_jobs j WHERE j.generation_id=d.generation_id AND j.job_key='lead:'||d.id)
+         ORDER BY p.last_turn NULLS FIRST,d.id LIMIT 1`);
       if (!candidate) return false;
       await transaction(db, async (tx) => {
         const { id, generationId, projectId, scopeId, questionId, a, b } = candidate;
         await lockIntakeProject(tx, projectId);
+        const current = await tx.query('SELECT 1 FROM harness_live_review_pairs WHERE id=$1 AND generation_id=$2', [id,generationId]);
+        if (!current.rowCount) return;
         const gate = await getLockedGate(tx, projectId, scopeId);
         const revision = await synchronize(tx, projectId, scopeId, gate);
         const question = (await getQuestions(tx, scopeId, revision.version)).find((row) => row.id === questionId && row.active);
@@ -322,7 +357,7 @@ export function publication(db: Pool, queue: WorkQueue, profile: ResearchProfile
       await tx.query(
         `INSERT INTO harness_review_results(generation_id,dispute_id,stage,result)
          VALUES($1,$2,$3,$4) ON CONFLICT DO NOTHING`, [task.generationId, dispute.id, stage, outcome]);
-      if (outcome.kind === 'proposal') {
+      if (outcome.kind === 'proposal' && (!outcome.checks || pairConfirmed(outcome.checks))) {
         const { aObservationId, bObservationId, explanation } = outcome;
         for (const branch of ['A', 'B'] as const) {
           await queue.enqueue({

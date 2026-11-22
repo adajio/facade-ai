@@ -46,13 +46,35 @@ export function connectReader(
     return rows;
   }
 
+  async function reviewWindows({ task }: ReaderContext, id: string | null, offset: number) {
+    if (!task.earlyPair || task.job.mode === 'primary') return [];
+    const { rows } = await db.query<{ id: string; place: Place; support: 'A' | 'B'; format: string }>(
+      `SELECT hp.obligation_id AS id,hp.place,hp.branch AS support,m.format
+       FROM harness_live_review_pairs d
+       JOIN harness_primary_places hp ON hp.generation_id=d.generation_id AND hp.question_id=d.question_id
+         AND hp.version_id::text=CASE hp.branch WHEN 'A' THEN d.a#>>'{citation,versionId}' ELSE d.b#>>'{citation,versionId}' END
+       JOIN harness_document_maps m ON m.version_id=hp.version_id AND m.project_id=d.project_id
+       JOIN gateway_jobs j ON j.generation_id=hp.generation_id AND j.obligation_id=hp.obligation_id::text
+       WHERE d.id=$1 AND d.generation_id=$2 AND d.project_id=$3 AND d.scope_id=$4 AND d.independent_sources
+         AND NOT (j.payload ? 'localRefusal') AND ($5::uuid IS NULL OR hp.obligation_id=$5)
+         AND EXISTS (SELECT 1 FROM intake_occurrences c ${occurrenceScopeJoin}
+           WHERE c.project_id=d.project_id AND c.version_id=hp.version_id AND c.state='accepted'
+             AND (d.scope_id=ANY(${occurrenceScope}) OR ${occurrenceScope} IS NULL))
+       ORDER BY coalesce((hp.place->>'page')::int,0),hp.branch,hp.unit_key,hp.obligation_id
+       LIMIT 33 OFFSET $6`, [task.job.dispute.id, task.generationId, task.projectId, task.scopeId, id, offset],
+    );
+    return rows;
+  }
+
   return {
     async contexts(context, offset) {
-      const rows = await contextPlaces(context, null, offset);
+      const rows = context.task.job.mode === 'primary' ? await contextPlaces(context, null, offset) :
+        await reviewWindows(context, null, offset);
       return { items: rows.slice(0, 32), ...(rows.length > 32 ? { nextOffset: offset + 32 } : {}) };
     },
     async openContext(context, id, representation) {
-      const [authorized] = await contextPlaces(context, id, 0);
+      const [authorized] = context.task.job.mode === 'primary'
+        ? await contextPlaces(context, id, 0) : await reviewWindows(context, id, 0);
       if (!authorized) throw new ReaderRefusal('context_window_unavailable', 'permanent');
       const { place } = authorized;
       try {
@@ -64,7 +86,8 @@ export function connectReader(
           throw new ReaderRefusal('context_window_unavailable', 'permanent');
         }
         return { evidenceId: evidence.id, place, readerVersion: evidence.readerVersion, sha256: evidence.sha256,
-          mediaType: evidence.mediaType, bytes, limitations: evidence.limitations };
+          mediaType: evidence.mediaType, bytes, limitations: evidence.limitations,
+          ...('support' in authorized ? { support: authorized.support as 'A' | 'B' } : {}) };
       } catch (error) {
         return refusal(error);
       }

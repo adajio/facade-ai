@@ -402,7 +402,8 @@ export async function snapshot(tx: PoolClient, revision: Revision, gate?: Gate, 
   const outcomes = new Set(questions.map((question) => question.outcome));
   const ready = outcomes.has("covered") || outcomes.has("excluded");
   const problem = outcomes.has("confirmed_missing") || outcomes.has("confirmed_conflict");
-  const unresolved = outcomes.has("needs_review") || revision.limitations.length > 0 || Boolean(gate?.holds.length);
+  const unresolved = outcomes.has("needs_review") || revision.limitations.length > 0 || Boolean(gate?.holds.length) ||
+    questions.some(({ machine }) => machine.outcome === "confirmed_conflict" && machine.limitations.length > 0);
   const outcome = Number(ready) + Number(problem) + Number(unresolved) > 1 ? "mixed" :
     unresolved ? "needs_review" : problem ? "confirmed_problems" : "sufficient";
   return {

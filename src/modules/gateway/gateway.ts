@@ -17,6 +17,7 @@ const actions: Record<string, string> = {
   route_rate_limited: 'wait_for_route_interval',
   route_busy: 'wait_for_route_slot',
   primary_barrier: 'close_pending_primary_obligations',
+  review_pair_stale: 'load_current_generation',
   effect_conflict: 'inspect_original_effect',
   budget_exhausted: 'wait_for_reserve_settlement',
   budget_frozen: 'operator_review_ledger',
@@ -47,7 +48,9 @@ type Gate = {
   effect: string;
   requestHash: string;
   quote: RequestQuote | null;
+  earlyReview: boolean;
 };
+export type ReviewAdmission = (tx: PoolClient, work: LeasedJob) => Promise<'early' | 'standard' | 'stale'>;
 const active = "('reserved','prepared','sending','unknown')";
 
 function knownCost(value: unknown): value is number {
@@ -91,7 +94,8 @@ export class Gateway extends WorkQueue {
   private recovered = false;
   private pendingRecovery?: Promise<unknown>;
 
-  constructor(db: Pool, private readonly journal?: PostgresIntentJournal, private readonly transport?: ModelTransport) {
+  constructor(db: Pool, private readonly journal?: PostgresIntentJournal, private readonly transport?: ModelTransport,
+    private readonly reviewAdmission?: ReviewAdmission) {
     super(db);
   }
 
@@ -136,6 +140,13 @@ export class Gateway extends WorkQueue {
   }
 
   private async gate(tx: PoolClient, input: CallInput, wire: string): Promise<Gate | string> {
+    if (this.reviewAdmission) {
+      // Reader publication and source replacement lock the intake project before the generation.
+      await tx.query(
+        `SELECT pg_advisory_xact_lock(hashtextextended('intake/project/' || project_id::text, 0))
+         FROM gateway_jobs WHERE id=$1 AND purpose='review'`, [input.lease.jobId],
+      );
+    }
     const work = await this.lockLease(tx, input.lease);
     if (!work) return 'lease_lost';
     if (work.purpose === 'local') return 'route_denied';
@@ -164,7 +175,9 @@ export class Gateway extends WorkQueue {
     });
     if (typeof authorization === 'string') return authorization;
     if (authorization === false) return 'route_data_unapproved';
-    if (work.purpose === 'review') {
+    const review = work.purpose === 'review' ? await this.reviewAdmission?.(tx, work) : undefined;
+    if (review === 'stale') return 'review_pair_stale';
+    if (work.purpose === 'review' && review !== 'early') {
       const barrier = await tx.query(
         `SELECT 1 FROM gateway_generations WHERE generation_id=$1 AND sealed
           AND NOT EXISTS (SELECT 1 FROM gateway_primary WHERE generation_id=$1 AND state='pending')
@@ -175,7 +188,7 @@ export class Gateway extends WorkQueue {
       if (!barrier.rowCount) return 'primary_barrier';
     }
     return {
-      work: { ...work, purpose: work.purpose }, route, quote,
+      work: { ...work, purpose: work.purpose }, route, quote, earlyReview: review === 'early',
       effect: hash([work.projectId, work.scopeId, work.generationId, work.key, input.effectKey]),
       requestHash: hash([route.id, route.revision, input.dataClass, input.inputRefs, wire, ...(quote ? [quote] : [])]),
     };
@@ -365,7 +378,7 @@ export class Gateway extends WorkQueue {
             return typeof current === 'string' ? current : 'effect_conflict';
           }
           const claimStartedAt = performance.now();
-          const permission = await journal.claim(reserved.id, current.route);
+          const permission = await journal.claim(reserved.id, current.route, current.earlyReview);
           if (permission !== 'claimed') return permission;
 
           // After the external commit no sibling may send this attempt. Recheck the lease before calling fetch.
@@ -384,7 +397,7 @@ export class Gateway extends WorkQueue {
       if (!started) {
         if (['route_denied','route_data_unapproved','synthetic_retention_not_approved','route_training_policy_unverified',
           'route_parameters_unsupported','route_zdr_unavailable','route_endpoint_unverified','invalid_request',
-          'route_bound_unavailable','primary_barrier','effect_conflict','route_busy','route_rate_limited',
+          'route_bound_unavailable','primary_barrier','review_pair_stale','effect_conflict','route_busy','route_rate_limited',
           'route_reconciliation','budget_frozen','budget_exhausted'].includes(denied)) {
           // Cancellation is conditional in the journal because a concurrent caller may already own the attempt.
           await this.mirror(await journal.cancelPrepared(reserved.id), journal);

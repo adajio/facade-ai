@@ -169,6 +169,38 @@ test("assessment rules distinguish unit equivalence, versions, unreadable values
     exclusion: { until: "2026-11-20T00:00:00Z" } }, new Date("2026-11-22T00:00:00Z")), "needs_review");
 });
 
+test("only a current independently verified conflict can bypass unrelated coverage", async () => {
+  const { evaluate } = await fromBuild("src/modules/assessment/domain.js");
+  const requirement = { formats: ["pdf"], sourceRoles: ["design"], applicability: "applicable" };
+  const sample = (branch, value) => ({
+    kind: "value", format: "pdf", sourceRole: "design", applicability: "active", comparisonKey: "same-subject-and-variant",
+    citation: { observationId: branch, branch, versionId: "version-" + branch, sha256: "hash-" + branch,
+      value, unit: "mm", address: { unitId: "page-1" }, receiptId: "receipt" },
+  });
+  const a = sample("A", "12");
+  const b = sample("B", "19");
+  const unrelated = { ...sample("extra", "21"), applicability: "unknown" };
+  const waiting = { findings: [a, b, unrelated], completenessChecked: false, remaining: ["primary_coverage_pending"] };
+  const proof = { ...waiting, confirmedPairs: [{ a: "A", b: "B" }] };
+  assert.equal(evaluate(requirement, waiting).outcome, "needs_review");
+  assert.deepEqual(evaluate(requirement, proof).citations, [a.citation, b.citation]);
+  assert.equal(evaluate(requirement, proof).outcome, "confirmed_conflict");
+  assert.deepEqual(evaluate(requirement, proof).limitations, waiting.remaining);
+  for (const unsuitable of [
+    { ...b, applicability: "superseded" },
+    { ...b, applicability: "unknown" },
+    { ...b, comparisonKey: "different-variant" },
+    { ...b, citation: { ...b.citation, sha256: a.citation.sha256 } },
+    { ...b, citation: { ...b.citation, branch: "A" } },
+    { ...b, citation: { ...b.citation, value: "12" } },
+    { ...b, citation: { ...b.citation, unit: "kg" } },
+  ]) {
+    assert.equal(evaluate(requirement, { ...proof, findings: [a, unsuitable] }).outcome, "needs_review");
+  }
+  assert.equal(evaluate(requirement, { ...proof, findings: [] }).outcome, "needs_review");
+  assert.equal(evaluate({ ...requirement, applicability: "unknown" }, proof).outcome, "needs_review");
+});
+
 test("document revision survives repeated conversions of an original", async () => {
   const { createDocumentRevisionReader } = await fromBuild("src/modules/assessment/document-revision.js");
   const header = "Working document. Revision N05.";

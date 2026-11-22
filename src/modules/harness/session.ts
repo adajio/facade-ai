@@ -1,22 +1,23 @@
 import { randomUUID } from 'node:crypto';
 import type { PoolClient } from 'pg';
 import type {
-  Branch, EvidenceRef, ModelResult, ObservationInput, ReaderPort, ResearchOutcome, ResearchSuspension, ResearchTask,
+  Branch, EvidenceRef, ModelResult, ObservationInput, Place, ReaderPort, ResearchOutcome, ResearchSuspension, ResearchTask,
 } from './contracts.js';
-import { ReaderRefusal } from './contracts.js';
+import { pairConfirmed, pairCriteria, ReaderRefusal, type PairChecks } from './contracts.js';
 import { contains } from '../pdf/types.js';
 import { canonicalJson, isInventoryRole } from '../assessment/domain.js';
 import { deliveredLines } from '../questions/attribute-aliases.js';
 import { escapeRegex } from '../questions/domain.js';
 import {
   checkToolArguments, commands, decodeCompletion, hashBytes, imageMessage, initialMessages, observationArguments, permittedTool, request,
-  toolMessage, type AssistantMessage, type FunctionCall, type ToolReply,
+  pairCommands, toolMessage, type AssistantMessage, type FunctionCall, type ToolReply,
 } from './openrouter.js';
 
 type AssistantEvent = {
   kind: 'model'; turn: number; attemptId: string; finishReason: string;
   message: AssistantMessage | null; inputRefs: string[]; requestHash: string;
   compoundContract?: true;
+  pairContract?: true;
 };
 type RejectionEvent = {
   kind: 'rejected'; turn: number; attemptId: string; code: string; retryable: boolean; retryAt?: string;
@@ -163,6 +164,43 @@ function restore(task: ResearchTask, events: ResearchEvent[]) {
 
 function branchOf(task: ResearchTask): Branch {
   return task.job.mode === 'lead' ? 'A' : task.job.branch;
+}
+
+function reviewEvidence(state: State, evidenceIds: readonly string[], citations: readonly { branch: Branch; place: Place }[]) {
+  const replies = evidenceIds.map((id) => state.delivered.has(id) ? state.replies.get(id) : undefined);
+  return {
+    delivered: replies.every((reply) => reply?.evidence),
+    both: citations.every((citation) => replies.some((reply) =>
+      reply?.support === citation.branch && reply.readKind !== 'open_context' &&
+      reply.evidence && samePlace(citation.place, reply.evidence.place))),
+  };
+}
+
+function checkPairEvidence(state: State, checks: PairChecks): ToolReply | null {
+  for (const criterion of pairCriteria) {
+    const check = checks[criterion];
+    const supports = new Set<Branch>();
+    for (const { evidenceId, quote } of check.sources) {
+      const reply = state.delivered.has(evidenceId) ? state.replies.get(evidenceId) : undefined;
+      if (!reply?.evidence || !reply.support) return failedTool('evidence_not_delivered', evidenceCorrection);
+      const body = reply.body as { content?: unknown };
+      const lines = typeof body.content === 'string' ? deliveredLines(body.content) : [];
+      if (!lines.some(({ text }) => text.includes(quote))) {
+        return failedTool('pair_quote_not_found', 'Укажите дословную цитату из открытой текстовой опоры или OCR.');
+      }
+      if (criterion === 'revision' && check.status === 'confirmed' &&
+          !/(?:^|[^\p{L}\p{N}])(?:revision|rev\.?|редакция|ревизия|ред\.?)\s*[:№]?\s*[\p{L}\p{N}][\p{L}\p{N}_.-]*/iu.test(quote)) {
+        return failedTool('pair_revision_not_addressed',
+          'Цитата должна содержать явное обозначение редакции в открытом оригинале. Если редакцию подтвердить нельзя, укажите unclear.');
+      }
+      supports.add(reply.support);
+    }
+    if (check.status === 'confirmed' && supports.size !== 2) {
+      return failedTool('pair_check_evidence_required',
+        `Для проверки ${criterion} укажите открытые опоры обеих сторон или оставьте результат неопределённым.`);
+    }
+  }
+  return null;
 }
 
 function supportPlace(task: ResearchTask, support: Branch) {
@@ -322,11 +360,14 @@ async function executeTool(
 ): Promise<{ reply: ToolReply; outcome?: ResearchOutcome }> {
   if (state.outcome) return { reply: failedTool('already_finished') };
   const name = call.function.name;
-  if (!permittedTool(task.job, name)) return { reply: failedTool('unknown_tool', 'Выберите инструмент из списка для вашей роли.') };
+  const earlyPair = state.pending?.model.pairContract === true;
+  if (!permittedTool(task.job, name, earlyPair)) return { reply: failedTool('unknown_tool', 'Выберите инструмент из списка для вашей роли.') };
   const args = decodeArguments(call.function.arguments);
-  const parsed = checkToolArguments(task.job, name, args);
+  const parsed = checkToolArguments(task.job, name, args, earlyPair);
   if (!parsed.success) {
-    const nextAction = name === 'save_observation' ? observationCorrection(args) : name === 'verify_resolution'
+    const nextAction = name === 'save_observation' ? observationCorrection(args) :
+      earlyPair && (name === 'verify_resolution' || name === 'propose_resolution')
+        ? 'Укажите checks по исполнению, ревизии, применимости и сопоставимости и evidenceIds открытых опор.' : name === 'verify_resolution'
       ? 'Передайте verdict, explanation и evidenceIds. Для supported нужны IDs обеих открытых опор.'
       : `Повторите ${name} с аргументами из схемы инструмента.`;
     return { reply: failedTool('invalid_arguments', nextAction) };
@@ -356,7 +397,7 @@ async function executeTool(
       const { evidenceId, place, readerVersion, sha256 } = view;
       const evidence = { evidenceId, place, readerVersion, sha256 };
       return { reply: { body: { ok: true, evidence, content: view.bytes.toString('utf8'), limitations: view.limitations },
-        evidence, readKind: name } };
+        evidence, readKind: name, ...(view.support ? { support: view.support } : {}) } };
     }
     case 'survey': case 'zoom': case 'extract': case 'ocr': case 'search': {
       // Parse by tool name to retain the argument type at the dispatch boundary.
@@ -482,22 +523,38 @@ async function executeTool(
     }
     case 'propose_resolution': {
       if (task.job.mode !== 'lead') throw new Error('Proposal from a non-lead job');
-      const proposal = commands.propose_resolution.parse(parsed.data);
+      const proposal: Omit<Extract<ResearchOutcome, { kind: 'proposal' }>, 'kind'> = earlyPair
+        ? pairCommands.propose_resolution.parse(parsed.data) : commands.propose_resolution.parse(parsed.data);
       const { a, b } = task.job.dispute;
       if (proposal.aObservationId !== a.observationId || proposal.bObservationId !== b.observationId) {
         return { reply: failedTool('proposal_pair_mismatch', 'Возьмите aObservationId и bObservationId из закреплённой пары в задании.') };
+      }
+      if (proposal.checks && proposal.evidenceIds) {
+        const evidence = reviewEvidence(state, proposal.evidenceIds, [a, b]);
+        if (!evidence.delivered) return { reply: failedTool('evidence_not_delivered', evidenceCorrection) };
+        if (pairConfirmed(proposal.checks) && !evidence.both) {
+          return { reply: failedTool('both_supports_required', 'Сначала откройте обе опоры с support A и B.') };
+        }
+        const missing = checkPairEvidence(state, proposal.checks);
+        if (missing) return { reply: missing };
       }
       return { reply: { body: { ok: true } }, outcome: { kind: 'proposal', ...proposal } };
     }
     case 'verify_resolution': {
       if (task.job.mode !== 'verify') throw new Error('Verification from a non-verification job');
-      const input = commands.verify_resolution.parse(parsed.data);
-      const replies = input.evidenceIds.map((id) => state.delivered.has(id) ? state.replies.get(id) : undefined);
-      if (replies.some((reply) => !reply?.evidence)) return { reply: failedTool('evidence_not_delivered', evidenceCorrection) };
+      const input: Omit<Extract<ResearchOutcome, { kind: 'verification' }>, 'kind'> = earlyPair
+        ? pairCommands.verify_resolution.parse(parsed.data) : commands.verify_resolution.parse(parsed.data);
       const { a, b } = task.job.dispute;
-      const corroborates = [a, b].every((citation) => replies.some((reply) =>
-        reply?.support === citation.branch && reply.evidence && samePlace(citation.place, reply.evidence.place)));
-      if (input.verdict === 'supported' && !corroborates) return { reply: failedTool('both_supports_required', 'Откройте обе назначенные опоры с support A и B и укажите их evidenceIds. Если проверить пару не удалось, используйте unclear.') };
+      const evidence = reviewEvidence(state, input.evidenceIds, [a, b]);
+      if (!evidence.delivered) return { reply: failedTool('evidence_not_delivered', evidenceCorrection) };
+      if (input.verdict === 'supported' && !evidence.both) return { reply: failedTool('both_supports_required', 'Откройте обе назначенные опоры с support A и B и укажите их evidenceIds. Если проверить пару не удалось, используйте unclear.') };
+      if (input.verdict === 'supported' && earlyPair && !pairConfirmed(input.checks)) {
+        return { reply: failedTool('pair_check_unresolved', 'Если хотя бы одна проверка остаётся открытой или несовместимой, выберите unclear.') };
+      }
+      if (input.checks) {
+        const missing = checkPairEvidence(state, input.checks);
+        if (missing) return { reply: missing };
+      }
       return { reply: { body: { ok: true } }, outcome: { kind: 'verification', ...input } };
     }
   }
@@ -578,7 +635,7 @@ export async function advance(task: ResearchTask, ports: SessionPorts): Promise<
     };
   }
   const turn = state.latestModel + 1;
-  const modelRequest = request(task.job, state.currentMessages);
+  const modelRequest = request(task.job, state.currentMessages, 'current', task.earlyPair);
   let serialized = JSON.stringify(modelRequest);
   if (Buffer.byteLength(serialized) > 16 * 1024 * 1024) {
     return {
@@ -593,10 +650,12 @@ export async function advance(task: ResearchTask, ports: SessionPorts): Promise<
   });
   let result = await send(modelRequest);
   let compoundContract = true;
+  let pairContract = task.earlyPair;
   // The unfiltered history is still needed to identify requests already recorded in the gateway.
   const previouslySent = state.currentMessages === state.previousCurrentMessages ? []
     : [['current', state.previousCurrentMessages] as const];
-  for (const [wire, messages] of [...previouslySent, ['compound-v1', state.previousCurrentMessages],
+  const prePair = task.earlyPair ? [['current', state.currentMessages] as const] : [];
+  for (const [wire, messages] of [...prePair, ...previouslySent, ['compound-v1', state.previousCurrentMessages],
     ['observation-v1', state.previousCurrentMessages], ['role-v1', state.roleMessages], ['shared-v1', state.messages]] as const) {
     if (result.status !== 'held' || result.code !== 'effect_conflict' || !result.attemptId) break;
     // An existing attempt can only be recovered with its original request hash.
@@ -607,6 +666,7 @@ export async function advance(task: ResearchTask, ports: SessionPorts): Promise<
       result = await send(legacy);
       serialized = legacyWire;
       compoundContract = wire === 'current' || wire === 'compound-v1';
+      pairContract = undefined;
     }
   }
   if (result.status === 'held') return {
@@ -627,6 +687,7 @@ export async function advance(task: ResearchTask, ports: SessionPorts): Promise<
   await ports.append(events.length, () => ({
     kind: 'model', turn, attemptId: result.attemptId, inputRefs, requestHash: hashBytes(serialized),
     ...(compoundContract ? { compoundContract: true as const } : {}),
+    ...(pairContract ? { pairContract } : {}),
     finishReason: decoded?.finishReason ?? 'invalid_response',
     message: decoded?.message ?? null,
   }));

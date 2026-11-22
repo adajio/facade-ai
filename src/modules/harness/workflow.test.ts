@@ -161,6 +161,44 @@ test('truncation preserves real assistant text, its reasoning, and an explicit r
   assert.equal((await advance(task, ports)).status, 'suspended');
 });
 
+test('a lead cannot confirm a revision without quoted evidence of its revision mark', async () => {
+  const { task, ports, events } = setup();
+  if (task.job.mode !== 'primary') assert.fail();
+  const a = { branch: 'A' as const, observationId: randomUUID(), evidenceId: randomUUID(),
+    quote: 'Thickness 12 mm', value: '12', unit: 'mm', place: task.job.place };
+  const b = { ...a, branch: 'B' as const, observationId: randomUUID(), evidenceId: randomUUID(),
+    quote: 'Thickness 19 mm', value: '19', place: { ...a.place,
+      source: { ...a.place.source, documentId: randomUUID(), versionId: randomUUID(), sha256: 'b'.repeat(64) } } };
+  const lead: ResearchTask = { ...task, earlyPair: true, job: { mode: 'lead', settings: task.job.settings, dispute: {
+    id: randomUUID(), question: { id: randomUUID(), subject: 'Assembly', property: 'Thickness' }, a, b,
+  } } };
+  const refs = { A: randomUUID(), B: randomUUID() };
+  ports.reader.read = async (_context, input) => {
+    const side = input.support === 'A' ? a : b;
+    const bytes = Buffer.from(JSON.stringify({ lines: [{ text: side.quote }] }));
+    return { evidenceId: refs[side.branch], place: side.place, readerVersion: 'test', mediaType: 'application/json',
+      sha256: hashBytes(bytes), bytes };
+  };
+  let turn = 0;
+  const supported = { status: 'confirmed', reason: 'Both parts checked.',
+    sources: [{ evidenceId: refs.A, quote: a.quote }, { evidenceId: refs.B, quote: b.quote }] };
+  ports.call = async ({ request: wire }) => {
+    turn++;
+    if (turn < 3) return receipt('extract', { support: turn === 1 ? 'A' : 'B' });
+    if (turn === 4) assert.match(String(wire.messages.at(-1)?.content), /pair_revision_not_addressed/);
+    const revision = turn === 3 ? supported : { status: 'unclear', reason: 'Neither original shows its effective revision.', sources: [] };
+    return receipt('propose_resolution', { aObservationId: a.observationId, bObservationId: b.observationId,
+      explanation: 'Conflicting measurements.', evidenceIds: [refs.A, refs.B],
+      checks: { variant: supported, revision, applicability: supported, comparability: supported } });
+  };
+  let state = await advance(lead, ports);
+  for (let steps = 0; steps < 20 && state.status === 'continue'; steps++) state = await advance(lead, ports);
+  assert.equal(state.status, 'done');
+  assert.equal(state.outcome.kind, 'proposal');
+  assert.equal(state.outcome.checks?.revision.status, 'unclear');
+  assert.ok(events.some((event) => event.kind === 'tool' && JSON.stringify(event.reply.body).includes('pair_revision_not_addressed')));
+});
+
 test('visual and text tools advertise only arguments accepted in their assigned role', () => {
   const { task } = setup();
   const primary = request(task.job, initialMessages(task.job));

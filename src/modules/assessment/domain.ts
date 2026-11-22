@@ -87,6 +87,7 @@ export type Review = {
   remaining: string[];
   completenessChecked: boolean;
   inventory?: InventoryProof;
+  confirmedPairs?: { a: string; b: string }[];
 };
 
 export type Machine = {
@@ -223,6 +224,19 @@ export function evaluate(
   };
   if (requirement.applicability !== "applicable") {
     return { ...base, limitations: ["applicability_unknown"] };
+  }
+  if (review?.confirmedPairs?.length) {
+    const byId = new Map(values.map((value) => [value.citation.observationId, value]));
+    const supported = review.confirmedPairs.flatMap(({ a, b }) => {
+      const left = byId.get(a);
+      const right = byId.get(b);
+      if (!left || !right || left.citation.branch !== "A" || right.citation.branch !== "B" ||
+          left.citation.versionId === right.citation.versionId || left.citation.sha256 === right.citation.sha256 ||
+          left.comparisonKey !== right.comparisonKey || compare(left.citation, right.citation) !== "different") return [];
+      return [left.citation, right.citation];
+    });
+    if (supported.length) return { ...base, outcome: "confirmed_conflict",
+      citations: distinctConflictSources(supported), limitations: review.remaining };
   }
   if (!review || !review.completenessChecked || review.remaining.length ||
       findings.some((finding) => finding.applicability === "unknown" ||

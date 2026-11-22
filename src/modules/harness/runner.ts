@@ -8,6 +8,7 @@ import {
   type ResearchSuspension, type ResearchTask, type ScheduledResearchTask,
 } from './contracts.js';
 import { researchSlot, type ResearchSlot } from './profile.js';
+import { reviewPairAdmission } from './review-pair.js';
 import type { FlowState, ResearchEvent, SessionPorts } from './session.js';
 import { runResearchWorkflow } from './workflow.js';
 
@@ -156,7 +157,12 @@ async function runAssignment(
   if (!settings) return {
     status: 'suspended', hold: { reason: 'research_profile_unavailable', nextAction: `Настроить профиль для ${slot}.` },
   };
-  let task: ResearchTask = { ...scheduled, job: { ...scheduled.job, settings } };
+  const review = scheduled.job.mode === 'primary' ? 'standard' :
+    await transaction(db, tx => reviewPairAdmission(tx, work));
+  if (review === 'stale') return {
+    status: 'suspended', hold: { reason: 'review_pair_stale', nextAction: 'Откройте актуальные опоры вопроса.' },
+  };
+  let task: ResearchTask = { ...scheduled, job: { ...scheduled.job, settings }, ...(review === 'early' ? { earlyPair: true } : {}) };
   const hold = services.admit?.(task);
   if (hold) return { status: 'suspended', hold };
   if (!scheduled.job.settings && !binding) {

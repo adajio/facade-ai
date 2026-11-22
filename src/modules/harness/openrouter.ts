@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
 import { z } from 'zod';
-import { boxSchema, branchSchema, type EvidenceRef, type ResearchJob } from './contracts.js';
+import { boxSchema, branchSchema, pairChecksSchema, type EvidenceRef, type ResearchJob } from './contracts.js';
 import { componentLinks, componentRoles } from '../pdf/types.js';
 
 const shortText = z.string().trim().min(1).max(500);
@@ -104,8 +104,16 @@ const currentCommands = {
   verify_resolution: verificationArguments,
 };
 
-export function checkToolArguments(job: ResearchJob, name: keyof typeof commands, args: unknown) {
-  const schema = name === 'save_observation' ? observationArguments(job) : currentCommands[name];
+export const pairCommands = {
+  propose_resolution: currentCommands.propose_resolution.extend({ checks: pairChecksSchema, evidenceIds: verificationFields.evidenceIds }),
+  verify_resolution: commands.verify_resolution.extend({ checks: pairChecksSchema, explanation: argumentText }),
+};
+const isPairCommand = (name: keyof typeof commands): name is keyof typeof pairCommands =>
+  name === 'propose_resolution' || name === 'verify_resolution';
+
+export function checkToolArguments(job: ResearchJob, name: keyof typeof commands, args: unknown, earlyPair = false) {
+  const schema = earlyPair && isPairCommand(name) ? pairCommands[name] :
+    name === 'save_observation' ? observationArguments(job) : currentCommands[name];
   return schema.safeParse(args);
 }
 
@@ -193,8 +201,9 @@ function enabledTools(job: ResearchJob, compound = true): Array<keyof typeof com
   }
 }
 
-export function permittedTool(job: ResearchJob, name: string): name is keyof typeof commands {
-  return enabledTools(job).some((tool) => tool === name);
+export function permittedTool(job: ResearchJob, name: string, earlyPair = false): name is keyof typeof commands {
+  return enabledTools(job).some((tool) => tool === name) ||
+    (earlyPair && job.mode !== 'primary' && (name === 'open_context' || name === 'context_inventory'));
 }
 
 export function initialMessages(job: ResearchJob): Message[] {
@@ -216,15 +225,25 @@ export function initialMessages(job: ResearchJob): Message[] {
 
 export type ToolWire = 'current' | 'compound-v1' | 'observation-v1' | 'role-v1' | 'shared-v1';
 
-export function request(job: ResearchJob, messages: Message[], wire: ToolWire = 'current') {
+export function request(job: ResearchJob, messages: Message[], wire: ToolWire = 'current', earlyPair = false) {
   const hasCompound = wire === 'current' || wire === 'compound-v1';
   const hasObservationForms = hasCompound || wire === 'observation-v1';
   return {
     model: job.settings.model,
     messages,
-    tools: enabledTools(job, hasCompound).map((name) => {
+    tools: [...enabledTools(job, hasCompound), ...(earlyPair ? ['context_inventory', 'open_context'] as const : [])].map((name) => {
       let schema: z.ZodType = hasObservationForms && name !== 'verify_resolution' ? currentCommands[name] : commands[name];
       let description = toolDescriptions[name];
+      if (earlyPair && isPairCommand(name)) {
+        schema = pairCommands[name];
+        description += ' Reopen both assigned originals independently. Check the same implementation (variant), effective revision of each source, scope and applicability to the assigned subject, and whether units and measured properties are comparable. For each confirmed check, provide a verbatim quote linked to freshly opened evidence from each support. For revision use the printed revision and explain why it is effective here. Look for titles and adjacent windows with context_inventory. Mark unclear when the relevant revision or variant cannot be established. The top-level evidenceIds must contain fresh reads of both original measurement windows. Never infer applicability merely from unequal numbers.';
+      }
+      if (earlyPair && name === 'context_inventory') {
+        description = 'List navigable windows in the two assigned immutable versions, including title pages. Use nextOffset to continue.';
+      }
+      if (earlyPair && name === 'open_context') {
+        description = 'Open a window of either assigned version using its context_inventory ID as contextId. When the required context is missing, report the unresolved check.';
+      }
       if (name === 'save_observation' && job.mode === 'primary') {
         if (job.observationProtocol === 2) {
           description += ' For an explicit delivery or non-delivery statement, send deliveryStatement with its verbatim item, quote and sourceRole (inventory for a transmittal). A context quote may cite another line of the same representation. Leave value and unit empty. A blank result or missing OCR text cannot establish non-delivery.';
@@ -244,7 +263,7 @@ export function request(job: ResearchJob, messages: Message[], wire: ToolWire = 
           const forms = z.toJSONSchema(observationArguments(job), { io: 'input' });
           Object.assign(parameters, { anyOf: forms.anyOf });
         }
-        if (name === 'verify_resolution') {
+        if (name === 'verify_resolution' && !earlyPair) {
           const forms = z.toJSONSchema(verificationArguments, { io: 'input' });
           Object.assign(parameters, forms.oneOf ? { oneOf: forms.oneOf } : { anyOf: forms.anyOf });
         }

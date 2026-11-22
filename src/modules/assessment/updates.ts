@@ -160,6 +160,9 @@ async function resolveReview(
     findings,
     remaining: review.remaining.map((limitation) => shortText(limitation, 500)),
     completenessChecked: review.completenessChecked === true,
+    ...(review.confirmedPairs?.length ? { confirmedPairs: review.confirmedPairs.map(({ a, b }) => ({
+      a: identifier(a), b: identifier(b),
+    })) } : {}),
     ...(inventory ? { inventory } : {}),
   };
 }
