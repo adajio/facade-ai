@@ -41,13 +41,19 @@ async function claim(db: Pool): Promise<Job | undefined> {
 
 async function search(db: Pool, job: Job, ports: QuestionSearchPorts, signal: AbortSignal): Promise<SearchResult> {
   const found = await db.query<{ source: ObservationPublication; superseded: boolean }>(
-    `SELECT source, superseded FROM inquiry_observations
-     WHERE project_id = $1 AND scope_id = $2 AND stage = $3 AND property_key = $4
-     ORDER BY (id = $5) DESC NULLS LAST, (variant_key = $6 AND subject_names && $7::text[]) DESC,
-       (variant_key = $6) DESC, (NOT superseded AND source->>'revision' = 'effective') DESC, id
+    `SELECT o.source, (o.superseded OR EXISTS (
+       SELECT 1 FROM inquiry_replaced_places x
+       WHERE x.question_id=$9 AND x.catalog_version_id=$10 AND x.scope_version=s.version
+         AND o.source->>'assessmentQuestionId'=x.question_id::text
+         AND x.version_id=o.version_id AND x.address=o.source->'address'
+     )) AS superseded
+     FROM inquiry_observations o JOIN project_scopes s ON s.id=o.scope_id
+     WHERE o.project_id = $1 AND o.scope_id = $2 AND o.stage = $3 AND o.property_key = $4
+     ORDER BY (o.id = $5) DESC NULLS LAST, (o.variant_key = $6 AND o.subject_names && $7::text[]) DESC,
+       (o.variant_key = $6) DESC, (NOT o.superseded AND o.source->>'revision' = 'effective') DESC, o.id
      LIMIT $8`,
     [job.project_id, job.scope_id, job.stage, job.property_key, job.anchor_id,
-      job.variant_key, job.subject_names, searchLimit + 1],
+      job.variant_key, job.subject_names, searchLimit + 1, job.assessment_question_id, job.catalog_version_id],
   );
 
   const candidates: Candidate[] = [];
@@ -63,13 +69,13 @@ async function search(db: Pool, job: Job, ports: QuestionSearchPorts, signal: Ab
         applicability = "address_unavailable";
       } else {
         const meaning = await ports.checkMeaning(job.subject, source, opened, signal, {
-          inquiryId: job.id, scopeId: job.scope_id, projectId: job.project_id,
+          inquiryId: job.id, assessmentQuestionId: job.assessment_question_id, scopeId: job.scope_id, projectId: job.project_id,
           searchVersion: job.search_version, generationId: job.generation_id,
         });
         applicability = meaning === "same" ? "verified" : meaning === "different" ? "meaning_different" : "meaning_unclear";
       }
     }
-    candidates.push({ source, reason, applicability });
+    candidates.push({ source, reason: source.subjectVerified === false && applicability === "verified" ? "registered_alias" : reason, applicability });
   }
 
   let pairs: Pair[] = [];

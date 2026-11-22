@@ -41,10 +41,13 @@ export interface OpenSupport {
   versionId: string;
   sha256: string;
   content: { kind: "text"; text: string } | { kind: "image"; bytes: Uint8Array; mediaType: string };
+  lineId?: string;
+  grounding?: "text" | "visual" | "limited";
 }
 
 export interface InquirySearchContext {
   inquiryId: string;
+  assessmentQuestionId?: string | null;
   projectId: string;
   scopeId: string;
   searchVersion: number;
@@ -104,7 +107,6 @@ export function checkLocalApplicability(
   if (source.role === "unknown") return "role_unknown";
   if (source.role === "reference") return "reference_only";
   if (!source.readable) return "unreadable";
-  if (source.subjectVerified === false) return "meaning_unclear";
 }
 
 const lengthPowers = new Map([

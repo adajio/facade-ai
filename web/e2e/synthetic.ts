@@ -73,8 +73,9 @@ export async function account(owner: BrowserContext, invitee: BrowserContext, or
   return { login, password, userId: invitation.userId };
 }
 
-export function pdf(line = 'AL-01 2 mm') {
-  const content = 'BT /F1 20 Tf 40 240 Td (' + line + ') Tj ET\n';
+export function pdf(line: string | string[] = 'AL-01 2 mm') {
+  const lines = Array.isArray(line) ? line : [line];
+  const content = 'BT /F1 20 Tf 40 240 Td 24 TL ' + lines.map((text) => '(' + text + ') Tj').join(' T* ') + ' ET\n';
   const objects = [
     '<< /Type /Catalog /Pages 2 0 R >>',
     '<< /Type /Pages /Kids [3 0 R] /Count 1 >>',

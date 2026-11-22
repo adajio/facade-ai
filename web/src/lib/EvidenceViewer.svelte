@@ -38,6 +38,7 @@
   let zoom = $state(100);
   let full = $state(false);
   let viewport = $state<HTMLDivElement>();
+  let locator = $derived({ ...evidence?.address.locator, ...observation?.address?.locator });
   let box = $derived(observation?.box ?? observation?.address?.box ?? evidence?.address?.box);
 
   $effect(() => {
@@ -173,16 +174,17 @@
   {#if evidence}
     <dl class="details">
       {#if evidence.source.name || evidence.source.relativePath}<dt>Файл</dt><dd>{evidence.source.name ?? evidence.source.relativePath}</dd>{/if}
-      <dt>Редакция</dt><dd>{evidence.source.versionId}</dd>
+      {#if citation.documentRevision?.label}<dt>Редакция документа</dt><dd>{citation.documentRevision.label}</dd>{/if}
+      <dt>Версия оригинала</dt><dd>{evidence.source.versionId}</dd>
       <dt>Ветвь</dt><dd>{observation?.branch ?? evidence.branch ?? '—'}</dd>
       {#if observation?.scope}<dt>Область</dt><dd>{observation.scope}</dd>{/if}
-      {#if evidence.address.page || evidence.address.locator?.page}
-        <dt>Физическая страница</dt><dd>{evidence.address.page ?? evidence.address.locator?.page}</dd>
+      {#if locator.page || evidence.address.page}
+        <dt>Физическая страница</dt><dd>{locator.page ?? evidence.address.page}</dd>
       {:else if evidence.address.unitId}
         <dt>Физическая единица</dt><dd>{evidence.address.unitId}</dd>
       {/if}
-      {#each Object.entries(evidence.address.locator ?? {}).filter(([key]) => key !== 'page') as [key, value] (key)}
-        <dt>{({sheet: 'Лист', range: 'Ячейки', paragraph: 'Абзац', section: 'Раздел', handle: 'Объект', layout: 'Вид'} as Record<string, string>)[key] ?? key}</dt><dd>{value}</dd>
+      {#each Object.entries(locator).filter(([key]) => key !== 'page') as [key, value] (key)}
+        <dt>{({sheet: 'Лист', range: 'Ячейки', cell: 'Ячейка', line: 'Строка', row: 'Строка таблицы', column: 'Столбец', paragraph: 'Абзац', section: 'Раздел', handle: 'Объект', layout: 'Вид'} as Record<string, string>)[key] ?? key}</dt><dd>{value}</dd>
       {/each}
     </dl>
     {#if observation?.quote || citation.quote}<blockquote>{observation?.quote ?? citation.quote}</blockquote>{/if}

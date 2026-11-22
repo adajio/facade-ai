@@ -181,3 +181,21 @@ export async function getCurrentInquiryPairs(tx: PoolClient, projectId: string, 
   }
   return [...found.values()];
 }
+
+
+/** Refresh only search cards that have the named assessment dependency. */
+export async function refreshAssessmentInquiries(
+  tx: PoolClient, projectId: string, scopeId: string, questionId: string, catalogVersionId: string,
+  anchor?: string,
+) {
+  const { rows } = await tx.query<{ id: string; search_version: number }>(
+    `UPDATE inquiries SET version=version+1, search_version=search_version+1,
+       needs_review=needs_review OR EXISTS (SELECT 1 FROM inquiry_decisions d WHERE d.inquiry_id=inquiries.id),
+       anchor_id=CASE WHEN anchor_id IS NULL THEN NULL ELSE coalesce($5::uuid,anchor_id) END
+     WHERE project_id=$1 AND scope_id=$2 AND assessment_question_id=$3 AND catalog_version_id=$4
+     RETURNING id,search_version`,
+    [projectId, scopeId, questionId, catalogVersionId, anchor ?? null],
+  );
+  for (const { id, search_version } of rows) await enqueue(tx, id, search_version);
+  return rows.map(({ id }) => id);
+}

@@ -1,7 +1,7 @@
 import type { Observation, ReaderLine } from "../pdf/types.js";
 import { escapeRegex, normalize } from "./domain.js";
 
-type AssignedSubject = { subject: string; property: string };
+type AssignedSubject = { subject: string; property: string; aliases?: readonly string[] };
 type Measure = Pick<Observation, "value" | "unit">;
 
 function words(text: string): string[] {
@@ -47,13 +47,29 @@ export function hasAddressedSubject(
   if (observation.grounding !== "text" || !observation.lineId) return false;
   const valueLine = lines.find(({ id }) => id === observation.lineId);
   if (!valueLine || !observation.quote || !valueLine.text.includes(observation.quote)) return false;
-  const required = [...new Set(words(`${target.subject} ${target.property}`))];
+  const names = [`${target.subject} ${target.property}`, ...target.aliases ?? []];
+  return names.some((name) => bindsAttribute([...new Set(words(name))], observation, valueLine, lines));
+}
+
+export function isAttributeAlias(target: AssignedSubject, alias: string, unit: string): boolean {
+  const identifiers = words(`${target.subject} ${target.property}`).filter(isIdentifier);
+  const excluded = new Set([...identifiers, ...words(unit), "mm", "мм", "cm", "см", "m", "м"]);
+  const tokens = words(alias);
+  return identifiers.every((identifier) => tokens.includes(identifier)) &&
+    tokens.some((token) => !excluded.has(token) && !isIdentifier(token) && /\p{L}{2}/u.test(token));
+}
+
+function isIdentifier(word: string): boolean {
+  return /\p{L}/u.test(word) && /\p{N}/u.test(word);
+}
+
+function bindsAttribute(required: string[], observation: Measure, valueLine: ReaderLine, lines: readonly ReaderLine[]): boolean {
   if (!required.length) return false;
   const label = measureLabel(valueLine.text, observation);
   if (label === undefined) return false;
   if (containsWords(label, required)) return true;
 
-  const identifiers = required.filter((word) => /\p{L}/u.test(word) && /\p{N}/u.test(word));
+  const identifiers = required.filter(isIdentifier);
   const { row, column, line } = valueLine.locator ?? {};
   if (typeof row === "number" && typeof column === "number") {
     const table = lines.filter((candidate) => sameTable(candidate, valueLine));

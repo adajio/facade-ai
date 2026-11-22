@@ -1,5 +1,6 @@
 import { selectConfirmedGrounds } from '../assessment/commands.js';
 import type { Ground as AssessmentGround, GroundsOptions } from '../assessment/commands.js';
+import { canonicalJson } from '../assessment/domain.js';
 import { AssessmentError } from '../assessment/store.js';
 import { externalLine } from './content.js';
 import type { Ground } from './content.js';
@@ -36,20 +37,42 @@ function clientSource(citation: Citation) {
   return { label, address: citation };
 }
 
+function distinctConflictCitations(citations: readonly Citation[]): Citation[] {
+  const locations = new Map<string, Citation>();
+  for (const citation of citations) {
+    const { documentId, versionId, sha256, address, value, unit } = citation;
+    const key = canonicalJson([documentId, versionId, sha256, address, value, unit]);
+    const previous = locations.get(key);
+    if (!previous || (!previous.documentRevision && citation.documentRevision)) locations.set(key, citation);
+  }
+  return [...locations.values()];
+}
+
+function conflictFact(sources: Ground['sources']): string {
+  const byValue = new Map<string, string[]>();
+  for (const { label, address } of sources) {
+    const value = externalLine([address.value, address.unit].filter((entry) => entry !== null).join(' '));
+    const labels = byValue.get(value);
+    if (labels) labels.push(label);
+    else byValue.set(value, [label]);
+  }
+  const values = [...byValue].map(([value, labels]) => {
+    const place = labels.length === 1 ? 'в источнике' : 'в источниках';
+    return `${place} ${labels.join(' и ')} указано ${value}`;
+  });
+  return `Значения расходятся, ${values.join(', а ')}.`;
+}
+
 export function renderGround(ground: AssessmentGround): Ground {
   const { scope, subject, part, requestedAction, citations, kind } = ground;
   const item = subject === part ? subject : `${subject} — ${part}`;
   const intro = `${externalLine(scope.name)}. ${externalLine(item)}.`;
-  const sources = citations.map(clientSource);
+  const sources = (kind === 'confirmed_conflict' ? distinctConflictCitations(citations) : citations).map(clientSource);
   const action = externalLine(requestedAction).replace(/[.!?]+$/u, '');
   const direction = `Просим ${action.slice(0, 1).toLocaleLowerCase('ru')}${action.slice(1)}.`;
   let facts: string[];
   if (kind === 'confirmed_conflict') {
-    const values = citations.map((citation, index) => {
-      const value = [citation.value, citation.unit].filter((entry) => entry !== null).join(' ');
-      return `в источнике ${sources[index].label} указано ${externalLine(value)}`;
-    });
-    facts = [`Значения расходятся, ${values.join(', а ')}.`];
+    facts = [conflictFact(sources)];
   } else {
     const formats = ground.requiredFormats.map(externalLine);
     const missing = formats.length ? `Не получен материал в требуемом формате (${formats.join(', ')}).` : 'Материал не передан.';

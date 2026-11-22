@@ -6,9 +6,10 @@ import { applyAssessmentUpdate, type AssessmentChange } from '../assessment/upda
 import type { WorkQueue } from '../gateway/queue.js';
 import { transaction } from '../gateway/types.js';
 import { lockIntakeProject } from '../intake/gate.js';
-import type { Observation, ReaderLine } from '../pdf/types.js';
+import type { Observation } from '../pdf/types.js';
 import type { ObservationPublication } from '../questions/domain.js';
 import { publishReaderObservation } from '../questions/reader.js';
+import { deliveredLines, readAttributeAliases } from '../questions/attribute-aliases.js';
 import { hasAddressedSubject } from '../questions/subject-evidence.js';
 import type {
   Branch, Citation, ObservationInput, Place, ReaderContext, ResearchOutcome, ScheduledResearchTask, TargetQuestion,
@@ -19,16 +20,13 @@ import { researchKind } from './runner.js';
 
 type Ref = Pick<ScheduledResearchTask, 'projectId' | 'scopeId' | 'generationId'>;
 
-type FindingRow = { finding: Finding; subjectVerified: boolean | null; observation: Observation; content: string | null };
+type FindingRow = {
+  finding: Finding; subjectVerified: boolean | null; revision: ObservationPublication['revision'];
+  observation: Observation; content: string | null;
+};
 
-function addressedSubject(target: TargetQuestion, observation: Observation, content: string | null): boolean {
-  if (!content) return false;
-  try {
-    const parsed = JSON.parse(content) as { lines?: ReaderLine[] } | null;
-    return Array.isArray(parsed?.lines) && hasAddressedSubject(target, observation, parsed.lines);
-  } catch {
-    return false;
-  }
+function addressedSubject(target: TargetQuestion, observation: Observation, content: string | null, aliases?: string[]): boolean {
+  return hasAddressedSubject({ ...target, aliases }, observation, deliveredLines(content));
 }
 
 const meaningfulRoles = new Set<string>(['design', 'schedule', 'approved_change', 'reference']);
@@ -92,20 +90,32 @@ async function scheduleDisputes(
 
 async function findingsFor(tx: PoolClient, ref: Ref, target: TargetQuestion, requirement: Requirement) {
   const { rows } = await tx.query<FindingRow>(
-    `SELECT h.finding, (i.source->>'subjectVerified')::boolean AS "subjectVerified",
+    `SELECT h.finding, (i.source->>'subjectVerified')::boolean AS "subjectVerified", i.source->>'revision' AS revision,
        o.payload AS observation, delivered.content
      FROM harness_observations h
      JOIN inquiry_observations i ON i.id=h.observation_id
      JOIN reader_observations o ON o.id=h.observation_id
+     JOIN project_scopes s ON s.id=h.scope_id
+     JOIN projects p ON p.id=s.project_id
      LEFT JOIN LATERAL (
        SELECT e.event#>>'{reply,body,content}' AS content FROM harness_research_events e
        WHERE e.job_id=o.run_id AND e.event#>>'{reply,evidence,evidenceId}'=o.evidence_id::text
        ORDER BY e.sequence LIMIT 1
-     ) delivered ON h.finding->>'kind'='value' AND NOT (i.source ? 'subjectVerified')
+     ) delivered ON h.finding->>'kind'='value' AND i.source->>'subjectVerified' IS DISTINCT FROM 'true'
      WHERE h.generation_id=$1 AND h.question_id=$2 AND NOT i.superseded
+       AND NOT EXISTS (
+         SELECT 1 FROM inquiry_replaced_places x WHERE x.question_id=h.question_id
+         AND x.catalog_version_id=p.catalog_version_id AND x.scope_version=s.version
+         AND x.version_id=i.version_id AND x.address=i.source->'address'
+       )
      ORDER BY h.observation_id LIMIT 501`, [ref.generationId, target.id]);
-  return rows.flatMap(({ finding, subjectVerified, observation, content }) => {
-    if (finding.kind !== 'value' || (subjectVerified ?? addressedSubject(target, observation, content))) return [finding];
+  const aliases = rows.some(({ finding, subjectVerified }) => finding.kind === 'value' && subjectVerified !== true)
+    ? await readAttributeAliases(tx, target.id) : [];
+  return rows.flatMap(({ finding, revision, subjectVerified, observation, content }) => {
+    if (finding.kind !== 'value' || subjectVerified) return [finding];
+    if (addressedSubject(target, observation, content, aliases)) {
+      return [{ ...finding, applicability: revision === 'effective' ? 'active' as const : finding.applicability }];
+    }
     // An unresolved value of an inadmissible format remains available by address in the inquiry.
     if (!requirement.formats.includes(finding.format) && finding.sourceRole !== 'approved_change') return [];
     return [{ ...finding, applicability: 'unknown' as const }];
@@ -142,14 +152,16 @@ async function updateQuestion(
   const { rows: [review] } = await tx.query<{ pending: boolean; unclear: boolean }>(
     `SELECT EXISTS(
        SELECT 1 FROM harness_disputes d
-       WHERE d.generation_id=$1 AND d.question_id=$2 AND (
+       WHERE d.generation_id=$1 AND d.question_id=$2
+         AND d.a_observation_id=ANY($3::uuid[]) AND d.b_observation_id=ANY($3::uuid[]) AND (
          NOT EXISTS (SELECT 1 FROM harness_review_results r WHERE r.generation_id=$1 AND r.dispute_id=d.id AND r.stage='A')
          OR NOT EXISTS (SELECT 1 FROM harness_review_results r WHERE r.generation_id=$1 AND r.dispute_id=d.id AND r.stage='B')
        )
      ) AS pending, EXISTS(
        SELECT 1 FROM harness_disputes d JOIN harness_review_results r ON r.dispute_id=d.id AND r.generation_id=d.generation_id
        WHERE d.generation_id=$1 AND d.question_id=$2 AND r.result->>'verdict'='unclear'
-     ) AS unclear`, [ref.generationId, question.id]);
+         AND d.a_observation_id=ANY($3::uuid[]) AND d.b_observation_id=ANY($3::uuid[])
+     ) AS unclear`, [ref.generationId, question.id, findings.map(({ citation }) => citation.observationId)]);
   if (heldDecision && review.pending) return;
   const remaining = [
     ...(!coverage.sealed ? ['inventory_open'] : []),

@@ -64,6 +64,23 @@ test("assessment rules distinguish unit equivalence, versions, unreadable values
     { ...different, comparisonKey: "D1:thickness:variant-2" }] }).outcome, "needs_review");
   assert.equal(evaluate(requirement, { ...complete, findings: [a,
     { ...different, applicability: "superseded" }] }).outcome, "needs_review");
+  const source = (item, name, version, extras = {}) => ({
+    ...item, citation: { ...item.citation, documentId: name, versionId: version, sha256: name, ...extras },
+  });
+  const pdfSupport = source(a, "drawing.pdf", "drawing-v1");
+  const docxSupport = source(different, "log.docx", "docx-v1");
+  const docSupport = source(finding("A", "1.8", "mm", 2), "log.doc", "doc-v2");
+  const docRepeat = source(different, "log.doc", "doc-v2", { receiptId: "repeat", address: { page: 2, box: [1, 2] } });
+  const outdated = { ...source(finding("A", "22", "mm", 2), "log.doc", "doc-v1"), applicability: "superseded" };
+  const completeConflict = evaluate(requirement, {
+    ...complete, findings: [pdfSupport, docxSupport, docSupport, docRepeat, outdated],
+  });
+  assert.equal(completeConflict.outcome, "confirmed_conflict");
+  assert.deepEqual(completeConflict.citations, [pdfSupport.citation, docxSupport.citation, docSupport.citation]);
+  const pending = { ...source(finding("B", "29", "mm", 3), "unverified.pdf", "guess"), applicability: "unknown" };
+  assert.equal(evaluate(requirement, {
+    ...complete, findings: [pdfSupport, docxSupport, docSupport, docRepeat, pending],
+  }).outcome, "needs_review");
   const damaged = evaluate(requirement, { ...complete, findings: [{ ...a, kind: "delivery" }] });
   assert.equal(damaged.outcome, "needs_review");
   assert.equal(damaged.delivery, "received");
@@ -88,6 +105,36 @@ test("assessment rules distinguish unit equivalence, versions, unreadable values
   assert.deepEqual(contested.limitations, ["non_delivery_contradicted"]);
   assert.equal(effectiveOutcome(damaged, { action: "exclude", outcome: "excluded",
     exclusion: { until: "2026-11-20T00:00:00Z" } }, new Date("2026-11-22T00:00:00Z")), "needs_review");
+});
+
+test("document revision survives repeated conversions of an original", async () => {
+  const { createDocumentRevisionReader } = await fromBuild("src/modules/assessment/document-revision.js");
+  const header = "Working document. Revision N05.";
+  const bytes = (text, derivativeSha256) => Buffer.from(JSON.stringify({
+    derivativeSha256, lines: [{ text, locator: { paragraph: 2 } }],
+  }));
+  const entries = Array.from({ length: 12 }, (_, index) => ({
+    evidence: {
+      id: String(index),
+      size: bytes(header, index).length,
+      format: "doc",
+      address: { unitId: "paragraphs:1", locator: { firstParagraph: 1 } },
+    },
+  }));
+  const tx = { query: async () => ({ rows: entries }) };
+  const read = createDocumentRevisionReader({ content: async ({ id }) => bytes(header, id) });
+  const resolve = (reader) => reader(tx, "project", "Design", {
+    address: { locator: { table: 1, row: 2, column: 2 } },
+  });
+  assert.deepEqual(await resolve(read), {
+    label: "N05", quote: header,
+    address: { unitId: "paragraphs:1", locator: { firstParagraph: 1, paragraph: 2 } },
+    evidenceId: "0",
+  });
+  const contradictory = createDocumentRevisionReader({
+    content: async ({ id }) => bytes(id === "11" ? "Working document. Revision N06." : header, id),
+  });
+  assert.equal(await resolve(contradictory), undefined);
 });
 
 async function createScopedApi(config) {
@@ -464,6 +511,16 @@ test("assessment through real HTTP, PostgreSQL, reader and letter modules", {
   const conflictSnapshot = await http("GET", `/letters/${letter.id}/revisions/${letter.revisionId}`, 200);
   assert.deepEqual(conflictSnapshot.items[0].sources.map(({ address }) => address), conflictSource);
 
+  const recorded = await http("POST", `/letters/${letter.id}/sent`, 201, {
+    revisionId: letter.revisionId,
+    itemIds: conflictSnapshot.items.map(({ id }) => id),
+    recipient: base.addressee,
+    text: text.text,
+    sentAt: new Date().toISOString(),
+  });
+  const oldSentPath = `/letters/${letter.id}/sent/${recorded.id}`;
+  const oldSent = await http("GET", oldSentPath, 200);
+  assert.equal(oldSent.items[0].sources.length, 2);
   const pendingReceipt = await http("POST", `${p}/receipts`, 201, {});
   const pending = await upload("Pending new data", "North revision.pdf", [north.id], false, pendingReceipt.receiptId);
   await http("GET", `/letters/${letter.id}/current-text`, 409, undefined, letter.version);
@@ -568,5 +625,37 @@ test("assessment through real HTTP, PostgreSQL, reader and letter modules", {
   const earlier = await http("GET", `${p}/assessments/${priorDecision.assessmentVersion}?scopeId=${north.id}`, 200);
   const preserved = earlier.questions.find(({ id }) => id === target.id);
   assert.deepEqual(preserved.decision.basis.citations.map(({ versionId }) => versionId), [a.versionId, b.versionId]);
+
+
+  // A third reviewed original introduces a conflict against two independent agreeing originals.
+  const furtherReceipt = await http("POST", `${p}/receipts`, 201, {});
+  const furtherFile = await upload(["Revision N08", "Thickness D1 0.0018 m"], "Third original.pdf",
+    [north.id], true, furtherReceipt.receiptId);
+  await http("POST", `/receipts/${furtherReceipt.receiptId}/seal`, 200, {});
+  const thirdA = await read(furtherFile, "A", "Thickness D1 0.0018 m", "0.0018", "m");
+  const thirdB = await read(furtherFile, "B", "Thickness D1 0.0018 m", "0.0018", "m");
+  const withThirdInput = await current(north);
+  await publishValues(withThirdInput, settled, [finding(left), finding(replacement), finding(thirdA), finding(thirdB)]);
+  const allSupports = await current(north);
+  const conflictWithThree = allSupports.questions.find(({ id }) => id === target.id);
+  assert.equal(conflictWithThree.outcome, "confirmed_conflict");
+  const versionIds = [a.versionId, replacementFile.versionId, furtherFile.versionId].sort();
+  assert.deepEqual(conflictWithThree.machine.citations.map(({ versionId }) => versionId).sort(), versionIds);
+  for (const hold of allSupports.holds) {
+    await http("POST", `${p}/supplements/holds/${hold.id}/resolve`, 200, {
+      generation: hold.generation, reason: "Verified this contribution before opening the letter.",
+      impacts: [{ scopeId: north.id, assessmentVersion: allSupports.version, questionIds: [] }],
+    }, hold.version);
+  }
+  const decisionWithThree = await http("POST", confirmPath, 201, decisionInput, conflictWithThree.version);
+  const newLetter = await http("POST", `${p}/letters`, 201, {
+    scopeId: north.id, recipient: base.addressee,
+    items: [{ questionId: target.id, questionVersion: decisionWithThree.version, decisionId: decisionWithThree.id }],
+  });
+  const newSnapshot = await http("GET", `/letters/${newLetter.id}/revisions/${newLetter.revisionId}`, 200);
+  assert.deepEqual(newSnapshot.items[0].sources.map(({ address }) => address.versionId).sort(), versionIds);
+  const newText = await http("GET", `/letters/${newLetter.id}/current-text`, 200, undefined, newLetter.version);
+  assert.match(newText.text, /Third original\.pdf/u);
+  assert.deepEqual(await http("GET", oldSentPath, 200), oldSent);
 
 });

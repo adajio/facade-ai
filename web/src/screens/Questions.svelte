@@ -3,17 +3,16 @@
   import { conflictMessage } from '../lib/conflict';
   import { date, label } from '../lib/format';
   import { ApiError, describe, id, interrupted, query, type Api } from '../lib/http';
-  import { V1, projectV1, scopedUrl, type Citation, type OpenEvidence, type WorkspaceProps } from '../lib/workspace';
+  import { V1, projectV1, scopedUrl, type OpenEvidence, type WorkspaceProps } from '../lib/workspace';
+  import { supportCitation, type InquirySupport as Support } from '../lib/inquiry-supports';
+  import InquirySupportDetails from '../lib/InquirySupportDetails.svelte';
   import EvidenceButtons from '../lib/EvidenceButtons.svelte';
   import Notice from '../lib/Notice.svelte';
+  import QuestionReplacement from './QuestionReplacement.svelte';
 
   type Summary = {
     id: string; subject: string; state: string; nextAction?: string; version: number;
     searchVersion: number; needsReview?: boolean; stage: string; scopeId: string; assessmentQuestionId?: string;
-  };
-  type Support = Citation & {
-    observationId: string; subject: string; property: string; variant?: string; revision: string;
-    role: string; versionId: string; receiptId: string; measurement?: { value: string; unit: string };
   };
   type Candidate = { source: Support; reason: string; applicability: string };
   type Decision = { action: string; reason: string; answer?: string; createdAt: string; authorId: string; version: number };
@@ -158,9 +157,6 @@
     }
   }
 
-  function citation(source: Support): Citation {
-    return { ...source, value: source.measurement?.value, unit: source.measurement?.unit };
-  }
 </script>
 
 {#if !context.scopeId}
@@ -225,7 +221,7 @@
           <section class="card">
             <h2>Пары для сверки</h2>
             <ul class="plain-list">{#each inquiry.pairs as pair}
-              <li><strong>{label(pair.comparison)}</strong><EvidenceButtons citations={[citation(pair.left), citation(pair.right)]} {open} /></li>
+              <li><strong>{label(pair.comparison)}</strong><EvidenceButtons citations={[supportCitation(pair.left), supportCitation(pair.right)]} {open} /></li>
             {/each}</ul>
           </section>
         {/if}
@@ -236,14 +232,18 @@
               <li>
                 <strong>{candidate.source.subject} · {candidate.source.property}{candidate.source.variant ? ' · ' + candidate.source.variant : ''}</strong>
                 <p class="meta">{label(candidate.applicability)} · {label(candidate.reason)} · {label(candidate.source.revision)} · {label(candidate.source.role)}</p>
-                {#if candidate.source.quote}<blockquote>{candidate.source.quote}</blockquote>{/if}
-                <EvidenceButtons citations={[citation(candidate.source)]} {open} />
+                <InquirySupportDetails source={candidate.source} {open} />
                 {#if context.canEdit && !context.revision && candidate.applicability === 'verified'}
                   <label><input type="checkbox" bind:group={selected} value={candidate.source.observationId} onchange={() => basedOn ??= inquiry?.version} /> Использовать опору</label>
                 {/if}
               </li>
             {/each}</ul>
           </section>
+        {/if}
+        {#if mode === 'questions' && inquiry.assessmentQuestionId}
+          {#key inquiry.assessmentQuestionId}
+            <QuestionReplacement {api} questionId={inquiry.assessmentQuestionId} candidates={inquiry.candidates} {context} {open} {renew} />
+          {/key}
         {/if}
         {#if context.canEdit && !context.revision && !['queued', 'searching'].includes(inquiry.state)}
           <section class="card">

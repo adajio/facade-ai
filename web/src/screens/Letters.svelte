@@ -103,7 +103,27 @@
   }
 
   function supports(item: Ground) {
-    return item.basis?.citations ?? item.basis?.machine?.citations ?? item.sources?.map((source) => source.address).filter((address) => address?.evidenceId) ?? [];
+    const sources = (item.sources ?? []).flatMap(({ address, label }) => address?.evidenceId
+      ? [{ ...address, sourceLabel: label }]
+      : []);
+    const saved = item.basis?.citations ?? item.basis?.machine?.citations ?? [];
+    if (item.kind !== 'confirmed_conflict') return sources.length ? sources : saved;
+
+    // Some already-saved revisions carry fewer display sources than their stored basis.
+    const distinct = new Map<string, Citation>();
+    for (const citation of [...sources, ...saved]) {
+      const key = JSON.stringify([citation.documentId ?? citation.evidenceId, citation.versionId,
+        citation.sha256, sortAddress(citation.address), citation.value, citation.unit]);
+      if (!distinct.has(key)) distinct.set(key, citation);
+    }
+    return [...distinct.values()];
+  }
+
+  function sortAddress(value: unknown): unknown {
+    if (Array.isArray(value)) return value.map(sortAddress);
+    if (!value || typeof value !== 'object') return value;
+    return Object.fromEntries(Object.entries(value).sort(([a], [b]) => a.localeCompare(b))
+      .map(([key, entry]) => [key, sortAddress(entry)]));
   }
 
   $effect(() => {

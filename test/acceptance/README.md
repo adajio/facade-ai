@@ -70,3 +70,17 @@ PYTHONDONTWRITEBYTECODE=1 python3 test/acceptance/summarize_trace.py "$private_m
 ```sh
 PYTHONDONTWRITEBYTECODE=1 python3 test/acceptance/followup_regression.py "$run_evidence_dir"
 ```
+
+Для адресного повтора письма добавьте `--letter-oracle "$private_gold_dir/mixed.json"` на хосте. К прежним проверкам истории добавится `letterSemantics`. Она проверяет ровно один внешний пункт по зазору QF-91, адресата, область, стадию, запрошенное действие и три отдельные опоры PDF, DOCX и DOC в сохранённой редакции и обоих экспортах. Для каждой опоры проверяются исходный SHA-256, версия, редакция, адрес, величина и открытие оригинала. Опоры берутся из `letter.decisions.gap.sources` замороженного эталона. Проверка текста сопоставляет поля с метками и числовыми утверждениями текущего рендерера, допуская перестановку опор. При изменении формы этих утверждений нужна явная смысловая сверка. Эталон остаётся за пределами стенда.
+
+```sh
+PYTHONDONTWRITEBYTECODE=1 python3 test/acceptance/followup_regression.py \
+  "$run_evidence_dir" --letter-oracle "$private_gold_dir/mixed.json"
+```
+
+`STEP15_CASES=mixed-addressed` сохраняет тот же слепой пакет и результат N06 до допуска TXT. Затем тестовый инженер пробует `POST /api/questions/:id/source-replacements` на исходном каталоге с выбранными адресами. Отдельный каталог с эквивалентом TXT закрепляется после исходного удержания. Тот же штатный маршрут получает прежние адреса PDF, DOCX и DOC и обе опоры строки 3 N06. Сохраняются машинное состояние сразу после команды, аудит, история первого письма и новый подтверждённый вывод тестовой роли. Опоры выбираются из текущих адресных наблюдений, исходники открытия проверяются по хэшам. Управляемый транспорт и замороженный эталон прежние.
+
+```sh
+PYTHONDONTWRITEBYTECODE=1 python3 test/acceptance/followup_regression.py \
+  "$run_evidence_dir" --letter-oracle "$private_gold_dir/mixed.json" --addressed
+```

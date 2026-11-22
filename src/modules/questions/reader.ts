@@ -9,6 +9,8 @@ import { escapeRegex, matchReason, normalize } from "./domain.js";
 import type { ObservationPublication, QuestionSearchPorts } from "./domain.js";
 import { onObservationPublished } from "./store.js";
 import { hasVerifiedMeaning } from "./semantic-review.js";
+import { deliveredLines, readAttributeAliases } from "./attribute-aliases.js";
+import { hasAddressedSubject } from "./subject-evidence.js";
 
 type Reader = Pick<ReturnType<typeof createRuntimePdfService>, "findObservation" | "findEvidence" | "content">;
 
@@ -79,19 +81,25 @@ function hasName(line: string, name: string): boolean {
 export function createRuntimeInquiryPorts(
   db: Pool, reader: Reader, objects: IntakeStorage["objects"],
   checkMeaning?: QuestionSearchPorts["checkMeaning"],
+  tx?: PoolClient,
 ): QuestionSearchPorts {
   return {
     async openSupport(source, signal) {
-      const pin = await reader.findObservation(source.projectId, source.observationId);
+      const pin = tx
+        ? (await tx.query<{ payload: Observation }>(
+          "SELECT payload FROM reader_observations WHERE project_id=$1 AND id=$2",
+          [source.projectId, source.observationId],
+        )).rows[0]?.payload
+        : await reader.findObservation(source.projectId, source.observationId);
       if (!pin || pin.scope !== source.scopeId || pin.receiptId !== source.receiptId ||
         pin.evidenceId !== source.evidenceId || pin.source.documentId !== source.documentId ||
         pin.source.versionId !== source.versionId || pin.source.sha256 !== source.sha256 ||
         pin.quote !== source.quote || (source.measurement && (pin.value !== source.measurement.value ||
           pin.unit !== source.measurement.unit)) ||
         canonicalJson(pin.address) !== canonicalJson(source.address)) return null;
-      const evidence = await reader.findEvidence(source.projectId, source.evidenceId);
+      const evidence = await reader.findEvidence(source.projectId, source.evidenceId, tx);
       if (!evidence || evidence.source.versionId !== source.versionId || evidence.source.sha256 !== source.sha256) return null;
-      const file = await original(db, pin.source);
+      const file = await original(tx ?? db, pin.source);
       if (!file || file.original_id !== source.originalId || file.sha256 !== source.sha256) return null;
       try {
         const content = await objects.get(file.object_key);
@@ -107,6 +115,7 @@ export function createRuntimeInquiryPorts(
         const bytes = await reader.content(evidence);
         return {
           observationId: pin.id, versionId: source.versionId, sha256: source.sha256,
+          lineId: pin.lineId, grounding: pin.grounding,
           content: evidence.mediaType.startsWith("image/")
             ? { kind: "image", bytes, mediaType: evidence.mediaType }
             : { kind: "text", text: bytes.toString("utf8") },
@@ -118,6 +127,17 @@ export function createRuntimeInquiryPorts(
       }
     },
     async checkMeaning(question, candidate, support, signal, context) {
+      if (candidate.subjectVerified === false) {
+        if (!candidate.assessmentQuestionId || candidate.assessmentQuestionId !== context.assessmentQuestionId ||
+          support.content.kind !== "text" ||
+          matchReason(question, candidate) === "same_property") return "unclear";
+        const aliases = await readAttributeAliases(db, candidate.assessmentQuestionId);
+        if (!aliases.length) return "unclear";
+        return hasAddressedSubject({ subject: "", property: "", aliases }, {
+          quote: candidate.quote, value: candidate.measurement?.value, unit: candidate.measurement?.unit,
+          lineId: support.lineId, grounding: support.grounding ?? "limited",
+        }, deliveredLines(support.content.text)) ? "same" : "unclear";
+      }
       if (support.content.kind === "text" && candidate.quote &&
         matchReason(question, candidate) !== "same_property") {
         const text = support.content.text;

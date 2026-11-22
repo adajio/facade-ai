@@ -6,6 +6,7 @@ export type DocumentRevisionReader = (
   tx: PoolClient, projectId: string, stage: string, citation: Citation,
 ) => Promise<DocumentRevision | undefined>;
 
+const maxHeaderEvidenceBytes = 8 * 1024 * 1024;
 const explicitRevision = /(?:^|[.·;]\s*)(?:редакция|ред\.?|revision)\s*[:№]?\s*([\p{L}\d][\p{L}\d_-]{0,23})(?=$|[\s.·;,])/iu;
 const revisionCode = /^(?:\p{L}{0,4}\d[\p{L}\d_-]{0,22}|[A-ZА-ЯЁ])$/u;
 
@@ -54,10 +55,12 @@ export function createDocumentRevisionReader(
            OR (m.format IN ('doc', 'docx') AND e.payload#>>'{address,locator,firstParagraph}' = '1')
            OR (m.format = 'txt' AND e.payload#>>'{address,locator,firstLine}' = '1')
          )
-       ORDER BY e.payload->>'sha256', e.created_at, e.id LIMIT 9`,
+       ORDER BY e.payload->>'sha256', e.created_at, e.id`,
       [projectId, citation.versionId, citation.sha256, citation.documentId, page == null ? null : String(page)],
     );
-    if (rows.length > 8) return undefined;
+    // Conversion metadata can give identical headers different artifact hashes across reads.
+    const totalBytes = rows.reduce((sum, { evidence }) => sum + evidence.size, 0);
+    if (totalBytes > maxHeaderEvidenceBytes) return undefined;
 
     const revisions = new Map<string, DocumentRevision>();
     for (const { evidence } of rows) {

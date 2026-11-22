@@ -11,8 +11,8 @@ const fromBuild = (path) => import(pathToFileURL(resolve(build, `src/${path}.js`
 const sha256 = (bytes) => createHash("sha256").update(bytes).digest("hex");
 
 // Real reader input, generated per address so byte deduplication cannot masquerade as an independent original.
-function pdf(line) {
-  const body = `BT /F1 18 Tf 30 165 Td (${line}) Tj ET\n`;
+function pdf(...lines) {
+  const body = `BT /F1 18 Tf 30 165 Td ${lines.map((line) => `(${line}) Tj`).join(" 0 -22 Td ")} ET\n`;
   const objects = [
     "<< /Type /Catalog /Pages 2 0 R >>",
     "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
@@ -563,4 +563,251 @@ test("addressed subject requires the measured attribute, including two attribute
   const bound = [adjacent[0], { ...adjacent[1], text: "For P-16 use 12 mm." }];
   assert.equal(hasAddressedSubject(task("gap"), value("value", bound[1].text, "12"), bound), true);
   assert.equal(hasAddressedSubject(task("length"), value("value", bound[1].text, "12"), bound), false);
+});
+
+test("engineer confirms a CAD alias and replaces only the selected question's addressed grounds", {
+  skip: !process.env.DATABASE_URL || !process.env.FACADE_S3_ENDPOINT,
+  timeout: 90_000,
+}, async (t) => {
+  const { createApi } = await fromBuild("platform/api");
+  const { readConfig } = await fromBuild("platform/config");
+  const { passwordHash } = await fromBuild("modules/access/auth");
+  const { transaction } = await fromBuild("modules/access/commands");
+  const { getLockedGate } = await fromBuild("modules/assessment/store");
+  const { applyAssessmentUpdate } = await fromBuild("modules/assessment/updates");
+  const { createIntakeStorage } = await fromBuild("modules/intake/blob");
+  const { createRuntimePdfService } = await fromBuild("modules/pdf/index");
+  const { createFormatAdapters } = await fromBuild("modules/formats/index");
+  const { createRuntimeInquiryPorts, processNextInquiry, publishReaderObservation } = await fromBuild("modules/questions/index");
+
+  const config = readConfig();
+  const app = await createApi(config);
+  const storage = createIntakeStorage(config.dataDir);
+  const reader = createRuntimePdfService(app.db, config, { storage, adapters: createFormatAdapters() });
+  t.after(async () => { storage.objects.close(); await app.close(); });
+
+  async function insertId(sql, args) {
+    const { rows: [{ id }] } = await app.db.query(sql, args);
+    return id;
+  }
+  const organizationId = await insertId("INSERT INTO organizations(name) VALUES('Question applicability') RETURNING id");
+  const baseRequirements = [
+    { key: "gap", part: "Clearance P-16", formats: ["pdf"] },
+    { key: "span", part: "Span P-16", formats: ["pdf"] },
+    { key: "bracket", part: "Кронштейн P-22", formats: ["dxf"] },
+    { key: "length", part: "Длина P-22", formats: ["dxf"] },
+  ].map((requirement) => ({ ...requirement, applicability: "all", equivalents: [], sourceRoles: ["design"],
+    completenessCriterion: "Addressed measure", addressee: "Customer" }));
+  const password = `synthetic-${randomUUID()}`;
+  const engineerLogin = `engineer-${randomUUID()}`;
+  const viewerLogin = `viewer-${randomUUID()}`;
+  const hash = await passwordHash(password);
+  const addUser = (login) => insertId(
+    "INSERT INTO users(organization_id,login,password_hash,state) VALUES($1,$2,$3,'active') RETURNING id",
+    [organizationId, login, hash],
+  );
+  const engineer = await addUser(engineerLogin);
+  const viewer = await addUser(viewerLogin);
+  const catalog = await insertId(`INSERT INTO catalog_versions(organization_id,catalog_key,revision,name,requirements,created_by)
+    VALUES($1,'applicability',1,'Controlled',$2,$3) RETURNING id`, [organizationId, JSON.stringify(baseRequirements), engineer]);
+  const projectId = await insertId(
+    "INSERT INTO projects(organization_id,name,catalog_version_id) VALUES($1,'Scoped replacement',$2) RETURNING id",
+    [organizationId, catalog],
+  );
+  const scopeId = await insertId(
+    "INSERT INTO project_scopes(project_id,stage,name) VALUES($1,'design','Test') RETURNING id", [projectId],
+  );
+  await app.db.query(`INSERT INTO project_memberships(project_id,organization_id,user_id,role)
+    VALUES($1,$2,$3,'engineer'),($1,$2,$4,'viewer')`, [projectId, organizationId, engineer, viewer]);
+
+  const headers = { host: "127.0.0.1", origin: "http://127.0.0.1" };
+  async function login(name) {
+    const response = await app.inject({ method: "POST", url: "/api/sessions", headers, payload: { login: name, password } });
+    assert.equal(response.statusCode, 200);
+    return { cookie: response.headers["set-cookie"].split(";")[0], "x-csrf-token": response.json().csrfToken };
+  }
+  const auth = await login(engineerLogin);
+  const readOnly = await login(viewerLogin);
+  async function request(method, url, payload, expected, extra = {}, actor = auth) {
+    const response = await app.inject({ method, url, payload, headers: { ...headers, ...actor,
+      "idempotency-key": randomUUID(), ...extra } });
+    assert.equal(response.statusCode, expected, `${method} ${url}: ${response.body.slice(0, 350)}`);
+    return response;
+  }
+  const json = async (...args) => (await request(...args)).json();
+  const project = `/api/projects/${projectId}`;
+  const assessment = () => json("GET", `${project}/assessments/current?scopeId=${scopeId}`, undefined, 200);
+  const byKey = (card, key) => card.questions.find(({ requirement }) => requirement.positionId === key);
+  const etag = (version) => ({ "If-Match": `"${version}"` });
+  const ports = createRuntimeInquiryPorts(app.db, reader, storage.objects);
+  const signal = new AbortController().signal;
+  async function searchCandidates(questionId) {
+    for (let count = 0; count < 40; count++) {
+      if (!await processNextInquiry(app.db, ports, signal)) break;
+    }
+    const { rows: [result] } = await app.db.query(
+      `SELECT r.candidates FROM inquiries i JOIN inquiry_search_results r ON r.inquiry_id=i.id
+       AND i.search_version=r.search_version WHERE i.assessment_question_id=$1`, [questionId],
+    );
+    assert.ok(result, "current worker search published");
+    return new Map(result.candidates.map((candidate) => [candidate.source.observationId, candidate]));
+  }
+
+  async function upload(name, bytes) {
+    const { receiptId } = await json("POST", `${project}/receipts`, {}, 201);
+    const digest = sha256(bytes);
+    const { uploadId } = await json("POST", `/api/receipts/${receiptId}/uploads`, {
+      relativePath: name, size: bytes.length, sha256: digest, scopeIds: [scopeId],
+    }, 201);
+    await request("PUT", `/api/uploads/${uploadId}/parts/1`, bytes, 200, {
+      "content-type": "application/octet-stream", "content-length": String(bytes.length), "x-part-sha256": digest,
+    });
+    const published = await json("POST", `/api/uploads/${uploadId}/complete`, {}, 200);
+    await json("POST", `/api/receipts/${receiptId}/seal`, {}, 200);
+    return { projectId, documentId: published.documentId, versionId: published.versionId, sha256: digest };
+  }
+
+  async function observe(source, question, quote, value, subjectVerified) {
+    const { units } = await reader.map(source);
+    return Promise.all(["A", "B"].map(async (branch) => {
+      const runId = randomUUID();
+      const read = { runId, branch, operationKey: "address" };
+      const { evidence, bytes } = await reader.open(source, read, { representation: "native", address: { unitId: units[0].id } });
+      const line = JSON.parse(bytes.toString("utf8")).lines.find(({ text }) => text.includes(quote));
+      assert.ok(line);
+      const pin = await transaction(app.db, async (tx) => {
+        await getLockedGate(tx, projectId, scopeId);
+        const observation = await reader.pin(source, { ...read, operationKey: "pin" }, {
+          scope: scopeId, evidenceId: evidence.id, lineId: line.id, quote, value, unit: "mm",
+        }, tx);
+        await publishReaderObservation(tx, {
+          observation, projectId, scopeId, readerJobId: runId, subject: question.requirement.subject,
+          property: question.requirement.part, role: "design", revision: "effective", priority: "peer",
+          comparableContext: question.id, assessmentQuestionId: question.id, subjectVerified,
+        });
+        return observation;
+      });
+      return { observationId: pin.id, evidenceId: evidence.id, versionId: source.versionId };
+    }));
+  }
+
+  // Prepare a completed test review using the production assessment port and the real stored reader pins.
+  async function report(question, findings) {
+    await transaction(app.db, async (tx) => {
+      const gate = await getLockedGate(tx, projectId, scopeId);
+      await applyAssessmentUpdate(tx, { projectId, scopeId, eventId: randomUUID(), reason: "Completed fixture review",
+        changes: [{ questionId: question.id, expectedDependencyVersion: question.dependencyVersion,
+          review: { inputGeneration: gate.generation, remaining: [], completenessChecked: true,
+            findings: findings.map(({ observationId, applicability }) => ({
+              observationId, applicability, kind: "value", sourceRole: "design", comparisonKey: question.id,
+            })) } }],
+      });
+    });
+  }
+  const findings = (refs, applicability = "active") => refs.map((ref) => ({ ...ref, applicability }));
+  const initial = await assessment();
+  const bracket = byKey(initial, "bracket");
+  const length = byKey(initial, "length");
+  const dxfText = "P-22 bracket width 46 mm";
+  const cad = await upload("detail.dxf", Buffer.from([
+    "0", "SECTION", "2", "ENTITIES", "0", "TEXT", "5", "2A", "8", "Dimensions", "10", "0", "20", "0",
+    "40", "2", "1", dxfText, "0", "ENDSEC", "0", "EOF", "",
+  ].join("\n")));
+  const cadProof = await observe(cad, bracket, dxfText, "46", false);
+  const lengthProof = await observe(cad, length, dxfText, "46", false);
+  await report(bracket, findings(cadProof, "unknown"));
+  await report(length, findings(lengthProof, "unknown"));
+  const beforeAlias = await assessment();
+  const bracketPath = `/api/questions/${bracket.id}`;
+  const aliasPayload = { alias: "P-22 bracket width", reason: "Verified same detail at the recorded CAD handle.", proof: cadProof };
+  const aliasVersion = byKey(beforeAlias, "bracket").version;
+  assert.equal(byKey(beforeAlias, "bracket").machine.outcome, "needs_review");
+  assert.equal((await json("POST", `${bracketPath}/attribute-aliases`, { ...aliasPayload, alias: "P-22 mm" },
+    422, etag(aliasVersion))).code, "attribute_alias_unverified");
+  await request("POST", `${bracketPath}/attribute-aliases`, aliasPayload, 403, etag(aliasVersion), readOnly);
+  await json("POST", `${bracketPath}/attribute-aliases`, aliasPayload, 201, etag(aliasVersion));
+  const afterAlias = await assessment();
+  assert.equal(byKey(afterAlias, "bracket").machine.outcome, "covered");
+  assert.deepEqual(byKey(afterAlias, "length"), byKey(beforeAlias, "length"));
+  const approvedCandidates = await searchCandidates(bracket.id);
+  for (const { observationId } of cadProof) {
+    assert.equal(approvedCandidates.get(observationId)?.applicability, "verified");
+    assert.equal(approvedCandidates.get(observationId)?.reason, "registered_alias");
+  }
+  const { source: approvedCad } = approvedCandidates.get(cadProof[0].observationId);
+  const openedCad = await ports.openSupport(approvedCad, signal);
+  assert.ok(openedCad);
+  assert.equal(await ports.checkMeaning(approvedCad, approvedCad, openedCad, signal, {
+    inquiryId: randomUUID(), assessmentQuestionId: length.id, scopeId, projectId, searchVersion: 1, generationId: null,
+  }), "unclear", "an approved alias cannot transfer to another assessment question");
+  const unapprovedCandidates = await searchCandidates(length.id);
+  for (const { observationId } of lengthProof) {
+    assert.equal(unapprovedCandidates.get(observationId)?.applicability, "meaning_unclear");
+  }
+
+  const gap = byKey(afterAlias, "gap");
+  const span = byKey(afterAlias, "span");
+  const measure = (value) => `Clearance P-16 ${value} mm`;
+  const spanMeasure = "Span P-16 90 mm";
+  const a = await upload("design.pdf", pdf(measure("12"), spanMeasure));
+  const b = await upload("schedule.pdf", pdf(measure("15"), spanMeasure));
+  const update = await upload("revision.txt", Buffer.from(measure("12") + "\n"));
+  const first = await observe(a, gap, measure("12"), "12", true);
+  const second = await observe(b, gap, measure("15"), "15", true);
+  const next = await observe(update, gap, measure("12"), "12", true);
+  const spanProof = [...await observe(a, span, spanMeasure, "90", true),
+    ...await observe(b, span, spanMeasure, "90", true)];
+  const group = [...first, ...second, ...next];
+  await report(gap, findings(group));
+  const replacePath = `/api/questions/${gap.id}/source-replacements`;
+  const payload = { replaced: [first[0], second[0]], replacements: next,
+    reason: "The accepted correction replaces the clearance at these two specific addresses." };
+  const preAdmission = byKey(await assessment(), "gap");
+  assert.equal(preAdmission.machine.outcome, "confirmed_conflict");
+  const held = await json("POST", replacePath, payload, 422, etag(preAdmission.version));
+  assert.equal(held.code, "support_format_not_admitted");
+
+  const scopeRoute = `${project}/scopes/${scopeId}`;
+  const scope = await json("GET", scopeRoute, undefined, 200);
+  await json("PUT", scopeRoute + "/requirements", {
+    requirements: baseRequirements.map((item) => item.key === "gap" ? { ...item, equivalents: ["txt"] } : item),
+  }, 200, etag(scope.version));
+  await report(byKey(await assessment(), "gap"), findings(group));
+  await report(byKey(await assessment(), "span"), findings(spanProof));
+  const ready = await assessment();
+  const current = byKey(ready, "gap");
+  const idem = { ...etag(current.version), "Idempotency-Key": randomUUID() };
+  await request("POST", replacePath, { ...payload, replaced: [lengthProof[0], first[0]] }, 404, etag(current.version));
+  const approved = await json("POST", replacePath, payload, 201, idem);
+  const retry = await request("POST", replacePath, payload, 201, idem);
+  assert.equal(retry.headers["idempotency-replayed"], "true");
+  assert.deepEqual(retry.json(), approved);
+  assert.equal((await json("POST", replacePath, payload, 412, etag(current.version))).code, "version_conflict");
+
+  const final = await assessment();
+  const affected = byKey(final, "gap");
+  assert.equal(affected.machine.outcome, "covered");
+  assert.deepEqual([...new Set(affected.machine.citations.map(({ versionId }) => versionId))], [update.versionId]);
+  assert.deepEqual(byKey(final, "length"), byKey(ready, "length"));
+  assert.deepEqual(byKey(final, "bracket"), byKey(ready, "bracket"));
+  assert.deepEqual(byKey(final, "span"), byKey(ready, "span"));
+  assert.deepEqual(new Set(byKey(final, "span").machine.citations.map(({ versionId }) => versionId)),
+    new Set([a.versionId, b.versionId]));
+  const republished = await observe(a, gap, measure("12"), "12", true);
+  const addressed = await searchCandidates(gap.id);
+  for (const { observationId } of [...first, ...second, ...republished]) {
+    assert.equal(addressed.get(observationId)?.applicability, "revision_superseded");
+  }
+  const unaffected = await searchCandidates(span.id);
+  for (const { observationId } of spanProof) {
+    assert.equal(unaffected.get(observationId)?.applicability, "verified");
+  }
+  const history = await json("GET", `/api/questions/${gap.id}/applicability`, undefined, 200);
+  assert.equal(history.replacements.length, 1);
+  assert.equal(history.replacements[0].authorId, engineer);
+  assert.deepEqual(history.replacements[0].replaced.sort((left, right) => left.versionId.localeCompare(right.versionId)),
+    [...payload.replaced].sort((left, right) => left.versionId.localeCompare(right.versionId)));
+  for (const support of [...first, ...second, ...next]) {
+    await request("GET", `/api/v1/evidence/${support.evidenceId}/content`, undefined, 200);
+  }
 });

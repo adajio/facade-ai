@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import { randomUUID, createHash } from 'node:crypto';
 import { resolve } from 'node:path';
+import { Readable } from 'node:stream';
 import { setTimeout as delay } from 'node:timers/promises';
 import { pathToFileURL } from 'node:url';
 import test from 'node:test';
@@ -83,13 +84,20 @@ test('Адрес письма берётся из закреплённой оп�
   assert.deepEqual(missing.sources[0].address, actual);
   assert.match(missing.wording, /ред\. N05, строка 2/u);
 
-  const conflict = renderGround({ ...basis, kind: 'confirmed_conflict', citations: [
-    { label: 'Чертёж.pdf', address: { locator: { page: 1 } }, value: '19', unit: 'мм' },
-    { label: 'Ведомость.docx', address: { locator: { table: 1, row: 2, column: 2 } }, value: '26', unit: 'мм' },
-  ] });
+  const first = { documentId: 'drawing', versionId: 'drawing-v1', sha256: 'drawing-hash',
+    label: 'Чертёж.pdf', address: { locator: { page: 1 } }, value: '19', unit: 'мм', branch: 'A' };
+  const second = { documentId: 'schedule', versionId: 'schedule-v2', sha256: 'schedule-hash',
+    label: 'Ведомость.docx', address: { locator: { table: 1, row: 2, column: 2 } }, value: '26', unit: 'мм', branch: 'B' };
+  const reread = { ...second, branch: 'A', address: { locator: { row: 2, column: 2, table: 1 } } };
+  const third = { ...second, documentId: 'protocol', versionId: 'protocol-v2', sha256: 'protocol-hash',
+    label: 'Протокол.doc', documentRevision: { label: 'N07' } };
+  const conflict = renderGround({ ...basis, kind: 'confirmed_conflict', citations: [first, second, reread, third] });
   assert.deepEqual(conflict.sources.map(({ label }) => label), [
     '«Чертёж.pdf», стр. 1', '«Ведомость.docx», табл. 1, строка 2, столбец 2',
+    '«Протокол.doc», ред. N07, табл. 1, строка 2, столбец 2',
   ]);
+  assert.equal(conflict.basis.citations.length, 4);
+  assert.equal(conflict.wording.split('26 мм').length - 1, 1);
   assert.match(conflict.wording, /стр\. 1 указано 19 мм[\s\S]*столбец 2 указано 26 мм/u);
 });
 
@@ -395,7 +403,45 @@ test('AC06, R02 и блокировка текущего экспорта чер
   assert.equal(next.number, 2);
   const nextRevision = await json(200, 'GET', `/api/letters/${next.id}/revisions/${next.revisionId}`);
   assert.deepEqual(nextRevision.items.map(({ questionId }) => questionId), [newGround.questionId]);
-  assert.deepEqual((await json(200, 'GET', sent.url)).items, original.items);
+
+  const fromPdf = { unitId: '1', locator: { page: 1 } };
+  const fromTable = { unitId: 'table:1:1', locator: { table: 1, row: 2, column: 2 } };
+  const multipleOrigins = ['A', 'B'].flatMap((branch) => [
+    evidence(ids, 'conflictPdf', branch, fromPdf, '37', 'мм'),
+    evidence(ids, 'conflictDocx', branch, fromTable, '44', 'мм'),
+    evidence(ids, 'conflictDoc', branch, fromTable, '44', 'мм'),
+  ]);
+  await saveReaderHeaders(db, ids, ['conflictPdf', 'conflictDocx', 'conflictDoc']);
+  await update(scopeId, [{ questionId: newGround.questionId, review: review(multipleOrigins) }], 'Подтверждены три адресуемых оригинала');
+  const multipleQuestion = (await readAssessment(scopeId)).questions.find(({ id }) => id === newGround.questionId);
+  const multipleDecision = await confirm(multipleQuestion);
+  const multi = await json(201, 'POST', base, { payload: { scopeId, recipient, items: [multipleDecision] } });
+  const multiPath = `/api/letters/${multi.id}`;
+  const multiRevision = await json(200, 'GET', `${multiPath}/revisions/${multi.revisionId}`);
+  assert.equal(multiRevision.items.length, 1);
+  const [{ sources }] = multiRevision.items;
+  assert.deepEqual(sources.map(({ address }) => address.documentRevision.label), ['N05', 'N06', 'N04']);
+  assert.deepEqual(new Set(sources.map(({ address }) => address.versionId)),
+    new Set(['conflictPdf', 'conflictDocx', 'conflictDoc'].map((key) => ids.documents[key].versionId)));
+  const multiText = (await json(200, 'GET', `${multiPath}/current-text`, { version: multi.version })).text;
+  for (const label of [
+    '«Чертёж.pdf», ред. N05, стр. 1',
+    '«Спецификация.docx», ред. N06, табл. 1, строка 2, столбец 2',
+    '«Ведомость.doc», ред. N04, табл. 1, строка 2, столбец 2',
+  ]) assert.equal(multiText.split(label).length - 1, 1);
+  assert.equal(multiText.split('44 мм').length - 1, 1);
+  assert.equal(multiText.split('37 мм').length - 1, 1);
+  assert.match(multiText, /в источниках «Спецификация\.docx»[\s\S]* и «Ведомость\.doc»[\s\S]* указано 44 мм/u);
+  for (const format of ['txt', 'docx']) {
+    const entry = await json(201, 'POST', `${multiPath}/exports`, { version: multi.version, payload: { format } });
+    const exported = await call('GET', entry.url);
+    assert.equal(exported.statusCode, 200);
+    assert.equal(format === 'txt' ? exported.rawPayload.toString('utf8') : extractDocx(exported.rawPayload), multiText);
+  }
+  assert.deepEqual(await json(200, 'GET', sent.url), snapshot);
+  assert.deepEqual((await call('GET', files[0].historicalUrl)).rawPayload, txt.rawPayload);
+  assert.deepEqual((await call('GET', files[1].historicalUrl)).rawPayload, docx.rawPayload);
+  t.diagnostic('Три оригинала PDF/DOCX/DOC вошли в один пункт, 44 мм сгруппированы. Старые отправка и файлы совпали побайтно.');
   await db.query('DELETE FROM project_memberships WHERE project_id = $1 AND user_id = $2', [projectId, ids.viewerId]);
   assert.equal((await call('GET', files[1].historicalUrl, { as: viewer })).statusCode, 404);
 });
@@ -443,7 +489,7 @@ async function seed(db, auth) {
   }
   const [actorId, viewerId] = users;
   const requirements = [['U1', 'Узлы'], ['AL-01', 'AL-01, толщина']].map(([key, part]) => ({
-    key, part, formats: ['pdf'], equivalents: [], applicability: 'all',
+    key, part, formats: ['pdf'], equivalents: key === 'AL-01' ? ['docx', 'doc'] : [], applicability: 'all',
     sourceRoles: ['project'], completenessCriterion: 'Все применимые исходные данные', addressee: 'ООО «Заказчик»',
   }));
   const catalogId = await insert(db, `INSERT INTO catalog_versions(organization_id, catalog_key, revision, name, requirements, created_by)
@@ -460,18 +506,27 @@ async function seed(db, auth) {
   const receiptId = await insert(db, `INSERT INTO intake_receipts(project_id, source, created_by, sealed_at)
     VALUES ($1, 'upload', $2, now()) RETURNING id`, [projectId, actorId]);
   const documents = {};
-  for (const [key, filename] of Object.entries({ inventory: 'Опись.pdf', spec: 'Спецификация R2.pdf', specUpdated: 'Спецификация R2.pdf', task: 'Задание R1.pdf' })) {
+  const filenames = {
+    inventory: 'Опись.pdf', spec: 'Спецификация R2.pdf', specUpdated: 'Спецификация R2.pdf', task: 'Задание R1.pdf',
+    conflictPdf: 'Чертёж.pdf', conflictDocx: 'Спецификация.docx', conflictDoc: 'Ведомость.doc',
+  };
+  const mime = {
+    pdf: 'application/pdf', doc: 'application/msword',
+    docx: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+  };
+  for (const [key, filename] of Object.entries(filenames)) {
+    const format = filename.split('.').at(-1);
     const sha256 = digest(key);
     const originalId = await insert(db, `INSERT INTO intake_originals(id, project_id, sha256, size, object_key)
       VALUES (gen_random_uuid(), $1, $2, 100, $3) RETURNING id`, [projectId, sha256, randomUUID()]);
     const documentId = await insert(db, 'INSERT INTO intake_documents(project_id) VALUES ($1) RETURNING id', [projectId]);
     const versionId = await insert(db, `INSERT INTO intake_document_versions(project_id, document_id, original_id, media_type)
-      VALUES ($1, $2, $3, 'application/pdf') RETURNING id`, [projectId, documentId, originalId]);
+      VALUES ($1, $2, $3, $4) RETURNING id`, [projectId, documentId, originalId, mime[format]]);
     await db.query(`INSERT INTO intake_occurrences(project_id, receipt_id, relative_path, declared_media_type, version_id, state)
-      VALUES ($1, $2, $3, 'application/pdf', $4, 'accepted')`, [projectId, receiptId, filename, versionId]);
+      VALUES ($1, $2, $3, $4, $5, 'accepted')`, [projectId, receiptId, filename, mime[format], versionId]);
     await db.query(`INSERT INTO reader_maps(project_id, document_id, version_id, reader_version, receipt_id, original_sha256, format, units)
-      VALUES ($1, $2, $3, 'test-reader', $4, $5, 'pdf', '[]')`, [projectId, documentId, versionId, receiptId, sha256]);
-    documents[key] = { documentId, versionId, sha256 };
+      VALUES ($1, $2, $3, 'test-reader', $4, $5, $6, '[]')`, [projectId, documentId, versionId, receiptId, sha256, format]);
+    documents[key] = { documentId, versionId, sha256, format };
   }
   return { ...names, password, projectId, scopeId, coveredScope, reviewScope, actorId, viewerId, receiptId, documents };
 }
@@ -481,20 +536,53 @@ async function insert(db, sql, params) {
   return result.rows[0].id;
 }
 
-function evidence(ids, key, branch, page, value = null, unit = null) {
+function evidence(ids, key, branch, place, value = null, unit = null) {
   const inventory = key === 'inventory';
+  const { format, ...document } = ids.documents[key];
+  const address = typeof place === 'number' ? { unitId: String(place), locator: { page: place } } : place;
   const observationId = randomUUID();
   const evidenceId = randomUUID();
   return {
     kind: inventory ? 'absence' : 'value', applicability: 'active',
-    sourceRole: inventory ? 'inventory' : 'project', format: 'pdf', comparisonKey: 'AL-01',
+    sourceRole: inventory ? 'inventory' : 'project', format, comparisonKey: 'AL-01',
     citation: {
-      observationId, evidenceId, receiptId: ids.receiptId, ...ids.documents[key],
-      address: { unitId: String(page), locator: { page } },
+      observationId, evidenceId, receiptId: ids.receiptId, ...document,
+      address,
       quote: inventory ? 'Узлы в данную передачу не входят' : `${value} ${unit}`,
       value, unit, branch, href: `/api/evidence/${evidenceId}`,
     },
   };
+}
+
+async function saveReaderHeaders(db, ids, keys) {
+  const { createIntakeStorage } = await load('intake/blob.js');
+  const { objects } = createIntakeStorage(process.env.FACADE_DATA_DIR);
+  const labels = { conflictPdf: 'N05', conflictDocx: 'N06', conflictDoc: 'N04' };
+  try {
+    for (const key of keys) {
+      const { versionId, documentId, sha256: originalSha256, format } = ids.documents[key];
+      const page = format === 'pdf';
+      const address = page
+        ? { unitId: '1', locator: { page: 1 } }
+        : { unitId: 'paragraphs:1', locator: { firstParagraph: 1 } };
+      const line = { id: 'header', text: `Редакция ${labels[key]}`, ...(page
+        ? { box: { x: 10, y: 10, width: 100, height: 10 } }
+        : { locator: { paragraph: 1 } }) };
+      const bytes = Buffer.from(JSON.stringify({ lines: [line] }));
+      const sha256 = digest(bytes);
+      await objects.put(`reader-evidence/${ids.projectId}/${sha256}`, { sha256, size: bytes.length }, Readable.from([bytes]));
+      const id = randomUUID();
+      const payload = {
+        id, format, address, representation: 'native', mediaType: 'application/json', sha256, size: bytes.length,
+        source: { projectId: ids.projectId, documentId, versionId, sha256: originalSha256 },
+      };
+      await db.query(`INSERT INTO reader_evidence(id, project_id, version_id, reader_version, run_id, branch, operation_key, request_sha256, payload)
+        VALUES ($1,$2,$3,'test-reader',$4,'A','revision header',$5,$6)`,
+      [id, ids.projectId, versionId, randomUUID(), sha256, JSON.stringify(payload)]);
+    }
+  } finally {
+    objects.close();
+  }
 }
 
 async function publishEvidence(tx, ids, scopeId, citation) {

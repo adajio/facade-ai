@@ -19,6 +19,12 @@ export function scopedUrl(projectId: string, section: Section, params: Record<st
 export type Citation = {
   evidenceId: string;
   observationId?: string;
+  documentId?: string;
+  versionId?: string;
+  sha256?: string;
+  label?: string;
+  documentRevision?: { label: string; evidenceId?: string };
+  sourceLabel?: string;
   quote?: string;
   branch?: 'A' | 'B';
   value?: string | null;

@@ -46,7 +46,10 @@ export async function recordDecision(
   tx: PoolClient, context: DecideContext, authorId: string, input: Decide,
 ) {
   const { question, gate, projectId, scopeId, revision } = context;
-  const basis = chooseBasis(question, input);
+  const confirmingConflict = (input.action === "confirm" || input.action === "correct") &&
+    question.machine.outcome === "confirmed_conflict" && question.review !== null;
+  const machine = confirmingConflict ? evaluate(question.requirement, question.review) : question.machine;
+  const basis = chooseBasis({ ...question, machine }, input);
   if (input.action === "revoke" && (!question.decision || question.decision.action === "revoke")) {
     invalidInput("Нет действующего решения для отмены.");
   }
@@ -79,6 +82,7 @@ export async function recordDecision(
   await writeQuestion(tx, next, {
     ...question,
     version,
+    machine,
     decision,
     previous_decision_id: question.decision?.id ?? question.previous_decision_id,
   });
@@ -139,13 +143,12 @@ export async function selectConfirmedGrounds(tx: PoolClient, options: GroundsOpt
           (recipient !== undefined && recipient !== requirement.recipient)) continue;
       const kind = effectiveOutcome(question.machine, decision, now);
       if (kind !== "confirmed_missing" && kind !== "confirmed_conflict") continue;
-      const citations = readDocumentRevision
-        ? await Promise.all(decision.basis.citations.map(async (citation) => {
-          const documentRevision = citation.documentRevision ??
-            await readDocumentRevision(tx, projectId, revision.scope.stage, citation);
-          return documentRevision ? { ...citation, documentRevision } : citation;
-        }))
-        : decision.basis.citations;
+      const citations = [];
+      for (const citation of decision.basis.citations) {
+        const documentRevision = citation.documentRevision ??
+          await readDocumentRevision?.(tx, projectId, revision.scope.stage, citation);
+        citations.push(documentRevision ? { ...citation, documentRevision } : citation);
+      }
       grounds.push({
         questionId: question.id,
         questionVersion: question.version,

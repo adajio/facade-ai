@@ -160,6 +160,20 @@ function compare(a: Citation, b: Citation): "equal" | "different" | "unknown" {
   return "unknown";
 }
 
+function distinctConflictSources(citations: readonly Citation[]): Citation[] {
+  const byVersion = new Map<string, Citation[]>();
+  const distinct: Citation[] = [];
+  for (const citation of citations) {
+    const key = canonicalJson([citation.documentId, citation.versionId, citation.sha256]);
+    const measurements = byVersion.get(key) ?? [];
+    if (measurements.some((other) => compare(other, citation) === "equal")) continue;
+    measurements.push(citation);
+    byVersion.set(key, measurements);
+    distinct.push(citation);
+  }
+  return distinct;
+}
+
 export function canonicalJson(value: unknown): string {
   if (value === null || typeof value !== "object") return JSON.stringify(value) ?? "null";
   if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
@@ -248,7 +262,11 @@ export function evaluate(
     }
   }
   const pair = crossBranchConflict ?? (manual ? conflict : null);
-  if (pair) return { ...base, outcome: "confirmed_conflict", citations: pair };
+  if (pair) {
+    // A pair establishes the conflict. Include other active sources of the same compared assertion.
+    const citations = distinctConflictSources([...pair, ...values.map(({ citation }) => citation)]);
+    return { ...base, outcome: "confirmed_conflict", citations };
+  }
   if (values.length) {
     if (variants.size !== 1 || conflict || (!manual && !independent(values))) {
       return { ...base, limitations: ["comparison_unresolved"] };

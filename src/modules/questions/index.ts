@@ -8,6 +8,7 @@ import { inProjectionSnapshot, publishProjectEvent, readProjectionPosition } fro
 import type { Candidate, ObservationPublication, Pair } from "./domain.js";
 import { createInquiry } from "./store.js";
 import type { InquiryRow, SearchResult } from "./store.js";
+import { registerApplicability } from "./applicability.js";
 
 export { getCurrentInquiryPairs, onObservationPublished } from "./store.js";
 export { processNextInquiry } from "./worker.js";
@@ -99,6 +100,7 @@ export async function register(app: FastifyInstance): Promise<void> {
     if (error instanceof AccessError) return sendAccessError(error, request, reply);
     throw error;
   });
+  await registerApplicability(app);
 
   for (const prefix of ["/api", "/api/v1"]) {
     app.get<{ Params: { projectId: string }; Querystring: { scopeId: string; after?: string } }>(
