@@ -236,3 +236,34 @@ HTTP 206 для того же Range. Снятие копии, восстанов
 выключенными. Побайтовая сверка отпечатка до обновления и после проверки писем подтвердила тот же нативный ledger,
 отозванный допуск и одну неизвестную попытку. Резерв $9,084216, доступный остаток $0,915784, новых живых эффектов 0.
 [Контроль журнала](</Volumes/ADATA SE920/OrbStack/facade-ai-test-server/step15/delivery-check.iAD0iC5Z/after-letters.json>)
+
+## Общий снимок 5/6/8/11/12 и исходный рецепт Office
+
+Окончательный Git-срез `fe63b027fa59cf1698385379da9a8c06fdb6b9c3` отличается от проверенного `421632b` только
+`src/modules/formats/Dockerfile`. В Office-стадии режим `/opt/tika` закреплён как `0755`, для JAR как `0644`.
+Добавленная сборочная проверка под UID 65534 без сети проверяет проход в каталог, чтение JAR и `--version` Tika.
+В `f3176af` сама инструкция `COPY --chmod=0644` создавала новый каталог с режимом `0644`. Изолированная сборка рабочих
+байтов рецепта подтвердила исправление перед фиксацией Git, SHA-256 Dockerfile
+`0f48a35f18a5723c317452c4dd6c33a55b68c6a8b0e6347a4788b48fdebfaf5e`. JAR Tika 3.3.3 сохранил SHA-256
+`f29d4e0d2cff1fc32396f6ac5ce436dfc7b19f9303d3b899e1f56fde85711c96`.
+[Preflight интегратора](</Volumes/ADATA SE920/OrbStack/facade-ai-test-server/step15/shared-release.jOLzH58g/final-source/office-preflight-for-step17.json>) · [Манифесты](</Volumes/cargo/facade-ai-integration-20261122/logs/manifest-combined-release-code.sha256>)
+
+Образ Office из исходного рецепта `sha256:9f42791d2656657fbe1eaeb21012d34cf1e15df510e4890fdefd2e1799b526d4`
+включает LibreOffice 7.4.7.2. Образ DWG `sha256:561a1a324440a155a295fd1aa7cab1719fdb9ebaf00b7261f591b22e8843b557`
+включает `dwg2dxf` и `dwgread` 0.13.4. Стадия DWG побайтно совпадает с `421632b`. На предыдущем образе reader
+со штатным брокером прошли 7 проверок DOC, DWG и DXF. У запущенного worker обычный DWG открыл Model и Paper, а исходный
+DWG с незавершённым DXF дал частичную карту Model, пять доступных строк и ограничение `cad_dwg_json_recovery`.
+[Проверки адаптеров](</Volumes/ADATA SE920/OrbStack/facade-ai-test-server/step15/shared-release.jOLzH58g/adapter-cad-broker.log>) · [Обычный DWG](</Volumes/ADATA SE920/OrbStack/facade-ai-test-server/step15/shared-release.jOLzH58g/deployed-dwg-normal.json>) · [DWG с восстановлением](</Volumes/ADATA SE920/OrbStack/facade-ai-test-server/step15/shared-release.jOLzH58g/deployed-dwg-fallback.json>)
+
+Основные API и worker на `18443` и offline API на `18085` используют образ
+`sha256:279fe8722abcbd44c22032b35818ab468cc535422b45ca01f32b12cec6f2830d`. Все 245 записей манифеста из `stand build reader`
+совпали побайтово с интегратором, SHA-256 `6b9dcf2c6387aef24cf96a3bb70ed469c6b722e9a247a185d1aaf44ab315b302`.
+Прошли 10 HTTPS-проверок, включая хэши JS/CSS, и `/readyz` offline API. PostgreSQL и S3 сохранили время старта.
+Повторили один адресный тест Office через штатный брокер. В таблице 1, строке 2 получены отдельные ячейки `AX-725`, `63`, `mm`.
+В контейнере штатного worker также подтверждены ID конвертера и шесть адресных строк таблицы.
+[Развёртывание и smoke](</Volumes/ADATA SE920/OrbStack/facade-ai-test-server/step15/shared-release.jOLzH58g/final-source/stand-deploy.log>) · [Office на штатном брокере](</Volumes/ADATA SE920/OrbStack/facade-ai-test-server/step15/shared-release.jOLzH58g/final-source/office-addressed-smoke.log>) · [Проверка из worker](</Volumes/ADATA SE920/OrbStack/facade-ai-test-server/step15/shared-release.jOLzH58g/final-source/deployed-doc.json>)
+
+Отпечаток нативного журнала до и после совпал. Сохранились одна попытка с неизвестным исходом, отозванный допуск
+и резерв $9,084216. Платный worker и его прокси выключены, новых живых попыток 0. Результаты испытаний 10 ГиБ и
+восстановления переиспользованы.
+[Отпечаток после проверки](</Volumes/ADATA SE920/OrbStack/facade-ai-test-server/step15/shared-release.jOLzH58g/final-source/after-all.json>)
