@@ -267,3 +267,22 @@ DWG с незавершённым DXF дал частичную карту Model
 и резерв $9,084216. Платный worker и его прокси выключены, новых живых попыток 0. Результаты испытаний 10 ГиБ и
 восстановления переиспользованы.
 [Отпечаток после проверки](</Volumes/ADATA SE920/OrbStack/facade-ai-test-server/step15/shared-release.jOLzH58g/final-source/after-all.json>)
+
+## Снимок точечной замены N06 и третьего источника
+
+`stand build reader aa973a406246522732c5a6eed6612bfcf0b764bd` собрал Linux arm64 образ
+`sha256:50c9a63cb5dc72bb577df1c1fc0e985fc4383b37d25169870ecc7cd43a4e02f7`. Все 255 записей манифеста совпали побайтово
+с манифестом интегратора `42382b2628c644c8d52acb6c34c11d707a455c824105c1918783e2fcefaa0c2a`.
+В 11:12 МСК этот образ подтверждён у API и worker на основном HTTPS и у offline API на `18085`. Прошли 10 HTTPS-проверок,
+включая сверку SHA-256 новых JS и CSS с образом, и `/readyz` offline API.
+[Чистая проверка интегратора](</Volumes/cargo/facade-ai-integration-20261122/logs/replacement/status.log>) · [Манифест](</Volumes/cargo/facade-ai-integration-20261122/logs/manifest-replacement-code.sha256>) · [Переключение и smoke](</Volumes/ADATA SE920/OrbStack/facade-ai-test-server/step15/n06-replacement.AxfXE9wg/release.log>)
+
+В обеих БД добавилась только `12_questions_z_applicability.sql`. Хэши 15 применённых миграций совпали с Git и между БД.
+Хэши всех 14 ранее применённых миграций сохранились. Интегратор отдельно проверил миграцию на синтетической копии
+и подтвердил совпадение хэшей исторических редакций, экспортов, фиксации отправки и ответа.
+[Реестр после обновления](</Volumes/ADATA SE920/OrbStack/facade-ai-test-server/step15/n06-replacement.AxfXE9wg/after-main-migrations.txt>) · [Проверка истории на копии](</Volumes/cargo/facade-ai-integration-20261122/logs/replacement-upgrade/after-history.sha256>)
+
+Входы сборки конвертеров и код брокера совпали с `fe63b02`. Брокер, образы Office и DWG, PostgreSQL и S3 сохранили
+идентификаторы. Ресурсные испытания переиспользованы. Live worker и прокси оставались выключенными. Контрольный отпечаток
+нативного журнала совпал до и после, сохранились одна попытка `unknown`, отозванный допуск и резерв $9,084216.
+[Закреплённые образы](</Volumes/ADATA SE920/OrbStack/facade-ai-test-server/step15/n06-replacement.AxfXE9wg/converters-after.env>) · [Отпечаток журнала](</Volumes/ADATA SE920/OrbStack/facade-ai-test-server/step15/n06-replacement.AxfXE9wg/after-smoke.json>)

@@ -23,6 +23,7 @@ const { readConfig } = await appFile('platform/config');
 const { bootstrapAdmin } = await appFile('modules/access/bootstrap');
 const { createGateway, journalFromEnv } = await appFile('modules/gateway/index');
 const { startWorker } = await appFile('modules/harness/index');
+const { canonicalJson } = await appFile('modules/assessment/domain');
 
 delete process.env.FACADE_GATEWAY_LIVE_MODE;
 delete process.env.FACADE_GATEWAY_OPENROUTER_KEY;
@@ -41,10 +42,10 @@ let worker, stop;
 let provider;
 const calls = new Map();
 
-async function request(method, path, payload, headers = {}) {
+async function request(method, path, payload, headers = {}, timeoutMs = 12000) {
   const startedNs = since();
   const response = await fetch(origin + path, {
-    method, redirect: 'error', signal: AbortSignal.timeout(12000),
+    method, redirect: 'error', signal: AbortSignal.timeout(timeoutMs),
     headers: { origin, 'idempotency-key': randomUUID(), ...session,
       ...(payload !== undefined ? { 'content-type': 'application/json' } : {}), ...headers },
     body: Buffer.isBuffer(payload) ? payload : payload === undefined ? undefined : JSON.stringify(payload),
@@ -579,9 +580,106 @@ async function mixedFollowup(project, targetScope, baseline, firstLetter, engine
   }
 }
 
-async function checkCatalogAlternative(project, profile) {
+async function storedQuestionReview(view, question) {
+  const { rows: [stored] } = await app.db.query(`SELECT review FROM assessment_question_revisions
+    WHERE scope_id=$1 AND question_id=$2 AND assessment_version<=$3
+    ORDER BY assessment_version DESC LIMIT 1`, [view.scope.id, question.id, view.version]);
+  return stored?.review;
+}
+
+function replacementSelection(review, cold, followup) {
+  const oldPaths = [
+    'Комплект/Монтаж/Выпуск 134.pdf', 'Комплект/Монтаж/Протокол монтажа.docx', 'Комплект/Монтаж/Протокол монтажа.doc',
+  ];
+  const oldSources = new Map(oldPaths.map(path => [cold.receipt.versions[path].versionId, path]));
+  const incoming = new Set(Object.values(followup.receipt.versions).map(({ versionId }) => versionId));
+  const replaced = new Map();
+  const replacements = new Map();
+  for (const finding of review?.findings ?? []) {
+    if (finding.kind !== 'value') continue;
+    const { citation } = finding;
+    const { versionId, address, branch } = citation;
+    const locator = address.locator ?? {};
+    const path = oldSources.get(versionId);
+    const atOldAddress = path?.endsWith('.pdf') ? locator.page === 1
+      : locator.table === 1 && locator.row === 2 && locator.column === 2;
+    if (path && atOldAddress && finding.applicability === 'active') {
+      replaced.set(canonicalJson([versionId, address]), citation);
+    }
+    if (incoming.has(versionId) && locator.line === 3 && ['A', 'B'].includes(branch)) replacements.set(branch, citation);
+  }
+  const selected = { replaced: [...replaced.values()], replacements: [...replacements.values()] };
+  return { ...selected, ready: new Set(selected.replaced.map(({ versionId }) => versionId)).size === oldSources.size
+    && selected.replacements.length === 2 };
+}
+
+async function applySyntheticReplacement(gap, selection) {
+  if (!selection.ready) return { status: null, code: 'fixture_addresses_unavailable' };
+  const references = entries => entries.map(({ observationId, evidenceId, versionId }) => ({ observationId, evidenceId, versionId }));
+  const res = await request('POST', `/api/questions/${gap.id}/source-replacements`, {
+    reason: 'Тестовый инженер подтверждает замену только указанных старых адресов зазора QF-91 на опоры A/B редакции N06.',
+    replaced: references(selection.replaced), replacements: references(selection.replacements),
+  }, { 'if-match': `"${gap.version}"` }, 40000);
+  return { status: res.status, value: res.value };
+}
+
+async function checkAddressedReplacement(project, scopeName, before, gap, selection, firstLetter, storedBefore) {
+  const proof = await Promise.all([...selection.replaced, ...selection.replacements].map(openCitation));
+  const response = proof.every(verifiedCitation) ? await applySyntheticReplacement(gap, selection)
+    : { status: null, code: 'reference_open_failed' };
+  const after = await assessmentViews(project);
+  const updated = after[scopeName].questions.find(item => item.id === gap.id);
+  const storedReview = await storedQuestionReview(after[scopeName], updated);
+  let finalDecision = null;
+  if (response.status === 201 && updated.machine.outcome === 'covered') {
+    const newProof = await Promise.all(updated.machine.citations.map(openCitation));
+    if (newProof.length && newProof.every(verifiedCitation)) {
+      const res = await request('POST', `/api/questions/${gap.id}/decisions`, {
+        action: 'confirm', reason: 'Тестовый инженер открыл действующие опоры N06 и подтвердил новое значение.',
+        requestExternal: false,
+      }, { 'if-match': `"${updated.version}"` });
+      finalDecision = { status: res.status, value: res.value, proof: newProof, assessments: await assessmentViews(project) };
+    }
+  }
+  const history = firstLetter.createStatus === 201 ? await readHistory(firstLetter) : null;
+  const applicability = await request('GET', `/api/questions/${gap.id}/applicability`);
+  const base = `/api/projects/${project.id}`;
+  const eligible = await request('GET', `${base}/letters/eligible?scopeId=${after[scopeName].scope.id}`);
+  const oldConclusion = await request('GET', `${base}/assessments/${storedBefore.initialConclusion.value.version}?scopeId=${after[scopeName].scope.id}`);
+  await result('mixed-addressed-replacement.json', { selection, proof, response, before, after, history, storedReview, finalDecision,
+    applicability: { status: applicability.status, value: applicability.value },
+    eligible: { status: eligible.status, value: eligible.value },
+    oldConclusion: { status: oldConclusion.status, value: oldConclusion.value?.conclusion },
+    expectedEngineerId: engineerId,
+    frozenOriginalResultSha256: sha(await readFile(join(output, 'mixed-followup-result.json'))) });
+}
+
+async function checkCatalogAlternative(project, profile, firstLetter, addressReplacement) {
   const projectPath = `/api/projects/${project.id}`;
   const original = (await command('GET', projectPath)).value;
+  const cold = JSON.parse(await readFile(join(output, 'mixed-cold.json')));
+  const followup = JSON.parse(await readFile(join(output, 'mixed-followup-machine.json')));
+  const storedBefore = JSON.parse(await readFile(join(output, 'mixed-before-followup-history.json')));
+  const scopeName = profile.project.scopeName;
+  if (addressReplacement) {
+    const ownerSession = session;
+    session = engineerSession;
+    try {
+      const view = (await assessmentViews(project))[scopeName];
+      const gap = view.questions.find(item => item.requirement.positionId === 'gap');
+      const current = replacementSelection(await storedQuestionReview(view, gap), cold, followup);
+      const frozenFindings = followup.evidence.observations.filter(item => item.question_id === gap.id
+        && item.scope_id === view.scope.id).map(item => item.finding);
+      const selection = current.ready ? current : replacementSelection({ findings: frozenFindings }, cold, followup);
+      const response = await applySyntheticReplacement(gap, selection);
+      const history = await request('GET', `/api/questions/${gap.id}/applicability`);
+      await result('mixed-original-replacement-hold.json', { selection, response, history: { status: history.status, value: history.value },
+        equivalentFormats: gap.requirement.equivalentFormats });
+      if (response.status === 201) return;
+    } finally {
+      session = ownerSession;
+    }
+  }
   const baseline = await databaseState(project.id);
   const catalog = structuredClone(profile.catalog);
   const rule = catalog.requirements.find(item => item.key === 'gap');
@@ -595,15 +693,17 @@ async function checkCatalogAlternative(project, profile) {
   session = engineerSession;
   try {
     const assessments = await assessmentViews(project);
-    const view = assessments[profile.project.scopeName];
+    const view = assessments[scopeName];
     const gap = view.questions.find(item => item.requirement.positionId === 'gap');
-    const { rows: [stored] } = await app.db.query(`SELECT review FROM assessment_question_revisions
-      WHERE scope_id=$1 AND question_id=$2 AND assessment_version<=$3
-      ORDER BY assessment_version DESC LIMIT 1`, [view.scope.id, gap.id, view.version]);
+    const stored = await storedQuestionReview(view, gap);
     await result('mixed-catalog-alternative.json', { previousCatalogId: original.catalogVersionId, newCatalogId: approved.id,
-      equivalents: rule.equivalents, workload, assessments, storedReview: stored?.review,
+      equivalents: rule.equivalents, workload, assessments, storedReview: stored,
       frozenOriginalResultSha256: sha(await readFile(join(output, 'mixed-followup-result.json'))) });
-    const followup = JSON.parse(await readFile(join(output, 'mixed-followup-machine.json')));
+    if (addressReplacement) {
+      const selection = replacementSelection(stored, cold, followup);
+      await checkAddressedReplacement(project, scopeName, assessments, gap, selection, firstLetter, storedBefore);
+      return;
+    }
     const newVersions = new Set(Object.values(followup.receipt.versions).map(({ versionId }) => versionId));
     if (gap.machine.outcome === 'covered' && gap.machine.citations.some(({ versionId }) => newVersions.has(versionId))) {
       const proofs = await Promise.all(gap.machine.citations.map(openCitation));
@@ -678,7 +778,7 @@ try {
   await startProvider();
   beginWorker();
   for (const scenario of process.env.STEP15_CASES.split(',')) {
-    const followup = ['mixed-followup', 'mixed-regression'].includes(scenario);
+    const followup = ['mixed-followup', 'mixed-regression', 'mixed-addressed'].includes(scenario);
     const caseName = followup ? 'mixed' : scenario;
     const profile = JSON.parse(await readFile(join(root, 'config', caseName + '.json')));
     if (caseName === 'missing') {
@@ -729,7 +829,7 @@ try {
       letter: coldLetter });
     if (followup) {
       await mixedFollowup(project, profile.project.scopeName, coldState, coldLetter, engineerPassword, scenario === 'mixed-followup');
-      if (scenario === 'mixed-regression') await checkCatalogAlternative(project, profile);
+      if (scenario !== 'mixed-followup') await checkCatalogAlternative(project, profile, coldLetter, scenario === 'mixed-addressed');
       continue;
     }
     const warmStart = since();

@@ -42,15 +42,20 @@ def matches_source(citation, place, path, version):
             and all(locator.get(key) == value for key, value in expected_locator.items()))
 
 
-def displayed_source(source, place, path, body):
+def displayed_source(source, place, path, body, source_labels):
     label, citation = source['label'], source['address']
     locator = citation['address']['locator']
     required = [f'«{path}»', f"ред. {place['revision']}"]
     for key, prefix in {'page': 'стр.', 'table': 'табл.', 'row': 'строка', 'column': 'столбец'}.items():
         if key in locator:
             required.append(f'{prefix} {locator[key]}')
-    statement = rf"{re.escape(label)}\s+указано\s+{re.escape(citation['value'])}\s+{re.escape(citation['unit'])}(?!\w)"
-    return all(re.search(rf'{re.escape(field)}(?!\w)', label) for field in required) and bool(re.search(statement, body))
+    alternatives = '|'.join(map(re.escape, sorted(source_labels, key=len, reverse=True)))
+    token = f'(?:{alternatives})'
+    group = rf'в источник(?:е|ах)\s+({token}(?: и {token})*)\s+указано\s+([+-]?\d+(?:[.,]\d+)?)\s+(\w+)'
+    label_in_group = rf'(?:^| и ){re.escape(label)}(?:$| и )'
+    claims = [(value, unit) for labels, value, unit in re.findall(group, body) if re.search(label_in_group, labels)]
+    return all(re.search(rf'{re.escape(field)}(?!\w)', label) for field in required) and claims == [
+        (citation['value'], citation['unit'])]
 
 
 def letter_semantics(cold, before, letter, question, texts, oracle):
@@ -91,6 +96,7 @@ def letter_semantics(cold, before, letter, question, texts, oracle):
         == sorted(place['originalSha256'] for place in required),
     }
     source_checks = {}
+    source_labels = {entry['label'] for entry in item.get('sources', [])}
     for place in required:
         path = paths[place['originalSha256']]
         version = cold['receipt']['versions'][path]['versionId']
@@ -105,7 +111,7 @@ def letter_semantics(cold, before, letter, question, texts, oracle):
             'proof': any(proof['status'] == proof['originalStatus'] == 200
                          and proof['originalSha256'] == proof['expectedSha256'] == place['originalSha256']
                          for proof in delivered),
-            **{format_name: any(displayed_source(source, place, path, body) for source in displayed)
+            **{format_name: any(displayed_source(source, place, path, body, source_labels) for source in displayed)
                for format_name, body in texts.items()},
         }
     return {'passed': all(checks.values()) and all(all(fields.values()) for fields in source_checks.values()),
