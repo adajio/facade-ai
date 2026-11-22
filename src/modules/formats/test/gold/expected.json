@@ -1,0 +1,36 @@
+{
+  "docx": {
+    "table": 1,
+    "row": 2,
+    "column": 3,
+    "text": "2.40 mm"
+  },
+  "xlsx": {
+    "sheet": "Schedule M",
+    "cell": "C3",
+    "formula": "B3*2",
+    "cachedValue": "4.80"
+  },
+  "dxf": {
+    "space": "Model",
+    "handle": "32",
+    "text": "AX-17 rev B | 2 x 35 mm | 70 mm"
+  },
+  "ifc": {
+    "step": "#42",
+    "globalId": "0Xa1Bc2De3Fg4Hi5Jk6Lm7"
+  },
+  "pdf": {
+    "page": 1,
+    "box": {
+      "x": 60,
+      "y": 330,
+      "width": 480,
+      "height": 192
+    },
+    "text": "ZX-582",
+    "value": "8.65 mm",
+    "rotatedPage": 2,
+    "unreadablePage": 3
+  }
+}

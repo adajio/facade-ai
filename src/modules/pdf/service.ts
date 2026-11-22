@@ -1,0 +1,462 @@
+import { createHash, randomUUID } from 'node:crypto';
+import { createWriteStream } from 'node:fs';
+import { mkdir, mkdtemp, rm, statfs } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { pipeline } from 'node:stream/promises';
+import type { Pool, PoolClient } from 'pg';
+import {
+  type ArtifactStore, type Box, type DocumentKey, type Evidence, type Observation,
+  type Original, type PageMap, type PinInput, type ReaderAdapter, type ReaderAddress, type ReaderLine,
+  type ReadRequest, type ReadScope, type ResolveOriginal, type SourceRef, contains, ReaderError, validBox,
+} from './types.js';
+
+const uuid = /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/;
+const digest = /^[0-9a-f]{64}$/;
+const maxArtifactBytes = 32 * 1024 * 1024;
+
+export const sha256 = (bytes: string | Buffer): string => createHash('sha256').update(bytes).digest('hex');
+export const isReaderId = (id: unknown): id is string => typeof id === 'string' && uuid.test(id);
+
+export interface ReaderDependencies {
+  resolveOriginal: ResolveOriginal;
+  artifacts: ArtifactStore;
+  scratchDir?: string;
+  scratchReserveBytes?: number;
+  maxOriginalBytes?: number;
+}
+
+interface MapRow {
+  project_id: string;
+  document_id: string;
+  version_id: string;
+  receipt_id: string;
+  original_sha256: string;
+  reader_version: string;
+  format: string;
+  units: PageMap['units'];
+}
+
+interface ReplayRow<Result> {
+  request_sha256: string;
+  payload: Result;
+}
+
+type ReaderTable = 'reader_evidence' | 'reader_observations';
+
+function checkedSource(source: SourceRef): SourceRef {
+  const { projectId, documentId, versionId, sha256 } = source;
+  if (![projectId, documentId, versionId].every(isReaderId) || typeof sha256 !== 'string' || !digest.test(sha256)) {
+    throw new ReaderError('reader_source_invalid', 'Нужны ID проекта, документа, версии и SHA-256 оригинала', 422);
+  }
+  return { projectId, documentId, versionId, sha256 };
+}
+
+function checkedScope({ runId, branch, operationKey }: ReadScope): ReadScope {
+  if (!isReaderId(runId) || (branch !== 'A' && branch !== 'B')
+    || typeof operationKey !== 'string' || operationKey.length < 1 || operationKey.length > 200
+    || operationKey.includes('\0')) {
+    throw new ReaderError('reader_attempt_invalid', 'Неверная ветвь, запуск или ключ инструмента', 422);
+  }
+  return { runId, branch, operationKey };
+}
+
+function checkedBox(box: Box | undefined): Box | undefined {
+  if (box === undefined) return;
+  if (!validBox(box)) throw new ReaderError('reader_address_invalid', 'Неверная рамка', 422);
+  return { x: box.x, y: box.y, width: box.width, height: box.height };
+}
+
+function checkedRead(input: ReadRequest): ReadRequest {
+  const { representation, address, dpi, query } = input;
+  if (!['render', 'native', 'ocr'].includes(representation) || !address || typeof address.unitId !== 'string'
+    || !address.unitId.length || address.unitId.length > 200
+    || (dpi !== undefined && (representation === 'native' || !Number.isSafeInteger(dpi) || dpi <= 0))
+    || (query !== undefined && (representation !== 'native' || typeof query !== 'string'
+      || !query.trim() || query.length > 500 || query.includes('\0')))) {
+    throw new ReaderError('reader_address_invalid', 'Неверный вид чтения или физический адрес', 422);
+  }
+  const entries = Object.entries(address.locator ?? {});
+  if (entries.length > 16 || entries.some(([key, val]) => key.length > 100
+    || !(typeof val === 'string' && val.length <= 300 || typeof val === 'number' && Number.isFinite(val)))) {
+    throw new ReaderError('reader_address_invalid', 'Неверный физический адрес', 422);
+  }
+  return {
+    address: {
+      unitId: address.unitId, box: checkedBox(address.box),
+      locator: entries.length ? Object.fromEntries(entries.sort(([a], [b]) => a.localeCompare(b, 'en'))) : undefined,
+    },
+    representation, dpi, query: query?.trim(),
+  };
+}
+
+function checkedStatement(input: PinInput): PinInput['deliveryStatement'] {
+  const statement = input.deliveryStatement;
+  if (statement === undefined) return;
+  const text = (value: unknown): value is string =>
+    typeof value === 'string' && Boolean(value.trim()) && value.length <= 500 && !value.includes('\0');
+  if (!statement || (statement.status !== 'delivered' && statement.status !== 'not_delivered')
+    || !text(statement.item) || !text(input.quote) || input.value !== undefined || input.unit !== undefined
+    || input.normalizedValue !== undefined || input.limitation !== undefined || input.alternatives !== undefined
+    || (statement.context !== undefined
+      && (!statement.context || !text(statement.context.lineId) || !text(statement.context.quote)))
+    || (!input.quote.includes(statement.item) && !statement.context?.quote.includes(statement.item))) {
+    throw new ReaderError('reader_statement_invalid', 'Утверждению о передаче нужны дословная цитата и её предмет', 422);
+  }
+  return {
+    status: statement.status, item: statement.item,
+    ...(statement.context ? { context: { lineId: statement.context.lineId, quote: statement.context.quote } } : {}),
+  };
+}
+
+function checkedPin(input: PinInput): PinInput {
+  const { evidenceId, scope, quote, value, unit, normalizedValue, limitation, lineId, alternatives } = input;
+  const statement = checkedStatement(input);
+  const values = [scope, quote, value, unit, limitation, lineId];
+  if (!isReaderId(evidenceId) || !isReaderId(scope) || values.some((val) => val !== undefined
+    && (typeof val !== 'string' || !val.trim() || val.length > 8000 || val.includes('\0')))
+    || (normalizedValue !== undefined && !(typeof normalizedValue === 'string' && normalizedValue.length <= 8000
+      && !normalizedValue.includes('\0') || typeof normalizedValue === 'number' && Number.isFinite(normalizedValue)))
+    || (!quote && value !== undefined) || (value === undefined && (unit !== undefined || normalizedValue !== undefined))
+    || ((!quote || value === undefined) && !limitation && !statement) || (lineId && !quote)
+    || (alternatives !== undefined && (!Array.isArray(alternatives) || alternatives.length > 12
+      || alternatives.some((value) => typeof value !== 'string' || !value.trim() || value.length > 500
+        || value.includes('\0'))))) {
+    throw new ReaderError('reader_observation_invalid', 'Для наблюдения нужны место, область и цитата либо ограничение', 422);
+  }
+  return {
+    evidenceId, scope, quote, value, unit, normalizedValue, limitation, lineId, alternatives, box: checkedBox(input.box),
+    ...(statement ? { deliveryStatement: statement } : {}),
+  };
+}
+
+function mapFromRow(row: MapRow): PageMap {
+  return {
+    source: {
+      projectId: row.project_id, documentId: row.document_id, versionId: row.version_id, sha256: row.original_sha256,
+    },
+    receiptId: row.receipt_id, readerVersion: row.reader_version, format: row.format, units: row.units,
+  };
+}
+
+function sameSource(left: SourceRef, right: SourceRef): boolean {
+  return left.projectId === right.projectId && left.documentId === right.documentId
+    && left.versionId === right.versionId && left.sha256 === right.sha256;
+}
+
+function mismatch(): never {
+  throw new ReaderError('reader_source_mismatch', 'Оригинал отличается от назначенной версии или SHA-256', 422);
+}
+
+async function withOriginal<T>(
+  original: Original, deps: ReaderDependencies, use: (path: string) => Promise<T>,
+): Promise<T> {
+  if (!Number.isSafeInteger(original.size) || original.size <= 0 || original.size > (deps.maxOriginalBytes ?? 512 * 1024 ** 2)) {
+    throw new ReaderError('reader_original_limit', 'Размер оригинала за пределами профиля reader', 422);
+  }
+  const root = deps.scratchDir ?? tmpdir();
+  await mkdir(root, { recursive: true, mode: 0o700 });
+  const fs = await statfs(root, { bigint: true });
+  if (fs.bavail * fs.bsize < BigInt(original.size) + BigInt(deps.scratchReserveBytes ?? 0)) {
+    throw new ReaderError('reader_scratch_unavailable', 'Не хватает временного места для оригинала', 503);
+  }
+  const folder = await mkdtemp(join(root, 'facade-reader-'));
+  const path = join(folder, 'original');
+  try {
+    let size = 0;
+    const hash = createHash('sha256');
+    try {
+      await pipeline(await original.open(), async function* (input) {
+        for await (const chunk of input) {
+          size += chunk.length;
+          if (size > original.size) mismatch();
+          hash.update(chunk);
+          yield chunk;
+        }
+        if (size !== original.size || hash.digest('hex') !== original.sha256) mismatch();
+      }, createWriteStream(path, { flags: 'wx', mode: 0o600 }));
+    } catch (error) {
+      if (error instanceof ReaderError) throw error;
+      const failure = error as { code?: string; statusCode?: number };
+      if (failure.code === 'ENOSPC') {
+        throw new ReaderError('reader_scratch_unavailable', 'Не хватает временного места для оригинала', 503);
+      }
+      if (failure.statusCode === 424) {
+        throw new ReaderError('reader_original_unavailable', 'Принятый оригинал недоступен', 424);
+      }
+      throw new ReaderError('reader_original_read_failed', 'Не удалось получить байты принятого оригинала', 503);
+    }
+    return await use(path);
+  } finally {
+    await rm(folder, { recursive: true, force: true });
+  }
+}
+
+function checkReplay<Result>(row: ReplayRow<Result>, requestHash: string): Result {
+  if (row.request_sha256 !== requestHash) {
+    throw new ReaderError('reader_operation_conflict', 'Ключ операции уже использован с другим входом', 409);
+  }
+  return row.payload;
+}
+
+async function replay<Result>(
+  db: Pool | PoolClient, table: ReaderTable, projectId: string, scope: ReadScope, requestHash: string,
+): Promise<Result | undefined> {
+  const result = await db.query<ReplayRow<Result>>(
+    `SELECT request_sha256, payload FROM ${table}
+     WHERE project_id = $1 AND run_id = $2 AND branch = $3 AND operation_key = $4`,
+    [projectId, scope.runId, scope.branch, scope.operationKey],
+  );
+  if (result.rows[0]) return checkReplay(result.rows[0], requestHash);
+}
+
+async function saveArtifact(store: ArtifactStore, projectId: string, bytes: Buffer): Promise<{ sha256: string; size: number }> {
+  if (!bytes.length || bytes.length > maxArtifactBytes) {
+    throw new ReaderError('reader_artifact_limit', 'Размер представления за пределами профиля reader', 422);
+  }
+  const hash = sha256(bytes);
+  try {
+    await store.put(projectId, hash, bytes);
+  } catch (error) {
+    if (error instanceof ReaderError) throw error;
+    throw new ReaderError('reader_artifact_write_failed', 'Не удалось сохранить представление', 503);
+  }
+  return { sha256: hash, size: bytes.length };
+}
+
+export async function readArtifact(
+  store: ArtifactStore, projectId: string, sha: string, size: number,
+): Promise<Buffer> {
+  let bytes: Buffer;
+  try {
+    bytes = await store.get(projectId, sha, size);
+  } catch {
+    throw new ReaderError('reader_artifact_unavailable', 'Сохранённое представление недоступно', 424);
+  }
+  if (bytes.length !== size || sha256(bytes) !== sha) {
+    throw new ReaderError('reader_artifact_mismatch', 'Повреждено сохранённое представление', 424);
+  }
+  return bytes;
+}
+
+export function createReaderService(db: Pool, deps: ReaderDependencies, adapters: readonly ReaderAdapter[]) {
+  const registry = new Map(adapters.map((adapter) => [adapter.format, adapter]));
+  if (registry.size !== adapters.length) throw new Error('Duplicate reader adapter format');
+
+  async function describe(source: SourceRef): Promise<{ original: Original; adapter: ReaderAdapter; version: string }> {
+    const original = await deps.resolveOriginal(source);
+    if (!original || !sameSource(original, source) || !isReaderId(original.receiptId)) mismatch();
+    const adapter = registry.get(original.format);
+    if (!adapter) throw new ReaderError('reader_format_unsupported', 'Для формата нет reader', 422);
+    return { original, adapter, version: await adapter.version() };
+  }
+
+  async function lookupMap(source: SourceRef, version: string, tx?: PoolClient): Promise<PageMap | undefined> {
+    const { rows } = await (tx ?? db).query<MapRow>(
+      `SELECT * FROM reader_maps
+       WHERE version_id = $1 AND project_id = $2 AND document_id = $3 AND reader_version = $4`,
+      [source.versionId, source.projectId, source.documentId, version],
+    );
+    if (!rows[0]) return;
+    const map = mapFromRow(rows[0]);
+    if (!sameSource(map.source, source)) mismatch();
+    return map;
+  }
+
+  async function insertMap(
+    source: SourceRef, original: Original, version: string, adapter: ReaderAdapter, path: string,
+  ): Promise<PageMap> {
+    const units = await adapter.inspect(path);
+    if (new Set(units.map(({ id }) => id)).size !== units.length || units.some(({ id }) => !id || id.length > 200)) {
+      throw new ReaderError('reader_inventory_invalid', 'Reader вернул недопустимую карту физических единиц', 422);
+    }
+    await db.query(
+      `INSERT INTO reader_maps
+       (project_id, document_id, version_id, reader_version, receipt_id, original_sha256, format, units)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8) ON CONFLICT (version_id, reader_version) DO NOTHING`,
+      [source.projectId, source.documentId, source.versionId, version, original.receiptId, source.sha256,
+        adapter.format, JSON.stringify(units)],
+    );
+    const stored = await lookupMap(source, version);
+    if (!stored) mismatch();
+    return stored;
+  }
+
+  async function open(sourceRef: SourceRef, readScope: ReadScope, input: ReadRequest) {
+    const source = checkedSource(sourceRef);
+    const scope = checkedScope(readScope);
+    const request = checkedRead(input);
+    const requestHash = sha256(JSON.stringify({ source, request }));
+    const previous = await replay<Evidence>(db, 'reader_evidence', source.projectId, scope, requestHash);
+    if (previous) return { evidence: previous, bytes: await content(previous) };
+
+    const { original, adapter, version } = await describe(source);
+    let output = await withOriginal(original, deps, async (path) => {
+      const map = await lookupMap(source, version) ?? await insertMap(source, original, version, adapter, path);
+      const unit = map.units.find(({ id }) => id === request.address.unitId);
+      if (!unit) throw new ReaderError('reader_address_invalid', 'Физическая единица отсутствует в оригинале', 422);
+      return adapter.read(path, request, unit);
+    });
+    if (output.address.unitId !== request.address.unitId || (output.address.box && !validBox(output.address.box))) {
+      throw new ReaderError('reader_address_invalid', 'Reader вернул неожиданный адрес', 422);
+    }
+    if (request.query !== undefined) {
+      const needle = request.query.normalize('NFC').toLowerCase();
+      const lines = (output.lines ?? []).filter(({ text }) => text.normalize('NFC').toLowerCase().includes(needle));
+      const limitations = [...(output.limitations ?? []), ...(!lines.length ? ['reader_no_text_match'] : [])];
+      const bytes = Buffer.from(JSON.stringify({ address: output.address, lines, limitations }));
+      output = { ...output, lines, limitations, bytes, mediaType: 'application/json' };
+    }
+    const artifact = await saveArtifact(deps.artifacts, source.projectId, output.bytes);
+    const inputImage = output.inputImage && {
+      ...await saveArtifact(deps.artifacts, source.projectId, output.inputImage.bytes),
+      transform: output.inputImage.transform,
+    };
+    const evidence: Evidence = {
+      id: randomUUID(), source, receiptId: original.receiptId, runId: scope.runId, branch: scope.branch,
+      readerVersion: version, format: adapter.format, address: output.address, representation: request.representation,
+      mediaType: output.mediaType, ...artifact, transform: output.transform, limitations: output.limitations ?? [],
+      relativePath: original.relativePath, inputImage,
+    };
+    const stored = await db.query<{ payload: Evidence }>(
+      `INSERT INTO reader_evidence
+       (id, project_id, version_id, reader_version, run_id, branch, operation_key, request_sha256, payload)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+       ON CONFLICT (project_id, run_id, branch, operation_key) DO NOTHING RETURNING payload`,
+      [evidence.id, source.projectId, source.versionId, version, scope.runId, scope.branch,
+        scope.operationKey, requestHash, evidence],
+    );
+    if (stored.rows[0]) return { evidence: stored.rows[0].payload, bytes: output.bytes };
+    const winner = await replay<Evidence>(db, 'reader_evidence', source.projectId, scope, requestHash);
+    if (!winner) throw new Error('Missing evidence after concurrent insert');
+    return { evidence: winner, bytes: await content(winner) };
+  }
+
+  async function content(evidence: Evidence, part: 'presentation' | 'ocr-input' = 'presentation'): Promise<Buffer> {
+    const identity = part === 'ocr-input' ? evidence.inputImage : evidence;
+    if (!identity) throw new ReaderError('reader_artifact_missing', 'У представления нет входного изображения OCR', 404);
+    return readArtifact(deps.artifacts, evidence.source.projectId, identity.sha256, identity.size);
+  }
+
+  async function findEvidence(projectId: string, id: string, tx?: PoolClient): Promise<Evidence | undefined> {
+    const { rows } = await (tx ?? db).query<{ payload: Evidence }>(
+      'SELECT payload FROM reader_evidence WHERE project_id = $1 AND id = $2', [projectId, id],
+    );
+    return rows[0]?.payload;
+  }
+
+  async function pin(sourceRef: SourceRef, readScope: ReadScope, input: PinInput, tx?: PoolClient): Promise<Observation> {
+    const source = checkedSource(sourceRef);
+    const scope = checkedScope(readScope);
+    const candidate = checkedPin(input);
+    const conn = tx ?? db;
+    const requestHash = sha256(JSON.stringify({ source, candidate }));
+    const previous = await replay<Observation>(conn, 'reader_observations', source.projectId, scope, requestHash);
+    if (previous) return previous;
+
+    const evidence = await findEvidence(source.projectId, candidate.evidenceId, tx);
+    if (!evidence || !sameSource(source, evidence.source)
+      || evidence.runId !== scope.runId || evidence.branch !== scope.branch) {
+      throw new ReaderError('reader_evidence_scope_mismatch', 'Выдача недоступна в этой версии, ветви или запуске', 422);
+    }
+    const map = await lookupMap(source, evidence.readerVersion, tx);
+    const unit = map?.units.find(({ id }) => id === evidence.address.unitId);
+    const delivered = evidence.address.box ?? (unit?.width && unit.height
+      ? { x: 0, y: 0, width: unit.width, height: unit.height } : undefined);
+    if (candidate.box && (!delivered || !contains(delivered, candidate.box))) {
+      throw new ReaderError('reader_address_invalid', 'Рамка наблюдения выходит за границу выдачи', 422);
+    }
+    const scale = evidence.transform?.pixelsPerPoint;
+    if (candidate.box && scale && (candidate.box.width * scale < 1 || candidate.box.height * scale < 1)) {
+      throw new ReaderError('reader_address_invalid', 'Рамка мельче одного пикселя выдачи', 422);
+    }
+    const linkedScope = await conn.query('SELECT 1 FROM project_scopes WHERE project_id = $1 AND id = $2', [
+      source.projectId, candidate.scope,
+    ]);
+    if (!linkedScope.rowCount) {
+      throw new ReaderError('reader_scope_invalid', 'Область наблюдения не принадлежит проекту', 422);
+    }
+    const bytes = await content(evidence);
+    if (evidence.inputImage) await content(evidence, 'ocr-input');
+    let address: ReaderAddress = { ...evidence.address, box: candidate.box ?? evidence.address.box };
+    let grounding: Observation['grounding'] = 'limited';
+    if (candidate.quote && evidence.representation === 'render') {
+      if (candidate.lineId || candidate.deliveryStatement?.context) {
+        throw new ReaderError('reader_quote_mismatch', 'Изображение не содержит ID строки', 422);
+      }
+      if (candidate.deliveryStatement && !candidate.box) {
+        throw new ReaderError('reader_address_invalid', 'Для визуальной цитаты нужна рамка утверждения', 422);
+      }
+      grounding = 'visual';
+    }
+    if (candidate.quote && evidence.representation !== 'render') {
+      const { lines } = JSON.parse(bytes.toString('utf8')) as { lines: ReaderLine[] };
+      const matches = lines.filter((line) => line.text.includes(candidate.quote!)
+        && (!candidate.lineId || candidate.lineId === line.id)
+        && (!candidate.box || (line.box && contains(candidate.box, line.box))));
+      if (matches.length !== 1) {
+        throw new ReaderError('reader_quote_mismatch', 'Цитата не соответствует единственной строке в указанной выдаче', 422);
+      }
+      const [line] = matches;
+      const context = candidate.deliveryStatement?.context;
+      if (context && !lines.some((row) => row.id === context.lineId && row.text.includes(context.quote))) {
+        throw new ReaderError('reader_quote_mismatch', 'Контекст утверждения отсутствует в этой выдаче', 422);
+      }
+      address = {
+        ...address, box: line.box ?? address.box,
+        locator: address.locator || line.locator ? { ...address.locator, ...line.locator } : undefined,
+      };
+      candidate.lineId = line.id;
+      grounding = 'text';
+    }
+    const observation: Observation = {
+      ...candidate, id: randomUUID(), source, receiptId: evidence.receiptId, readerVersion: evidence.readerVersion,
+      runId: scope.runId, branch: scope.branch, address, grounding,
+    };
+    const stored = await conn.query<{ payload: Observation }>(
+      `INSERT INTO reader_observations
+       (id, project_id, version_id, run_id, branch, operation_key, request_sha256, evidence_id, scope_id, payload)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+       ON CONFLICT (project_id, run_id, branch, operation_key) DO NOTHING RETURNING payload`,
+      [observation.id, source.projectId, source.versionId, scope.runId, scope.branch,
+        scope.operationKey, requestHash, evidence.id, candidate.scope, observation],
+    );
+    if (stored.rows[0]) return stored.rows[0].payload;
+    const winner = await replay<Observation>(conn, 'reader_observations', source.projectId, scope, requestHash);
+    if (!winner) throw new Error('Missing observation after concurrent insert');
+    return winner;
+  }
+
+  return {
+    async map(sourceRef: SourceRef): Promise<PageMap> {
+      const source = checkedSource(sourceRef);
+      const { original, adapter, version } = await describe(source);
+      return await lookupMap(source, version)
+        ?? await withOriginal(original, deps, (path) => insertMap(source, original, version, adapter, path));
+    },
+    async latestMap(document: DocumentKey): Promise<PageMap | undefined> {
+      const { rows } = await db.query<MapRow>(
+        `SELECT * FROM reader_maps WHERE project_id = $1 AND document_id = $2 AND version_id = $3
+         ORDER BY created_at DESC, reader_version DESC LIMIT 1`,
+        [document.projectId, document.documentId, document.versionId],
+      );
+      if (rows[0]) return mapFromRow(rows[0]);
+    },
+    open, pin, findEvidence, content,
+    async findObservation(projectId: string, id: string): Promise<Observation | undefined> {
+      const { rows } = await db.query<{ payload: Observation }>(
+        'SELECT payload FROM reader_observations WHERE project_id = $1 AND id = $2', [projectId, id],
+      );
+      return rows[0]?.payload;
+    },
+    async listPositions(projectId: string, runId: string): Promise<{ A: Observation[]; B: Observation[] }> {
+      const { rows } = await db.query<{ payload: Observation }>(
+        'SELECT payload FROM reader_observations WHERE project_id = $1 AND run_id = $2 ORDER BY created_at, id',
+        [projectId, runId],
+      );
+      const positions: { A: Observation[]; B: Observation[] } = { A: [], B: [] };
+      for (const { payload } of rows) positions[payload.branch].push(payload);
+      return positions;
+    },
+  };
+}

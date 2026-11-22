@@ -1,0 +1,18 @@
+services:
+  worker:
+    labels:
+      io.facade.step15-config-revision: ${FACADE_STAND_STEP15_CONFIG_REVISION:-initial}
+    networks:
+      default: {}
+      openrouter-private: {}
+    depends_on:
+      openrouter-egress:
+        condition: service_started
+    environment:
+      NODE_USE_ENV_PROXY: "1"
+      HTTPS_PROXY: http://openrouter-egress:3128
+      NO_PROXY: postgres,postgres-journal,objects,localhost,127.0.0.1
+      FACADE_GATEWAY_LIVE_MODE: step-15
+    volumes:
+      - ${FACADE_STAND_STEP15_ENV:?}:/run/facade/step15.env:ro
+    entrypoint: ["node", "--env-file=/run/facade/runtime.env", "--env-file=/run/facade/step15.env"]

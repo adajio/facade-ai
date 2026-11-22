@@ -1,0 +1,151 @@
+# Reader форматов · шаг 11
+
+Единая точка интеграции — reader шага 4. Шаг 11 экспортирует `createFormatAdapters()` из
+`src/modules/formats/index.ts`. Выбор адаптера производится по расширению исходного имени
+без учёта регистра; адаптер `unknown` выдаёт исход «только оригинал». PDF обслуживает шаг 4.
+Сервис передаёт адаптеру уже проверенный временный файл конкретной версии. Продолжение,
+учёт фактической доставки, закрепление и HTTP просмотра идут через тот же reader, что и PDF.
+Регистрация маршрутов и запись квитанций принадлежат общему reader.
+
+Для шага 9. Обходить каждую единицу карты, включая пустые и удержанные. Использовать
+`unitId` и выбранный `locator`; для подтверждения указывать ID квитанции фактической выдачи.
+Отсутствие представления или частичный охват остаются внутренним ограничением. Сначала фиксируется обязанность обхода, затем выдаются совпадения поиска. Карта и цитаты другой ветви закрыты до завершения первичного чтения.
+
+Для шага 13. Использовать маршруты `/api/v1/.../reader/units` и `/api/v1/evidence/:id[/content]`
+из [контракта шага 4](../pdf/README.md). Показывать физическую единицу и поля адреса исходного
+формата из `locator`. Ссылка «Оригинал» относится к `documentId` и `versionId` квитанции.
+Адрес старого DOC/XLS/DWG уточняет место в производной, связанной с оригиналом. SHA-256
+представления и закреплённая квитанция позволяют проверить его после перезапуска.
+
+### Вход адресного инструмента worker
+
+В `ReadRequest.address.locator` передаются поля выбранного места, перечисленные ниже. Только `unitId` читает окно целиком. При выборе CAD-объекта `render` возвращает PNG с окружением, `native` возвращает точную строку. Для XLSX, DOCX, TXT и IFC обзор делается как `native`. `ocr` относится к PDF. Поля `coverage`, `candidateCount` и `limitations` доступны в карте; `held` и `original_only` требуют учёта по месту без модельного запроса. Пустая пригодная единица сохраняет обязанность обхода.
+
+| Формат | Поля выбранного места |
+| --- | --- |
+| DOCX/DOC | `paragraph` либо `table, row, column`; у строки может быть путь `section` |
+| XLSX/XLS | `sheet, cell` (например, `C3`) либо `sheet, range` (например, `A1:C4` в одном окне) |
+| TXT/CSV/TSV | `line` с 1 |
+| DXF | `space, handle`, при выборе именованного вида `view`, при геометрическом открытии также `box` |
+| DWG | `space, derivativeHandle` при доступной конвертации |
+| IFC | `step` (например, `#42`), при наличии `globalId` |
+| RVT, неизвестный | `unitId: "original"`, исходный оригинал и код причины |
+
+Для выбора через Mastra порт шага 9 должен передать JSON-объект `locator` от инструмента в
+`service.open(… { address: { unitId, box, locator } })`. Область, версия и SHA берутся из
+назначения; locator проверяется адаптером. При чтении целого окна строка возвращает собственные
+`locator` и `id`. Для двух буквально одинаковых цитат при записи передаётся `lineId`. Для
+проверки сохранённой опоры публикуется эффективный `evidence.address.locator` и адрес строки из
+`observation.address.locator`.
+
+### Конвертация и развёртывание
+
+DOC, XLS и DWG используют [порт конвертеров](../converter-port/README.md).
+В worker передаётся путь к Unix-сокету через `FACADE_CONVERTER_SOCKET`.
+Владелец стенда создаёт нужный образ из `Dockerfile` (стадии `office`, `dwg`)
+и закрепляет его ID в брокере. Вход и результат legacy-операции ограничены
+16 МиБ каждый. Профиль брокера — один CPU, 512 МиБ RAM, 96 МиБ одноразового
+`/tmp`, 64 процесса и до 35 с выполнения внутри контейнера; временные ожидания
+брокера имеют собственные сроки. Контейнер получает один вход только для
+чтения. Приложение связывает ID образа и SHA-256 производной с выданным
+представлением. Смена образа или появление конвертера применяется при
+перезапуске reader. Повторное назначение ранее удержанного чтения относится к
+очереди worker.
+
+- LibreOffice поставляется по MPL 2.0, новый код проекта доступен также по LGPL 3.0+. [Условия проекта](https://www.libreoffice.org/licenses/).
+- GNU LibreDWG поставляется по GPLv3+. Dockerfile закрепляет SHA-256 бинарного архива, а манифест сборки указывает архив исходников. [GNU LibreDWG](https://www.gnu.org/software/libredwg/manual/html_node/Overview.html).
+
+### Воспроизведение
+
+```bash
+node --test src/modules/formats/test/adapters.test.mjs
+FACADE_STEP11_STAND=1 node --test src/modules/formats/test/stand.test.mjs
+(cd src/modules/formats/test && shasum -a 256 -c gold/SHA256SUMS)
+```
+
+Тестам нужны сборка из текущего дерева и, для PDF, Poppler и Tesseract с
+`eng.traineddata`. Для отдельного выхода TypeScript задайте `FACADE_STEP11_DIST`.
+Тест стенда требует новой БД PostgreSQL с применёнными миграциями и выделенного
+бакета Garage. Он использует штатные API загрузки, хранения и просмотра, порт
+worker с управляемыми чтениями и две ветви. Опциональный
+`FACADE_STEP11_CHROME=1` проверяет открытие JSON-выдачи в Chrome; сценарии
+карточки приведены отдельно. Для проверок legacy подключите рабочий сокет
+брокера и задайте `FACADE_STEP11_OFFICE=1` или `FACADE_STEP11_DWG=1`.
+
+[Фактический профиль и измерения](test/qualification.md) ·
+[Сценарии просмотрщика](test/viewer-scenarios.md) ·
+[Оригиналы](test/fixtures/) · [Контрольные места](test/gold/expected.json)
+
+### Готовый вход для стенда шага 14 · DWG
+
+`dwg` упаковывает тот же проверенный JLL-бинарник GNU LibreDWG 0.13.4+0
+с glibc. ARM64 и AMD64 имеют отдельные закреплённые SHA-256, а упаковка
+выбирает один архив для целевой архитектуры. В образ входят `dwg2dxf`,
+его библиотека и текст GPLv3+. [Манифест JLL](https://raw.githubusercontent.com/JuliaBinaryWrappers/LibreDWG_jll.jl/LibreDWG-v0.13.4%2B0/Artifacts.toml) ·
+[Исходник и рецепт сборки JLL](https://github.com/JuliaBinaryWrappers/LibreDWG_jll.jl/tree/LibreDWG-v0.13.4%2B0).
+
+Команды для владельца [стенда](../../../infra/test-stand/README.md) в Docker-контексте OrbStack
+на внешнем SSD. На Mac ARM64 явно выбран `linux/arm64`. Для будущего x86-64
+профиля подставляется `linux/amd64`.
+
+```bash
+docker --context orbstack build --platform linux/arm64 --target dwg \
+  --tag facade-ai-dwg:0.13.4-jll src/modules/formats
+dwg_image_id="$(docker --context orbstack image inspect --format '{{.Id}}' facade-ai-dwg:0.13.4-jll)"
+docker --context orbstack run --rm --pull=never --network=none --read-only \
+  "$dwg_image_id" version-dwg
+```
+
+Передайте `dwg_image_id` в `FACADE_DWG_IMAGE` брокера шага 14, подключите его
+Unix-сокет к worker и перезапустите worker. В новую синтетическую область
+загрузите [schedule.dwg](test/fixtures/schedule.dwg) обычным API или через
+интерфейс. Ожидаются две физические единицы Model и Paper и два независимых
+чтения Model. Контроль Model — B и C с разными составами и одинаковым
+итогом 70 mm. При чтении B исходный путь доступен через `versionId`, адрес
+производной — `space: Model, derivativeHandle: 2E`. Открытие возвращает
+`cad_converted_handle_unverified` и карту подстановки шрифта для этой фикстуры.
+Управляемый маршрут можно контролировать по выдаче с типом
+`application/json` и закреплённому PNG. Проверяйте назначенные места и
+фактическую выдачу с исходным SHA-256, затем карточку. У запуска с
+недоступным образом ожидается адресное удержание `dwg_converter_unavailable`.
+
+Архив ARM64, использованный в измерении, сохранён на внешнем SSD в каталоге
+`databases/test_step11_2d254d04f627/tmp/step11-check.NF38hU/dwg-reference/libredwg.tgz`
+под корнем стенда. Ожидаемый SHA-256
+`9564f3befabc1baca44747ce79f8caadbca774412846fccfa77e1e74d48f902f`.
+
+Работающий worker проверяется без OpenRouter на новой синтетической БД и
+отдельном журнале (`infra/test-stand/stand add-journal "$db_env"`). В окружение
+прогона передаётся адрес подключённого к DWG брокера.
+
+```bash
+FACADE_STEP11_STAND=1 FACADE_STEP11_WORKER_DWG=1 \
+  node --test src/modules/formats/test/stand.test.mjs
+```
+
+Сценарий загружает DWG штатным API, запускает `startWorker` и запрашивает
+обзор и извлечение у обеих ветвей через управляемый транспорт. Он сверяет
+SHA-256 фактически полученного PNG, обе строки Model, сохранённые наблюдения,
+адрес производной и нулевую сумму внешнего журнала.
+
+В текущем стенде закрепите DWG вместе с уже подключёнными семействами
+через `stand broker-up "$archive_image" "$office_image" "$dwg_image_id"`.
+Для закрытого теста на Linux используйте выделенную БД, журнал и текущий
+готовый reader-образ шага 14. Журнал доступен в закрытой Docker-сети.
+Сценарий можно запустить в одноразовом процессе со штатными модулями worker:
+
+```bash
+infra/test-stand/stand migrate "$image" "$db_env"
+run="$(dirname -- "$db_env")"
+docker --context orbstack run --rm --pull=never --init --read-only \
+  --user "$(id -u):$(id -g)" --network facade-ai-test-server_private \
+  --memory=768m --cpus=1 --env-file "$run/runtime.env" \
+  -e FACADE_DATA_DIR=/data/objects -e TMPDIR=/data/tmp -e FACADE_GATEWAY_LIVE_MODE= \
+  -e FACADE_CONVERTER_SOCKET=/run/facade-ai-stand-converters/broker.sock \
+  -e FACADE_STEP11_STAND=1 -e FACADE_STEP11_WORKER_DWG=1 \
+  --mount "type=bind,source=$run/objects,target=/data/objects" \
+  --mount "type=bind,source=$run/tmp,target=/data/tmp" \
+  --mount "type=bind,source=$(pwd)/src/modules/formats/test,target=/app/src/modules/formats/test,readonly" \
+  --mount type=volume,source=facade-ai-test-server_converter-socket,target=/run/facade-ai-stand-converters,readonly \
+  "$image" --test /app/src/modules/formats/test/stand.test.mjs
+```

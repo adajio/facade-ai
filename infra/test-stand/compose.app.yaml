@@ -1,0 +1,42 @@
+x-runtime: &runtime
+  image: ${FACADE_STAND_IMAGE:?}
+  pull_policy: never
+  init: true
+  user: "${FACADE_STAND_UID:?}:${FACADE_STAND_GID:?}"
+  read_only: true
+  labels:
+    io.facade.runtime-config-revision: ${FACADE_STAND_CONFIG_REVISION:-initial}
+  environment:
+    HOST: "0.0.0.0"
+    PORT: "3000"
+    FACADE_DATA_DIR: /data/objects
+    FACADE_PUBLIC_ORIGIN: https://127.0.0.1:18443
+    FACADE_GATEWAY_LIVE_MODE: ""
+    TMPDIR: /data/tmp
+  volumes:
+    - ${FACADE_STAND_RUN:?}/objects:/data/objects
+    - ${FACADE_STAND_RUN:?}/tmp:/data/tmp
+    - ${FACADE_STAND_RUN:?}/runtime.env:/run/facade/runtime.env:ro
+  depends_on:
+    postgres:
+      condition: service_healthy
+    objects:
+      condition: service_healthy
+  cpuset: "0-3"
+  entrypoint: ["node", "--env-file=/run/facade/runtime.env"]
+
+services:
+  api:
+    <<: *runtime
+    command: ["dist/apps/api/src/main.js"]
+    mem_limit: 768m
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/readyz').then(r=>{if(!r.ok)process.exitCode=1},()=>{process.exitCode=1})"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+  worker:
+    <<: *runtime
+    command: ["dist/apps/worker/src/main.js"]
+    mem_limit: 2560m

@@ -1,0 +1,41 @@
+{
+  "name": "facade-ai",
+  "version": "1.1.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=24",
+    "npm": ">=11"
+  },
+  "workspaces": [
+    "src/modules/*"
+  ],
+  "scripts": {
+    "build": "npm run build:server && npm run build:web",
+    "build:server": "tsc -p tsconfig.json && node src/platform/link-workspaces.mjs",
+    "build:web": "npm --prefix web run build",
+    "typecheck": "tsc -p tsconfig.json --noEmit && npm --prefix web run check",
+    "test": "npm run build:server && npm run test:node && npm run test:workspaces && npm run test:fixtures && npm run test:acceptance",
+    "test:node": "node src/platform/test-groups.mjs local",
+    "test:stand:intake": "node src/platform/test-groups.mjs intake",
+    "test:stand:supplements": "node src/platform/test-groups.mjs supplements",
+    "test:workspaces": "npm test --workspaces --if-present",
+    "test:fixtures": "python3 -m unittest discover -s test/fixtures -p 'test_*.py'",
+    "test:acceptance": "python3 -m unittest discover -s test/acceptance -p 'test_*.py'",
+    "migrate": "node dist/src/platform/migrate.js",
+    "start": "npm run start:api",
+    "start:api": "node dist/apps/api/src/main.js",
+    "start:worker": "node dist/apps/worker/src/main.js",
+    "test:platform:stand": "node test/fixtures/platform-smoke.mjs"
+  },
+  "dependencies": {
+    "@fastify/static": "8.3.0",
+    "fastify": "5.12.8",
+    "pg": "8.23.1"
+  },
+  "devDependencies": {
+    "@types/node": "24.19.2",
+    "@types/pg": "8.23.1",
+    "typescript": "5.9.3"
+  }
+}

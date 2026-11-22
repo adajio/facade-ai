@@ -1,0 +1,10 @@
+services:
+  worker:
+    networks:
+      default: {}
+      import-private: {}
+    depends_on:
+      import-egress:
+        condition: service_started
+    environment:
+      FACADE_IMPORT_HTTPS_PROXY: http://import-egress:3128

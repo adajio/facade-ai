@@ -1,0 +1,38 @@
+services:
+  converter-broker:
+    image: ${FACADE_STAND_BROKER_IMAGE:?}
+    pull_policy: never
+    user: "0:${FACADE_STAND_GID:?}"
+    network_mode: none
+    init: true
+    read_only: true
+    cpuset: "0-3"
+    mem_limit: 256m
+    restart: unless-stopped
+    environment:
+      FACADE_CONVERTER_SOCKET: /run/facade-ai-stand-converters/broker.sock
+      FACADE_CONVERTER_SCRATCH: ${FACADE_STAND_BROKER_SCRATCH:?}
+      FACADE_ARCHIVE_IMAGE: ${FACADE_ARCHIVE_IMAGE:-}
+      FACADE_OFFICE_IMAGE: ${FACADE_OFFICE_IMAGE:-}
+      FACADE_DWG_IMAGE: ${FACADE_DWG_IMAGE:-}
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - converter-socket:/run/facade-ai-stand-converters
+      - converter-scratch:${FACADE_STAND_BROKER_SCRATCH:?}
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - >
+          require('node:http').get({socketPath:process.env.FACADE_CONVERTER_SOCKET,path:'/v1/info'},
+          r=>{r.resume();if(r.statusCode!==200)process.exitCode=1}).on('error',()=>{process.exitCode=1})
+      interval: 3s
+      timeout: 4s
+      retries: 20
+volumes:
+  converter-socket:
+    name: facade-ai-test-server_converter-socket
+  converter-scratch:
+    name: facade-ai-test-server_converter-scratch
+    external: true

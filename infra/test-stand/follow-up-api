@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+set -euo pipefail
+umask 077
+
+here="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+stage="${1:?source or restore}"
+case "$stage" in source) port=18083 ;; restore) port=18084 ;; *) exit 2 ;; esac
+container="facade-ai-followup-$stage"
+run="$(dirname -- "${2:?database env}")"
+image="${3:?reader image}"
+evidence="${4:?evidence directory}"
+[[ -s "$run/runtime.env" && -d "$evidence" ]]
+docker_bin="$(command -v docker)"
+docker_cmd=("$docker_bin" --context orbstack)
+
+"${docker_cmd[@]}" run -d --name "$container" --pull=never --init --read-only \
+  --network facade-ai-test-server_private --cpuset-cpus 0-3 --memory 512m \
+  --user "$(id -u):$(id -g)" -e HOST=0.0.0.0 -e PORT=3000 \
+  -e "FACADE_PUBLIC_ORIGIN=http://127.0.0.1:$port" -e FACADE_INTAKE_PART_BYTES=1048576 \
+  -e FACADE_DATA_DIR=/data/objects -e TMPDIR=/data/tmp -e FACADE_GATEWAY_LIVE_MODE= \
+  --mount "type=bind,source=$run/runtime.env,target=/run/test.env,readonly" \
+  --mount "type=bind,source=$run/objects,target=/data/objects" \
+  --mount "type=bind,source=$run/tmp,target=/data/tmp" \
+  "$image" --env-file=/run/test.env dist/apps/api/src/main.js
+
+python3 - "$evidence" "$stage" "$(command -v node)" "$here/follow-up-relay.mjs" "$docker_bin" "$container" "$port" <<'PY'
+from pathlib import Path
+import subprocess
+import sys
+
+folder, phase, *cmd = sys.argv[1:]
+folder = Path(folder)
+with (folder / (phase + "-relay.log")).open("ab") as log:
+    child = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=log, stderr=log,
+                             start_new_session=True)
+(folder / (phase + "-relay.pid")).write_text(f"{child.pid}\n")
+PY
+for attempt in {1..30}; do
+  if curl --noproxy '*' -fsS --max-time 3 "http://127.0.0.1:$port/readyz"; then exit 0; fi
+  sleep 0.5
+done
+exit 1

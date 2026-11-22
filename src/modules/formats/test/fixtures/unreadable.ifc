@@ -1,0 +1,13 @@
+ISO-10303-21;
+HEADER;
+FILE_DESCRIPTION(('ViewDefinition [CoordinationView]'),'2;1');
+FILE_NAME('synthetic.ifc','2026-11-22T00:00:00',('Fixture'),('Fixture'),'synthetic','synthetic','');
+FILE_SCHEMA(('IFC4'));
+ENDSEC;
+DATA;
+#11=IFCCARTESIANPOINT((0.,0.,0.));
+#42=IFCWALL('0Xa1Bc2De3Fg4Hi5Jk6Lm7',$,'AX-17 rev B; Wing M',$,$,$,$,'AX-17',.STANDARD.);
+#42=IFCWALL('0Xa1Bc2De3Fg4Hi5Jk6Lm8',$,'AX-17 rev C; Wing M',$,$,$,$,'AX-17',.STANDARD.);
+#50=IFCPROPERTYSINGLEVALUE('Thickness',$,IFCLENGTHMEASURE(0.0024),$);
+ENDSEC;
+END-ISO-10303-21;

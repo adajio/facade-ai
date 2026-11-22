@@ -1,0 +1,401 @@
+import { BUDGET_USD_NANOS, GatewayError, hash, positiveInteger, type ModelTransport, type RoutePolicy, type RouterDiagnostic } from './types.js';
+
+type SyntheticScope = {
+  projectId: string;
+  scopeId: string;
+  approvalRef: string;
+  originalSha256s: readonly string[];
+};
+
+type OpenRouterPricingQualification = {
+  maxImageWidth: number;
+  maxImageHeight: number;
+  maxImageBytes: number;
+  cacheReadNanosPerToken: number;
+  cacheWriteNanosPerToken: number;
+  cacheBilling: 'replaces-input' | 'supplement';
+  reasoningNanosPerToken: number;
+  reasoningBilling: 'replaces-output' | 'supplement';
+  completionCapIncludesReasoning: true;
+  completionParameter: 'max_tokens' | 'max_completion_tokens';
+};
+
+export type OpenRouterProfile = {
+  routeId: string;
+  revision: string;
+  model: string;
+  provider: string;
+  expectedResponseProvider: string;
+  mode: 'synthetic-research' | 'strict-zdr';
+  zdrEvidenceRef?: string;
+  syntheticScopes?: readonly SyntheticScope[];
+  boundEvidenceRef: string;
+  validUntil: string;
+  inputTokenUpperBound: number;
+  outputTokenLimit: number;
+  maxImages: number;
+  maxImagePixels: number;
+  promptNanosPerToken: number;
+  completionNanosPerToken: number;
+  requestNanos: number;
+  imageNanos: number;
+  additionalNanos: number;
+  knownNoChargeStatuses: readonly number[];
+} & Partial<OpenRouterPricingQualification>;
+
+export type QualifiedOpenRouterProfile = OpenRouterProfile & OpenRouterPricingQualification;
+
+export type Step15Approval = {
+  qualification: 'step-15';
+  apiKey: string;
+  endpoint: 'https://openrouter.ai' | 'https://eu.openrouter.ai' | 'https://us.openrouter.ai';
+  profiles: readonly OpenRouterProfile[];
+};
+
+const requestFields = new Set(['model','messages','tools','tool_choice','parallel_tool_calls','max_tokens','max_completion_tokens','stream']);
+const messageFields = new Set(['role','name','content','tool_call_id','tool_calls','reasoning','reasoning_details']);
+const functionFields = new Set(['name','description','parameters','strict']);
+const endpoints = ['https://openrouter.ai','https://eu.openrouter.ai','https://us.openrouter.ai'];
+const allowedModel = /^[a-z0-9._-]+\/[a-z0-9._-]+$/;
+const allowedProvider = /^[a-z0-9._-]+(?:\/[a-z0-9._-]+)*$/;
+const imageUrl = /^data:image\/png;base64,([A-Za-z0-9+/]+={0,2})$/;
+const uuid = /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/;
+const sha256 = /^[a-f0-9]{64}$/;
+const signature = Buffer.from('89504e470d0a1a0a', 'hex');
+const tracePlaceholder = '00000000-0000-0000-0000-000000000000';
+
+export type OpenRouterCostBound = {
+  input: number;
+  outputAndReasoning: number;
+  images: number;
+  request: number;
+  additional: number;
+  ceilingUsdNanos: number;
+};
+
+function record(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : null;
+}
+
+const errorTypes = new Set([
+  'context_length_exceeded','max_tokens_exceeded','token_limit_exceeded','string_too_long',
+  'authentication','permission_denied','payment_required','rate_limit_exceeded','provider_overloaded',
+  'provider_unavailable','invalid_request','invalid_prompt','not_found','precondition_failed','payload_too_large',
+  'unprocessable','content_policy_violation','refusal','invalid_image','image_too_large','image_too_small',
+  'unsupported_image_format','image_not_found','image_download_failed','server','timeout','unmapped',
+]);
+const routingSteps = new Map([
+  ['Filter by Max Price', 'max_price'],
+  ['Filter by Quantization', 'quantization'],
+]);
+const requestIdPattern = /^req-[0-9]{10,16}-[A-Za-z0-9_-]{1,64}$/;
+const generationIdPattern = /^gen-[A-Za-z0-9_-]{1,128}$/;
+const errorBodyLimit = 64 * 1024;
+
+async function readErrorBody(response: Response): Promise<unknown> {
+  const reader = response.body?.getReader();
+  if (!reader) return null;
+  const decoder = new TextDecoder();
+  let bytes = 0;
+  let body = '';
+  try {
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) return JSON.parse(body + decoder.decode()) as unknown;
+      bytes += value.byteLength;
+      if (bytes > errorBodyLimit) {
+        void reader.cancel().catch(() => undefined);
+        return null;
+      }
+      body += decoder.decode(value, { stream: true });
+    }
+  } catch {
+    return null;
+  } finally {
+    reader.releaseLock();
+  }
+}
+
+function routerDiagnostic(response: Response, result: Record<string, unknown> | null, traceId: string,
+  generationId: string | undefined): RouterDiagnostic {
+  const choice = Array.isArray(result?.choices) ? record(result.choices[0]) : null;
+  const error = record(result?.error) ?? record(choice?.error);
+  const metadata = record(error?.metadata);
+  const router = record(result?.openrouter_metadata);
+  const errorCode = typeof error?.code === 'number' && positiveInteger(error.code, 599) && error.code >= 400
+    ? error.code : undefined;
+  const errorType = typeof metadata?.error_type === 'string' && errorTypes.has(metadata.error_type)
+    ? metadata.error_type : undefined;
+  const failedRoutingStep = typeof metadata?.failed_routing_step === 'string'
+    ? routingSteps.get(metadata.failed_routing_step) : undefined;
+  const routerAttempt = typeof router?.attempt === 'number' && Number.isSafeInteger(router.attempt) && router.attempt >= 0
+    ? router.attempt : undefined;
+  const requestId = [response.headers.get('x-request-id'), result?.request_id]
+    .find((value): value is string => typeof value === 'string' && requestIdPattern.test(value));
+  const endpoints = record(router?.endpoints);
+  const providerAttempted = (routerAttempt ?? 0) > 0 || (Array.isArray(router?.attempts) && router.attempts.length > 0)
+    || (Array.isArray(endpoints?.available) && endpoints.available.some(candidate => record(candidate)?.selected === true))
+    || typeof metadata?.provider_name === 'string';
+  const stage = providerAttempted ? 'provider_attempted'
+    : response.status === 404 && errorCode === 404 && routerAttempt === 0 && !generationId
+      ? 'before_provider' : 'undetermined';
+
+  return { traceId, httpStatus: response.status, stage,
+    ...(errorCode !== undefined ? { errorCode } : {}), ...(errorType ? { errorType } : {}),
+    ...(failedRoutingStep ? { failedRoutingStep } : {}), ...(routerAttempt !== undefined ? { routerAttempt } : {}),
+    ...(requestId ? { requestId } : {}) };
+}
+
+function nonnegative(value: unknown): value is number {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0 && value <= BUDGET_USD_NANOS;
+}
+
+function tokenCount(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0 ? value : undefined;
+}
+
+function validPng(url: unknown, profile: QualifiedOpenRouterProfile): boolean {
+  if (typeof url !== 'string') return false;
+  const match = imageUrl.exec(url);
+  if (!match || match[1].length > Math.ceil(profile.maxImageBytes / 3) * 4) return false;
+  const png = Buffer.from(match[1], 'base64');
+  if (png.length < 33 || png.length > profile.maxImageBytes || png.toString('base64') !== match[1]
+    || !png.subarray(0,8).equals(signature) || png.readUInt32BE(8) !== 13
+    || png.toString('ascii',12,16) !== 'IHDR') return false;
+  const width = png.readUInt32BE(16);
+  const height = png.readUInt32BE(20);
+  if (!positiveInteger(width, profile.maxImageWidth) || !positiveInteger(height, profile.maxImageHeight)
+    || width * height > profile.maxImagePixels) return false;
+
+  let pixels = false;
+  for (let offset = 33; offset + 12 <= png.length;) {
+    const size = png.readUInt32BE(offset);
+    const type = png.toString('ascii', offset + 4, offset + 8);
+    offset += 12 + size;
+    if (offset > png.length || ['acTL','fcTL','fdAT','IHDR'].includes(type)) return false;
+    if (type === 'IDAT') pixels = true;
+    if (type === 'IEND') return pixels && size === 0 && offset === png.length;
+  }
+  return false;
+}
+
+function requireZdr(profile: OpenRouterProfile): boolean {
+  return profile.mode === 'strict-zdr' || profile.model.startsWith('moonshotai/kimi-');
+}
+
+function approvedProfile(profile: OpenRouterProfile): boolean {
+  const kimi = profile.model.startsWith('moonshotai/kimi-');
+  const qwen = profile.model.startsWith('qwen/');
+  if ((kimi && profile.provider !== 'wafer/us') || (requireZdr(profile) && !profile.zdrEvidenceRef?.trim())) return false;
+  if (profile.mode === 'strict-zdr') return true;
+  if (profile.mode !== 'synthetic-research' || (!kimi && !qwen)
+    || (qwen && !/^alibaba(?:\/|$)/.test(profile.provider))
+    || !Array.isArray(profile.syntheticScopes) || !profile.syntheticScopes.length) return false;
+  return profile.syntheticScopes.every(scope => uuid.test(scope.projectId) && uuid.test(scope.scopeId)
+    && typeof scope.approvalRef === 'string' && Boolean(scope.approvalRef.trim())
+    && Array.isArray(scope.originalSha256s) && scope.originalSha256s.length > 0
+    && scope.originalSha256s.every((digest: unknown) => typeof digest === 'string' && sha256.test(digest)));
+}
+
+function assignedSources(payload: unknown): Record<string, unknown>[] {
+  const job = record(payload);
+  const dispute = record(job?.dispute);
+  const places = job?.mode === 'primary' ? [job.place]
+    : job?.mode === 'lead' || job?.mode === 'verify' ? [record(dispute?.a)?.place, record(dispute?.b)?.place] : [];
+  return places.map(place => record(record(place)?.source) ?? {});
+}
+
+function localFunction(value: unknown): boolean {
+  const tool = record(value);
+  const fn = record(tool?.function);
+  return Boolean(tool && Object.keys(tool).length === 2 && tool.type === 'function' && fn
+    && typeof fn.name === 'string' && Object.keys(fn).every(key => functionFields.has(key)));
+}
+
+function requestBody(profile: QualifiedOpenRouterProfile, value: unknown, route: RoutePolicy): {
+  wire: object; cost: OpenRouterCostBound;
+} | null {
+  const body = record(value);
+  if (!body || Object.keys(body).some(key => !requestFields.has(key))
+    || body.model !== profile.model || (body.stream !== false && body.stream !== undefined)
+    || !Array.isArray(body.messages) || !body.messages.length || Date.parse(profile.validUntil) <= Date.now()
+    || (body.tools !== undefined && (!Array.isArray(body.tools) || !body.tools.every(localFunction)))) return null;
+  const tokens = body.max_completion_tokens ?? body.max_tokens;
+  if (typeof tokens !== 'number' || !positiveInteger(tokens, profile.outputTokenLimit)
+    || (body.max_completion_tokens !== undefined && body.max_tokens !== undefined)) return null;
+  let images = 0;
+  const messages: Record<string, unknown>[] = [];
+  for (const candidate of body.messages) {
+    const message = record(candidate);
+    if (!message || !['system','user','assistant','tool','developer'].includes(String(message.role))) return null;
+    messages.push(Object.fromEntries(Object.entries(message).filter(([key]) => messageFields.has(key))));
+    const content = message.content;
+    if (content === null || content === undefined || typeof content === 'string') continue;
+    if (!Array.isArray(content)) return null;
+    for (const candidatePart of content) {
+      const part = record(candidatePart);
+      if (!part || Object.keys(part).length !== 2) return null;
+      if (part.type === 'text' && typeof part.text === 'string') continue;
+      const image = record(part.image_url);
+      if (part.type !== 'image_url' || !image || Object.keys(image).length !== 1 || !validPng(image.url, profile)) return null;
+      images++;
+    }
+  }
+  if (images > profile.maxImages) return null;
+  const inputRate = profile.cacheBilling === 'replaces-input'
+    ? Math.max(profile.promptNanosPerToken, profile.cacheReadNanosPerToken, profile.cacheWriteNanosPerToken)
+    : profile.promptNanosPerToken + profile.cacheReadNanosPerToken + profile.cacheWriteNanosPerToken;
+  const outputRate = profile.reasoningBilling === 'replaces-output'
+    ? Math.max(profile.completionNanosPerToken, profile.reasoningNanosPerToken)
+    : profile.completionNanosPerToken + profile.reasoningNanosPerToken;
+  const input = BigInt(profile.inputTokenUpperBound) * BigInt(inputRate);
+  const outputAndReasoning = BigInt(tokens) * BigInt(outputRate);
+  const imageCharge = BigInt(images) * BigInt(profile.imageNanos);
+  const total = input + outputAndReasoning + imageCharge + BigInt(profile.requestNanos) + BigInt(profile.additionalNanos);
+  const ceilingUsdNanos = Math.max(1, Number(total));
+  if (!positiveInteger(ceilingUsdNanos, route.ceilingUsdNanos)) return null;
+
+  const { max_tokens: _legacy, max_completion_tokens: _completion, ...approved } = body;
+  const wire = {
+    ...approved, messages, [profile.completionParameter]: tokens, stream: false, usage: { include: true },
+    provider: {
+      only: [profile.provider], order: [profile.provider], allow_fallbacks: false,
+      require_parameters: true, data_collection: 'deny', zdr: requireZdr(profile),
+      max_price: {
+        prompt: profile.promptNanosPerToken / 1_000, completion: profile.completionNanosPerToken / 1_000,
+        request: profile.requestNanos / 1_000_000_000, image: profile.imageNanos / 1_000_000_000,
+      },
+    },
+  };
+  if (Buffer.byteLength(JSON.stringify({ ...wire, trace: { trace_id: tracePlaceholder } })) > route.maxRequestBytes) return null;
+  return {
+    wire,
+    cost: { input: Number(input), outputAndReasoning: Number(outputAndReasoning), images: Number(imageCharge),
+      request: profile.requestNanos, additional: profile.additionalNanos, ceilingUsdNanos },
+  };
+}
+
+function validProfile(profile: OpenRouterProfile): profile is QualifiedOpenRouterProfile {
+  return Boolean(profile.routeId && profile.revision && allowedModel.test(profile.model) && allowedProvider.test(profile.provider)
+    && profile.expectedResponseProvider?.trim() && approvedProfile(profile)
+    && profile.boundEvidenceRef?.trim() && Number.isFinite(Date.parse(profile.validUntil))
+    && positiveInteger(profile.inputTokenUpperBound, 10_000_000) && positiveInteger(profile.outputTokenLimit, 1_000_000)
+    && profile.completionCapIncludesReasoning === true
+    && (profile.completionParameter === 'max_tokens' || profile.completionParameter === 'max_completion_tokens')
+    && (profile.cacheBilling === 'replaces-input' || profile.cacheBilling === 'supplement')
+    && (profile.reasoningBilling === 'replaces-output' || profile.reasoningBilling === 'supplement')
+    && [profile.maxImages, profile.maxImagePixels, profile.maxImageWidth, profile.maxImageHeight, profile.maxImageBytes,
+      profile.promptNanosPerToken, profile.completionNanosPerToken, profile.cacheReadNanosPerToken,
+      profile.cacheWriteNanosPerToken, profile.reasoningNanosPerToken, profile.requestNanos,
+      profile.imageNanos, profile.additionalNanos].every(nonnegative)
+    && (profile.maxImages === 0 || [profile.maxImagePixels, profile.maxImageWidth,
+      profile.maxImageHeight, profile.maxImageBytes].every(bound => nonnegative(bound) && bound > 0))
+    && Array.isArray(profile.knownNoChargeStatuses)
+    && profile.knownNoChargeStatuses.every(code => Number.isInteger(code) && code >= 400 && code < 500));
+}
+
+export function estimateOpenRouterRequest(profile: OpenRouterProfile, route: RoutePolicy, request: unknown): OpenRouterCostBound | null {
+  if (route.transport !== 'openrouter' || profile.routeId !== route.id || profile.revision !== route.revision || !validProfile(profile)) return null;
+  return requestBody(profile, request, route)?.cost ?? null;
+}
+
+export function openRouterTransport(approval: Step15Approval): ModelTransport {
+  if (approval.qualification !== 'step-15' || !approval.apiKey.trim() || !endpoints.includes(approval.endpoint)) {
+    throw new GatewayError('step15_approval_required');
+  }
+  const profiles = new Map<string, { profile: QualifiedOpenRouterProfile; fingerprint: string }>();
+  for (const profile of structuredClone(approval.profiles)) {
+    const key = profile.routeId + '/' + profile.revision;
+    if (profiles.has(key) || !validProfile(profile)) throw new GatewayError('invalid_openrouter_profile');
+    profiles.set(key, { profile, fingerprint: hash([approval.endpoint, profile]) });
+  }
+  if (!profiles.size) throw new GatewayError('step15_profile_required');
+  const apiKey = approval.apiKey;
+  const url = approval.endpoint + '/api/v1/chat/completions';
+  const profileFor = (route: RoutePolicy) => profiles.get(route.id + '/' + route.revision);
+  return {
+    kind: 'openrouter',
+    validate(route, request) {
+      const selected = profileFor(route);
+      return Boolean(selected && requestBody(selected.profile, request, route));
+    },
+    quote(route, request) {
+      const selected = profileFor(route);
+      const bound = selected && requestBody(selected.profile, request, route)?.cost;
+      return bound && selected
+        ? { ceilingUsdNanos: bound.ceilingUsdNanos, pricingFingerprint: selected.fingerprint }
+        : null;
+    },
+    async authorize(tx, route, context) {
+      const profile = profileFor(route)?.profile;
+      if (!profile) return false;
+      if (profile.mode === 'strict-zdr') return true;
+      const scope = profile.syntheticScopes?.find(item => item.projectId === context.projectId && item.scopeId === context.scopeId);
+      if (context.dataClass !== 'synthetic' || !scope) return false;
+      const sources = assignedSources(context.payload);
+      if (!sources.length || sources.some(source => source.projectId !== context.projectId
+        || typeof source.versionId !== 'string' || !uuid.test(source.versionId)
+        || typeof source.documentId !== 'string' || !uuid.test(source.documentId)
+        || typeof source.sha256 !== 'string' || !scope.originalSha256s.includes(source.sha256))
+        || context.inputRefs.some(id => !uuid.test(id))) return false;
+
+      const expected = sources.map(source => ({ version_id: source.versionId, document_id: source.documentId, sha256: source.sha256 }));
+      const evidenceIds = [...new Set(context.inputRefs)];
+      const result = await tx.query<{ authorized: boolean }>(
+        `SELECT
+          NOT EXISTS (SELECT 1 FROM intake_originals WHERE project_id=$1 AND sha256<>ALL($2::text[]))
+          AND (SELECT count(*) FROM jsonb_to_recordset($3::jsonb) src(version_id uuid,document_id uuid,sha256 text)
+            JOIN intake_document_versions v ON v.project_id=$1 AND v.id=src.version_id AND v.document_id=src.document_id
+            JOIN intake_originals o ON o.project_id=v.project_id AND o.id=v.original_id AND o.sha256=src.sha256)=$4
+          AND (SELECT count(*) FROM reader_evidence e
+            JOIN reader_maps m USING(project_id,version_id,reader_version)
+            WHERE e.project_id=$1 AND e.run_id=$5 AND e.id=ANY($6::uuid[])
+              AND m.original_sha256=ANY($2::text[]))=$7 AS authorized`,
+        [context.projectId, scope.originalSha256s, JSON.stringify(expected), expected.length,
+         context.jobId, evidenceIds, evidenceIds.length],
+      );
+      return result.rows[0].authorized;
+    },
+    async send(attempt, route, request, signal) {
+      const selected = profileFor(route);
+      const profile = selected?.profile;
+      const body = profile && requestBody(profile, request, route);
+      if (!selected || !body || selected.fingerprint !== attempt.pricingFingerprint
+        || body.cost.ceilingUsdNanos !== attempt.ceilingUsdNanos) {
+        return { receipt: { state: 'rejected', code: 'invalid_request', evidenceRef: 'gateway:no-network' } };
+      }
+      const response = await fetch(url, {
+        method: 'POST', redirect: 'error', signal,
+        headers: {
+          authorization: 'Bearer ' + apiKey, 'content-type': 'application/json', 'X-OpenRouter-Metadata': 'enabled',
+        },
+        body: JSON.stringify({ ...body.wire, trace: { trace_id: attempt.id } }),
+      });
+      const output: unknown = response.ok ? await response.json().catch(() => null) : await readErrorBody(response);
+      const result = record(output);
+      const id = typeof result?.id === 'string' && generationIdPattern.test(result.id) ? 'openrouter:' + result.id : undefined;
+      const usage = record(result?.usage);
+      const cost = typeof usage?.cost === 'number' && usage.cost >= 0
+        ? Math.ceil(usage.cost * 1_000_000_000) : NaN;
+      if (!response.ok || !id || !Number.isSafeInteger(cost)) {
+        const headerId = response.headers.get('x-generation-id');
+        const providerId = id ?? (headerId && generationIdPattern.test(headerId) ? 'openrouter:' + headerId : undefined);
+        const diagnostic = routerDiagnostic(response, result, attempt.id, providerId);
+        const code = response.ok ? 'usage_unconfirmed' : 'http_' + response.status;
+        if (!response.ok && selected.profile.knownNoChargeStatuses.includes(response.status)) {
+          return { receipt: { state: 'rejected', code, evidenceRef: 'openrouter:qualified-no-charge:' + response.status,
+            routerDiagnostic: diagnostic } };
+        }
+        return { receipt: { state: 'unknown', code, providerId, routerDiagnostic: diagnostic } };
+      }
+      const model = typeof result?.model === 'string' ? result.model : undefined;
+      const provider = typeof result?.provider === 'string' ? result.provider : undefined;
+      const routeVerified = model === selected.profile.model && provider === selected.profile.expectedResponseProvider;
+      return {
+        receipt: { state: 'paid', costUsdNanos: cost, providerId: id, evidenceRef: id, model, provider, routeVerified,
+          promptTokens: tokenCount(usage?.prompt_tokens), completionTokens: tokenCount(usage?.completion_tokens) },
+        ...(routeVerified ? { output } : {}),
+      };
+    },
+  };
+}
