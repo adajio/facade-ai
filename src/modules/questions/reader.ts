@@ -69,6 +69,7 @@ export async function publishReaderObservation(tx: PoolClient, input: Anchoring 
     readable: observation.grounding !== "limited" && !observation.limitation,
     measurement: observation.value !== undefined && observation.unit !== undefined
       ? { value: observation.value, unit: observation.unit } : undefined,
+    ...(observation.components?.length ? { components: observation.components } : {}),
     supersedesVersionIds: replacesConfirmed && file.replaces_version_id ? [file.replaces_version_id] : undefined,
   });
 }
@@ -96,22 +97,41 @@ export function createRuntimeInquiryPorts(
         pin.source.versionId !== source.versionId || pin.source.sha256 !== source.sha256 ||
         pin.quote !== source.quote || (source.measurement && (pin.value !== source.measurement.value ||
           pin.unit !== source.measurement.unit)) ||
+        canonicalJson(pin.components) !== canonicalJson(source.components) ||
         canonicalJson(pin.address) !== canonicalJson(source.address)) return null;
       const evidence = await reader.findEvidence(source.projectId, source.evidenceId, tx);
       if (!evidence || evidence.source.versionId !== source.versionId || evidence.source.sha256 !== source.sha256) return null;
       const file = await original(tx ?? db, pin.source);
       if (!file || file.original_id !== source.originalId || file.sha256 !== source.sha256) return null;
       try {
-        const content = await objects.get(file.object_key);
-        const hash = createHash("sha256");
-        let length = 0;
-        for await (const bytes of content) {
-          signal.throwIfAborted();
-          length += bytes.length;
-          if (length > Number(file.size)) return null;
-          hash.update(bytes);
+        const intact = async (original: ReaderOriginal) => {
+          const content = await objects.get(original.object_key);
+          const hash = createHash("sha256");
+          let length = 0;
+          for await (const bytes of content) {
+            signal.throwIfAborted();
+            length += bytes.length;
+            if (length > Number(original.size)) return false;
+            hash.update(bytes);
+          }
+          return length === Number(original.size) && hash.digest("hex") === original.sha256;
+        };
+        if (!await intact(file)) return null;
+        const originals = new Set([pin.source.versionId]);
+        const seen = new Set([evidence.id]);
+        for (const part of pin.components ?? []) {
+          if (part.source.projectId !== source.projectId) return null;
+          if (!originals.has(part.source.versionId)) {
+            const owner = await original(tx ?? db, part.source);
+            if (!owner || owner.sha256 !== part.source.sha256 || !await intact(owner)) return null;
+            originals.add(part.source.versionId);
+          }
+          if (seen.has(part.evidenceId)) continue;
+          const issued = await reader.findEvidence(source.projectId, part.evidenceId, tx);
+          if (!issued || issued.branch !== pin.branch || canonicalJson(issued.source) !== canonicalJson(part.source)) return null;
+          await reader.content(issued);
+          seen.add(part.evidenceId);
         }
-        if (length !== Number(file.size) || hash.digest("hex") !== source.sha256) return null;
         const bytes = await reader.content(evidence);
         return {
           observationId: pin.id, versionId: source.versionId, sha256: source.sha256,
@@ -127,6 +147,9 @@ export function createRuntimeInquiryPorts(
       }
     },
     async checkMeaning(question, candidate, support, signal, context) {
+      if (candidate.components?.length && candidate.subjectVerified && candidate.measurement &&
+          hasAddressedSubject(question, { ...candidate.measurement, quote: candidate.quote,
+            lineId: support.lineId, grounding: support.grounding ?? "limited", components: candidate.components }, [])) return "same";
       if (candidate.subjectVerified === false) {
         if (!candidate.assessmentQuestionId || candidate.assessmentQuestionId !== context.assessmentQuestionId ||
           support.content.kind !== "text" ||

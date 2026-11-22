@@ -1,7 +1,7 @@
-import type { Observation, ReaderLine } from "../pdf/types.js";
+import type { Observation, ReaderLine, ReaderObservationComponent } from "../pdf/types.js";
 import { escapeRegex, normalize } from "./domain.js";
 
-type AssignedSubject = { subject: string; property: string; aliases?: readonly string[] };
+type AssignedSubject = { subject: string; property: string; aliases?: readonly string[]; variant?: string };
 type Measure = Pick<Observation, "value" | "unit">;
 
 function words(text: string): string[] {
@@ -41,14 +41,54 @@ function priorLabel(before: readonly ReaderLine[]): string {
 /** Verify an assigned attribute against the addressed line, with only structural context from its delivered representation. */
 export function hasAddressedSubject(
   target: AssignedSubject,
-  observation: Pick<Observation, "quote" | "value" | "unit" | "lineId" | "grounding">,
+  observation: Pick<Observation, "quote" | "value" | "unit" | "lineId" | "grounding" | "components">,
   lines: readonly ReaderLine[],
 ): boolean {
   if (observation.grounding !== "text" || !observation.lineId) return false;
+  if (observation.components?.length) return hasCompoundSubject(target, observation.components);
   const valueLine = lines.find(({ id }) => id === observation.lineId);
   if (!valueLine || !observation.quote || !valueLine.text.includes(observation.quote)) return false;
   const names = [`${target.subject} ${target.property}`, ...target.aliases ?? []];
   return names.some((name) => bindsAttribute([...new Set(words(name))], observation, valueLine, lines));
+}
+
+function engineeringWords(text: string): string[] {
+  const named = text.replace(/\bAnchorSpacing\b/giu, "шаг креплений")
+    .replace(/\bhinge\s+bracket\b/giu, "шарнирный кронштейн")
+    .replace(/\bthickness\b/giu, "толщина");
+  return words(named).map((word) => {
+    if (/^габарит(?:ы|ная|ной|ное)?$/u.test(word)) return "габарит";
+    if (/^шарнирн(?:ый|ого|ая)$/u.test(word)) return "шарнирный";
+    if (/^кронштейн(?:а|ы)?$/u.test(word)) return "кронштейн";
+    return word;
+  });
+}
+
+function hasCompoundSubject(target: AssignedSubject, components: ReaderObservationComponent[]) {
+  const [value] = components;
+  if (!value || value.role !== "value" || value.link.kind !== "anchor") return false;
+  const local = components.filter((part) => part.source.versionId === value.source.versionId && part.source.sha256 === value.source.sha256);
+  const variantSuffix = /(?:исполнени[ея]|variant)\s*[:№]?\s*([a-zа-я]\d*)(?=$|[^\p{L}\p{N}])/iu;
+  const names = [target.subject + " " + target.property, ...target.aliases ?? []];
+  const variant = normalize(target.variant ?? variantSuffix.exec(names[0]!)?.[1] ?? "");
+  if (variant) {
+    const named = local.find((part) => part.role === "variant");
+    const identifier = local.filter((part) => part.role === "identifier" || part.role === "value");
+    const variantCode = escapeRegex(variant);
+    const explicitVariant = new RegExp(`(?:исполнени[ея]|variant)\\s*[:№]?\\s*${variantCode}(?=$|[^\\p{L}\\p{N}])|[|/]\\s*${variantCode}\\s*(?=[|\\s,'";)]|$)`, "iu");
+    if (named ? normalize(named.literal) !== variant : !identifier.some(({ quote }) => explicitVariant.test(quote))) return false;
+  }
+  const row = typeof value.address.locator?.row === "number";
+  const headers = local.filter((part) => part.link.kind === "column_header");
+  const usesHeading = row && headers.length > 0;
+  const text = local.filter((part) => part.role !== "revision" && part.role !== "variant" &&
+    (!usesHeading || part.role !== "unit" || part.link.kind === "column_header")).map(({ quote }) => quote);
+  if (usesHeading && typeof value.address.locator?.sheet === "string") text.push(value.address.locator.sheet);
+  const supported = new Set(engineeringWords(text.join(" ")));
+  return names.some((name) => {
+    const required = engineeringWords(name.replace(new RegExp(variantSuffix.source, "giu"), ""));
+    return required.length > 0 && required.every((word) => supported.has(word));
+  });
 }
 
 export function isAttributeAlias(target: AssignedSubject, alias: string, unit: string): boolean {

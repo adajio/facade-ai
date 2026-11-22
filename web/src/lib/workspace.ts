@@ -32,6 +32,17 @@ export type Citation = {
   unit?: string | null;
   href?: string;
   address?: RecordData;
+  components?: CitationComponent[];
+};
+
+export type CitationComponent = {
+  role: 'value' | 'unit' | 'variant' | 'revision' | 'identifier' | 'relationship';
+  quote: string;
+  literal: string;
+  evidenceId: string;
+  lineId: string;
+  address: RecordData;
+  source: { documentId: string; versionId: string; sha256: string };
 };
 
 export type OpenEvidence = (refs: Citation[], index: number, trigger: HTMLElement) => void;
@@ -76,6 +87,11 @@ export type AssessmentQuestion = {
   version: number;
   dependencyVersion?: number;
   outcome: string;
+  researchStops?: {
+    id?: string; jobId: string; branch: 'A' | 'B'; reason: string; nextAction: string; continuationRequested?: boolean;
+    place: { unitId: string; page?: number; source: { documentId: string; versionId: string } };
+    lastRejectedTool?: { name: string; code: string; turn: number };
+  }[];
   requirement: {
     positionId: string; partId: string; subject: string; part: string;
     formats: string[]; applicability?: string; recipient?: string; requestedAction?: string;

@@ -76,7 +76,9 @@ export async function onObservationPublished(tx: PoolClient, event: ObservationP
     `INSERT INTO inquiry_observations
        (id, project_id, scope_id, stage, version_id, property_key, variant_key, subject_names, source, superseded)
      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,
-       EXISTS (SELECT 1 FROM inquiry_superseded_versions WHERE scope_id = $3 AND stage = $4 AND version_id = $5))
+       EXISTS (SELECT 1 FROM inquiry_superseded_versions superseded WHERE scope_id = $3 AND stage = $4
+         AND (version_id = $5 OR EXISTS (SELECT 1 FROM jsonb_array_elements(coalesce($9::jsonb->'components','[]'::jsonb)) AS c(part)
+           WHERE c.part#>>'{source,versionId}'=superseded.version_id::text))))
      ON CONFLICT (id) DO NOTHING RETURNING superseded`,
     [event.observationId, event.projectId, event.scopeId, event.stage, event.versionId, propertyKey, variant, subjectNames, event],
   );
@@ -98,7 +100,9 @@ export async function onObservationPublished(tx: PoolClient, event: ObservationP
     );
     await tx.query(
       `UPDATE inquiry_observations SET superseded = true
-       WHERE scope_id = $1 AND stage = $2 AND version_id = ANY($3::uuid[])`,
+       WHERE scope_id = $1 AND stage = $2 AND (version_id = ANY($3::uuid[]) OR EXISTS (
+         SELECT 1 FROM jsonb_array_elements(coalesce(source->'components','[]'::jsonb)) AS c(part)
+         WHERE c.part#>>'{source,versionId}'=ANY($3::uuid[]::text[])))`,
       [event.scopeId, event.stage, replaced],
     );
   }
@@ -106,7 +110,9 @@ export async function onObservationPublished(tx: PoolClient, event: ObservationP
   const inquiries = await tx.query<InquiryRow & { direct: boolean; replaced: boolean; refresh_anchor: boolean }>(
     `WITH replaced_observations AS (
        SELECT id, property_key, variant_key, subject_names FROM inquiry_observations
-       WHERE scope_id = $1 AND stage = $2 AND version_id = ANY($5::uuid[])
+       WHERE scope_id = $1 AND stage = $2 AND (version_id = ANY($5::uuid[]) OR EXISTS (
+         SELECT 1 FROM jsonb_array_elements(coalesce(source->'components','[]'::jsonb)) AS c(part)
+         WHERE c.part#>>'{source,versionId}'=ANY($5::uuid[]::text[])))
      )
      SELECT i.*,
        (NOT $8 AND i.property_key = $3 AND i.variant_key = $6 AND i.subject_names && $4::text[]) AS direct,

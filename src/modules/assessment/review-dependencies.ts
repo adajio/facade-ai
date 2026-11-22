@@ -12,8 +12,13 @@ function setOf(values: string[]): string[] {
 }
 
 function findingKey({ citation, ...finding }: Finding): string {
-  const { observationId: _observationId, evidenceId: _evidenceId, href: _href, documentRevision: _revision, ...source } = citation;
-  return canonicalJson({ ...finding, source });
+  const { observationId: _observationId, evidenceId: _evidenceId, href: _href, documentRevision: _revision,
+    components, ...source } = citation;
+  const componentKey = components?.map(({ role, literal, quote, source, address }) =>
+    canonicalJson({ role, literal, quote, source, address }));
+  const support = components?.map(({ link }, index) => canonicalJson({ part: componentKey?.[index], kind: link.kind,
+    origin: link.kind === "anchor" ? null : componentKey?.[link.to] }));
+  return canonicalJson({ ...finding, source, ...(support?.length ? { support: setOf(support) } : {}) });
 }
 
 function dependencies(question: Question, review: Review) {

@@ -3,7 +3,7 @@
   import { conflictMessage } from '../lib/conflict';
   import { date, label } from '../lib/format';
   import { describe, id, interrupted, query, type Api } from '../lib/http';
-  import { V1, projectV1, scopedUrl, type Assessment, type AssessmentQuestion, type OpenEvidence, type WorkspaceProps } from '../lib/workspace';
+  import { V1, projectApi, projectV1, scopedUrl, type Assessment, type AssessmentQuestion, type OpenEvidence, type WorkspaceProps } from '../lib/workspace';
   import EvidenceButtons from '../lib/EvidenceButtons.svelte';
   import Notice from '../lib/Notice.svelte';
   import ScopeRequirements from './ScopeRequirements.svelte';
@@ -53,6 +53,13 @@
 
   function edit() {
     basedOn ??= row?.version;
+  }
+
+  async function continueResearch(stopId: string) {
+    if (saving) return;
+    await run(async () => {
+      await commands.send(projectApi(context.project.id) + '/research-stops/' + id(stopId) + '/resume', 'POST', {});
+    });
   }
 
   async function saveQuestion(event: SubmitEvent) {
@@ -210,6 +217,28 @@
             {/if}
           </dl>
           {#if row.machine.limitations.length}<p class="meta">{row.machine.limitations.map((item) => label(item)).join(' · ')}</p>{/if}
+          {#if row.researchStops?.length}
+            <details open>
+              <summary>Остановленные задания чтения ({row.researchStops.length})</summary>
+              <ul class="plain-list">
+                {#each row.researchStops as stop (stop.jobId)}
+                  <li>
+                    <strong>Ветвь {stop.branch} · {label(stop.reason)}</strong>
+                    <p class="meta">{stop.place.page ? 'Стр. ' + stop.place.page : stop.place.unitId} · {stop.nextAction}</p>
+                    {#if stop.lastRejectedTool}
+                      <p class="meta">Ход {stop.lastRejectedTool.turn} · {stop.lastRejectedTool.name} · {label(stop.lastRejectedTool.code)}</p>
+                    {/if}
+                    <a href={'/api/documents/' + id(stop.place.source.documentId) + '/versions/' + id(stop.place.source.versionId) + '/content'} target="_blank" rel="noopener">Открыть оригинал остановленного задания</a>
+                    {#if stop.continuationRequested}
+                      <p class="meta">Продолжение запрошено.</p>
+                    {:else if context.canEdit && !historical && stop.id}
+                      <button type="button" disabled={saving} onclick={() => stop.id && continueResearch(stop.id)}>Продолжить чтение</button>
+                    {/if}
+                  </li>
+                {/each}
+              </ul>
+            </details>
+          {/if}
           <EvidenceButtons citations={row.machine.citations} {open} />
           {#if row.machine.receiptIds.length}
             <ul class="plain-list">{#each row.machine.receiptIds as receipt, i (receipt)}

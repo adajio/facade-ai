@@ -268,7 +268,7 @@ test("assessment through real HTTP, PostgreSQL, reader and letter modules", {
   const blocked = await http("POST", confirmPath, 409, { action: "confirm", reason: "checked" }, conflictQuestion.version);
   assert.equal(blocked.code, "scope_held");
 
-  async function read(file, branch, quote, value, unit, deliveryStatement) {
+  async function read(file, branch, quote, value, unit, deliveryStatement, compound = false) {
     const source = { projectId: project.id, documentId: file.documentId,
       versionId: file.versionId, sha256: file.sha256 };
     const run = { runId: randomUUID(), branch };
@@ -277,17 +277,32 @@ test("assessment through real HTTP, PostgreSQL, reader and letter modules", {
     const { evidence } = file.plain
       ? await reader.open(source, nativeScope, { representation: "native", address: { unitId: "lines:1" } })
       : await reader.native(source, nativeScope, { page: 1 });
-    const observation = await reader.pin(source, { ...run, operationKey: "pin" }, {
-      evidenceId: evidence.id, scope: north.id, quote, value, unit, deliveryStatement,
-    });
     const href = `/api/v1/evidence/${evidence.id}`;
-    const citation = await http("GET", href, 200);
     const rendered = await http("GET", `${href}/content`, 200);
+    const { id: lineId } = rendered.lines.find(({ text }) => text.includes(quote));
+    const parts = compound ? [
+      { role: "value", literal: value, quote, lineId, evidenceId: evidence.id, link: { kind: "anchor" } },
+      { role: "unit", literal: unit, quote, lineId, evidenceId: evidence.id, link: { kind: "source_context", to: 0 } },
+    ] : undefined;
+    const observation = await reader.pin(source, { ...run, operationKey: "pin" }, {
+      evidenceId: evidence.id, scope: north.id, quote, value, unit, deliveryStatement, ...(compound ? { lineId } : {}),
+    }, undefined, parts);
+    const citation = await http("GET", href, 200);
     assert.equal(rendered.lines.some(({ text }) => text.includes(quote)), true);
+    if (compound) {
+      const saved = await http("GET", `/api/v1/observations/${observation.id}`, 200);
+      assert.deepEqual(saved.components, observation.components);
+      assert.equal(saved.components.length, 2);
+      for (const part of saved.components) {
+        assert.equal(part.source.sha256, source.sha256);
+        assert.equal(part.address.locator.page, 1);
+        assert.equal((await http("GET", part.evidenceHref, 200)).source.versionId, source.versionId);
+      }
+    }
     return { observation, citation };
   }
 
-  const left = await read(a, "A", "Thickness D1 1.5 mm", "1.5", "mm");
+  const left = await read(a, "A", "Thickness D1 1.5 mm", "1.5", "mm", undefined, true);
   const right = await read(b, "B", "Thickness D1 0.0018 m", "0.0018", "m");
   const absentQuote = "Finish schedule excluded from this delivery";
   const ordinaryAbsence = await read(inventory, "A", absentQuote, "excluded");
@@ -436,7 +451,7 @@ test("assessment through real HTTP, PostgreSQL, reader and letter modules", {
   ] };
   assert.deepEqual(await apply(sameReview), { assessmentVersion: absenceDecision.assessmentVersion, replayed: false });
   assert.deepEqual(await apply(sameReview), { assessmentVersion: absenceDecision.assessmentVersion, replayed: true });
-  const reread = await read(a, "A", "Thickness D1 1.5 mm", "1.5", "mm");
+  const reread = await read(a, "A", "Thickness D1 1.5 mm", "1.5", "mm", undefined, true);
   assert.notEqual(reread.observation.id, left.observation.id);
   const repeated = await apply({ ...sameReview, eventId: randomUUID(), changes: [{
     ...sameReview.changes[0],
@@ -510,6 +525,10 @@ test("assessment through real HTTP, PostgreSQL, reader and letter modules", {
   assert.match(text.text, /N06/u);
   const conflictSnapshot = await http("GET", `/letters/${letter.id}/revisions/${letter.revisionId}`, 200);
   assert.deepEqual(conflictSnapshot.items[0].sources.map(({ address }) => address), conflictSource);
+  const assembled = conflictSnapshot.items[0].sources.find(({ address }) => address.observationId === left.observation.id);
+  assert.deepEqual(assembled.address.components, left.observation.components);
+  assert.equal(conflictSnapshot.items[0].sources.some(({ address }) =>
+    address.observationId === right.observation.id && address.components === undefined), true);
 
   const recorded = await http("POST", `/letters/${letter.id}/sent`, 201, {
     revisionId: letter.revisionId,

@@ -98,7 +98,9 @@ async function resolveReview(
   const lookup = await tx.query<ObservationRow>(
     `SELECT o.payload AS observation, m.format, a.relative_path AS label,
             EXISTS (SELECT 1 FROM inquiry_superseded_versions AS superseded
-                    WHERE superseded.scope_id = $2 AND superseded.version_id = o.version_id) AS superseded
+                    WHERE superseded.scope_id = $2 AND (superseded.version_id = o.version_id OR EXISTS (
+                      SELECT 1 FROM jsonb_array_elements(coalesce(o.payload->'components','[]'::jsonb)) AS c(part)
+                      WHERE c.part#>>'{source,versionId}' = superseded.version_id::text))) AS superseded
      FROM reader_observations AS o
      JOIN reader_evidence AS e ON e.id = o.evidence_id AND e.project_id = o.project_id
      JOIN reader_maps AS m ON m.version_id = e.version_id AND m.reader_version = e.reader_version
@@ -142,6 +144,7 @@ async function resolveReview(
         sha256: o.source.sha256, branch: o.branch, address: { ...o.address },
         label: row.label, quote, value: o.value ?? null, unit: o.unit ?? null,
         ...(o.deliveryStatement ? { deliveryStatement: o.deliveryStatement } : {}),
+        ...(o.components?.length ? { components: o.components } : {}),
         href: `/api/v1/evidence/${o.evidenceId}`,
       },
     };

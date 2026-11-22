@@ -16,7 +16,8 @@ function addressLabel(citation: Citation) {
   return [
     ['page', 'стр.'], ['sheet', 'лист'], ['section', 'раздел'], ['paragraph', 'абз.'],
     ['table', 'табл.'], ['row', 'строка'], ['column', 'столбец'], ['cell', 'ячейка'],
-    ['layout', 'лист'], ['view', 'вид'], ['handle', 'объект'],
+    ['layout', 'лист'], ['view', 'вид'], ['space', 'пространство'], ['handle', 'объект'],
+    ['derivativeHandle', 'объект производного вида'], ['step', 'запись IFC'], ['propertyPath', 'путь свойства'],
   ].flatMap(([key, prefix]) => {
     const value = key === 'row' ? locator.row ?? locator.line : locator[key];
     if ((typeof value === 'number' && Number.isFinite(value)) || (typeof value === 'string' && value.trim())) {

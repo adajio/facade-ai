@@ -6,9 +6,10 @@ import { publishProjectEvent } from "../supplements/events.js";
 import { getIntakeGate, lockIntakeProject } from "../intake/index.js";
 import {
   canonicalJson, effectiveOutcome, evaluate,
-  type Decision, type Machine, type Requirement, type Review, type Scope,
+  type Citation, type Decision, type Machine, type Requirement, type Review, type Scope,
 } from "./domain.js";
 import { activeResearchMaterials } from "./non-delivery.js";
+import { currentResearchStops } from "./research-stops.js";
 
 export class AssessmentError extends AccessError {
   get details(): Record<string, unknown> { return this.info; }
@@ -233,16 +234,20 @@ function catalogRequirements(source: ScopeSource): { requirements: Requirement[]
   return { requirements, limitations: requirements.length ? [] : ["no_applicable_requirements"] };
 }
 
+function citationVersions(citation: Citation): string[] {
+  return [citation.versionId, ...citation.components?.map(({ source }) => source.versionId) ?? []];
+}
+
 function activeVersions(question: Question): string[] {
   return question.review?.findings
     .filter((finding) => finding.applicability === "active")
-    .map(({ citation }) => citation.versionId) ?? [];
+    .flatMap(({ citation }) => citationVersions(citation)) ?? [];
 }
 
 function reviewAfterSourceChange(question: Question, superseded: ReadonlySet<string>, reason: string): Review | null {
   if (!question.review) return null;
   return {
-    findings: question.review.findings.filter(({ citation }) => !superseded.has(citation.versionId)),
+    findings: question.review.findings.filter(({ citation }) => !citationVersions(citation).some((id) => superseded.has(id))),
     completenessChecked: false,
     remaining: [reason],
   };
@@ -381,6 +386,7 @@ export function assessmentHref(projectId: string, scopeId: string): string {
 export async function snapshot(tx: PoolClient, revision: Revision, gate?: Gate) {
   const historical = gate === undefined;
   const when = historical ? revision.created_at : new Date();
+  const stops = gate && await currentResearchStops(tx, revision, gate.generation);
   const questions = (await getQuestions(tx, revision.scope_id, revision.version)).filter((item) => item.active)
     .map((question) => ({
       id: question.id,
@@ -388,6 +394,7 @@ export async function snapshot(tx: PoolClient, revision: Revision, gate?: Gate) 
       dependencyVersion: question.dependency_version,
       requirement: question.requirement,
       machine: question.machine,
+      ...(stops && stops.has(question.id) ? { researchStops: stops.get(question.id)! } : {}),
       decision: question.decision,
       previousDecisionId: question.previous_decision_id,
       outcome: effectiveOutcome(question.machine, question.decision, when),

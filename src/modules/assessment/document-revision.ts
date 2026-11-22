@@ -38,6 +38,12 @@ export function createDocumentRevisionReader(
   reader: { content(evidence: Evidence): Promise<Buffer> },
 ): DocumentRevisionReader {
   return async (tx, projectId, stage, citation) => {
+    const component = citation.components?.find((part) => part.role === "revision" &&
+      part.source.projectId === projectId && part.source.documentId === citation.documentId &&
+      part.source.versionId === citation.versionId && part.source.sha256 === citation.sha256 &&
+      revisionCode.test(part.literal) && explicitRevision.exec(part.quote)?.[1] === part.literal);
+    if (component) return { label: component.literal, quote: component.quote, address: { ...component.address },
+      evidenceId: component.evidenceId };
     // The printed revision belongs to the same original as this citation.
     const locator = citation.address.locator as Record<string, unknown> | undefined;
     const page = locator?.page ?? citation.address.page ?? citation.address.unitId;
@@ -46,7 +52,7 @@ export function createDocumentRevisionReader(
        FROM reader_evidence e
        JOIN reader_maps m ON m.project_id = e.project_id
          AND m.version_id = e.version_id AND m.reader_version = e.reader_version
-       WHERE e.project_id = $1 AND e.version_id = $2 AND m.original_sha256 = $3 AND m.document_id = $4
+       WHERE e.project_id = $1 AND e.version_id = $2 AND m.original_sha256 = $3 AND m.document_id = $4 AND e.branch = $6
          AND e.payload#>>'{source,sha256}' = $3
          AND e.payload->>'representation' = 'native' AND e.payload->>'mediaType' = 'application/json'
          AND (e.payload->>'size')::bigint BETWEEN 1 AND 1048576
@@ -56,7 +62,7 @@ export function createDocumentRevisionReader(
            OR (m.format = 'txt' AND e.payload#>>'{address,locator,firstLine}' = '1')
          )
        ORDER BY e.payload->>'sha256', e.created_at, e.id`,
-      [projectId, citation.versionId, citation.sha256, citation.documentId, page == null ? null : String(page)],
+      [projectId, citation.versionId, citation.sha256, citation.documentId, page == null ? null : String(page), citation.branch],
     );
     // Conversion metadata can give identical headers different artifact hashes across reads.
     const totalBytes = rows.reduce((sum, { evidence }) => sum + evidence.size, 0);

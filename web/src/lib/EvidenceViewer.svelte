@@ -24,7 +24,18 @@
     api: Api; refs: Citation[]; index: number; select: (i: number) => void; close: () => void; verify: () => void;
   } = $props();
 
-  let citation = $derived(refs[index]);
+  const componentLabel = {
+    value: 'Значение', unit: 'Единица', variant: 'Исполнение', revision: 'Редакция',
+    identifier: 'Обозначение', relationship: 'Связь источников',
+  } as const;
+  let parent = $derived(refs[index]);
+  let selected = $state<{ citation: Citation; index: number }>();
+  let components = $derived(parent?.components ?? []);
+  let component = $derived(selected?.citation === parent ? components[selected?.index ?? -1] : undefined);
+  let citation: Citation = $derived(component ? {
+    evidenceId: component.evidenceId, quote: component.quote, address: component.address,
+    ...component.source, branch: parent.branch,
+  } satisfies Citation : parent);
   let root: HTMLElement;
   let closeButton: HTMLButtonElement;
   let evidence = $state<Evidence>();
@@ -38,8 +49,9 @@
   let zoom = $state(100);
   let full = $state(false);
   let viewport = $state<HTMLDivElement>();
-  let locator = $derived({ ...evidence?.address.locator, ...observation?.address?.locator });
-  let box = $derived(observation?.box ?? observation?.address?.box ?? evidence?.address?.box);
+  let selectedAddress = $derived(citation?.address as Evidence['address'] | undefined);
+  let locator = $derived({ ...evidence?.address.locator, ...selectedAddress?.locator, ...observation?.address?.locator });
+  let box = $derived(observation?.box ?? observation?.address?.box ?? selectedAddress?.box ?? evidence?.address?.box);
 
   $effect(() => {
     const ref = citation;
@@ -60,6 +72,9 @@
       const path = V1 + '/evidence/' + id(ref.evidenceId);
       try {
         const meta = await api.json<Evidence>(path, { signal });
+        if (ref.versionId && meta.source.versionId !== ref.versionId || ref.sha256 && meta.source.sha256 !== ref.sha256) {
+          throw new Error('Открытое место не совпадает с закреплённой версией оригинала.');
+        }
         evidence = meta;
         if (ref.observationId) {
           observation = await api.json<Observation>(V1 + '/observations/' + id(ref.observationId), { signal });
@@ -167,6 +182,16 @@
       <button type="button" disabled={index < 1} onclick={() => selectPlace(index - 1)}>Предыдущее место</button>
       <span aria-live="polite">{index + 1} из {refs.length}</span>
       <button type="button" disabled={index >= refs.length - 1} onclick={() => selectPlace(index + 1)}>Следующее место</button>
+    </div>
+  {/if}
+  {#if components.length}
+    <div class="actions fragment-nav" aria-label="Компоненты доказательства">
+      <button type="button" aria-pressed={!component} onclick={() => selected = undefined}>Основная цитата</button>
+      {#each components as part, componentIndex (`${part.evidenceId}:${part.lineId}:${componentIndex}`)}
+        <button type="button" aria-pressed={component === part} onclick={() => selected = { citation: parent, index: componentIndex }}>
+          {componentLabel[part.role]} · {part.literal}
+        </button>
+      {/each}
     </div>
   {/if}
   {#if pending}<p role="status">Открываем сохранённый адрес…</p>{/if}

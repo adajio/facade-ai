@@ -1,3 +1,5 @@
+import type { ReaderObservationComponent } from "../pdf/types.js";
+
 export type SourceRole = "design" | "schedule" | "approved_change" | "reference" | "unknown";
 export type RevisionState = "effective" | "superseded" | "unknown";
 
@@ -29,6 +31,7 @@ export interface ObservationPublication extends Subject {
   format?: string;
   quote?: string;
   measurement?: { value: string; unit: string };
+  components?: ReaderObservationComponent[];
   readable: boolean;
   subjectVerified?: boolean;
   assessmentQuestionId?: string;

@@ -1,4 +1,4 @@
-import type { DeliveryStatement } from "../pdf/types.js";
+import type { DeliveryStatement, ReaderObservationComponent } from "../pdf/types.js";
 
 export type Outcome =
   | "covered"
@@ -51,6 +51,7 @@ export type Citation = {
   href: string;
   deliveryStatement?: DeliveryStatement;
   documentRevision?: DocumentRevision;
+  components?: ReaderObservationComponent[];
 };
 
 export type NonDeliveryStatement = {

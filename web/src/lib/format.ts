@@ -54,6 +54,16 @@ const labels: Record<string, string> = {
   review_incomplete: 'Сверка ещё не завершена',
   applicability_unknown: 'Применимость не установлена',
   comparison_unresolved: 'Сопоставимость требует проверки',
+  repeated_rejected_action: 'Инструмент повторил отклонённое действие',
+  turn_limit: 'Исчерпан предел ходов',
+  input_size_limit: 'Превышен размер входа',
+  effect_conflict: 'Сохранённый запрос требует сверки',
+  route_bound_unavailable: 'Предел расходов требует сверки',
+  unknown_charge: 'Исход отправки требует сверки',
+  route_receipt_mismatch: 'Квитанция не совпала с маршрутом',
+  http_429: 'Маршрут ограничил запросы',
+  invalid_arguments: 'Инструмент отклонил аргументы',
+  unit_not_in_evidence: 'Единица не связана с исходной цитатой',
 };
 
 export function label(value: unknown, placeholder = '—'): string {
