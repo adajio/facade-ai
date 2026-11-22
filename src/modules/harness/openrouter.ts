@@ -23,20 +23,39 @@ const observationFields = z.strictObject({
   alternatives: z.array(shortText).min(2).max(5).optional(),
   box: boxSchema.optional(),
 });
-const hasValueOrLimitation = (input: z.infer<typeof observationFields>) => input.limitation !== undefined
-  || (input.quote !== undefined && input.value !== undefined && input.unit !== undefined);
-const legacyObservation = observationFields.refine(hasValueOrLimitation);
+// These object fields also reproduce requests from before observation forms were exposed on the wire.
+const legacyObservation = observationFields;
 const statementObservation = observationFields.extend({
   deliveryStatement: z.strictObject({
     status: z.enum(['delivered', 'not_delivered']),
     item: shortText,
     context: z.strictObject({ lineId: shortText, quote: shortText }).optional(),
   }).optional(),
-}).refine((input) => input.deliveryStatement
-  ? input.quote !== undefined && input.sourceRole !== undefined && input.value === undefined
-    && input.unit === undefined && input.normalizedValue === undefined && input.limitation === undefined
-    && input.alternatives === undefined
-  : hasValueOrLimitation(input));
+});
+
+const argumentText = z.string().max(500).regex(/^[^\u0000]*[^\s\u0000][^\u0000]*$/u).trim();
+const observationAddress = {
+  evidenceId: z.string().uuid(), sourceRole: argumentText.optional(), box: boxSchema.optional(),
+};
+const quoted = { quote: argumentText, lineId: argumentText.optional() };
+const measurement = { ...observationAddress, ...quoted, value: argumentText, unit: argumentText,
+  normalizedValue: argumentText.optional() };
+const limitation = { limitation: argumentText, alternatives: z.array(argumentText).min(2).max(5).optional() };
+const observationForms = [
+  z.strictObject(measurement),
+  z.strictObject({ ...observationAddress, ...limitation }),
+  z.strictObject({ ...observationAddress, ...limitation, ...quoted }),
+  z.strictObject({ ...measurement, ...limitation }),
+] as const;
+const deliveryForm = z.strictObject({ ...observationAddress, ...quoted, sourceRole: argumentText,
+  deliveryStatement: z.strictObject({ status: z.enum(['delivered', 'not_delivered']), item: argumentText,
+    context: z.strictObject({ lineId: argumentText, quote: argumentText }).optional() }) });
+const valueOrLimitation = z.union(observationForms);
+const withDelivery = z.union([...observationForms, deliveryForm]);
+
+export function observationArguments(job: ResearchJob) {
+  return job.mode === 'primary' && job.observationProtocol === 2 ? withDelivery : valueOrLimitation;
+}
 
 export const commands = {
   inventory: z.strictObject({}),
@@ -63,6 +82,25 @@ export const commands = {
   }),
 };
 
+const verificationFields = { evidenceIds: z.array(z.string().uuid()).max(8), explanation: argumentText };
+const verificationArguments = z.discriminatedUnion('verdict', [
+  z.strictObject({ verdict: z.literal('supported'), ...verificationFields, evidenceIds: verificationFields.evidenceIds.min(2) }),
+  z.strictObject({ verdict: z.literal('unclear'), ...verificationFields }),
+]);
+const currentCommands = {
+  ...commands,
+  search: commands.search.extend({ query: argumentText }),
+  request_next: commands.request_next.extend({ reason: argumentText }),
+  finish_reading: commands.finish_reading.extend({ explanation: argumentText }),
+  propose_resolution: commands.propose_resolution.extend({ explanation: argumentText }),
+  verify_resolution: verificationArguments,
+};
+
+export function checkToolArguments(job: ResearchJob, name: keyof typeof commands, args: unknown) {
+  const schema = name === 'save_observation' ? observationArguments(job) : currentCommands[name];
+  return schema.safeParse(args);
+}
+
 const toolDescriptions: Record<keyof typeof commands, string> = {
   inventory: 'List assigned source addresses and physical units.',
   survey: 'Open the image overview of the assigned unit. Open raster regions even if text search finds no hits.',
@@ -75,6 +113,18 @@ const toolDescriptions: Record<keyof typeof commands, string> = {
   finish_reading: 'Submit the result for this assigned place. Unreadable or partial work requires a concrete limitation.',
   propose_resolution: 'Propose a resolution naming both assigned observation IDs and the reason.',
   verify_resolution: 'Check the proposed pair against each original. Use evidence IDs opened during this verification.',
+};
+
+const currentGuidance: Partial<Record<keyof typeof commands, string>> = {
+  inventory: 'Returns the map. Opening an assigned representation is a separate step.',
+  zoom: 'The box must be inside the assigned window.',
+  extract: 'An optional box must be inside the assigned window.',
+  ocr: 'An optional box must be inside the assigned window.',
+  save_observation: 'Use an evidenceId already returned to this reader. For a measurement send the verbatim quote, literal value within it, and original unit visible in the same line, adjacent unit cell, or its column heading. Never invent a unit or combine cells into a quote. If the value or unit cannot be supported, send limitation without value, unit or normalizedValue. A visual quote needs a box inside the image, the literal unit in the quote, and no lineId; a text quote must match one returned line. Use the optional lineId to select that line.',
+  request_next: 'The assigned place stays unchanged. A returned nextScheduledPlace is informational.',
+  finish_reading: 'PDF requires a previously delivered visual survey. Use covered after a saved qualified observation, unreadable after a saved addressed limitation, and no_match after reading with evidence and zero observations. Use partial to continue on this same assignment. A no_match result is a record of the search, not evidence of absence.',
+  propose_resolution: 'Use the two observation IDs in the assignment, keeping their A/B order.',
+  verify_resolution: 'To say supported, include evidence IDs freshly opened from both assigned supports. Unclear may omit supporting IDs by passing an empty array.',
 };
 
 const functionCall = z.looseObject({
@@ -152,12 +202,14 @@ export function initialMessages(job: ResearchJob): Message[] {
   ];
 }
 
-export function request(job: ResearchJob, messages: Message[], legacyToolSchema = false) {
+export type ToolWire = 'current' | 'role-v1' | 'shared-v1';
+
+export function request(job: ResearchJob, messages: Message[], wire: ToolWire = 'current') {
   return {
     model: job.settings.model,
     messages,
     tools: enabledTools(job).map((name) => {
-      let schema: z.ZodType = commands[name];
+      let schema: z.ZodType = wire === 'current' && name !== 'verify_resolution' ? currentCommands[name] : commands[name];
       let description = toolDescriptions[name];
       if (name === 'save_observation' && job.mode === 'primary') {
         if (job.observationProtocol === 2) {
@@ -166,13 +218,26 @@ export function request(job: ResearchJob, messages: Message[], legacyToolSchema 
           schema = legacyObservation;
         }
       }
-      if (!legacyToolSchema && isReadTool(name)) {
-        schema = job.mode === 'primary' ? z.strictObject(readArguments[name])
-          : z.strictObject({ support: branchSchema, ...readArguments[name] });
+      if (wire !== 'shared-v1' && isReadTool(name)) {
+        const fields = name === 'search' && wire === 'current' ? { query: argumentText } : readArguments[name];
+        schema = job.mode === 'primary' ? z.strictObject(fields) : z.strictObject({ support: branchSchema, ...fields });
         if (job.mode !== 'primary') description += ' Select the assigned citation with support A or B.';
         else if (name === 'survey') description += ' Call with {} to open your assigned page.';
       }
-      return { type: 'function', function: { name, description, parameters: z.toJSONSchema(schema, { io: 'input' }) } };
+      const parameters = z.toJSONSchema(schema, { io: 'input' });
+      if (wire === 'current') {
+        if (name === 'save_observation') {
+          const forms = z.toJSONSchema(observationArguments(job), { io: 'input' });
+          Object.assign(parameters, { anyOf: forms.anyOf });
+        }
+        if (name === 'verify_resolution') {
+          const forms = z.toJSONSchema(verificationArguments, { io: 'input' });
+          Object.assign(parameters, forms.oneOf ? { oneOf: forms.oneOf } : { anyOf: forms.anyOf });
+        }
+        const guidance = currentGuidance[name];
+        if (guidance) description += ` ${guidance}`;
+      }
+      return { type: 'function', function: { name, description, parameters } };
     }),
     tool_choice: job.settings.toolChoice ?? 'required',
     parallel_tool_calls: false,

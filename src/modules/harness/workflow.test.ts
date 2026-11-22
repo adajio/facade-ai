@@ -3,7 +3,7 @@ import { test } from 'node:test';
 import { randomUUID } from 'node:crypto';
 import type { PoolClient } from 'pg';
 import type { ModelResult, ResearchTask } from './contracts.js';
-import { commands, hashBytes, initialMessages, request } from './openrouter.js';
+import { hashBytes, initialMessages, observationArguments, request } from './openrouter.js';
 import type { ResearchEvent, SessionPorts } from './session.js';
 import { runResearchWorkflow } from './workflow.js';
 
@@ -138,13 +138,18 @@ test('visual and text tools advertise only arguments accepted in their assigned 
       assert.ok(Object.hasOwn(schema.properties ?? {}, 'support'), name);
       assert.ok(Array.isArray(schema.required) && schema.required.includes('support'), name);
     }
+    if (job.mode === 'verify') {
+      const schema = review.tools.find(({ function: tool }) => tool.name === 'verify_resolution')!.function.parameters;
+      const forms = (schema.oneOf ?? schema.anyOf) as { properties: { verdict: { const: string }; evidenceIds: { minItems?: number } } }[];
+      assert.equal(forms.find(({ properties }) => properties.verdict.const === 'supported')?.properties.evidenceIds.minItems, 2);
+    }
   }
 });
 
 test('a reserved old request keeps its original shape and a bad support argument receives a safe retry', async () => {
   const { task, ports, events, reads } = setup();
   const oldReceipt = receipt('survey', { support: 'A' });
-  const oldRequest = request(task.job, initialMessages(task.job), true);
+  const oldRequest = request(task.job, initialMessages(task.job), 'shared-v1');
   const sent: string[] = [];
   ports.call = async ({ effectKey, request: wire }) => {
     sent.push(effectKey);
@@ -154,24 +159,27 @@ test('a reserved old request keeps its original shape and a bad support argument
         assert.ok(!Object.hasOwn(survey.properties ?? {}, 'support'));
         return { status: 'held', code: 'effect_conflict', attemptId: oldReceipt.attemptId, nextAction: 'inspect_original_effect' };
       case 2:
+        assert.ok(!Object.hasOwn(survey.properties ?? {}, 'support'));
+        return { status: 'held', code: 'effect_conflict', attemptId: oldReceipt.attemptId, nextAction: 'inspect_original_effect' };
+      case 3:
         assert.deepEqual(wire, oldRequest);
         return oldReceipt;
-      case 3: {
+      case 4: {
         assert.ok(!Object.hasOwn(survey.properties ?? {}, 'support'));
         assert.deepEqual(wire.messages.at(-1), { role: 'tool', tool_call_id: oldReceipt.output.choices[0].message.tool_calls[0].id,
           content: JSON.stringify({ ok: false, code: 'foreign_branch', nextAction: 'Повторите survey с {}. Страница уже закреплена за вашим заданием.' }) });
         assert.deepEqual(reads, []);
         return receipt('survey', { support: 'B' });
       }
-      case 4:
+      case 5:
         assert.match(String(wire.messages.at(-1)?.content), /Повторите survey с \{\}/);
         assert.deepEqual(reads, []);
         return receipt('survey', { page: 7 });
-      case 5:
+      case 6:
         assert.match(String(wire.messages.at(-1)?.content), /invalid_arguments/);
         assert.deepEqual(reads, []);
         return receipt('survey', {});
-      case 6:
+      case 7:
         assert.equal(reads.length, 1);
         return receipt('finish_reading', { status: 'no_match', explanation: 'Reviewed assigned page.' });
       default: return assert.fail('Unexpected model send');
@@ -182,8 +190,56 @@ test('a reserved old request keeps its original shape and a bad support argument
   if (result.status === 'continue') result = await runResearchWorkflow(task, ports, signal);
   assert.equal(result.status === 'done' && result.outcome.kind, 'reviewed_no_match');
   assert.equal(sent[0], sent[1]);
+  assert.equal(sent[0], sent[2]);
   const first = events[0];
   assert.equal(first.kind === 'model' && first.requestHash, hashBytes(JSON.stringify(oldRequest)));
+});
+
+test('published observation forms require grounded measurement fields or an explicit limitation', () => {
+  const { task, textId } = setup();
+  const parameters = request(task.job, []).tools.find(({ function: tool }) => tool.name === 'save_observation')!.function.parameters;
+  assert.equal(parameters.type, 'object');
+  assert.equal(parameters.anyOf?.length, 4);
+  const forms = parameters.anyOf as { required: string[]; additionalProperties: boolean }[];
+  assert.ok(forms.every(({ required, additionalProperties }) => required.includes('evidenceId') && additionalProperties === false));
+  assert.ok(forms.filter(({ required }) => required.includes('value')).every(({ required }) => required.includes('unit') && required.includes('quote')));
+  const parse = observationArguments(task.job);
+  for (const input of [
+    { quote: '2', value: '2' }, { unit: 'мм', limitation: 'Uncertain' }, { limitation: 'Uncertain', lineId: '1' },
+    { quote: '2 мм', value: '2', unit: 'мм', alternatives: ['2', '3'] },
+  ]) assert.equal(parse.safeParse({ evidenceId: textId, ...input }).success, false);
+  assert.equal(parse.safeParse({ evidenceId: textId, quote: '2 мм', value: '2', unit: 'мм' }).success, true);
+  assert.equal(parse.safeParse({ evidenceId: textId, limitation: 'Единица не читается.' }).success, true);
+});
+
+test('the same reader can correct a missing unit, then keeps the evidence and the literal quote', async () => {
+  const { task, ports, textId, recorded, observationId } = setup();
+  const addr = { evidenceId: textId, quote: 'Толщина 2 мм', value: '2' };
+  let turn = 0;
+  ports.call = async ({ request: wire }) => {
+    const last = String(wire.messages.at(-1)?.content);
+    switch (++turn) {
+      case 1: return receipt('survey', {});
+      case 2: return receipt('extract', {});
+      case 3: return receipt('save_observation', addr);
+      case 4:
+        assert.match(last, /Добавьте unit только из источника/);
+        assert.deepEqual(recorded, []);
+        return receipt('save_observation', { ...addr, unit: 'см' });
+      case 5:
+        assert.match(last, /unit_not_in_evidence/);
+        assert.deepEqual(recorded, []);
+        return receipt('save_observation', { ...addr, unit: 'мм' });
+      case 6:
+        assert.equal(recorded.length, 1);
+        return receipt('finish_reading', { status: 'covered', explanation: 'Закреплена цитата.' });
+      default: return assert.fail('Unexpected model send');
+    }
+  };
+  const signal = new AbortController().signal;
+  let outcome = await runResearchWorkflow(task, ports, signal);
+  if (outcome.status === 'continue') outcome = await runResearchWorkflow(task, ports, signal);
+  assert.deepEqual(outcome, { status: 'done', outcome: { kind: 'covered', observationIds: [observationId] } });
 });
 
 test('text-only auto replies exhaust the assigned turns without executing an alleged tool call', async () => {
@@ -261,9 +317,10 @@ test('delivery statements require a literal quote and preserve the legacy tool w
     evidenceId: randomUUID(), sourceRole: 'inventory',
     deliveryStatement: { status: 'not_delivered', item: 'Torsion test report' },
   };
-  assert.equal(commands.save_observation.safeParse(input).success, false);
-  assert.equal(commands.save_observation.safeParse({ ...input, quote: 'No report included.', value: '0' }).success, false);
-  assert.equal(commands.save_observation.safeParse({
+  const schema = observationArguments({ ...task.job, observationProtocol: 2 });
+  assert.equal(schema.safeParse(input).success, false);
+  assert.equal(schema.safeParse({ ...input, quote: 'No report included.', value: '0' }).success, false);
+  assert.equal(schema.safeParse({
     ...input, quote: 'Torsion test report is not included.',
   }).success, true);
 });

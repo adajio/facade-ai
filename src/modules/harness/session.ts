@@ -1,12 +1,14 @@
 import type { PoolClient } from 'pg';
 import type {
-  Branch, EvidenceRef, ModelResult, ReaderPort, ResearchOutcome, ResearchSuspension, ResearchTask,
+  Branch, EvidenceRef, ModelResult, ObservationInput, ReaderPort, ResearchOutcome, ResearchSuspension, ResearchTask,
 } from './contracts.js';
 import { ReaderRefusal } from './contracts.js';
 import { contains } from '../pdf/types.js';
 import { isInventoryRole } from '../assessment/domain.js';
+import { deliveredLines } from '../questions/attribute-aliases.js';
+import { escapeRegex } from '../questions/domain.js';
 import {
-  commands, decodeCompletion, hashBytes, imageMessage, initialMessages, permittedTool, request,
+  checkToolArguments, commands, decodeCompletion, hashBytes, imageMessage, initialMessages, observationArguments, permittedTool, request,
   toolMessage, type AssistantMessage, type FunctionCall, type ToolReply,
 } from './openrouter.js';
 
@@ -55,6 +57,7 @@ type State = ReturnType<typeof restore>;
 function restore(task: ResearchTask, events: ResearchEvent[]) {
   const messages = initialMessages(task.job);
   const corrections = new Map<number, ReturnType<typeof toolMessage>>();
+  const legacyCorrections = new Map<number, ReturnType<typeof toolMessage>>();
   const replies = new Map<string, ToolReply>();
   const delivered = new Set<string>();
   const observations: NonNullable<ToolReply['observation']>[] = [];
@@ -102,8 +105,11 @@ function restore(task: ResearchTask, events: ResearchEvent[]) {
           results.forEach(({ reply }, index) => {
             const call = calls[index];
             const { body } = reply;
-            if (body && typeof body === 'object' && 'code' in body && !('nextAction' in body)) {
-              const nextAction = argumentCorrection(call.function.name, body.code);
+            if (body && typeof body === 'object' && 'code' in body) {
+              const prior = !('nextAction' in body) && argumentCorrection(call.function.name, body.code);
+              if (prior) legacyCorrections.set(messages.length, toolMessage(call, { body: { ...body, nextAction: prior } }));
+              const nextAction = recordedCorrection(call, body.code, task)
+                ?? (!('nextAction' in body) && typeof body.code === 'string' ? readerCorrections[body.code] : undefined);
               if (nextAction) corrections.set(messages.length, toolMessage(call, { body: { ...body, nextAction } }));
             }
             messages.push(toolMessage(call, reply));
@@ -118,7 +124,9 @@ function restore(task: ResearchTask, events: ResearchEvent[]) {
       }
     }
   }
-  return { messages, corrections, replies, delivered, observations, pending, latestModel, rejections, outcome };
+  const render = (replacements: typeof corrections) => messages.map((message, index) => replacements.get(index) ?? message);
+  return { messages, currentMessages: render(new Map([...legacyCorrections, ...corrections])),
+    roleMessages: render(legacyCorrections), replies, delivered, observations, pending, latestModel, rejections, outcome };
 }
 
 function branchOf(task: ResearchTask): Branch {
@@ -162,15 +170,101 @@ function decodeArguments(value: string): unknown {
   }
 }
 
+function observationCorrection(args: unknown): string {
+  const input = args && typeof args === 'object' ? args : {};
+  if (!('evidenceId' in input)) return 'Укажите evidenceId из уже полученной вами выдачи инструмента чтения.';
+  if ('deliveryStatement' in input) return 'Для утверждения о передаче укажите quote, sourceRole и deliveryStatement. Уберите value, unit, normalizedValue, limitation и alternatives.';
+  if ('value' in input && !('unit' in input)) return 'Добавьте unit только из источника и проверьте, что value входит в дословную quote одной строки. Если единица или значение не подтверждаются, сохраните limitation без value, unit и normalizedValue.';
+  if ('value' in input && !('quote' in input)) return 'Укажите дословную quote одной строки с указанным value.';
+  if (('unit' in input || 'normalizedValue' in input) && !('value' in input)) return 'Передайте quote, value и unit вместе либо уберите числовые поля и сохраните limitation.';
+  if ('alternatives' in input && !('limitation' in input)) return 'Для alternatives обязательно укажите limitation.';
+  if ('lineId' in input && !('quote' in input)) return 'Укажите дословную quote из строки lineId либо уберите lineId.';
+  return 'Заполните одну из форм save_observation: измерение с quote, value и unit, ограничение с limitation или разрешённое утверждение о передаче. Используйте только поля из схемы.';
+}
+
+const evidenceCorrection = 'Откройте нужную выдачу своим инструментом и повторите вызов с полученным evidenceId.';
+const groundingCorrection: Record<string, string> = {
+  covered: 'Сохраните подтверждённое наблюдение из ранее полученной выдачи и повторите covered.',
+  unreadable: 'Сохраните адресное limitation с evidenceId и повторите unreadable.',
+  no_match: 'Для no_match нужна хотя бы одна полученная выдача и ни одного наблюдения. При сохранённом ограничении используйте unreadable, если место полностью недоступно для ответа.',
+  partial: 'Откройте оставшийся участок этого места. Если прочитать его нельзя, сохраните адресное limitation и укажите соответствующий исход.',
+};
+const readerCorrections: Record<string, string> = {
+  reader_quote_mismatch: 'Для текста скопируйте дословную цитату одной полученной строки и её lineId. Можно убрать box, чтобы reader закрепил рамку строки. Для изображения используйте box вместо lineId.',
+  reader_statement_invalid: 'Укажите дословное утверждение о передаче. Предмет должен входить в quote или в дословный context той же выдачи.',
+  reader_address_invalid: 'Укажите рамку внутри назначенного окна и полученного представления. Для текста рамка должна включать цитируемую строку.',
+  outside_assigned_window: 'Выберите рамку внутри назначенного окна.',
+  reader_evidence_scope_mismatch: evidenceCorrection,
+};
+
+function recordedCorrection(call: FunctionCall, code: unknown, task: ResearchTask): string | undefined {
+  if (code === 'evidence_not_delivered') return evidenceCorrection;
+  if (call.function.name === 'save_observation' && code === 'invalid_arguments') {
+    const args = decodeArguments(call.function.arguments);
+    if (!observationArguments(task.job).safeParse(args).success) return observationCorrection(args);
+  }
+  if (call.function.name === 'finish_reading' && (code === 'grounding_required' || code === 'partial_coverage')) {
+    const parsed = commands.finish_reading.safeParse(decodeArguments(call.function.arguments));
+    if (parsed.success) return groundingCorrection[parsed.data.status];
+  }
+}
+
+function groundedUnit(prior: ToolReply, observation: { quote: string; value: string; unit: string; lineId?: string }) {
+  const { quote, value, unit, lineId } = observation;
+  const literal = escapeRegex(value);
+  const suffix = escapeRegex(unit);
+  const marker = `(?:\\(${suffix}\\)|\\[${suffix}\\])`;
+  const measure = new RegExp(`(?:(?<![\\d.,+-])${literal}\\s*${suffix}(?![\\p{L}\\p{N}])|${marker}\\s*${literal}(?![\\d.,]))`, 'u');
+  if (measure.test(quote)) return true;
+  if (prior.image) return false;
+  const body = prior.body;
+  if (!body || typeof body !== 'object' || !('content' in body) || typeof body.content !== 'string') return false;
+  const lines = deliveredLines(body.content);
+  const matches = lines.filter((line) => (!lineId || line.id === lineId) && line.text.includes(quote));
+  if (matches.length !== 1) return false;
+  const [valueLine] = matches;
+  if (measure.test(valueLine.text)) return true;
+  const { row, column } = valueLine.locator ?? {};
+  if (typeof row === 'number' && typeof column === 'number') {
+    return lines.some((line) => line.text.trim() === unit
+      && ['sheet', 'table', 'section'].every((key) => line.locator?.[key] === valueLine.locator?.[key])
+      && (line.locator?.row === row && line.locator?.column === column + 1
+        || row > 1 && line.locator?.row === 1 && line.locator?.column === column));
+  }
+  const valueBox = valueLine.box;
+  if (!valueBox) return false;
+  const rowCells = lines.flatMap(({ box, text }) => box
+    && Math.abs(box.y + box.height / 2 - valueBox.y - valueBox.height / 2) < Math.min(box.height, valueBox.height) / 2
+    ? [{ box, text }] : []);
+  const adjacent = rowCells.filter(({ box }) => box.x >= valueBox.x + valueBox.width).sort((a, b) => a.box.x - b.box.x);
+  if (adjacent[0]?.text.trim() === unit && (adjacent[1] === undefined || adjacent[0].box.x < adjacent[1].box.x)) return true;
+  const label = rowCells.filter(({ box }) => box.x + box.width <= valueBox.x)
+    .map(({ box, text }) => ({ end: box.x + box.width, text })).sort((a, b) => b.end - a.end);
+  if (label[0] && new RegExp(`${marker}\\s*$`, 'u').test(label[0].text)
+    && (label[1] === undefined || label[0].end > label[1].end)) return true;
+  const heading = lines.flatMap(({ box, text }) => {
+    const gap = box ? valueBox.y - (box.y + box.height) : -1;
+    return box && gap >= 0 && gap < 4 * valueBox.height && box.x < valueBox.x + valueBox.width
+      && box.x + box.width > valueBox.x ? [{ gap, text }] : [];
+  }).sort((a, b) => a.gap - b.gap);
+  return heading[0]?.text.trim() === unit && (heading[1] === undefined || heading[0].gap < heading[1].gap);
+}
+
 async function executeTool(
   tx: PoolClient | undefined, task: ResearchTask, reader: ReaderPort, effectKey: string,
   call: FunctionCall, state: State,
 ): Promise<{ reply: ToolReply; outcome?: ResearchOutcome }> {
   if (state.outcome) return { reply: failedTool('already_finished') };
   const name = call.function.name;
-  if (!permittedTool(task.job, name)) return { reply: failedTool('unknown_tool') };
-  const parsed = commands[name].safeParse(decodeArguments(call.function.arguments));
-  if (!parsed.success) return { reply: failedTool('invalid_arguments', `Повторите ${name} с аргументами из схемы инструмента.`) };
+  if (!permittedTool(task.job, name)) return { reply: failedTool('unknown_tool', 'Выберите инструмент из списка для вашей роли.') };
+  const args = decodeArguments(call.function.arguments);
+  const parsed = checkToolArguments(task.job, name, args);
+  if (!parsed.success) {
+    const nextAction = name === 'save_observation' ? observationCorrection(args) : name === 'verify_resolution'
+      ? 'Передайте verdict, explanation и evidenceIds. Для supported нужны IDs обеих открытых опор.'
+      : `Повторите ${name} с аргументами из схемы инструмента.`;
+    return { reply: failedTool('invalid_arguments', nextAction) };
+  }
   const context = { task, branch: branchOf(task), effectKey };
   const terminal = name === 'finish_reading' || name === 'propose_resolution' || name === 'verify_resolution';
   if (terminal && state.pending?.model.finishReason === 'length') {
@@ -211,32 +305,33 @@ async function executeTool(
     }
     case 'save_observation': {
       if (!tx) throw new Error('Observation requires a fenced transaction');
-      const { evidenceId, ...input } = commands.save_observation.parse(parsed.data);
+      const { evidenceId, ...fields } = observationArguments(task.job).parse(parsed.data);
+      const input: Omit<ObservationInput, 'evidence'> = fields;
       const prior = state.replies.get(evidenceId);
       if (!prior?.evidence || !state.delivered.has(evidenceId)) {
-        return { reply: failedTool('evidence_not_delivered') };
+        return { reply: failedTool('evidence_not_delivered', evidenceCorrection) };
       }
       if (task.job.mode !== 'primary') throw new Error('Observation from a non-primary job');
-      if (input.deliveryStatement && task.job.observationProtocol !== 2) {
-        return { reply: failedTool('unsupported_observation_protocol') };
-      }
       const inventoryStatement = input.deliveryStatement && input.sourceRole && isInventoryRole(input.sourceRole);
       if (input.sourceRole && !inventoryStatement && !task.job.question?.sourceRoles?.includes(input.sourceRole)) {
-        return { reply: failedTool('source_role_unassigned') };
+        return { reply: failedTool('source_role_unassigned', 'Используйте роль из назначения или опустите sourceRole, если она не подтверждается. Для утверждения о передаче роль обязательна.') };
       }
-      if (prior.image && (input.value || input.quote) && !input.box) {
-        return { reply: failedTool('visual_box_required') };
+      if (prior.image && input.quote && !input.box) {
+        return { reply: failedTool('visual_box_required', 'Укажите box вокруг цитаты внутри полученного изображения.') };
       }
-      if (!input.limitation && input.value && input.quote) {
-        const literal = input.value.trim();
+      if (prior.image && (input.lineId || input.deliveryStatement?.context)) {
+        return { reply: failedTool('reader_quote_mismatch', 'Для изображения используйте box без lineId и контекста строки. Для привязки к строкам откройте extract или ocr.') };
+      }
+      if (input.value && input.quote && input.unit) {
+        const literal = input.value;
         const numeric = /^[+-]?\d+(?:[.,]\d+)?$/.test(literal);
         const appears = numeric
-          ? new RegExp(`(?<![\\d.,+-])${literal.replace(/[+.]/g, '\\$&')}(?![\\d]|[.,]\\d)`, 'u').test(input.quote)
+          ? new RegExp(`(?<![\\d.,+-])${escapeRegex(literal)}(?![\\d]|[.,]\\d)`, 'u').test(input.quote)
           : input.quote.includes(literal);
-        if (!appears) return { reply: failedTool('value_not_in_quote') };
-      }
-      if (input.alternatives && !input.limitation) {
-        return { reply: failedTool('alphabet_ambiguity', 'Укажите ограничение и сохраните альтернативные написания.') };
+        if (!appears) return { reply: failedTool('value_not_in_quote', 'Выберите дословную цитату одной строки с указанным value. Соседнюю подпись не объединяйте с числом в quote.') };
+        if (!groundedUnit(prior, { ...input, quote: input.quote, value: input.value, unit: input.unit })) {
+          return { reply: failedTool('unit_not_in_evidence', 'Подтвердите исходную unit в строке значения, соседней ячейке или заголовке его столбца. Иначе сохраните limitation без числовых полей.') };
+        }
       }
       const stored = await reader.record(tx, context, { ...input, evidence: prior.evidence });
       const qualified = !input.limitation && !input.alternatives;
@@ -256,7 +351,7 @@ async function executeTool(
     case 'finish_reading': {
       const input = commands.finish_reading.parse(parsed.data);
       const observationIds = [...new Set(state.observations.filter(({ qualified }) => qualified).map(({ id }) => id))];
-      if (input.status === 'partial') return { reply: failedTool('partial_coverage', 'Откройте оставшийся участок назначенного места.') };
+      if (input.status === 'partial') return { reply: failedTool('partial_coverage', groundingCorrection.partial) };
       if (task.job.mode !== 'primary') throw new Error('Reading outcome from a non-primary job');
       const delivered = [...state.delivered].map((id) => state.replies.get(id));
       if (task.job.place.page && !delivered.some((reply) => reply?.readKind === 'survey' && reply.image)) {
@@ -275,14 +370,14 @@ async function executeTool(
           kind: 'final_refusal', reason: input.explanation, evidenceIds: [...state.delivered],
         } };
       }
-      return { reply: failedTool('grounding_required', 'Сохраните подтверждённое наблюдение или адрес нечитаемого участка.') };
+      return { reply: failedTool('grounding_required', groundingCorrection[input.status]) };
     }
     case 'propose_resolution': {
       if (task.job.mode !== 'lead') throw new Error('Proposal from a non-lead job');
       const proposal = commands.propose_resolution.parse(parsed.data);
       const { a, b } = task.job.dispute;
       if (proposal.aObservationId !== a.observationId || proposal.bObservationId !== b.observationId) {
-        return { reply: failedTool('proposal_pair_mismatch') };
+        return { reply: failedTool('proposal_pair_mismatch', 'Возьмите aObservationId и bObservationId из закреплённой пары в задании.') };
       }
       return { reply: { body: { ok: true } }, outcome: { kind: 'proposal', ...proposal } };
     }
@@ -290,11 +385,11 @@ async function executeTool(
       if (task.job.mode !== 'verify') throw new Error('Verification from a non-verification job');
       const input = commands.verify_resolution.parse(parsed.data);
       const replies = input.evidenceIds.map((id) => state.delivered.has(id) ? state.replies.get(id) : undefined);
-      if (replies.some((reply) => !reply?.evidence)) return { reply: failedTool('evidence_not_delivered') };
+      if (replies.some((reply) => !reply?.evidence)) return { reply: failedTool('evidence_not_delivered', evidenceCorrection) };
       const { a, b } = task.job.dispute;
       const corroborates = [a, b].every((citation) => replies.some((reply) =>
         reply?.support === citation.branch && reply.evidence && samePlace(citation.place, reply.evidence.place)));
-      if (input.verdict === 'supported' && !corroborates) return { reply: failedTool('both_supports_required') };
+      if (input.verdict === 'supported' && !corroborates) return { reply: failedTool('both_supports_required', 'Откройте обе назначенные опоры с support A и B и укажите их evidenceIds. Если проверить пару не удалось, используйте unclear.') };
       return { reply: { body: { ok: true } }, outcome: { kind: 'verification', ...input } };
     }
   }
@@ -325,7 +420,8 @@ export async function advance(task: ResearchTask, ports: SessionPorts): Promise<
             retryAt: new Date(Date.now() + 2_000),
           });
         }
-        return { kind: 'tool', turn: model.turn, index, reply: failedTool(error.code) };
+        const nextAction = readerCorrections[error.code];
+        return { kind: 'tool', turn: model.turn, index, reply: failedTool(error.code, nextAction) };
       }
     };
     const sequence = before + (prior ? 0 : 1);
@@ -357,8 +453,7 @@ export async function advance(task: ResearchTask, ports: SessionPorts): Promise<
     };
   }
   const turn = state.latestModel + 1;
-  const modelRequest = request(task.job, state.corrections.size
-    ? state.messages.map((message, index) => state.corrections.get(index) ?? message) : state.messages);
+  const modelRequest = request(task.job, state.currentMessages);
   let serialized = JSON.stringify(modelRequest);
   if (Buffer.byteLength(serialized) > 16 * 1024 * 1024) {
     return {
@@ -372,10 +467,11 @@ export async function advance(task: ResearchTask, ports: SessionPorts): Promise<
     ...(rejected ? { retryRejectedAttemptId: rejected.attemptId } : {}),
   });
   let result = await send(modelRequest);
-  if (result.status === 'held' && result.code === 'effect_conflict' && result.attemptId) {
+  for (const [wire, messages] of [['role-v1', state.roleMessages], ['shared-v1', state.messages]] as const) {
+    if (result.status !== 'held' || result.code !== 'effect_conflict' || !result.attemptId) break;
     // An existing attempt can only be recovered with its original request hash.
     // The gateway checks that identity before returning a receipt or authorizing a retry.
-    const legacy = request(task.job, state.messages, true);
+    const legacy = request(task.job, messages, wire);
     const legacyWire = JSON.stringify(legacy);
     if (Buffer.byteLength(legacyWire) <= 16 * 1024 * 1024) {
       result = await send(legacy);

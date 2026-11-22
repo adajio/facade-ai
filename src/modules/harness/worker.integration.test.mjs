@@ -139,6 +139,7 @@ test('ordinary upload runs two Mastra readers through PostgreSQL, the reader, qu
   let delayedSha;
   let exhaustedProjectId;
   let rasterSha;
+  const rasterUnits = new Map();
   const statementFixtures = new Map();
   const sentB = Promise.withResolvers();
   const releaseB = Promise.withResolvers();
@@ -207,7 +208,7 @@ test('ordinary upload runs two Mastra readers through PostgreSQL, the reader, qu
           });
         }
       } else if (assignment.place.source.sha256 === rasterSha) {
-        const box = { x: 40, y: 140, width: 530, height: 65 };
+        const box = { x: 40, y: 96, width: 530, height: 109 };
         if (completedTools.length === 2) {
           assert.deepEqual(JSON.parse(completed[1].content).lines, []);
           output = toolMessage('zoom', { box });
@@ -219,13 +220,18 @@ test('ordinary upload runs two Mastra readers through PostgreSQL, the reader, qu
           const { lines } = JSON.parse(source.content);
           const line = lines.find(({ text }) => /\b1200\b/.test(text));
           assert.ok(line, JSON.stringify(lines));
+          const unit = lines.find(({ text, box: heading }) => /^(mm|мм)$/iu.test(text.trim()) && heading && line.box
+            && heading.y < line.box.y && heading.x < line.box.x + line.box.width && heading.x + heading.width > line.box.x);
+          rasterUnits.set(routeId === 'managed-a' ? 'A' : 'B', unit?.text.trim());
           output = toolMessage('save_observation', {
             evidenceId: source.evidence.evidenceId, lineId: line.id, quote: line.text,
-            value: '1200', unit: 'мм', sourceRole: 'design',
+            ...(unit ? { value: '1200', unit: unit.text.trim() } : { limitation: 'Единица измерения не распознана однозначно.' }),
+            sourceRole: 'design',
           });
         } else {
           assert.ok(completed[4].observationId, JSON.stringify(completed[4]));
-          output = toolMessage('finish_reading', { status: 'covered', explanation: 'Raster evidence verified.' });
+          output = toolMessage('finish_reading', { status: completed[4].qualified ? 'covered' : 'unreadable',
+            explanation: 'Raster evidence and recognition limits checked.' });
         }
       } else if (completedTools.length === 2) {
         const source = completed[1];
@@ -235,7 +241,7 @@ test('ordinary upload runs two Mastra readers through PostgreSQL, the reader, qu
           lines.find(({ text, box }) => /^[23]$/.test(text) && box && header.box && Math.abs(box.y - header.box.y) < 1));
         if (!line) output = toolMessage('finish_reading', { status: 'no_match', explanation: 'Window inspected.' });
         else output = toolMessage('save_observation', {
-          evidenceId: source.evidence.evidenceId, lineId: line.id, quote: line.text, value: line.text.trim().at(-1), unit: 'мм', sourceRole: 'design',
+          evidenceId: source.evidence.evidenceId, lineId: line.id, quote: line.text, value: line.text.trim().at(-1), unit: 'mm', sourceRole: 'design',
         });
       } else {
         assert.ok(completed[2].observationId, JSON.stringify(completed[2]));
@@ -487,8 +493,8 @@ test('ordinary upload runs two Mastra readers through PostgreSQL, the reader, qu
   const versionHeader = { 'if-match': `"${letter.version}"` };
   const fullText = (await command('GET', `/api/letters/${letter.id}/current-text`, undefined, versionHeader)).json().text;
   assert.match(fullText, /R1 Thickness/);
-  assert.match(fullText, /2\s*мм/);
-  assert.match(fullText, /3\s*мм/);
+  assert.match(fullText, /2\s*mm/);
+  assert.match(fullText, /3\s*mm/);
   for (const format of ['txt', 'docx']) {
     const exported = (await command('POST', `/api/letters/${letter.id}/exports`, { format }, versionHeader)).json();
     const file = await command('GET', exported.url);
@@ -538,10 +544,22 @@ sys.stdout.write('\\n'.join(''.join(t.text or '' for t in p.findall('.//w:t', ns
   const completeRaster = await attach(rasterProject.id, rasterScope, rasterReceipt.receiptId, 'raster.pdf', raster);
   await completeRaster();
   await command('POST', `/api/receipts/${rasterReceipt.receiptId}/seal`, {});
-  const rasterCard = await until(async () => (await command('GET',
-    `/api/projects/${rasterProject.id}/assessments/current?scopeId=${rasterScope}`)).json(),
-  (card) => card.questions[0]?.machine.outcome === 'covered', 'OCR and zoom recover a zero-native-text place');
-  assert.deepEqual(rasterCard.questions[0].machine.citations.map(({ value }) => value), ['1200', '1200']);
+  const rasterResults = await until(async () => (await app.db.query(
+    `SELECT p.branch,p.state FROM gateway_primary p JOIN gateway_generations g USING(generation_id)
+     WHERE g.project_id=$1 AND g.current ORDER BY p.branch`, [rasterProject.id])).rows,
+  (rows) => rows.length === 2 && rows.every(({ state }) => state !== 'pending'), 'OCR and zoom address a zero-native-text place');
+  assert.deepEqual(rasterResults, ['A', 'B'].map((branch) => ({ branch,
+    state: rasterUnits.get(branch) ? 'completed' : 'final_refusal' })));
+  const { rows: rasterObservations } = await app.db.query(
+    'SELECT branch,payload FROM reader_observations WHERE project_id=$1 ORDER BY branch', [rasterProject.id]);
+  assert.equal(rasterObservations.length, 2);
+  for (const { branch, payload } of rasterObservations) {
+    assert.match(payload.quote, /\b1200\b/);
+    const unit = rasterUnits.get(branch);
+    assert.equal(payload.unit, unit);
+    assert.equal(payload.value, unit ? '1200' : undefined);
+    if (!unit) assert.match(payload.limitation, /Единица измерения/);
+  }
 
   await stopWorker();
   delete process.env.FACADE_HARNESS_MANAGED_URL;
