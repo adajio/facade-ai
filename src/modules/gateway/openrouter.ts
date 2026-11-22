@@ -5,6 +5,11 @@ type SyntheticScope = {
   scopeId: string;
   approvalRef: string;
   originalSha256s: readonly string[];
+  retentionApproval?: {
+    approvalRef: string;
+    noTrainingEvidenceRef: string;
+    validUntil: string;
+  };
 };
 
 type OpenRouterPricingQualification = {
@@ -197,6 +202,43 @@ function approvedProfile(profile: OpenRouterProfile): boolean {
     && scope.originalSha256s.every((digest: unknown) => typeof digest === 'string' && sha256.test(digest)));
 }
 
+function isAlibabaQwen4Max(profile: OpenRouterProfile): boolean {
+  return profile.model === 'qwen/qwen4-max' && profile.provider === 'alibaba';
+}
+
+function syntheticScope(profile: OpenRouterProfile, projectId: string, scopeId: string): SyntheticScope | undefined {
+  return profile.syntheticScopes?.find(item => item.projectId === projectId && item.scopeId === scopeId);
+}
+
+function retentionBlock(scope: SyntheticScope): string | null {
+  const approval = scope.retentionApproval;
+  if (!approval || typeof approval.approvalRef !== 'string' || !approval.approvalRef.trim()
+    || typeof approval.validUntil !== 'string' || !(Date.parse(approval.validUntil) > Date.now())) {
+    return 'synthetic_retention_not_approved';
+  }
+  if (typeof approval.noTrainingEvidenceRef !== 'string' || !approval.noTrainingEvidenceRef.trim()) {
+    return 'route_training_policy_unverified';
+  }
+  return null;
+}
+
+function endpointBlock(profile: QualifiedOpenRouterProfile, request: unknown, endpoint: Step15Approval['endpoint']): string | null {
+  if (!isAlibabaQwen4Max(profile)) return null;
+  if (requireZdr(profile)) return 'route_zdr_unavailable';
+  if (endpoint !== 'https://openrouter.ai') return 'route_endpoint_unverified';
+
+  const body = record(request);
+  const choice = body?.tool_choice;
+  const named = record(choice);
+  const choiceSupported = choice === undefined || choice === 'none' || choice === 'auto' || choice === 'required'
+    || (named?.type === 'function' && typeof record(named.function)?.name === 'string');
+  if (profile.completionParameter !== 'max_tokens' || !choiceSupported
+    || (body?.parallel_tool_calls !== undefined && body.parallel_tool_calls !== false)) {
+    return 'route_parameters_unsupported';
+  }
+  return null;
+}
+
 function assignedSources(payload: unknown): Record<string, unknown>[] {
   const job = record(payload);
   const dispute = record(job?.dispute);
@@ -255,12 +297,14 @@ function requestBody(profile: QualifiedOpenRouterProfile, value: unknown, route:
   const ceilingUsdNanos = Math.max(1, Number(total));
   if (!positiveInteger(ceilingUsdNanos, route.ceilingUsdNanos)) return null;
 
-  const { max_tokens: _legacy, max_completion_tokens: _completion, ...approved } = body;
+  const { max_tokens: _legacy, max_completion_tokens: _completion, parallel_tool_calls: parallelTools, ...approved } = body;
+  const alibaba = isAlibabaQwen4Max(profile);
   const wire = {
     ...approved, messages, [profile.completionParameter]: tokens, stream: false, usage: { include: true },
+    ...(!alibaba && parallelTools !== undefined ? { parallel_tool_calls: parallelTools } : {}),
     provider: {
       only: [profile.provider], order: [profile.provider], allow_fallbacks: false,
-      require_parameters: true, data_collection: 'deny', zdr: requireZdr(profile),
+      require_parameters: true, data_collection: alibaba && !requireZdr(profile) ? 'allow' : 'deny', zdr: requireZdr(profile),
       max_price: {
         prompt: profile.promptNanosPerToken / 1_000, completion: profile.completionNanosPerToken / 1_000,
         request: profile.requestNanos / 1_000_000_000, image: profile.imageNanos / 1_000_000_000,
@@ -296,6 +340,7 @@ function validProfile(profile: OpenRouterProfile): profile is QualifiedOpenRoute
 
 export function estimateOpenRouterRequest(profile: OpenRouterProfile, route: RoutePolicy, request: unknown): OpenRouterCostBound | null {
   if (route.transport !== 'openrouter' || profile.routeId !== route.id || profile.revision !== route.revision || !validProfile(profile)) return null;
+  if (endpointBlock(profile, request, 'https://openrouter.ai')) return null;
   return requestBody(profile, request, route)?.cost ?? null;
 }
 
@@ -315,13 +360,19 @@ export function openRouterTransport(approval: Step15Approval): ModelTransport {
   const profileFor = (route: RoutePolicy) => profiles.get(route.id + '/' + route.revision);
   return {
     kind: 'openrouter',
+    requestBlock(route, request) {
+      const selected = profileFor(route);
+      return selected ? endpointBlock(selected.profile, request, approval.endpoint) : null;
+    },
     validate(route, request) {
       const selected = profileFor(route);
-      return Boolean(selected && requestBody(selected.profile, request, route));
+      return Boolean(selected && !endpointBlock(selected.profile, request, approval.endpoint)
+        && requestBody(selected.profile, request, route));
     },
     quote(route, request) {
       const selected = profileFor(route);
-      const bound = selected && requestBody(selected.profile, request, route)?.cost;
+      const bound = selected && !endpointBlock(selected.profile, request, approval.endpoint)
+        && requestBody(selected.profile, request, route)?.cost;
       return bound && selected
         ? { ceilingUsdNanos: bound.ceilingUsdNanos, pricingFingerprint: selected.fingerprint }
         : null;
@@ -330,7 +381,7 @@ export function openRouterTransport(approval: Step15Approval): ModelTransport {
       const profile = profileFor(route)?.profile;
       if (!profile) return false;
       if (profile.mode === 'strict-zdr') return true;
-      const scope = profile.syntheticScopes?.find(item => item.projectId === context.projectId && item.scopeId === context.scopeId);
+      const scope = syntheticScope(profile, context.projectId, context.scopeId);
       if (context.dataClass !== 'synthetic' || !scope) return false;
       const sources = assignedSources(context.payload);
       if (!sources.length || sources.some(source => source.projectId !== context.projectId
@@ -338,6 +389,11 @@ export function openRouterTransport(approval: Step15Approval): ModelTransport {
         || typeof source.documentId !== 'string' || !uuid.test(source.documentId)
         || typeof source.sha256 !== 'string' || !scope.originalSha256s.includes(source.sha256))
         || context.inputRefs.some(id => !uuid.test(id))) return false;
+
+      if (isAlibabaQwen4Max(profile)) {
+        const block = retentionBlock(scope);
+        if (block) return block;
+      }
 
       const expected = sources.map(source => ({ version_id: source.versionId, document_id: source.documentId, sha256: source.sha256 }));
       const evidenceIds = [...new Set(context.inputRefs)];
@@ -360,9 +416,14 @@ export function openRouterTransport(approval: Step15Approval): ModelTransport {
       const selected = profileFor(route);
       const profile = selected?.profile;
       const body = profile && requestBody(profile, request, route);
-      if (!selected || !body || selected.fingerprint !== attempt.pricingFingerprint
-        || body.cost.ceilingUsdNanos !== attempt.ceilingUsdNanos) {
+      if (!selected || !profile || !body || endpointBlock(profile, request, approval.endpoint)
+        || selected.fingerprint !== attempt.pricingFingerprint || body.cost.ceilingUsdNanos !== attempt.ceilingUsdNanos) {
         return { receipt: { state: 'rejected', code: 'invalid_request', evidenceRef: 'gateway:no-network' } };
+      }
+      if (isAlibabaQwen4Max(profile)) {
+        const scope = syntheticScope(profile, attempt.projectId, attempt.scopeId);
+        const block = attempt.dataClass === 'synthetic' && scope ? retentionBlock(scope) : 'route_data_unapproved';
+        if (block) return { receipt: { state: 'rejected', code: block, evidenceRef: 'gateway:no-network' } };
       }
       const response = await fetch(url, {
         method: 'POST', redirect: 'error', signal,

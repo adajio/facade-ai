@@ -29,6 +29,11 @@ const actions: Record<string, string> = {
   dispatch_not_started: 'retry_same_effect',
   recovery_required: 'recover_pinned_external_ledger',
   route_data_unapproved: 'verify_project_data_authorization',
+  synthetic_retention_not_approved: 'verify_synthetic_project_retention_approval',
+  route_training_policy_unverified: 'verify_no_training_on_exact_provider_endpoint',
+  route_parameters_unsupported: 'use_supported_parameters_for_pinned_endpoint',
+  route_zdr_unavailable: 'verify_zdr_for_pinned_endpoint',
+  route_endpoint_unverified: 'verify_exact_regional_endpoint',
   route_receipt_mismatch: 'operator_verify_provider_endpoint',
 };
 
@@ -146,15 +151,19 @@ export class Gateway extends WorkQueue {
     const route = routeResult.rows[0];
     if (!route || route.transport !== this.transport?.kind) return 'route_denied';
     if (Buffer.byteLength(wire) > route.maxRequestBytes) return 'invalid_request';
+    const requestBlock = this.transport.requestBlock?.(route, input.request);
+    if (requestBlock) return requestBlock;
     const quote = this.transport.quote?.(route, input.request) ?? null;
     if (this.transport.quote && (!quote || !positiveInteger(quote.ceilingUsdNanos, route.ceilingUsdNanos))) {
       return 'route_bound_unavailable';
     }
     if (!this.transport.quote && this.transport.validate?.(route, input.request) === false) return 'invalid_request';
-    if (this.transport.authorize && !await this.transport.authorize(tx, route, {
+    const authorization = await this.transport.authorize?.(tx, route, {
       projectId: work.projectId, scopeId: work.scopeId, generationId: work.generationId,
       jobId: work.lease.jobId, payload: work.payload, dataClass: input.dataClass, inputRefs: input.inputRefs,
-    })) return 'route_data_unapproved';
+    });
+    if (typeof authorization === 'string') return authorization;
+    if (authorization === false) return 'route_data_unapproved';
     if (work.purpose === 'review') {
       const barrier = await tx.query(
         `SELECT 1 FROM gateway_generations WHERE generation_id=$1 AND sealed
@@ -208,7 +217,7 @@ export class Gateway extends WorkQueue {
       generationId: work.generationId, jobId: work.lease.jobId, purpose: work.purpose,
       effectKey: gate.effect, requestHash: gate.requestHash, routeId: route.id, revision: route.revision,
       ceilingUsdNanos: gate.quote?.ceilingUsdNanos ?? route.ceilingUsdNanos, previousRejectedId,
-      ...(gate.quote ? { pricingFingerprint: gate.quote.pricingFingerprint } : {}),
+      ...(gate.quote ? { pricingFingerprint: gate.quote.pricingFingerprint } : {}), dataClass: input.dataClass,
     };
     if (pending) return attempt;
     await tx.query(
@@ -373,7 +382,9 @@ export class Gateway extends WorkQueue {
         if (!started && error instanceof GatewayError) denied = error.code;
       }
       if (!started) {
-        if (['route_denied','route_data_unapproved','invalid_request','route_bound_unavailable','primary_barrier','effect_conflict','route_busy','route_rate_limited',
+        if (['route_denied','route_data_unapproved','synthetic_retention_not_approved','route_training_policy_unverified',
+          'route_parameters_unsupported','route_zdr_unavailable','route_endpoint_unverified','invalid_request',
+          'route_bound_unavailable','primary_barrier','effect_conflict','route_busy','route_rate_limited',
           'route_reconciliation','budget_frozen','budget_exhausted'].includes(denied)) {
           // Cancellation is conditional in the journal because a concurrent caller may already own the attempt.
           await this.mirror(await journal.cancelPrepared(reserved.id), journal);

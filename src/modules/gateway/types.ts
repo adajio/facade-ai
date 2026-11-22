@@ -51,6 +51,7 @@ export type Attempt = GenerationRef & {
   ceilingUsdNanos: number;
   previousRejectedId: string | null;
   pricingFingerprint?: string;
+  dataClass?: string;
 };
 
 export type RouterDiagnostic = {
@@ -106,7 +107,8 @@ export type ModelTransport = {
   kind: RoutePolicy['transport'];
   validate?(route: RoutePolicy, request: unknown): boolean;
   quote?(route: RoutePolicy, request: unknown): RequestQuote | null;
-  authorize?(tx: PoolClient, route: RoutePolicy, context: ModelAuthorization): Promise<boolean>;
+  requestBlock?(route: RoutePolicy, request: unknown): string | null;
+  authorize?(tx: PoolClient, route: RoutePolicy, context: ModelAuthorization): Promise<boolean | string>;
   send(attempt: Attempt, route: RoutePolicy, request: unknown, signal: AbortSignal): Promise<ProviderOutcome>;
   lookup?(attempt: Attempt): Promise<ProviderOutcome | null>;
 };

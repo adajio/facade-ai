@@ -1,15 +1,12 @@
 import { selectConfirmedGrounds } from '../assessment/commands.js';
 import type { Ground as AssessmentGround, GroundsOptions } from '../assessment/commands.js';
 import { AssessmentError } from '../assessment/store.js';
+import { externalLine } from './content.js';
 import type { Ground } from './content.js';
 import { LetterError } from './inputs.js';
 import type { LetterDependencies } from './routes.js';
 
 type Citation = AssessmentGround['citations'][number];
-
-function externalLine(value: string) {
-  return value.toWellFormed().replace(/[\u0000-\u001f\ufffe\uffff]/gu, ' ').replace(/ +/gu, ' ').trim();
-}
 
 function addressLabel(citation: Citation) {
   const address = citation.address;

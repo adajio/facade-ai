@@ -225,7 +225,17 @@ async function inputs(directory, prefix = '') {
   return list;
 }
 
-async function upload(project, files, manifest, targetScope) {
+async function stageInputs(caseName) {
+  const manifest = JSON.parse(await readFile(join(root, 'manifests', caseName + '.json')));
+  const files = await inputs(join(root, 'input', caseName));
+  if (JSON.stringify(Object.keys(manifest).sort()) !== JSON.stringify(files.map(({ name }) => name).sort()) ||
+      files.some(({ name, bytes }) => sha(bytes) !== manifest[name])) {
+    throw Error('Frozen input manifest does not match staged files');
+  }
+  return { manifest, files };
+}
+
+async function upload(project, files, manifest, targetScope, afterDeclare) {
   const base = `/api/projects/${project.id}`;
   const res = await command('POST', base + '/receipts', { source: 'upload' });
   const receipt = '/api/receipts/' + res.value.receiptId;
@@ -240,6 +250,7 @@ async function upload(project, files, manifest, targetScope) {
     });
     declarations.push({ ...file, digest, upload: '/api/uploads/' + prepared.value.uploadId });
   }
+  await afterDeclare?.({ receiptId: res.value.receiptId, href: receipt });
   const versions = {};
   for (const { name, bytes, digest, upload: id } of declarations) {
     await command('PUT', id + '/parts/1', bytes, {
@@ -293,13 +304,18 @@ async function settle(projectId, previous, limitMs) {
   return { ...state, observationEndedBy: 'time-limit' };
 }
 
-async function capture(project, receipt) {
-  const inventory = (await command('GET', receipt.href + '/inventory')).value;
+async function assessmentViews(project) {
   const assessments = {};
   for (const scope of project.scopes) {
     assessments[scope.name] = (await command('GET',
       `/api/projects/${project.id}/assessments/current?scopeId=${scope.id}`)).value;
   }
+  return assessments;
+}
+
+async function capture(project, receipt) {
+  const inventory = (await command('GET', receipt.href + '/inventory')).value;
+  const assessments = await assessmentViews(project);
   const cards = {};
   for (const value of Object.values(receipt.versions)) {
     const item = await request('GET', `/api/v1/documents/${value.documentId}/versions/${value.versionId}/reader/units`);
@@ -333,7 +349,7 @@ async function resolveInitialHolds(project, frozen, workload) {
   return changes;
 }
 
-async function engineerLetter(project, caseName, mode, state, targetScope, workload) {
+async function engineerLetter(project, caseName, mode, state, targetScope, workload, options) {
   const ownerSession = session;
   session = engineerSession;
   try {
@@ -341,42 +357,62 @@ async function engineerLetter(project, caseName, mode, state, targetScope, workl
     const scope = project.scopes.find(({ name }) => name === targetScope);
     const current = (await command('GET',
       `/api/projects/${project.id}/assessments/current?scopeId=${scope.id}`)).value;
-    return { classification, ...await letter(project, caseName, mode, current, targetScope) };
+    return { classification, ...await letter(project, caseName, mode, current, targetScope, options) };
   } finally {
     session = ownerSession;
   }
 }
 
-async function letter(project, caseName, mode, state, targetScope) {
+async function openCitation(citation) {
+  if (!citation.href?.startsWith('/api/')) return null;
+  const evidence = await request('GET', citation.href);
+  const href = evidence.value?.originalHref;
+  const original = href?.startsWith('/api/') ? await request('GET', href) : null;
+  return { evidenceId: citation.evidenceId, status: evidence.status, originalStatus: original?.status,
+    originalSha256: original?.bytes ? sha(original.bytes) : null, expectedSha256: citation.sha256,
+    address: citation.address, versionId: citation.versionId };
+}
+
+function verifiedCitation(proof) {
+  return proof?.status === 200 && proof.originalStatus === 200 && proof.originalSha256 === proof.expectedSha256;
+}
+
+async function letter(project, caseName, mode, state, targetScope, options = {}) {
   const scope = project.scopes.find(({ name }) => name === targetScope);
   const base = `/api/projects/${project.id}/letters`;
   const decisions = [];
   const proofs = [];
   for (const question of state.questions ?? []) {
+    if (options.changedQuestionId && question.id !== options.changedQuestionId) continue;
     const part = question.requirement?.part?.toLowerCase() ?? '';
     const expected = caseName === 'missing' && part.includes('герметизации') ? 'confirmed_missing'
       : ['conflict','mixed'].includes(caseName) && part.includes('зазор') ? 'confirmed_conflict' : null;
-    if (!expected) continue;
+    if (!options.allQuestions && !expected) continue;
     const citations = question.machine?.citations ?? [];
     for (const citation of citations) {
-      if (!citation.href?.startsWith('/api/')) continue;
-      const evidence = await request('GET', citation.href);
-      const href = evidence.value?.originalHref;
-      const original = href?.startsWith('/api/') ? await request('GET', href) : null;
-      proofs.push({ questionId: question.id, evidenceId: citation.evidenceId, status: evidence.status,
-        originalStatus: original?.status, originalSha256: original?.bytes ? sha(original.bytes) : null,
-        expectedSha256: citation.sha256, address: citation.address });
+      const proof = await openCitation(citation);
+      if (proof) proofs.push({ questionId: question.id, ...proof });
     }
-    const alreadySupported = question.machine?.outcome === expected;
-    const choice = alreadySupported ? { action: 'confirm' } : {
-      action: 'correct', outcome: expected,
-      observationIds: [...new Set(citations.map(({ observationId }) => observationId))],
-    };
+    const proven = proofs.filter(item => item.questionId === question.id && verifiedCitation(item));
+    const currentOutcome = question.machine?.outcome;
+    const successorRequired = options.changedQuestionId === question.id;
+    const currentBasis = !successorRequired || citations.some(({ versionId }) => options.newVersions.has(versionId));
+    const external = ['confirmed_missing', 'confirmed_conflict'].includes(currentOutcome);
+    const supportCurrent = currentBasis && proven.length === citations.length && citations.length > 0;
+    const target = options.allQuestions ? currentOutcome : expected;
+    const keepInternal = options.allQuestions && (currentOutcome === 'needs_review' || !supportCurrent || (successorRequired && external));
+    const choice = keepInternal ? { action: 'correct', outcome: 'needs_review' }
+      : currentOutcome === target ? { action: 'confirm' } : {
+        action: 'correct', outcome: target,
+        observationIds: [...new Set(citations.map(({ observationId }) => observationId))],
+      };
     const decision = await request('POST', `/api/questions/${question.id}/decisions`, {
-      ...choice, reason: 'Synthetic engineer checked the frozen managed result.',
-      requestExternal: true,
+      ...choice, reason: keepInternal ? 'Synthetic engineer retained an unresolved or superseded basis for internal review.'
+        : 'Synthetic engineer checked the frozen managed result and original citations.',
+      requestExternal: options.allQuestions ? !keepInternal && external : true,
     }, { 'if-match': `"${question.version}"` });
-    decisions.push({ id: question.id, action: choice.action, expected, status: decision.status, result: decision.value });
+    decisions.push({ id: question.id, action: keepInternal ? 'keep_internal' : choice.action, expected: target,
+      status: decision.status, result: decision.value });
     if (decision.status === 422) {
       const internal = await request('POST', `/api/questions/${question.id}/decisions`, {
         action: 'correct', outcome: 'needs_review', reason: 'Synthetic engineer retained an internal check.',
@@ -402,7 +438,7 @@ async function letter(project, caseName, mode, state, targetScope) {
         if (fetched.bytes && fetched.status === 200) {
           const name = `${caseName}-${mode}.${format}`;
           await writeFile(join(output, name), fetched.bytes);
-          exports[format] = { file: name, sha256: sha(fetched.bytes) };
+          exports[format] = { file: name, sha256: sha(fetched.bytes), url: item.value.url, historicalUrl: item.value.historicalUrl };
         }
       }
     }
@@ -410,6 +446,176 @@ async function letter(project, caseName, mode, state, targetScope) {
   const after = await request('GET', base);
   return { engineerId, proofs, decisions, eligible: eligible.value, createStatus: created.status, created: created.value, exports,
     before: before.value, after: after.value };
+}
+
+async function readHistory(firstLetter, sentUrl) {
+  const { id, revisionId, version } = firstLetter.created;
+  const path = `/api/letters/${id}`;
+  const current = await request('GET', path + '/current-text', undefined, { 'if-match': `"${version}"` });
+  const revision = await command('GET', `${path}/revisions/${revisionId}`);
+  const sent = sentUrl ? (await command('GET', sentUrl)).value : null;
+  const citations = (sent ?? revision.value).items.flatMap(item => item.basis.citations);
+  const proofs = await Promise.all(citations.map(openCitation));
+  const exports = {};
+  for (const [format, entry] of Object.entries(firstLetter.exports)) {
+    const historical = await request('GET', entry.historicalUrl);
+    const latest = await request('GET', entry.url);
+    exports[format] = { historicalStatus: historical.status, historicalHeader: historical.response.headers.get('x-letter-historical'),
+      historicalSha256: historical.bytes ? sha(historical.bytes) : null, currentStatus: latest.status, currentCode: latest.value?.code };
+  }
+  return { current: { status: current.status, value: current.value }, revision: revision.value, sent, exports, proofs };
+}
+
+async function researchEvidence(projectId, workload) {
+  const ids = workload.generations.map(({ id }) => id);
+  const { rows: observations } = await app.db.query(`SELECT generation_id, scope_id, question_id, finding
+    FROM harness_observations WHERE project_id=$1 AND generation_id=ANY($2::uuid[]) ORDER BY generation_id, observation_id`,
+  [projectId, ids]);
+  const { rows: representation } = await app.db.query(`SELECT j.generation_id, j.scope_id, j.subject_id, e.branch,
+      e.payload->'source' AS source, e.payload->'address' AS address, e.payload->>'representation' AS representation,
+      e.payload->>'format' AS format, e.id
+    FROM reader_evidence e JOIN gateway_jobs j ON j.id=e.run_id
+    WHERE e.project_id=$1 AND j.generation_id=ANY($2::uuid[]) ORDER BY j.generation_id, e.id`, [projectId, ids]);
+  return { observations, representation };
+}
+
+async function recordConclusion(projectPath, view) {
+  const startWork = view.outcome === 'sufficient' ? 'can_start' : 'cannot_start';
+  const item = await request('POST', projectPath + '/conclusions', {
+    scopeId: view.scope.id, startWork,
+    reason: startWork === 'cannot_start' ? 'Обязательные вопросы по синтетическому комплекту остаются открытыми.'
+      : 'Синтетическая проверка обязательных вопросов завершена.',
+  }, { 'if-match': `"${view.version}"` });
+  return { status: item.status, value: item.value, startWork };
+}
+
+async function mixedFollowup(project, targetScope, baseline, firstLetter, engineerPassword, recordSent) {
+  const ownerSession = session;
+  session = engineerSession;
+  try {
+    const projectPath = `/api/projects/${project.id}`;
+    const scope = project.scopes.find(({ name }) => name === targetScope);
+    const initialConclusion = await recordConclusion(projectPath, (await assessmentViews(project))[targetScope]);
+    const before = await assessmentViews(project);
+    const changed = before[targetScope].questions.find(item => item.requirement.positionId === 'gap');
+    session = {};
+    const secondLogin = await command('POST', '/api/sessions', { login: 'stage15_engineer', password: engineerPassword });
+    const secondSession = { cookie: secondLogin.response.headers.get('set-cookie').split(';')[0],
+      'x-csrf-token': secondLogin.value.csrfToken };
+    session = secondSession;
+    const secondRead = (await assessmentViews(project))[targetScope].questions.find(item => item.id === changed.id);
+    if (secondSession.cookie === engineerSession.cookie || secondRead.version !== changed.version) {
+      throw Error('The independent stale session did not open the same confirmed question version');
+    }
+    session = engineerSession;
+    let sent = null;
+    let beforeHistory = null;
+    if (firstLetter.createStatus === 201) {
+      const old = await readHistory(firstLetter);
+      beforeHistory = old;
+      if (recordSent) {
+        const item = old.revision.items.find(entry => entry.questionId === changed.id);
+        if (!item || old.current.status !== 200) throw Error('Missing current item for synthetic sent registration');
+        sent = (await command('POST', `/api/letters/${firstLetter.created.id}/sent`, {
+          revisionId: old.revision.id, recipient: old.revision.recipient, itemIds: [item.id],
+          text: old.current.value.text, sentAt: new Date().toISOString(),
+        })).value;
+        beforeHistory = await readHistory(firstLetter, sent.url);
+      }
+    }
+    await result('mixed-before-followup-history.json', { before, initialConclusion, sent, beforeHistory });
+    const { files, manifest } = await stageInputs('mixed-followup');
+    const receipt = await upload(project, files, manifest, targetScope, async pending => {
+      await result('mixed-followup-declared.json', { pending, assessments: await assessmentViews(project),
+        history: beforeHistory ? await readHistory(firstLetter, sent?.url) : null });
+    });
+    const workload = await settle(project.id, baseline.generations.map(({ id }) => id), mixedSettleLimit);
+    const captured = await capture(project, receipt);
+    const machineFile = 'mixed-followup-machine.json';
+    await result(machineFile, { project, receipt, workload, captured, evidence: await researchEvidence(project.id, workload) });
+    const linked = sent ? await request('POST', `${projectPath}/supplements/links`, {
+      receiptId: receipt.receiptId, letterId: firstLetter.created.id, sentId: sent.id,
+    }) : null;
+    const classification = [];
+    for (const hold of captured.assessments[targetScope].holds.filter(item => item.receiptId === receipt.receiptId)) {
+      const current = (await assessmentViews(project))[targetScope];
+      const impacts = [{ scopeId: scope.id, assessmentVersion: current.version, questionIds: [changed.id] }];
+      const item = await request('POST', `${projectPath}/supplements/holds/${hold.id}/resolve`, {
+        generation: hold.generation, reason: 'The accepted revision expressly changes only the QF-91 clearance.', impacts,
+      }, { 'if-match': `"${hold.version}"` });
+      classification.push({ holdId: hold.id, status: item.status, value: item.value, impacts });
+    }
+    const reviewedWork = await settle(project.id, [], mixedSettleLimit);
+    const beforeDecision = await assessmentViews(project);
+    await result('mixed-followup-after-impact-machine.json', { reviewedWork, assessments: beforeDecision,
+      evidence: await researchEvidence(project.id, reviewedWork) });
+    session = secondSession;
+    const stale = await request('POST', `/api/questions/${changed.id}/decisions`, {
+      action: 'confirm', reason: 'Synthetic stale-version negative control.', requestExternal: true,
+    }, { 'if-match': `"${secondRead.version}"` });
+    session = engineerSession;
+    const newVersions = new Set(Object.values(receipt.versions).map(({ versionId }) => versionId));
+    const after = await letter(project, 'mixed', 'followup', beforeDecision[targetScope], targetScope,
+      { allQuestions: true, changedQuestionId: changed.id, newVersions });
+    const nextConclusion = await recordConclusion(projectPath, (await assessmentViews(project))[targetScope]);
+    const oldAssessment = initialConclusion.status === 201 ? await request('GET',
+      `${projectPath}/assessments/${initialConclusion.value.version}?scopeId=${scope.id}`) : null;
+    const history = beforeHistory ? await readHistory(firstLetter, sent?.url) : null;
+    await result('mixed-followup-result.json', {
+      frozenMachineSha256: sha(await readFile(join(output, machineFile))),
+      linked: linked ? { status: linked.status, value: linked.value } : null, classification,
+      stale: { separateSession: true, originalQuestionVersion: secondRead.version, status: stale.status, value: stale.value },
+      after, nextConclusion, assessments: await assessmentViews(project),
+      historicalConclusion: oldAssessment ? { status: oldAssessment.status, value: oldAssessment.value?.conclusion,
+        unchanged: oldAssessment.status === 200 &&
+          JSON.stringify(oldAssessment.value?.conclusion) === JSON.stringify(before[targetScope].conclusion) } : null,
+      history, historyUnchanged: history && JSON.stringify(history.sent) === JSON.stringify(beforeHistory.sent) &&
+        JSON.stringify(history.revision) === JSON.stringify(beforeHistory.revision) &&
+        history.proofs.length > 0 && history.proofs.every(verifiedCitation) &&
+        Object.keys(firstLetter.exports).every(format => history.exports[format].historicalSha256 === firstLetter.exports[format].sha256),
+    });
+  } finally {
+    session = ownerSession;
+  }
+}
+
+async function checkCatalogAlternative(project, profile) {
+  const projectPath = `/api/projects/${project.id}`;
+  const original = (await command('GET', projectPath)).value;
+  const baseline = await databaseState(project.id);
+  const catalog = structuredClone(profile.catalog);
+  const rule = catalog.requirements.find(item => item.key === 'gap');
+  if (rule.formats.includes('txt') || rule.equivalents.includes('txt')) throw Error('TXT is already allowed');
+  rule.equivalents.push('txt');
+  const { value: approved } = await command('POST', '/api/catalogs', catalog);
+  await command('PUT', projectPath + '/catalog', { catalogVersionId: approved.id },
+    { 'if-match': `"${original.version}"` });
+  const workload = await settle(project.id, baseline.generations.map(({ id }) => id), mixedSettleLimit);
+  const ownerSession = session;
+  session = engineerSession;
+  try {
+    const assessments = await assessmentViews(project);
+    const view = assessments[profile.project.scopeName];
+    const gap = view.questions.find(item => item.requirement.positionId === 'gap');
+    const { rows: [stored] } = await app.db.query(`SELECT review FROM assessment_question_revisions
+      WHERE scope_id=$1 AND question_id=$2 AND assessment_version<=$3
+      ORDER BY assessment_version DESC LIMIT 1`, [view.scope.id, gap.id, view.version]);
+    await result('mixed-catalog-alternative.json', { previousCatalogId: original.catalogVersionId, newCatalogId: approved.id,
+      equivalents: rule.equivalents, workload, assessments, storedReview: stored?.review,
+      frozenOriginalResultSha256: sha(await readFile(join(output, 'mixed-followup-result.json'))) });
+    const followup = JSON.parse(await readFile(join(output, 'mixed-followup-machine.json')));
+    const newVersions = new Set(Object.values(followup.receipt.versions).map(({ versionId }) => versionId));
+    if (gap.machine.outcome === 'covered' && gap.machine.citations.some(({ versionId }) => newVersions.has(versionId))) {
+      const proofs = await Promise.all(gap.machine.citations.map(openCitation));
+      const decision = proofs.every(verifiedCitation) ? await request('POST', `/api/questions/${gap.id}/decisions`, {
+        action: 'confirm', reason: 'Тестовый инженер сверил основания с утверждённым эквивалентом.', requestExternal: false,
+      }, { 'if-match': `"${gap.version}"` }) : null;
+      await result('mixed-catalog-alternative-decision.json', { proofs,
+        decision: decision ? { status: decision.status, value: decision.value } : null });
+    }
+  } finally {
+    session = ownerSession;
+  }
 }
 
 async function rewindOneTestCheckpoint(project, caseName) {
@@ -471,18 +677,16 @@ try {
   session = ownerSession;
   await startProvider();
   beginWorker();
-  for (const caseName of process.env.STEP15_CASES.split(',')) {
+  for (const scenario of process.env.STEP15_CASES.split(',')) {
+    const followup = ['mixed-followup', 'mixed-regression'].includes(scenario);
+    const caseName = followup ? 'mixed' : scenario;
     const profile = JSON.parse(await readFile(join(root, 'config', caseName + '.json')));
     if (caseName === 'missing') {
       const control = profile.catalog.requirements.find(item => item.key === 'detail');
       control.sourceRoles.push('reference');
     }
     await result(caseName + '-profile.json', profile);
-    const manifest = JSON.parse(await readFile(join(root, 'manifests', caseName + '.json')));
-    const files = await inputs(join(root, 'input', caseName));
-    if (JSON.stringify(Object.keys(manifest).sort()) !== JSON.stringify(files.map(({ name }) => name).sort())) {
-      throw Error('Frozen input manifest does not match staged files');
-    }
+    const { manifest, files } = await stageInputs(caseName);
     const { value: catalog } = await command('POST', '/api/catalogs', profile.catalog);
     let { value: project } = await command('POST', '/api/projects', {
       ...profile.project, catalogVersionId: catalog.id,
@@ -515,10 +719,19 @@ try {
     const coldState = await settle(project.id, [], timeLimit);
     const cold = await capture(project, receipt);
     const coldMachine = caseName + '-cold-machine.json';
-    await result(coldMachine, { project, receipt, coldState, cold });
-    await result(caseName + '-cold.json', { project, receipt, coldStart, observedNs: since(), coldState, cold,
+    await result(coldMachine, { project, receipt, coldState, cold,
+      ...(followup ? { evidence: await researchEvidence(project.id, coldState) } : {}) });
+    const coldObservedNs = since();
+    const coldLetter = await engineerLetter(project, caseName, 'cold', cold, profile.project.scopeName, coldState,
+      followup ? { allQuestions: true } : undefined);
+    await result(caseName + '-cold.json', { project, receipt, coldStart, observedNs: coldObservedNs, coldState, cold,
       frozenMachineSha256: sha(await readFile(join(output, coldMachine))),
-      letter: await engineerLetter(project, caseName, 'cold', cold, profile.project.scopeName, coldState) });
+      letter: coldLetter });
+    if (followup) {
+      await mixedFollowup(project, profile.project.scopeName, coldState, coldLetter, engineerPassword, scenario === 'mixed-followup');
+      if (scenario === 'mixed-regression') await checkCatalogAlternative(project, profile);
+      continue;
+    }
     const warmStart = since();
     const { value: warmCatalog } = await command('POST', '/api/catalogs', profile.catalog);
     project = (await command('GET', projectPath)).value;

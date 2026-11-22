@@ -122,14 +122,18 @@ export function registerLetterRoutes(app: FastifyInstance, deps: LetterDependenc
     await checkHolds(tx, letter);
     if (revision.status === 'draft') unconfirmed();
     const selections = revision.items.map(({ questionId, questionVersion, decisionId }) => ({ questionId, questionVersion, decisionId }));
-    const grounds = await selectedGrounds(tx, { ...letter, recipient: revision.recipient, selections });
+    const { recipient, layout, items, text, textSha256 } = revision;
+    const grounds = await selectedGrounds(tx, { ...letter, recipient, selections });
+    // Earlier revisions were saved without a stage line. Check their original text as stored.
+    const matchesText = renderText(recipient, layout, items) === text
+      || renderText(recipient, layout, items, false) === text;
     if (grounds.length !== revision.items.length
       || grounds.some((ground, index) => {
         const item = revision.items[index];
         return ground.wording !== item.wording || !wordingIsCurrent(item, ground);
       })
-      || renderText(revision.recipient, revision.layout, revision.items) !== revision.text
-      || hashText(revision.text) !== revision.textSha256) {
+      || !matchesText
+      || hashText(text) !== textSha256) {
       stale(letter);
     }
   }

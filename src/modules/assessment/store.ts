@@ -239,6 +239,15 @@ function activeVersions(question: Question): string[] {
     .map(({ citation }) => citation.versionId) ?? [];
 }
 
+function reviewAfterSourceChange(question: Question, superseded: ReadonlySet<string>, reason: string): Review | null {
+  if (!question.review) return null;
+  return {
+    findings: question.review.findings.filter(({ citation }) => !superseded.has(citation.versionId)),
+    completenessChecked: false,
+    remaining: [reason],
+  };
+}
+
 export async function synchronize(
   tx: PoolClient, projectId: string, scopeId: string, gate: Gate,
 ): Promise<Revision> {
@@ -289,7 +298,11 @@ export async function synchronize(
       changedInventories.size ? "research_inventory_changed" : "exclusion_expired";
     const revision = await writeRevision(tx, current, current.version + 1, gate, makeChange(reason, changed));
     for (const question of changed) {
-      await writeQuestion(tx, revision, invalidate(question, affected(question) ? null : question.review));
+      const review = affected(question)
+        ? reviewAfterSourceChange(question, superseded,
+          sourceSuperseded(question) ? "source_superseded" : "research_inventory_changed")
+        : question.review;
+      await writeQuestion(tx, revision, invalidate(question, review));
     }
     await announceAssessment(tx, projectId, revision);
     return revision;
@@ -331,8 +344,13 @@ export async function synchronize(
     if (prior.active && unchanged && !priorAffected && !expiredIds.has(prior.id) && !skippedScopeVersions) continue;
     change.affectedQuestionIds.push(prior.id);
     if (prior.decision) change.previousDecisionIds.push(prior.decision.id);
-    replacements.push(invalidate({ ...prior, active: true, requirement },
-      prior.active && unchanged && !priorAffected && !skippedScopeVersions ? prior.review : null));
+    const review = prior.active && unchanged && !skippedScopeVersions
+      ? priorAffected
+        ? reviewAfterSourceChange(prior, superseded,
+          sourceSuperseded(prior) ? "source_superseded" : "research_inventory_changed")
+        : prior.review
+      : null;
+    replacements.push(invalidate({ ...prior, active: true, requirement }, review));
   }
   for (const prior of old.values()) {
     if (!prior.active) continue;

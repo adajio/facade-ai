@@ -97,7 +97,16 @@ async function readyHold(db: Pool | PoolClient, id?: string): Promise<ReadyHold 
          JOIN harness_observations o ON o.generation_id=s.generation_id
          JOIN inquiry_observations observed ON observed.id=o.observation_id AND NOT observed.superseded
            AND observed.version_id=m.version_id
-         WHERE s.id=c.id AND s.scope_id=c.scope_id AND NOT EXISTS (
+         JOIN LATERAL (
+           SELECT requirement FROM assessment_question_revisions
+           WHERE scope_id=s.scope_id AND question_id=o.question_id AND assessment_version<=s.assessment_version
+           ORDER BY assessment_version DESC LIMIT 1
+         ) required ON true
+         WHERE s.id=c.id AND s.scope_id=c.scope_id
+           AND (observed.source->>'subjectVerified' IS DISTINCT FROM 'false'
+             OR o.finding->>'sourceRole'='approved_change'
+             OR (required.requirement->'formats') ? (o.finding->>'format'))
+           AND NOT EXISTS (
            SELECT 1 FROM checked affected WHERE affected.id=c.id AND affected.scope_id=c.scope_id
              AND affected.version_id=m.version_id AND affected.question_id=o.question_id
          )

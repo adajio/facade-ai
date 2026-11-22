@@ -149,3 +149,13 @@ docker --context orbstack run --rm --pull=never --init --read-only \
   --mount type=volume,source=facade-ai-test-server_converter-socket,target=/run/facade-ai-stand-converters,readonly \
   "$image" --test /app/src/modules/formats/test/stand.test.mjs
 ```
+
+### Адресная диагностика после слепого прогона
+
+Поддержка DOC, DWG и DXF в `formats-1.1.1` сохраняет таблицу старого DOC при
+провале обычного импорта, текст DWG при обрыве DXF-экспорта и CAD-объекты
+без подтверждённых handle. Для DXF запасной селектор — `entityOrdinal`
+(номер записи в исходной секции `ENTITIES`, с 1). У DWG аналогичный
+селектор относится к производной. При восстановлении DWG через JSON
+у единицы `derivative: dwg-json`, подтверждённый адрес выдачи сохраняется
+как `derivativeHandle`. [Поиск причины и адресные проверки](test/postblind-201dc93.md).

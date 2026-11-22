@@ -1,14 +1,15 @@
 import { randomUUID } from 'node:crypto';
 import type { Pool, PoolClient } from 'pg';
-import { evaluate, isInventoryRole, type Finding, type NonDeliveryStatement } from '../assessment/domain.js';
+import { canonicalJson, evaluate, isInventoryRole, type Finding, type NonDeliveryStatement, type Requirement } from '../assessment/domain.js';
 import { getLockedGate, getQuestions, normalizeFormat, synchronize } from '../assessment/store.js';
 import { applyAssessmentUpdate, type AssessmentChange } from '../assessment/updates.js';
 import type { WorkQueue } from '../gateway/queue.js';
 import { transaction } from '../gateway/types.js';
 import { lockIntakeProject } from '../intake/gate.js';
-import type { Observation } from '../pdf/types.js';
+import type { Observation, ReaderLine } from '../pdf/types.js';
 import type { ObservationPublication } from '../questions/domain.js';
 import { publishReaderObservation } from '../questions/reader.js';
+import { hasAddressedSubject } from '../questions/subject-evidence.js';
 import type {
   Branch, Citation, ObservationInput, Place, ReaderContext, ResearchOutcome, ScheduledResearchTask, TargetQuestion,
 } from './contracts.js';
@@ -18,7 +19,18 @@ import { researchKind } from './runner.js';
 
 type Ref = Pick<ScheduledResearchTask, 'projectId' | 'scopeId' | 'generationId'>;
 
-type FindingRow = { finding: Finding };
+type FindingRow = { finding: Finding; subjectVerified: boolean | null; observation: Observation; content: string | null };
+
+function addressedSubject(target: TargetQuestion, observation: Observation, content: string | null): boolean {
+  if (!content) return false;
+  try {
+    const parsed = JSON.parse(content) as { lines?: ReaderLine[] } | null;
+    return Array.isArray(parsed?.lines) && hasAddressedSubject(target, observation, parsed.lines);
+  } catch {
+    return false;
+  }
+}
+
 const meaningfulRoles = new Set<string>(['design', 'schedule', 'approved_change', 'reference']);
 
 function qualifiedRole(role: string | undefined): ObservationPublication['role'] {
@@ -78,13 +90,26 @@ async function scheduleDisputes(
   }
 }
 
-async function findingsFor(tx: PoolClient, ref: Ref, questionId: string) {
+async function findingsFor(tx: PoolClient, ref: Ref, target: TargetQuestion, requirement: Requirement) {
   const { rows } = await tx.query<FindingRow>(
-    `SELECT h.finding FROM harness_observations h
+    `SELECT h.finding, (i.source->>'subjectVerified')::boolean AS "subjectVerified",
+       o.payload AS observation, delivered.content
+     FROM harness_observations h
      JOIN inquiry_observations i ON i.id=h.observation_id
+     JOIN reader_observations o ON o.id=h.observation_id
+     LEFT JOIN LATERAL (
+       SELECT e.event#>>'{reply,body,content}' AS content FROM harness_research_events e
+       WHERE e.job_id=o.run_id AND e.event#>>'{reply,evidence,evidenceId}'=o.evidence_id::text
+       ORDER BY e.sequence LIMIT 1
+     ) delivered ON h.finding->>'kind'='value' AND NOT (i.source ? 'subjectVerified')
      WHERE h.generation_id=$1 AND h.question_id=$2 AND NOT i.superseded
-     ORDER BY h.observation_id LIMIT 501`, [ref.generationId, questionId]);
-  return rows.map(({ finding }) => finding);
+     ORDER BY h.observation_id LIMIT 501`, [ref.generationId, target.id]);
+  return rows.flatMap(({ finding, subjectVerified, observation, content }) => {
+    if (finding.kind !== 'value' || (subjectVerified ?? addressedSubject(target, observation, content))) return [finding];
+    // An unresolved value of an inadmissible format remains available by address in the inquiry.
+    if (!requirement.formats.includes(finding.format) && finding.sourceRole !== 'approved_change') return [];
+    return [{ ...finding, applicability: 'unknown' as const }];
+  });
 }
 
 async function updateQuestion(
@@ -108,7 +133,10 @@ async function updateQuestion(
      GROUP BY g.sealed,h.input_generation`,
     [ref.generationId, target.id, revision.source_token]);
   if (!coverage || coverage.input_generation !== gate.generation) return;
-  const all = await findingsFor(tx, ref, question.id);
+  // The intake gate already protects the old decision while independent readers are still running.
+  const heldDecision = question.decision && gate.holds.length > 0;
+  if (heldDecision && (!coverage.sealed || coverage.pending)) return;
+  const all = await findingsFor(tx, ref, target, question.requirement);
   const findings = all.slice(0, 500);
   await scheduleDisputes(tx, ref, target, question.requirement, findings);
   const { rows: [review] } = await tx.query<{ pending: boolean; unclear: boolean }>(
@@ -122,6 +150,7 @@ async function updateQuestion(
        SELECT 1 FROM harness_disputes d JOIN harness_review_results r ON r.dispute_id=d.id AND r.generation_id=d.generation_id
        WHERE d.generation_id=$1 AND d.question_id=$2 AND r.result->>'verdict'='unclear'
      ) AS unclear`, [ref.generationId, question.id]);
+  if (heldDecision && review.pending) return;
   const remaining = [
     ...(!coverage.sealed ? ['inventory_open'] : []),
     ...(coverage.pending ? ['primary_coverage_pending'] : []),
@@ -130,9 +159,9 @@ async function updateQuestion(
     ...(review.unclear ? ['dispute_unresolved'] : []),
     ...(all.length > 500 ? ['review_finding_limit'] : []),
   ];
-  if (JSON.stringify(question.review?.remaining) === JSON.stringify(remaining) &&
-    JSON.stringify(question.review?.findings.map((item) => item.citation.observationId)) ===
-      JSON.stringify(findings.map((item) => item.citation.observationId))) return;
+  if (question.review && canonicalJson(question.review.remaining) === canonicalJson(remaining) &&
+    canonicalJson(question.review.findings.map(({ citation, applicability }) => [citation.observationId, applicability])) ===
+      canonicalJson(findings.map(({ citation, applicability }) => [citation.observationId, applicability]))) return;
   const change: AssessmentChange = {
     questionId: question.id, expectedDependencyVersion: question.dependency_version,
     review: {
@@ -211,12 +240,21 @@ export function publication(db: Pool, queue: WorkQueue, profile: ResearchProfile
         kind: 'explicit_non_delivery', subjectQuote: statement.item, questionId: target.id, receiptId: observation.receiptId,
       } : undefined;
       const activeStatement = !statement || (statement.status === 'not_delivered' && observation.grounding === 'text');
-      const active = assessmentRole !== 'unknown' && metadata.applicable && activeStatement;
+      let subjectVerified: boolean | undefined;
+      if (!statement && !input.limitation && observation.value !== undefined) {
+        const addressed = await tx.query<{ content: string | null }>(
+          `SELECT event#>>'{reply,body,content}' AS content FROM harness_research_events
+           WHERE job_id=$1 AND event#>>'{reply,evidence,evidenceId}'=$2 ORDER BY sequence LIMIT 1`,
+          [task.jobId, observation.evidenceId]);
+        subjectVerified = addressedSubject(target, observation, addressed.rows[0]?.content ?? null);
+      }
+      const sourceInScope = assessmentRole !== 'unknown' && metadata.applicable && activeStatement;
+      const active = sourceInScope && subjectVerified !== false;
       const comparisonKey = JSON.stringify([target.id, target.variant ?? '', assessmentRole]);
       await publishReaderObservation(tx, {
         observation, projectId: task.projectId, scopeId: task.scopeId, readerJobId: task.jobId,
         subject: target.subject, property: target.property, variant: target.variant,
-        role, revision: active ? 'effective' : 'unknown', priority: role, comparableContext: comparisonKey,
+        role, revision: sourceInScope ? 'effective' : 'unknown', priority: role, comparableContext: comparisonKey, subjectVerified,
         assessmentQuestionId: target.id, replacesConfirmed: metadata.applicable,
       });
       const finding: Finding = {

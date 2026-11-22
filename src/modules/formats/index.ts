@@ -8,7 +8,7 @@ import type { Legacy } from "./conversion.js";
 import { FormatHold, originalOnly, parseText, readInput, readerVersion } from "./model.js";
 import type { Locator, Parsed, Row, Unit } from "./model.js";
 import { cellAddress, parseDocx, parseXlsx } from "./office.js";
-import { parseDxf, parseIfc } from "./spatial.js";
+import { parseDwgRecovery, parseDxf, parseIfc } from "./spatial.js";
 
 const formats = ["docx", "xlsx", "txt", "csv", "tsv", "dxf", "ifc", "doc", "xls", "dwg", "rvt", "unknown"] as const;
 type Format = typeof formats[number];
@@ -36,7 +36,7 @@ function invalid(): never {
 function select(current: Unit, request: Locator = {}): { rows: Row[]; locator: Locator; handle?: string } {
   const locator = { ...current.locator };
   const qualifiers = new Set(["line", "paragraph", "section", "row", "column", "cell", "range", "handle",
-    "derivativeHandle", "step", "globalId", "merge"]);
+    "derivativeHandle", "entityOrdinal", "step", "globalId", "merge"]);
   for (const [key, value] of Object.entries(request)) {
     if (Object.hasOwn(locator, key) && locator[key] === value) continue;
     if (key === "coverage" && current.coverage === value) continue;
@@ -61,7 +61,9 @@ function select(current: Unit, request: Locator = {}): { rows: Row[]; locator: L
     }
     locator[key] = value;
   }
-  return { rows, locator, handle: String(request.handle ?? request.derivativeHandle ?? "") || undefined };
+  const handle = request.handle ?? request.derivativeHandle
+    ?? (request.entityOrdinal === undefined ? undefined : `ordinal:${request.entityOrdinal}`);
+  return { rows, locator, handle: handle === undefined ? undefined : String(handle) };
 }
 
 function mapUnit(current: Unit): ReaderUnit {
@@ -114,6 +116,7 @@ function rawOutput(parsed: Parsed, current: Unit, request: ReadRequest): ReaderO
 
 function adapter(format: Format): ReaderAdapter {
   const legacy = isLegacy(format) ? format : undefined;
+  const profile = format === "doc" || format === "dwg" || format === "dxf" ? "formats-1.1.1" : readerVersion;
   let configured: ReturnType<typeof converterFor> | undefined;
   const resolve = () => legacy ? configured ??= converterFor(legacy).catch((error) => {
     configured = undefined;
@@ -135,11 +138,13 @@ function adapter(format: Format): ReaderAdapter {
         : magic === "d0cf11e0a1b11ae1";
       if (!valid) throw new FormatHold(`${legacy}_signature_invalid`);
       const derivative = await convert(converter, input);
+      const dwgRecovery = legacy === "dwg" && /^\s*\{/.test(derivative.bytes.subarray(0, 128).toString("utf8"));
       const derived = legacy === "doc" ? await parseDocx(derivative.bytes)
-        : legacy === "xls" ? await parseXlsx(derivative.bytes) : parseDxf(derivative.bytes);
+        : legacy === "xls" ? await parseXlsx(derivative.bytes)
+        : dwgRecovery ? parseDwgRecovery(derivative.bytes) : parseDxf(derivative.bytes);
       // Coordinates assigned by a converter describe the derivative. Preserve that distinction in every line.
       for (const current of derived.units) {
-        current.locator.derivative = legacy === "doc" ? "docx" : legacy === "xls" ? "xlsx" : "dxf";
+        current.locator.derivative = legacy === "doc" ? "docx" : legacy === "xls" ? "xlsx" : dwgRecovery ? "dwg-json" : "dxf";
         current.coverage = current.coverage === "held" ? "held" : "partial";
         current.limitations.push(legacy === "dwg" ? "cad_converted_handle_unverified"
           : legacy === "xls" ? "xls_conversion_recalculation_unverified" : "doc_converted_address_approximate");
@@ -164,9 +169,9 @@ function adapter(format: Format): ReaderAdapter {
   return {
     format,
     async version() {
-      if (!legacy) return `${readerVersion}:${format}`;
+      if (!legacy) return `${profile}:${format}`;
       const converter = await resolve();
-      return `${readerVersion}:${format}:${converter?.id ?? "unavailable"}`;
+      return `${profile}:${format}:${converter?.id ?? "unavailable"}`;
     },
     async inspect(path) {
       const parsed = await parse(path);

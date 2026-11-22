@@ -2,6 +2,7 @@ import type { PoolClient } from "pg";
 import type { Observation } from "../pdf/types.js";
 import { canonicalJson, type Finding, type Review } from "./domain.js";
 import { matchesStatement, proveResearchNonDelivery } from "./non-delivery.js";
+import { hasSameReviewDependencies, isPendingReview } from "./review-dependencies.js";
 import {
   AssessmentError, announceAssessment, assessmentHref, getLockedGate, getQuestions, invalidate,
   invalidInput, makeChange, normalizeFormat, synchronize, writeQuestion, writeRevision,
@@ -211,15 +212,20 @@ export async function applyAssessmentUpdate(tx: PoolClient, update: AssessmentUp
     if (!question) throw new AssessmentError(404, "question_not_found", "Вопрос недоступен в заданной области.");
     assertCurrent(change, question, current, projectId);
     const review = change.review ? await resolveReview(tx, projectId, gate, current, question, change.review) : null;
+    if (review && (canonicalJson(question.review) === canonicalJson(review) ||
+        (question.decision && ((gate.holds.length > 0 && isPendingReview(review)) ||
+          hasSameReviewDependencies(question, review))))) continue;
     prior.push(question);
     revisions.push(invalidate(question, review));
   }
-  const next = await writeRevision(tx, current, current.version + 1, gate, makeChange(reason, prior));
+  const next = revisions.length
+    ? await writeRevision(tx, current, current.version + 1, gate, makeChange(reason, prior))
+    : current;
   for (const revision of revisions) await writeQuestion(tx, next, revision);
   await tx.query(
     `INSERT INTO assessment_updates (scope_id, event_id, input, assessment_version) VALUES ($1,$2,$3,$4)`,
     [scopeId, eventId, input, next.version],
   );
-  await announceAssessment(tx, projectId, next);
+  if (revisions.length) await announceAssessment(tx, projectId, next);
   return { assessmentVersion: next.version, replayed: false };
 }

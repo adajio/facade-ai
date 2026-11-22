@@ -15,6 +15,7 @@ const load = (module) => import(pathToFileURL(resolve(out, 'src/modules', module
 const golden = [
   'Запрос исходных данных',
   'Кому: ООО «Заказчик»',
+  'Стадия РД',
   '1. Фасад А. Узлы. Не получен материал в требуемом формате (pdf). Основание: «Опись.pdf», стр. 1. Просим предоставить Узлы.',
   '2. Фасад А. AL-01, толщина. Значения расходятся, в источнике «Спецификация R2.pdf», стр. 3 указано 2 мм, а в источнике «Задание R1.pdf», стр. 1 указано 0,003 м. Просим подтвердить значение для «AL-01, толщина».',
 ].join('\n\n');
@@ -46,6 +47,17 @@ test('DOCX сохраняет абзацы, кириллицу, табуляци
   const text = 'Проверка А и Б\n\n\t & <2 мм> ';
   assert.equal((await renderDocument('txt', text)).toString('utf8'), text);
   assert.equal(extractDocx(await renderDocument('docx', text)), text);
+});
+
+test('Оба оформления сохраняют произвольную стадию из основания', async () => {
+  const { renderText } = await load('letters/content.js');
+  const stage = 'Эскизный проект (вариант 2)';
+  const item = { basis: { scope: { stage } }, wording: 'Шаблонный текст.', editedWording: 'Авторский текст.' };
+  for (const layout of ['formal', 'brief']) {
+    const text = renderText('Получатель', layout, [item]);
+    assert.equal(text.split('\n\n')[2], `Стадия ${stage}`);
+    assert.equal(text.split('\n\n')[3], '1. Авторский текст.');
+  }
 });
 
 test('Адрес письма берётся из закреплённой опоры', async () => {
@@ -221,6 +233,7 @@ test('AC06, R02 и блокировка текущего экспорта чер
   const original = await json(200, 'GET', revisionPath);
   assert.equal(original.textSha256, digest(golden));
   assert.equal(original.items.length, 2);
+  assert.deepEqual(original.items.map(({ basis }) => basis.scope.stage), ['РД', 'РД']);
 
   const files = await Promise.all(['txt', 'docx'].map((format) =>
     json(201, 'POST', `${letterPath}/exports`, { version: 1, payload: { format } })));
@@ -350,7 +363,7 @@ test('AC06, R02 и блокировка текущего экспорта чер
   assert.equal((await json(409, 'GET', `${letterPath}/current-text`, { version: approved.version })).code, 'scope_held');
 
   const fact = { payload: {
-    revisionId: original.id, itemIds: original.items.map(({ id }) => id), recipient, text: `Добрый день!\n\n${golden}`,
+    revisionId: original.id, itemIds: original.items.map(({ id }) => id), recipient, text: `Добрый день!\n\n${golden.replace('\n\nСтадия РД', '')}`,
     sentAt: '2026-11-22T07:00:00+03:00',
   }, key: randomUUID() };
   const sent = await json(201, 'POST', `${letterPath}/sent`, fact);

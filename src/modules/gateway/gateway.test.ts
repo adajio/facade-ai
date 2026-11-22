@@ -494,7 +494,7 @@ test('known 429 permits one explicit retry and concurrent projects share the exa
   assert.equal(state.budget.reserveUsdNanos, 0);
 });
 
-test('synthetic Alibaba requires authorized originals and real or unknown input has no network path', sqlCase, async t => {
+test('synthetic Alibaba applies explicit retention and no-training evidence to the exact wire request', sqlCase, async t => {
   const s = await setup(t);
   const ref = project();
   const source = { projectId: ref.projectId, documentId: randomUUID(), versionId: randomUUID(), sha256: 'a'.repeat(64) };
@@ -510,11 +510,13 @@ test('synthetic Alibaba requires authorized originals and real or unknown input 
     [source.versionId, ref.projectId, source.documentId, originalId]);
 
   const profile = {
-    routeId: 'research-qwen', revision: 'v1', model: 'qwen/qwen-test', provider: 'alibaba',
+    routeId: 'research-qwen', revision: 'v1', model: 'qwen/qwen4-max', provider: 'alibaba',
     expectedResponseProvider: 'Alibaba', mode: 'synthetic-research', boundEvidenceRef: 'synthetic-rate-attestation',
     validUntil: '2099-01-01T00:00:00Z', ...fixtureRates, knownNoChargeStatuses: [],
     syntheticScopes: [{ projectId: ref.projectId, scopeId: ref.scopeId,
-      approvalRef: 'approval:synthetic-only', originalSha256s: [source.sha256] }],
+      approvalRef: 'approval:synthetic-only', originalSha256s: [source.sha256],
+      retentionApproval: { approvalRef: 'approval:synthetic-retention', noTrainingEvidenceRef: 'policy:exact-route-no-training',
+        validUntil: '2099-01-01T00:00:00Z' } }],
   } as const;
   const approval = { qualification: 'step-15', endpoint: 'https://openrouter.ai', apiKey: 'synthetic-key' } as const;
   assert.throws(() => openRouterTransport({ ...approval, profiles: [{ ...profile, mode: 'strict-zdr' }] }),
@@ -532,7 +534,24 @@ test('synthetic Alibaba requires authorized originals and real or unknown input 
   s.setCost(BUDGET_USD_NANOS - 350_000);
   assert.equal((await s.gateway.call(call(billed))).status, 'paid');
 
-  const transport = openRouterTransport({ ...approval, profiles: [profile] });
+  const scope = profile.syntheticScopes[0];
+  const blockedProfiles = [
+    [{ ...profile, routeId: 'no-retention', syntheticScopes: [{ ...scope, retentionApproval: undefined }] },
+      'synthetic_retention_not_approved'],
+    [{ ...profile, routeId: 'expired-retention', syntheticScopes: [{ ...scope, retentionApproval: {
+      ...scope.retentionApproval, validUntil: '2000-01-01T00:00:00Z',
+    } }] }, 'synthetic_retention_not_approved'],
+    [{ ...profile, routeId: 'no-training-evidence', syntheticScopes: [{ ...scope, retentionApproval: {
+      ...scope.retentionApproval, noTrainingEvidenceRef: '',
+    } }] }, 'route_training_policy_unverified'],
+    [{ ...profile, routeId: 'strict-alibaba', mode: 'strict-zdr', zdrEvidenceRef: 'fixture:purported-zdr' },
+      'route_zdr_unavailable'],
+    [{ ...profile, routeId: 'unsupported-completion', completionParameter: 'max_completion_tokens' },
+      'route_parameters_unsupported'],
+  ] as const satisfies readonly [OpenRouterProfile, string][];
+  // Omit absent approval from decoded JSON, as the worker does.
+  const profiles = JSON.parse(JSON.stringify([profile, ...blockedProfiles.map(([candidate]) => candidate)])) as OpenRouterProfile[];
+  const transport = openRouterTransport({ ...approval, profiles });
   const gateway = new Gateway(s.db, s.journal, transport);
   const route = { ...baseRoute, id: profile.routeId, transport: 'openrouter' } as const;
   await gateway.configureRoute(route);
@@ -552,9 +571,14 @@ test('synthetic Alibaba requires authorized originals and real or unknown input 
     assert.equal(options.redirect, 'error');
     const wire = JSON.parse(options.body as string);
     assert.deepEqual(wire.provider.only, ['alibaba']);
+    assert.deepEqual(wire.provider.order, ['alibaba']);
     assert.equal(wire.provider.allow_fallbacks, false);
     assert.equal(wire.provider.zdr, false);
-    assert.equal(wire.provider.data_collection, 'deny');
+    assert.equal(wire.provider.data_collection, 'allow');
+    assert.equal(wire.provider.require_parameters, true);
+    assert.equal(wire.parallel_tool_calls, undefined);
+    assert.equal(wire.tool_choice, 'required');
+    assert.equal(wire.tools[0].function.name, 'fixture_tool');
     assert.equal(wire.max_tokens, 200);
     assert.equal(wire.max_completion_tokens, undefined);
     assert.deepEqual(wire.provider.max_price, { prompt: 0.1, completion: 0.2, request: 0.000001, image: 0.00002 });
@@ -568,11 +592,34 @@ test('synthetic Alibaba requires authorized originals and real or unknown input 
   const input = { ...call(current.lease, route.id), inputRefs: [], request: {
     model: profile.model, messages: [
       { role: 'tool', tool_call_id: 'call-1', content: 'synthetic only', cache_control: { type: 'ephemeral' } }, { role: 'user', content: [onePixel] },
-    ], max_tokens: 200,
+    ], max_tokens: 200, parallel_tool_calls: false, tool_choice: 'required',
+    tools: [{ type: 'function', function: { name: 'fixture_tool', parameters: { type: 'object' } } }],
   } };
+  for (const [candidate, code] of blockedProfiles) {
+    const alternate = { ...route, id: candidate.routeId };
+    await gateway.configureRoute(alternate);
+    await grant(gateway, ref, true, alternate);
+    isHeld(await gateway.call({ ...input, routeId: alternate.id }), code);
+  }
+  const regional = new Gateway(s.db, s.journal, openRouterTransport({
+    ...approval, endpoint: 'https://eu.openrouter.ai', profiles: [profile],
+  }));
+  isHeld(await regional.call(input), 'route_endpoint_unverified');
+  isHeld(await gateway.call({ ...input, request: { ...input.request, parallel_tool_calls: true } }),
+    'route_parameters_unsupported');
   isHeld(await gateway.call({ ...input, dataClass: 'client' }), 'route_data_unapproved');
   isHeld(await gateway.call({ ...input, inputRefs: [randomUUID()] }), 'route_data_unapproved');
+  const foreign = project();
+  await gateway.openGeneration(foreign);
+  await gateway.sealGeneration(foreign, manifest);
+  await grant(gateway, foreign, true, route);
+  await gateway.enqueue({ ...foreign, key: 'foreign', kind: 'foreign', purpose: 'primary_a', subjectId: source.versionId,
+    obligationId: obligationA.id, payload: { mode: 'primary', place: { source } } });
+  const foreignWork = await gateway.claim({ workerId: 'foreign-worker', kinds: ['foreign'], leaseMs: 120_000 });
+  assert.ok(foreignWork);
+  isHeld(await gateway.call({ ...input, lease: foreignWork.lease }), 'route_data_unapproved');
   assert.equal(mockFetch.mock.callCount(), 0);
+  assert.equal((await s.read()).external.length, 1);
 
   const accepted = await gateway.call(input);
   assert.equal(accepted.status, 'paid');
@@ -707,6 +754,10 @@ test('OpenRouter 404 diagnostics distinguish a pre-provider refusal from an unpr
   const fetchSpy = t.mock.method(globalThis, 'fetch', async (_url: string, options: RequestInit) => {
     const wire = JSON.parse(options.body as string);
     traces.push(wire.trace.trace_id);
+    assert.deepEqual(wire.provider.only, ['wafer/us']);
+    assert.equal(wire.provider.zdr, true);
+    assert.equal(wire.provider.data_collection, 'deny');
+    assert.equal(wire.provider.allow_fallbacks, false);
     if (traces.length === 1) {
       // OpenRouter Router Metadata, No Providers Available (404).
       return Response.json({

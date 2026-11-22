@@ -62,10 +62,18 @@ export function hashText(text: string): string {
   return createHash('sha256').update(text).digest('hex');
 }
 
-export function renderText(recipient: string, layout: Layout, items: readonly LetterItem[]): string {
+export function externalLine(value: string) {
+  return value.toWellFormed().replace(/[\u0000-\u001f\ufffe\uffff]/gu, ' ').replace(/ +/gu, ' ').trim();
+}
+
+export function renderText(
+  recipient: string, layout: Layout, items: readonly LetterItem[], includeStage = true,
+): string {
   const contents = items.map((item, index) => `${index + 1}. ${item.editedWording ?? item.wording}`);
   const title = layout === 'formal' ? 'Запрос исходных данных' : 'Запрос';
-  return [title, `Кому: ${recipient}`, ...contents].join('\n\n');
+  const stage = includeStage ? externalLine(items[0]?.basis?.scope?.stage ?? '') : '';
+  const stageLine = stage ? [`Стадия ${stage}`] : [];
+  return [title, `Кому: ${recipient}`, ...stageLine, ...contents].join('\n\n');
 }
 
 export async function renderDocument(format: Format, text: string): Promise<Buffer> {

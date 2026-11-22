@@ -195,12 +195,12 @@ test("assessment through real HTTP, PostgreSQL, reader and letter modules", {
 
   const { receiptId } = await http("POST", `${p}/receipts`, 201, {});
   assert.equal((await current(north)).holds.length, 0);
-  const upload = async (line, relativePath, scopeIds, complete = true, id = receiptId) => {
+  const upload = async (line, relativePath, scopeIds, complete = true, id = receiptId, replacesVersionId) => {
     const plain = relativePath.endsWith(".txt");
     const bytes = plain ? Buffer.from(line + "\n") : pdf(line);
     const sha256 = createHash("sha256").update(bytes).digest("hex");
     const { uploadId } = await http("POST", `/receipts/${id}/uploads`, 201, {
-      relativePath, size: bytes.length, sha256, mediaType: plain ? "text/plain" : "application/pdf", scopeIds,
+      relativePath, size: bytes.length, sha256, mediaType: plain ? "text/plain" : "application/pdf", scopeIds, replacesVersionId,
     });
     if (!complete) return { uploadId };
     await http("PUT", `/uploads/${uploadId}/parts/1`, 200, bytes, undefined,
@@ -384,6 +384,22 @@ test("assessment through real HTTP, PostgreSQL, reader and letter modules", {
   const absenceDecision = await http("POST", `/questions/${absence.id}/decisions`, 201, {
     action: "confirm", reason: "Checked the delivery manifest and alternative sources.", requestExternal: true,
   }, absence.version);
+  const sameReview = { ...update, eventId: randomUUID(), reason: "primary_research_update", changes: [
+    { ...update.changes[0], expectedDependencyVersion: conflict.dependencyVersion },
+  ] };
+  assert.deepEqual(await apply(sameReview), { assessmentVersion: absenceDecision.assessmentVersion, replayed: false });
+  assert.deepEqual(await apply(sameReview), { assessmentVersion: absenceDecision.assessmentVersion, replayed: true });
+  const reread = await read(a, "A", "Thickness D1 1.5 mm", "1.5", "mm");
+  assert.notEqual(reread.observation.id, left.observation.id);
+  const repeated = await apply({ ...sameReview, eventId: randomUUID(), changes: [{
+    ...sameReview.changes[0],
+    review: { ...review, findings: [finding(right), finding(ordinaryAbsence), finding(reread)] },
+  }] });
+  assert.equal(repeated.assessmentVersion, absenceDecision.assessmentVersion);
+  const repeatedQuestion = (await current(north)).questions.find(({ id }) => id === conflict.id);
+  assert.deepEqual([repeatedQuestion.version, repeatedQuestion.dependencyVersion, repeatedQuestion.decision.id],
+    [decision.version, conflict.dependencyVersion, decision.id]);
+  assert.deepEqual(repeatedQuestion.machine.citations, conflict.machine.citations);
   const raw = await transaction(app.db, (tx) =>
     assessment.selectConfirmedGrounds(tx, { projectId: project.id, scopeId: north.id }));
   const withRevisions = await transaction(app.db, (tx) => assessment.selectConfirmedGrounds(tx, {
@@ -452,6 +468,20 @@ test("assessment through real HTTP, PostgreSQL, reader and letter modules", {
   const pending = await upload("Pending new data", "North revision.pdf", [north.id], false, pendingReceipt.receiptId);
   await http("GET", `/letters/${letter.id}/current-text`, 409, undefined, letter.version);
   assert.equal((await current(south)).holds.length, 0);
+  const duringHold = await current(north);
+  const interim = await apply({
+    ...sameReview, eventId: randomUUID(),
+    changes: duringHold.questions.map((question) => ({
+      questionId: question.id,
+      expectedDependencyVersion: question.dependencyVersion,
+      review: { inputGeneration: duringHold.inputGeneration,
+        completenessChecked: false, remaining: ["primary_coverage_pending"], findings: [] },
+    })),
+  });
+  assert.equal(interim.assessmentVersion, duringHold.version);
+  const decisionsDuringHold = await current(north);
+  assert.deepEqual(decisionsDuringHold.questions, duringHold.questions);
+  assert.equal(decisionsDuringHold.conclusion.id, conclusion.id);
   await http("POST", `/uploads/${pending.uploadId}/cancel`, 200, {});
   assert.equal((await current(north)).holds.length, 0);
   assert.equal((await http("GET", `/letters/${letter.id}/current-text`, 200, undefined, letter.version)).text, text.text);
@@ -488,4 +518,55 @@ test("assessment through real HTTP, PostgreSQL, reader and letter modules", {
     impacts: [{ scopeId: north.id, assessmentVersion: revised.version, questionIds: [] }],
   }, lateHold.version);
   await http("GET", `/letters/${missingLetter.id}/current-text`, 412, undefined, missingLetter.version);
+
+  // Re-establish the conflict under the original formats, then replace only its schedule source.
+  const currentProject = await http("GET", p, 200);
+  await http("PUT", `${p}/catalog`, 200, { catalogVersionId: rules.id }, currentProject.version);
+  const beforeReplacement = await current(north);
+  const target = beforeReplacement.questions.find(({ id }) => id === conflict.id);
+  const independent = beforeReplacement.questions.find(({ id }) => id === absence.id);
+  const publishValues = (assessmentSnapshot, question, findings) => apply({
+    projectId: project.id, scopeId: north.id, eventId: randomUUID(), reason: "primary_research_update",
+    changes: [{ questionId: question.id, expectedDependencyVersion: question.dependencyVersion,
+      review: { ...review, inputGeneration: assessmentSnapshot.inputGeneration, findings } }],
+  });
+  await publishValues(beforeReplacement, target, [finding(left), finding(right)]);
+  const newConflict = (await current(north)).questions.find(({ id }) => id === target.id);
+  const priorDecision = await http("POST", confirmPath, 201, decisionInput, newConflict.version);
+  const independentDecision = await http("POST", `/questions/${independent.id}/decisions`, 201,
+    { action: "confirm", reason: "Continue investigating the unrelated finish schedule." }, independent.version);
+
+  const replacementReceipt = await http("POST", `${p}/receipts`, 201, {});
+  const replacementFile = await upload(["Revision N07", "Thickness D1 1.5 mm"], "B-revised.pdf",
+    [north.id], true, replacementReceipt.receiptId, b.versionId);
+  assert.equal(replacementFile.documentId, b.documentId);
+  await http("POST", `/receipts/${replacementReceipt.receiptId}/seal`, 200, {});
+  const replacement = await read(replacementFile, "B", "Thickness D1 1.5 mm", "1.5", "mm");
+  const { publishReaderObservation } = await fromBuild("src/modules/questions/reader.js");
+  await transaction(app.db, (tx) => publishReaderObservation(tx, {
+    observation: replacement.observation, projectId: project.id, scopeId: north.id, readerJobId: randomUUID(),
+    subject: "D1 thickness", property: thickness.part, role: "design", revision: "effective",
+    assessmentQuestionId: target.id, replacesConfirmed: true,
+  }));
+  const replacementPending = await current(north);
+  const affected = replacementPending.questions.find(({ id }) => id === target.id);
+  assert.deepEqual(replacementPending.change.affectedQuestionIds, [target.id]);
+  assert.equal(affected.decision, null);
+  assert.equal(affected.previousDecisionId, priorDecision.id);
+  assert.equal(affected.outcome, "needs_review");
+  assert.deepEqual(affected.machine.citations.map(({ observationId }) => observationId), [left.observation.id]);
+  assert.equal(replacementPending.questions.find(({ id }) => id === independent.id).decision.id, independentDecision.id);
+  await assert.rejects(publishValues(replacementPending, newConflict, [finding(left), finding(replacement)]),
+    { code: "assessment_input_stale" });
+  await publishValues(replacementPending, affected, [finding(left), finding(replacement)]);
+  const replaced = await current(north);
+  const settled = replaced.questions.find(({ id }) => id === target.id);
+  assert.equal(settled.outcome, "covered");
+  assert.deepEqual(settled.machine.citations.map(({ versionId }) => versionId), [a.versionId, replacementFile.versionId]);
+  const retained = replaced.questions.find(({ id }) => id === independent.id);
+  assert.deepEqual([retained.version, retained.decision.id], [independentDecision.version, independentDecision.id]);
+  const earlier = await http("GET", `${p}/assessments/${priorDecision.assessmentVersion}?scopeId=${north.id}`, 200);
+  const preserved = earlier.questions.find(({ id }) => id === target.id);
+  assert.deepEqual(preserved.decision.basis.citations.map(({ versionId }) => versionId), [a.versionId, b.versionId]);
+
 });

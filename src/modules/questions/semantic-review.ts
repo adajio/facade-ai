@@ -29,7 +29,7 @@ export async function scheduleSemanticReview(db: Pool, tx: PoolClient, inquiry: 
   if (!inquiry.assessment_question_id || !inquiry.anchor_id) return;
   const questionId = inquiry.assessment_question_id;
   const eligible = result.candidates.filter(({ source, applicability }) =>
-    source.assessmentQuestionId === questionId && source.quote && source.measurement &&
+    source.assessmentQuestionId === questionId && source.subjectVerified !== false && source.quote && source.measurement &&
     (applicability === "verified" || applicability === "meaning_unclear"));
   const branchB = eligible.filter(({ source }) => source.branch === "B");
   const branchA = eligible.filter(({ source }) => source.branch === "A");

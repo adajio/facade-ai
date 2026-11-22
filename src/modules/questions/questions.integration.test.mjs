@@ -33,7 +33,7 @@ function pdf(line) {
   return Buffer.from(file);
 }
 
-test("addressed publication, two facades, opened pair and empty inquiry", {
+test("independent supports, scoped revision and opened pairs before and after a supplement", {
   skip: !process.env.DATABASE_URL || !process.env.FACADE_S3_ENDPOINT,
 }, async () => {
   const { createApi } = await fromBuild("platform/api");
@@ -185,15 +185,18 @@ test("addressed publication, two facades, opened pair and empty inquiry", {
     assert.ok(current.candidates.some(({ applicability }) => applicability === "revision_unknown"));
     assert.equal(current.candidates.some(({ source }) => source.scopeId === south.id), false);
     assert.ok(current.limitations.includes("revision_unknown"));
-    for (const support of [current.pairs[0].left, current.pairs[0].right]) {
-      const evidence = await json("GET", support.evidenceHref);
-      assert.equal(evidence.source.sha256, support.sha256);
-      const bytes = await request("GET", support.contentHref);
-      assert.equal(bytes.headers["cache-control"], "no-store");
-      assert.equal(sha256(bytes.rawPayload), evidence.sha256);
-      const original = await request("GET", support.originalHref);
-      assert.equal(sha256(original.rawPayload), support.sha256);
+    async function assertOpenPair(pair) {
+      for (const support of [pair.left, pair.right]) {
+        const evidence = await json("GET", support.evidenceHref);
+        assert.equal(evidence.source.sha256, support.sha256);
+        const bytes = await request("GET", support.contentHref);
+        assert.equal(bytes.headers["cache-control"], "no-store");
+        assert.equal(sha256(bytes.rawPayload), evidence.sha256);
+        const original = await request("GET", support.originalHref);
+        assert.equal(sha256(original.rawPayload), support.sha256);
+      }
     }
+    await assertOpenPair(current.pairs[0]);
 
     const absent = await json("POST", `${project}/inquiries`, {
       scopeId: south.id, sliceId: (await list(south.id)).sliceId, catalogVersionId,
@@ -213,6 +216,38 @@ test("addressed publication, two facades, opened pair and empty inquiry", {
       "POST", `/api/inquiries/${inquiry.id}/decisions`, body, expected, { "If-Match": `"${inquiry.version}"` },
     );
     assert.equal((await decide(current, 409)).code, "scope_held");
+
+    const later = await upload(north.id, "later-note.pdf", "D1 revision 2 names both sources: use 1.5 mm");
+    await observe(later, { value: "1.5", branch: "B", role: "schedule", assessmentQuestionId: qNorth.id });
+    await drain();
+    const withNote = await detail(main.id);
+    const oldPair = withNote.pairs.find(({ left, right }) =>
+      [left.versionId, right.versionId].includes(a.source.versionId) &&
+      [left.versionId, right.versionId].includes(b.source.versionId));
+    assert.equal(oldPair?.comparison, "conflict", "a newer document naming both sources preserves both existing grounds");
+    assert.ok(withNote.pairs.some(({ comparison, right }) => comparison === "agreement" && right.versionId === later.versionId));
+    await assertOpenPair(oldPair);
+
+    const revised = await upload(north.id, "north-schedule-revision.pdf", "Panel-A revision 2 thickness 0.0015 m",
+      b.source.versionId);
+    const replacement = await observe(revised, {
+      subject: "Panel-A", aliases: ["D1"], value: "0.0015", unit: "m", branch: "B", role: "schedule",
+      assessmentQuestionId: qNorth.id,
+    });
+    assert.equal(revised.documentId, b.source.documentId);
+    await drain();
+    const updated = await detail(main.id);
+    assert.equal(updated.candidates.find(({ source }) => source.observationId === b.id)?.applicability, "revision_superseded");
+    assert.equal(updated.candidates.find(({ source }) => source.observationId === a.id)?.applicability, "verified");
+    assert.equal(updated.pairs.some(({ comparison }) => comparison === "conflict"), false);
+    const revisedPair = updated.pairs.find(({ right }) => right.observationId === replacement.id);
+    assert.equal(revisedPair?.comparison, "agreement");
+    assert.equal(revisedPair.left.observationId, a.id);
+    await assertOpenPair(revisedPair);
+    const history = await detail(main.id, current.searchVersion);
+    assert.equal(history.pairs[0].comparison, "conflict");
+    assert.equal(history.pairs[0].right.observationId, b.id);
+    await assertOpenPair(history.pairs[0]);
 
   } finally {
     storage.objects.close();
@@ -257,12 +292,17 @@ test("ordinary worker closes only verified input holds and runs a semantic revie
   const { bootstrapAdmin } = await fromBuild("modules/access/bootstrap");
   const { createGateway, journalFromEnv } = await fromBuild("modules/gateway/index");
   const { startWorker } = await fromBuild("modules/harness/index");
+  const { publication } = await fromBuild("modules/harness/publication");
+  const { loadResearchProfile } = await fromBuild("modules/harness/profile");
+  const { transaction } = await fromBuild("modules/access/commands");
 
   const controller = new AbortController();
   const providerErrors = [];
   const calls = [];
   const warnings = new Set();
   const inputs = new Map();
+  const mainSubject = "R1 thickness";
+  const independentParts = ["R1 overall length", "R1 offset", "R1 bracket", "R1 anchor spacing"];
   const provider = createServer(async (req, res) => {
     try {
       const { attempt, request } = await new Response(req).json();
@@ -292,10 +332,17 @@ test("ordinary worker closes only verified input holds and runs a semantic revie
         const { lines } = JSON.parse(replies[1].content);
         const line = lines.find(({ text }) => text === fixture.text);
         assert.ok(line, "addressed fixture row delivered by reader");
-        [name, args] = ["save_observation", {
-          evidenceId: replies[1].evidence.evidenceId, lineId: line.id, quote: line.text,
-          value: fixture.value, unit: "mm", sourceRole: "design",
-        }];
+        const subject = assignment.question?.subject;
+        const wrongAttribute = subject === independentParts[0] && fixture.text.includes("gauge");
+        if (subject === mainSubject || wrongAttribute) {
+          [name, args] = ["save_observation", {
+            evidenceId: replies[1].evidence.evidenceId, lineId: line.id,
+            quote: fixture.text.includes("gauge") ? "Panel-A gauge 1.5" : line.text,
+            value: fixture.value, unit: "mm", sourceRole: "design",
+          }];
+        } else {
+          [name, args] = ["finish_reading", { status: "no_match", explanation: "Inspected; other attribute." }];
+        }
       } else {
         assert.ok(replies[2].observationId, "observation was saved");
         [name, args] = ["finish_reading", { status: "covered", explanation: "Addressed value." }];
@@ -345,8 +392,11 @@ test("ordinary worker closes only verified input holds and runs a semantic revie
   auth = { ...auth, cookie: session.headers["set-cookie"].split(";")[0], "x-csrf-token": session.json().csrfToken };
   const catalog = await json("POST", "/api/catalogs", {
     key: "step12-catalog", name: "Step 12",
-    requirements: [{ key: "thickness", part: "R1 thickness", applicability: "all", formats: ["pdf"],
-      equivalents: [], sourceRoles: ["design"], completenessCriterion: "Addressed value", addressee: "Customer" }],
+    requirements: [
+      { key: "thickness", part: mainSubject, formats: ["pdf"] },
+      ...independentParts.map((part, index) => ({ key: `independent-${index}`, part, formats: ["docx"] })),
+    ].map((requirement) => ({ ...requirement, applicability: "all", equivalents: [], sourceRoles: ["design"],
+      completenessCriterion: "Addressed value", addressee: "Customer" })),
   }, 201);
   const project = await json("POST", "/api/projects", {
     name: "Two facades", catalogVersionId: catalog.id, scopeName: "North", stage: "design",
@@ -398,15 +448,32 @@ test("ordinary worker closes only verified input holds and runs a semantic revie
     } while (Date.now() < deadline && providerErrors.length === 0);
     assert.fail(`${label}: ${JSON.stringify({ state, warnings: [...warnings], providerErrors }).slice(0, 2200)}`);
   }
+  const mainQuestion = (card) => card.questions.find(({ requirement }) => requirement.positionId === "thickness");
   const assessed = (outcome) => until(() => assessment(north),
-    (card) => card.holds.length === 0 && card.questions[0]?.machine.outcome === outcome, outcome);
+    (card) => card.holds.length === 0 && mainQuestion(card)?.machine.outcome === outcome, outcome);
 
   const initial = await declare(north, "design.pdf", "R1 thickness 1.5", "1.5");
   await initial.complete();
   await assessed("covered");
   const conflict = await declare(north, "schedule.pdf", "R1 thickness 1.8", "1.8");
   const { versionId } = await conflict.complete();
-  const before = (await assessed("confirmed_conflict")).questions[0];
+  const baseline = await assessed("confirmed_conflict");
+  const before = mainQuestion(baseline);
+  const independentDecisions = new Map();
+  for (const question of baseline.questions.filter(({ id }) => id !== before.id)) {
+    const saved = await json("POST", `/api/questions/${question.id}/decisions`, {
+      action: "correct", outcome: "needs_review", reason: "Retain independent internal review.",
+    }, 201, { "If-Match": `"${question.version}"` });
+    independentDecisions.set(question.id, { id: saved.id, version: saved.version, dependencyVersion: question.dependencyVersion });
+  }
+  assert.equal(independentDecisions.size, 4);
+  function assertIndependent(card) {
+    for (const [id, expected] of independentDecisions) {
+      const actual = card.questions.find((question) => question.id === id);
+      assert.deepEqual({ id: actual.decision?.id, version: actual.version, dependencyVersion: actual.dependencyVersion }, expected,
+        `dependency changed for ${actual.requirement.positionId}`);
+    }
+  }
   const confirmed = await json("POST", `/api/questions/${before.id}/decisions`, {
     action: "confirm", reason: "Checked both source values", requestExternal: true,
   }, 201, { "If-Match": `"${before.version}"` });
@@ -427,10 +494,29 @@ test("ordinary worker closes only verified input holds and runs a semantic revie
   const originalSent = await json("GET", sent.url, undefined, 200);
 
   const independent = await declare(south, "south.pdf", "R1 thickness 9.0", "9.0");
-  const supplement = await declare(north, "schedule-rev2.pdf", "Panel-A gauge 1.5", "1.5", versionId);
+  const supplement = await declare(north, "schedule-rev2.pdf", "R1 thickness - Panel-A gauge 1.5", "1.5", versionId);
   assert.equal((await json("GET", textPath, undefined, 409, ifMatch)).code, "scope_held");
   const replacement = await supplement.complete();
-  await assessed("covered");
+  const settled = await assessed("covered");
+  assertIndependent(settled);
+  const { rows: replayJobs } = await app.db.query(`
+    SELECT j.id AS "jobId", j.project_id AS "projectId", j.scope_id AS "scopeId",
+      j.generation_id AS "generationId", j.payload AS job, j.result
+    FROM gateway_jobs j JOIN gateway_generations g ON g.generation_id=j.generation_id AND g.current
+    WHERE j.project_id=$1 AND j.scope_id=$2 AND j.purpose IN ('primary_a','primary_b')
+      AND j.state='done' AND j.payload#>>'{question,id}'=ANY($3::text[])
+  `, [projectId, north, [...independentDecisions.keys()]]);
+  assert.ok(replayJobs.length >= 4);
+  const publish = publication(app.db, gateway, loadResearchProfile());
+  for (const { result, ...task } of replayJobs) await transaction(app.db, (tx) => publish.outcome(tx, task, result));
+  assertIndependent(await assessment(north));
+  const { rows: wrongAttribute } = await app.db.query(`
+    SELECT o.source->>'subjectVerified' AS verified, h.finding->>'applicability' AS applicability
+    FROM harness_observations h JOIN inquiry_observations o ON o.id=h.observation_id
+    WHERE o.version_id=$1 AND h.question_id=ANY($2::uuid[])
+  `, [replacement.versionId, [...independentDecisions.keys()]]);
+  assert.equal(wrongAttribute.length, 2, "each branch attempts the same false attachment");
+  assert.ok(wrongAttribute.every(({ verified, applicability }) => verified === "false" && applicability === "unknown"));
   const stale = await app.inject({ method: "GET", url: textPath, headers: { ...auth, ...ifMatch } });
   assert.ok([409, 412].includes(stale.statusCode));
   assert.notEqual(stale.json().code, "scope_held");
@@ -449,4 +535,32 @@ test("ordinary worker closes only verified input holds and runs a semantic revie
   assert.equal(proof.n, 2);
   assert.equal((await journal.journal.balance()).spentUsdNanos, 0);
   assert.deepEqual(providerErrors, []);
+});
+
+test("addressed subject requires the measured attribute, including two attributes of one item", async () => {
+  const { hasAddressedSubject } = await fromBuild("modules/questions/subject-evidence");
+  const task = (property) => ({ subject: "P-16", property });
+  const value = (lineId, quote, measure) => ({ lineId, quote, value: measure, unit: "mm", grounding: "text" });
+  const cells = [
+    ["key", "Mark", 1, 1], ["gap", "Gap", 1, 2], ["length", "Length", 1, 3],
+    ["item", "P-16", 2, 1], ["gap-value", "12", 2, 2], ["length-value", "38", 2, 3],
+  ].map(([id, text, row, column]) => ({ id, text, locator: { table: 1, row, column } }));
+  assert.equal(hasAddressedSubject(task("gap"), value("gap-value", "12", "12"), cells), true);
+  assert.equal(hasAddressedSubject(task("length"), value("length-value", "38", "38"), cells), true);
+  assert.equal(hasAddressedSubject(task("length"), value("gap-value", "12", "12"), cells), false);
+  assert.equal(hasAddressedSubject(task("gap"), value("length-value", "38", "38"), cells), false);
+
+  const text = "P-16 gap 12 mm; P-16 length 38 mm";
+  const inline = [{ id: "values", text }];
+  assert.equal(hasAddressedSubject(task("length"), value("values", text, "12"), inline), false);
+  assert.equal(hasAddressedSubject(task("length"), value("values", text, "38"), inline), true);
+  const adjacent = [
+    { id: "heading", text: "This revision concerns only gap P-16.", locator: { line: 1 } },
+    { id: "value", text: "Use 12 mm for P-16.", locator: { line: 2 } },
+  ];
+  // The disambiguating identifier must be in the addressed sentence before the value.
+  assert.equal(hasAddressedSubject(task("gap"), value("value", adjacent[1].text, "12"), adjacent), false);
+  const bound = [adjacent[0], { ...adjacent[1], text: "For P-16 use 12 mm." }];
+  assert.equal(hasAddressedSubject(task("gap"), value("value", bound[1].text, "12"), bound), true);
+  assert.equal(hasAddressedSubject(task("length"), value("value", bound[1].text, "12"), bound), false);
 });

@@ -30,6 +30,7 @@ export interface ObservationPublication extends Subject {
   quote?: string;
   measurement?: { value: string; unit: string };
   readable: boolean;
+  subjectVerified?: boolean;
   assessmentQuestionId?: string;
   generationId?: string;
   supersedesVersionIds?: readonly string[];
@@ -103,6 +104,7 @@ export function checkLocalApplicability(
   if (source.role === "unknown") return "role_unknown";
   if (source.role === "reference") return "reference_only";
   if (!source.readable) return "unreadable";
+  if (source.subjectVerified === false) return "meaning_unclear";
 }
 
 const lengthPowers = new Map([

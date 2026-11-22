@@ -13,7 +13,7 @@ import { hasVerifiedMeaning } from "./semantic-review.js";
 type Reader = Pick<ReturnType<typeof createRuntimePdfService>, "findObservation" | "findEvidence" | "content">;
 
 type Anchoring = Pick<ObservationPublication, "subject" | "aliases" | "property" | "variant" | "role" |
-  "revision" | "priority" | "comparableContext" | "assessmentQuestionId" | "generationId">;
+  "revision" | "priority" | "comparableContext" | "assessmentQuestionId" | "generationId" | "subjectVerified">;
 
 type ReaderOriginal = {
   original_id: string;

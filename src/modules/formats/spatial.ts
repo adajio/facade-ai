@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { decodeText, FormatHold, unit } from "./model.js";
-import type { CadShape, Parsed, Row, Unit } from "./model.js";
+import type { CadShape, Locator, Parsed, Row, Unit } from "./model.js";
 
 type Group = { code: number; value: string };
 type Entity = { type: string; groups: Group[] };
@@ -48,9 +48,10 @@ export function parseDxf(input: Buffer): Parsed {
   if (input.subarray(0, 20).toString().startsWith("AutoCAD Binary DXF")) {
     throw new FormatHold("dxf_binary_unsupported");
   }
-  const content = decodeText(input);
-  const records = dxfRecords(content);
-  const issues = new Set<string>();
+  return parseCadRecords(dxfRecords(decodeText(input)));
+}
+
+function parseCadRecords(records: Entity[], issues = new Set<string>()): Parsed {
   const spaces = new Map<string, { rows: Row[]; shapes: CadShape[]; limitations: Set<string> }>();
   const space = (name: string) => {
     if (!spaces.has(name)) spaces.set(name, { rows: [], shapes: [], limitations: new Set() });
@@ -92,7 +93,8 @@ export function parseDxf(input: Buffer): Parsed {
 
   let section = "";
   let entities = false;
-  const handles = new Set<string>();
+  const sourceEntities: Entity[] = [];
+  const handleCounts = new Map<string, number>();
   for (const record of records) {
     if (record.type === "SECTION") {
       section = first(record, 2) ?? "";
@@ -104,29 +106,35 @@ export function parseDxf(input: Buffer): Parsed {
       continue;
     }
     if (section !== "ENTITIES") continue;
+    sourceEntities.push(record);
+    const handle = first(record, 5)?.toUpperCase();
+    if (handle) handleCounts.set(handle, (handleCounts.get(handle) ?? 0) + 1);
+  }
+  if (!entities) throw new FormatHold("dxf_entities_section_missing");
+
+  for (const [index, record] of sourceEntities.entries()) {
     const name = first(record, 410) || ownerLayouts.get(first(record, 330)?.toUpperCase() ?? "")
       || (first(record, 67) === "1" ? "Paper" : "Model");
     const layout = space(name);
     if (layout.rows.length >= 6000 || layout.shapes.length > 15000) throw new FormatHold("cad_entity_limit");
-    const handle = first(record, 5)?.toUpperCase();
-    if (!handle || !/^[0-9A-F]{1,16}$/.test(handle) || handles.has(handle)) {
-      layout.limitations.add("cad_entity_handle_unconfirmed");
-      continue;
-    }
-    handles.add(handle);
+    const candidate = first(record, 5)?.toUpperCase();
+    const handle = candidate && /^[0-9A-F]{1,16}$/.test(candidate) && handleCounts.get(candidate) === 1
+      ? candidate : undefined;
+    const entityOrdinal = index + 1;
+    if (!handle) layout.limitations.add("cad_entity_handle_unconfirmed");
     const type = record.type;
     const text = ["TEXT", "MTEXT", "ATTRIB", "ATTDEF"].includes(type) ? cadText(record) : "";
     const x = numeric(record, 10);
     const y = numeric(record, 20);
     const layer = first(record, 8) ?? "0";
-    const locator = { space: name, handle };
+    const locator: Locator = handle ? { space: name, handle } : { space: name, entityOrdinal };
     const row: Row = { locator, text, details: { layer, entity: type } };
     layout.rows.push(row);
     if (x === undefined || y === undefined) {
       layout.limitations.add("cad_entity_geometry_unavailable");
       continue;
     }
-    const shape = { handle, layer, kind: type, x, y };
+    const shape = { handle: handle ?? `ordinal:${entityOrdinal}`, layer, kind: type, x, y };
     const extrusion = numeric(record, 230);
     if (numeric(record, 30) || numeric(record, 210) || numeric(record, 220)
         || (extrusion !== undefined && extrusion !== 1)) layout.limitations.add("cad_nonplanar_projection");
@@ -177,8 +185,6 @@ export function parseDxf(input: Buffer): Parsed {
       layout.limitations.add("cad_entity_type_unsupported");
     }
   }
-  if (!entities) throw new FormatHold("dxf_entities_section_missing");
-
   const units: Unit[] = [...spaces].map(([name, { rows, shapes, limitations }]) => {
     if (name.length > 300) throw new FormatHold("cad_layout_name_limit");
     const id = `space:${createHash("sha256").update(name).digest("hex").slice(0, 24)}`;
@@ -196,6 +202,53 @@ export function parseDxf(input: Buffer): Parsed {
       cad: model.shapes, cadView: frame });
   }
   return { units };
+}
+
+export function parseDwgRecovery(input: Buffer): Parsed {
+  const document: { created_by?: unknown; OBJECTS?: unknown } = JSON.parse(decodeText(input));
+  if (typeof document?.created_by !== "string" || !document.created_by.startsWith("LibreDWG ")
+      || !Array.isArray(document.OBJECTS)) throw new FormatHold("dwg_recovery_invalid");
+  if (document.OBJECTS.length > 60_000) throw new FormatHold("cad_entity_limit");
+
+  const issues = new Set(["cad_dwg_json_recovery"]);
+  const recovered: Entity[] = [];
+  for (const value of document.OBJECTS as unknown[]) {
+    if (value === null || typeof value !== "object") continue;
+    const object = value as Record<string, unknown>;
+    const { entity, entmode, ins_pt: point, height, rotation, handle } = object;
+    if (typeof entity !== "string") continue;
+    if (entmode !== 1 && entmode !== 2) {
+      issues.add("cad_dwg_entity_space_unconfirmed");
+      continue;
+    }
+    const text = entity === "MTEXT" ? object.text : object.text_value;
+    if (!["TEXT", "MTEXT", "ATTRIB", "ATTDEF"].includes(entity) || typeof text !== "string") {
+      issues.add("cad_dwg_recovery_text_only");
+      continue;
+    }
+    const groups: Group[] = [
+      { code: 67, value: entmode === 1 ? "1" : "0" },
+      { code: 8, value: "?" },
+      { code: 1, value: text },
+    ];
+    const handleValue = Array.isArray(handle) ? handle[2] : undefined;
+    if (typeof handleValue === "number" && Number.isSafeInteger(handleValue) && handleValue > 0) {
+      groups.push({ code: 5, value: handleValue.toString(16) });
+    }
+    if (Array.isArray(point) && point.length >= 2 && point.slice(0, 2).every(Number.isFinite)) {
+      groups.push({ code: 10, value: String(point[0]) }, { code: 20, value: String(point[1]) });
+    }
+    if (Number.isFinite(height)) groups.push({ code: 40, value: String(height) });
+    if (typeof rotation === "number" && Number.isFinite(rotation)) {
+      groups.push({ code: 50, value: String(rotation * 180 / Math.PI) });
+    }
+    recovered.push({ type: entity, groups });
+  }
+  if (!recovered.length) throw new FormatHold("dwg_recovery_no_addressable_text");
+  return parseCadRecords([
+    { type: "SECTION", groups: [{ code: 2, value: "ENTITIES" }] },
+    ...recovered, { type: "ENDSEC", groups: [] },
+  ], issues);
 }
 
 const ifcRoot = /^IFC(?:PROJECT|SITE|BUILDING|BUILDINGSTOREY|SPACE|WALL|WALLSTANDARDCASE|SLAB|BEAM|COLUMN|MEMBER|PLATE|DOOR|WINDOW|CURTAINWALL|ROOF|OPENINGELEMENT|PROPERTYSET|ELEMENTQUANTITY|REL[A-Z0-9]+|PROXY|BUILDINGELEMENTPROXY|FURNISHINGELEMENT|FLOWTERMINAL)$/;
