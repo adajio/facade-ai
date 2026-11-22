@@ -3,9 +3,11 @@ import { requireAccess } from '../access/index.js';
 import { uuid } from '../access/auth.js';
 import { unavailable } from '../access/errors.js';
 import type { Gateway } from './gateway.js';
-import { GatewayError, type KnownReceipt } from './types.js';
+import type { ReconciliationInput } from './journal.js';
+import { GatewayError } from './types.js';
 
-const conflicts = new Set(['operation_conflict','attempt_already_settled','attempt_in_flight','attempt_not_sent']);
+const conflicts = new Set(['operation_conflict','attempt_already_settled','attempt_in_flight','attempt_not_sent',
+  'attempt_not_isolatable','attempt_already_isolated']);
 
 function apiError(error: unknown, requestId: string) {
   const code = error instanceof GatewayError ? error.code : 'journal_unavailable';
@@ -16,7 +18,7 @@ function apiError(error: unknown, requestId: string) {
   return { status, body: { code, message: 'Сверка попытки шлюза', requestId } };
 }
 
-function resolution(body: Record<string, unknown>): KnownReceipt | { state: 'unknown'; code: string } {
+function resolution(body: Record<string, unknown>): ReconciliationInput['resolution'] {
   if (body.state === 'paid') {
     return { state: 'paid', costUsdNanos: body.costUsdNanos as number, providerId: body.providerId as string,
       evidenceRef: body.evidenceRef as string };
@@ -25,6 +27,9 @@ function resolution(body: Record<string, unknown>): KnownReceipt | { state: 'unk
     return { state: 'rejected', code: body.code as string, evidenceRef: body.evidenceRef as string };
   }
   if (body.state === 'unknown') return { state: 'unknown', code: body.code as string };
+  if (body.state === 'isolate_unknown' && Object.keys(body).every(key => key === 'state' || key === 'reasonRef')) {
+    return { state: 'isolate_unknown' };
+  }
   throw new GatewayError('invalid_reconciliation');
 }
 

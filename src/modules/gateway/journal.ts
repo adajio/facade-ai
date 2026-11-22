@@ -9,7 +9,7 @@ export type ReconciliationInput = {
   attemptId: string;
   operationKey: string;
   reasonRef: string;
-  resolution: KnownReceipt | { state: 'unknown'; code: string };
+  resolution: KnownReceipt | { state: 'unknown'; code: string } | { state: 'isolate_unknown' };
 };
 
 type JournalRow = JournalEntry & {
@@ -19,13 +19,18 @@ type JournalRow = JournalEntry & {
 
 const columns = 'metadata AS attempt,state,receipt,created_order::text AS "createdOrder",started_at AS "startedAt"';
 const reserved = "state IN ('prepared','sending','unknown')";
+const isolated = `EXISTS (
+  SELECT 1 FROM gateway_external_reconciliation r
+  WHERE r.attempt_id=gateway_external_attempts.id AND r.outcome->>'routeIsolated'='true'
+)`;
 
-function balanceOf(entry: JournalEntry) {
+function balanceOf(entry: JournalEntry, routeIsolated?: true) {
   return {
     state: entry.state,
     reserveUsdNanos: ['prepared','sending','unknown'].includes(entry.state) ? entry.attempt.ceilingUsdNanos : 0,
     spentUsdNanos: entry.receipt?.state === 'paid' ? entry.receipt.costUsdNanos : 0,
     receipt: entry.receipt,
+    ...(routeIsolated ? { routeIsolated } : {}),
   };
 }
 
@@ -60,6 +65,11 @@ export class PostgresIntentJournal {
       [effectKey],
     );
     return result.rows[0] ?? null;
+  }
+
+  private async hasRouteIsolation(tx: PoolClient, attemptId: string): Promise<boolean> {
+    const found = await tx.query(`SELECT 1 FROM gateway_external_attempts WHERE id=$1 AND ${isolated}`, [attemptId]);
+    return Boolean(found.rowCount);
   }
 
   async head(effectKey: string): Promise<JournalEntry | null> {
@@ -105,7 +115,8 @@ export class PostgresIntentJournal {
       const current = await this.latest(tx, attempt.effectKey);
       if (current?.attempt.id === attempt.id) return current;
       if (current && current.attempt.requestHash !== attempt.requestHash) return 'effect_conflict';
-      if (current && (current.state !== 'rejected' || current.attempt.id !== attempt.previousRejectedId)) return current;
+      if (current && (current.state !== 'rejected' || current.attempt.id !== attempt.previousRejectedId
+        || await this.hasRouteIsolation(tx, current.attempt.id))) return current;
       if (frozen) return 'budget_frozen';
       const budget = await this.budget(tx);
       if (budget.spentUsdNanos + budget.reserveUsdNanos + attempt.ceilingUsdNanos > BUDGET_USD_NANOS) {
@@ -134,12 +145,13 @@ export class PostgresIntentJournal {
           EXISTS (SELECT 1 FROM gateway_external_attempts WHERE route_id=$1 AND slot_until>clock_timestamp()
             AND state IN ('sending','unknown')) AS route_busy,
           EXISTS (SELECT 1 FROM gateway_external_attempts WHERE project_id=$2 AND route_id=$1
-            AND state IN ('sending','unknown')) AS unresolved,
+            AND (state='sending' OR (state='unknown'
+              AND (coalesce(metadata->>'jobId',$5)=$5 OR receipt->>'providerId' IS NOT NULL OR NOT ${isolated})))) AS unresolved,
           EXISTS (SELECT 1 FROM gateway_external_attempts WHERE generation_id=$3
             AND purpose IN ('primary_a','primary_b') AND state IN ('sending','unknown')) AS active_primary,
           EXISTS (SELECT 1 FROM gateway_external_attempts WHERE route_id=$1
             AND started_at>clock_timestamp()-$4::int*interval '1 millisecond') AS rate_limited`,
-        [route.id, entry.attempt.projectId, entry.attempt.generationId, route.minIntervalMs ?? 0],
+        [route.id, entry.attempt.projectId, entry.attempt.generationId, route.minIntervalMs ?? 0, entry.attempt.jobId],
       );
       const gate = gates.rows[0];
       if (entry.attempt.purpose === 'review' && gate.active_primary) return 'primary_barrier';
@@ -221,16 +233,24 @@ export class PostgresIntentJournal {
         return saved.rows[0].outcome;
       }
       const entry = await this.byId(tx, input.attemptId);
-      const active = await tx.query(
-        "SELECT 1 FROM gateway_external_attempts WHERE id=$1 AND state='sending' AND slot_until>clock_timestamp()",
-        [input.attemptId],
-      );
-      if (active.rowCount) throw new GatewayError('attempt_in_flight');
-      if (entry.state === 'paid' || entry.state === 'rejected') {
-        if (!sameSettlement(entry.receipt, input.resolution)) throw new GatewayError('attempt_already_settled');
+      let outcome: ReturnType<typeof balanceOf>;
+      if (input.resolution.state === 'isolate_unknown') {
+        if (entry.state !== 'unknown' || entry.receipt?.state !== 'unknown' || entry.receipt.providerId) {
+          throw new GatewayError('attempt_not_isolatable');
+        }
+        if (await this.hasRouteIsolation(tx, input.attemptId)) throw new GatewayError('attempt_already_isolated');
+        outcome = balanceOf(entry, true);
+      } else {
+        const active = await tx.query(
+          "SELECT 1 FROM gateway_external_attempts WHERE id=$1 AND state='sending' AND slot_until>clock_timestamp()",
+          [input.attemptId],
+        );
+        if (active.rowCount) throw new GatewayError('attempt_in_flight');
+        if ((entry.state === 'paid' || entry.state === 'rejected') && !sameSettlement(entry.receipt, input.resolution)) {
+          throw new GatewayError('attempt_already_settled');
+        }
+        outcome = balanceOf(await this.settlement(tx, entry, input.resolution));
       }
-      const final = await this.settlement(tx, entry, input.resolution);
-      const outcome = balanceOf(final);
       await tx.query(
         `INSERT INTO gateway_external_reconciliation(actor_id,operation_key,attempt_id,authority,reason_ref,
          fingerprint,previous,outcome) VALUES($1,$2,$3,$4,$5,$6,$7,$8)`,
@@ -238,6 +258,16 @@ export class PostgresIntentJournal {
          fingerprint, encode(balanceOf(entry)), encode(outcome)],
       );
       return outcome;
+    });
+  }
+
+  async routeIsolations(): Promise<JournalEntry[]> {
+    return transaction(this.pool, async tx => {
+      await this.bound(tx);
+      const result = await tx.query<JournalRow>(
+        `SELECT ${columns} FROM gateway_external_attempts WHERE ${isolated}`,
+      );
+      return result.rows;
     });
   }
 

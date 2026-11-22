@@ -452,18 +452,39 @@ export class Gateway extends WorkQueue {
     return this.journal;
   }
 
+  private async mirrorIsolation(entry: JournalEntry, journal: PostgresIntentJournal) {
+    await transaction(this.db, async tx => {
+      await this.mirror(entry, journal, tx);
+      await tx.query(
+        'UPDATE gateway_attempts SET route_isolated=true WHERE id=$1 AND ledger_id=$2 AND NOT route_isolated',
+        [entry.attempt.id, journal.ledgerId],
+      );
+    });
+  }
+
+  async syncRouteIsolations() {
+    const journal = this.requireJournal();
+    await transaction(this.db, tx => this.bind(tx, journal));
+    for (const entry of await journal.routeIsolations()) await this.mirrorIsolation(entry, journal);
+  }
+
   async reconcile(operator: OperatorAuthorization, input: ReconciliationInput) {
     if (operator.authority !== 'gateway:reconcile' || !shortRef(operator.actorId)) {
       throw new GatewayError('reconciliation_forbidden');
     }
-    if (!shortRef(input.operationKey) || !shortRef(input.reasonRef) || !validReceipt(input.resolution)) {
+    const requested = input.resolution;
+    if (!shortRef(input.operationKey) || !shortRef(input.reasonRef)
+      || (requested?.state !== 'isolate_unknown' && !validReceipt(requested))) {
       throw new GatewayError('invalid_reconciliation');
     }
     const journal = this.requireJournal();
     await transaction(this.db, tx => this.bind(tx, journal));
-    const outcome = await journal.reconcile(operator, { ...input, resolution: durableReceipt(input.resolution) });
+    const resolution = requested.state === 'isolate_unknown'
+      ? { state: 'isolate_unknown' as const } : durableReceipt(requested);
+    const outcome = await journal.reconcile(operator, { ...input, resolution });
     const entry = await journal.attempt(input.attemptId);
-    await this.mirror(entry, journal);
+    if (outcome.routeIsolated) await this.mirrorIsolation(entry, journal);
+    else await this.mirror(entry, journal);
     if (outcome.state === 'paid' || outcome.state === 'rejected') await this.resume(entry.attempt.jobId,
       ['unknown_charge','route_reconciliation','effect_already_claimed','journal_unavailable']);
     return outcome;
@@ -487,7 +508,7 @@ export class Gateway extends WorkQueue {
          ORDER BY j.created_at DESC LIMIT 200`, [projectId],
       ),
       this.db.query(
-        `SELECT id,job_id AS "jobId",route_id AS "routeId",state,
+        `SELECT id,job_id AS "jobId",route_id AS "routeId",state,route_isolated AS "routeIsolated",
          CASE WHEN state IN ${active} THEN ceiling_usd_nanos::float8 ELSE 0 END AS "reserveUsdNanos",
          coalesce((receipt->>'costUsdNanos')::float8,0) AS "spentUsdNanos",
          coalesce(receipt->>'code', CASE WHEN state='sending' THEN 'awaiting_provider_receipt' END) AS reason,

@@ -7,6 +7,7 @@ import pg from 'pg';
 import type {} from '../../platform/api.js';
 import { accessConfig, csrfToken, digest, randomSecret } from '../access/auth.js';
 import { register as registerAccess } from '../access/index.js';
+import { resumeInterruptedResearch } from '../harness/runner.js';
 import { registerOperatorRoutes } from './operator.js';
 import { Gateway } from './gateway.js';
 import { PostgresIntentJournal } from './journal.js';
@@ -69,6 +70,7 @@ async function isolated(t: TestContext, url: string, file?: string): Promise<pg.
     await admin.end();
   });
   if (file) await pool.query(await readFile(file, 'utf8'));
+  if (file === appSql) await pool.query(await readFile('db/migrations/08_gateway_z_route_isolation.sql', 'utf8'));
   return pool;
 }
 
@@ -598,6 +600,106 @@ test('restored database reconciles the original charge and repeats the operator 
   t.diagnostic('restore before application dispatch: 2 total sends, original effect held and settled once, restored reading preserved');
 });
 
+test('unknown isolation preserves the effect and reserve across concurrent same-route work and restart', sqlCase, async t => {
+  const s = await setup(t);
+  await s.db.query(await readFile('db/migrations/09_harness_z_route_bindings.sql', 'utf8'));
+  const ref = project();
+  const sameProject = { ...project(), projectId: ref.projectId };
+  await s.gateway.openGeneration(ref);
+  await s.gateway.sealGeneration(ref, manifest);
+  await grant(s.gateway, ref);
+  await s.gateway.openGeneration(sameProject);
+  await s.gateway.sealGeneration(sameProject, manifest);
+  const original = await lease(s.gateway, ref, 'original', obligationA);
+  const review = await lease(s.gateway, ref, 'review');
+  async function otherJob(key: string, kind = 'harness_research', generation = ref) {
+    await s.gateway.enqueue({ ...generation, key, kind, purpose: 'primary_b', subjectId: key,
+      obligationId: obligationB.id, payload: { settings: { routeId: baseRoute.id } } });
+    const work = await s.gateway.claim({ workerId: key, kinds: [kind], leaseMs: 120_000 });
+    assert.ok(work);
+    return work.lease;
+  }
+  const sibling = await otherJob('sibling');
+  const competitor = await otherJob('competitor', 'competitor', sameProject);
+  s.setBehavior(async () => 'disconnect');
+  const lost = isHeld(await s.gateway.call(call(original)), 'unknown_charge');
+  assert.ok(lost.attemptId);
+  const blocked = isHeld(await s.gateway.call(call(sibling)), 'route_reconciliation');
+  assert.ok(await s.gateway.suspend(sibling, { reason: blocked.code, nextAction: blocked.nextAction }));
+  await resumeInterruptedResearch(s.db, s.gateway, new AbortController().signal);
+  assert.equal(await s.gateway.claim({ workerId: 'old', kinds: ['harness_research'], leaseMs: 120_000 }), null);
+
+  const operation = {
+    attemptId: lost.attemptId, operationKey: 'isolate', reasonRef: 'synthetic:unattributed-key-delta',
+    resolution: { state: 'isolate_unknown' as const },
+  };
+  // Commit the journal first and simulate a crash before the app receives the marker.
+  const results = await Promise.all(Array.from({ length: 2 }, () => s.journal.reconcile(actor, operation)));
+  const [receipt] = results;
+  assert.deepEqual(results, [receipt, receipt]);
+  assert.deepEqual(receipt, {
+    state: 'unknown', routeIsolated: true, reserveUsdNanos: baseRoute.ceilingUsdNanos, spentUsdNanos: 0,
+    receipt: { state: 'unknown', code: 'provider_connection_lost' },
+  });
+  assert.equal((await s.outside.query('SELECT count(*)::int AS n FROM gateway_external_reconciliation')).rows[0].n, 1);
+  assert.equal((await s.db.query('SELECT route_isolated FROM gateway_attempts WHERE id=$1', [lost.attemptId])).rows[0].route_isolated, false);
+  const restarted = new Gateway(s.db, new PostgresIntentJournal(s.outside, s.journal.ledgerId), s.transport);
+  await restarted.syncRouteIsolations();
+  await resumeInterruptedResearch(s.db, restarted, new AbortController().signal);
+  const resumed = await restarted.claim({ workerId: 'resumed', kinds: ['harness_research'], leaseMs: 120_000 });
+  assert.equal(resumed?.lease.jobId, sibling.jobId);
+  assert.deepEqual(await restarted.reconcile(actor, operation), receipt);
+  await assert.rejects(restarted.reconcile(actor, { ...operation, operationKey: 'separate-command' }), /attempt_already_isolated/);
+  assert.equal(isHeld(await restarted.call(call(original)), 'unknown_charge').attemptId, lost.attemptId);
+  isHeld(await restarted.call({ ...call(original), effectKey: 'another-turn' }), 'route_reconciliation');
+  assert.ok(await restarted.suspend(original, { reason: lost.code, nextAction: lost.nextAction }));
+  assert.equal(await restarted.resume(original.jobId), false);
+  isHeld(await restarted.call(call(resumed!.lease)), 'route_busy');
+  isHeld(await restarted.call(call(review)), 'primary_barrier');
+  await s.outside.query("UPDATE gateway_external_attempts SET slot_until=clock_timestamp()-interval '1 second' WHERE id=$1",
+    [lost.attemptId]);
+
+  const largeRoute = { ...baseRoute, id: 'separate-bound-route', ceilingUsdNanos: BUDGET_USD_NANOS };
+  await restarted.configureRoute(largeRoute);
+  await grant(restarted, ref, true, largeRoute);
+  isHeld(await restarted.call(call(resumed!.lease, largeRoute.id)), 'budget_exhausted');
+
+  const dispatch = gate();
+  const release = gate();
+  t.after(release.release);
+  s.setBehavior(async () => { dispatch.release(); await release.promise; return 'disconnect'; });
+  const independent = restarted.call(call(resumed!.lease));
+  await reached(dispatch, independent);
+  isHeld(await restarted.call(call(competitor)), 'route_reconciliation');
+  const inFlight = await s.journal.balance();
+  assert.equal(inFlight.reserveUsdNanos, 2 * baseRoute.ceilingUsdNanos);
+  assert.equal(inFlight.spentUsdNanos, 0);
+  release.release();
+  const secondUnknown = isHeld(await independent, 'unknown_charge');
+  assert.notEqual(secondUnknown.attemptId, lost.attemptId);
+  isHeld(await restarted.call(call(competitor)), 'route_reconciliation');
+  let state = await s.read();
+  assert.equal(state.provider.length, 2);
+  assert.equal(state.budget.reserveUsdNanos, 2 * baseRoute.ceilingUsdNanos);
+  assert.equal(state.app.find(row => row.id === lost.attemptId).state, 'unknown');
+
+  await s.outside.query('UPDATE gateway_external_ledger SET frozen=true');
+  isHeld(await restarted.call(call(competitor)), 'budget_frozen');
+  const paid = await restarted.reconcile(actor, { ...operation, operationKey: 'later-real-receipt',
+    resolution: { state: 'paid', providerId: 'controlled:' + lost.attemptId,
+      evidenceRef: 'fixture:actual-receipt', costUsdNanos: 11_576_985 } });
+  assert.equal(paid.state, 'paid');
+  assert.equal(paid.reserveUsdNanos, 0);
+  assert.equal(paid.spentUsdNanos, 11_576_985);
+  const recoveredOriginal = await restarted.claim({ workerId: 'after-settlement', kinds: ['original'], leaseMs: 120_000 });
+  assert.ok(recoveredOriginal);
+  isHeld(await restarted.call(call(recoveredOriginal.lease)), 'result_missing');
+  state = await s.read();
+  assert.equal(state.provider.length, 2);
+  assert.equal(state.budget.reserveUsdNanos, baseRoute.ceilingUsdNanos);
+  assert.equal(state.budget.spentUsdNanos, 11_576_985);
+});
+
 test('known 429 permits one explicit retry and concurrent projects share the exact $10 limit', sqlCase, async t => {
   const policy = { ...baseRoute, ceilingUsdNanos: BUDGET_USD_NANOS };
   const s = await setup(t, policy);
@@ -926,10 +1028,20 @@ test('operator API authorizes organization and CSRF, stores an audit receipt and
   const repeated = await app.inject({ ...request, headers: allowed.headers });
   assert.equal(repeated.statusCode, first.statusCode);
   assert.deepEqual(repeated.json(), first.json());
+  const isolatePayload = { state: 'isolate_unknown', reasonRef: 'operator-evidence:key-delta' };
+  const isolateRequest = { ...request, headers: { ...allowed.headers, 'idempotency-key': 'fixture-isolate' },
+    payload: isolatePayload };
+  assert.equal((await app.inject({ ...isolateRequest, payload: { ...isolatePayload, providerId: 'invented-id' } })).statusCode, 422);
+  assert.equal((await app.inject({ ...isolateRequest, headers: other.headers })).statusCode, 404);
+  const isolatedAttempt = await app.inject(isolateRequest);
+  assert.equal(isolatedAttempt.statusCode, 200, isolatedAttempt.body);
+  assert.deepEqual(isolatedAttempt.json(), { ...first.json(), routeIsolated: true });
+  assert.deepEqual((await app.inject(isolateRequest)).json(), isolatedAttempt.json());
   const diagnostic = await app.inject({ method: 'GET', url: prefix, headers: allowed.headers });
   assert.equal(diagnostic.statusCode, 200);
   assert.equal(diagnostic.headers['cache-control'], 'no-store');
   assert.equal(diagnostic.json().attempts[0].nextAction, 'operator_reconcile_attempt');
+  assert.equal(diagnostic.json().attempts[0].routeIsolated, true);
   for (const hidden of ['synthetic-only','private-title','fragment-a:sha256']) assert.equal(diagnostic.body.includes(hidden), false);
   await s.provider.query("UPDATE provider_log SET state='rejected' WHERE id=$1", [result.attemptId]);
   const settled = await app.inject({ ...request,
@@ -939,10 +1051,15 @@ test('operator API authorizes organization and CSRF, stores an audit receipt and
   assert.equal(settled.statusCode, 200, settled.body);
   assert.equal(settled.json().reserveUsdNanos, 0);
   assert.equal(settled.json().state, 'rejected');
+  const repeatedEffect = await s.gateway.call({ ...call(worker), retryRejectedAttemptId: result.attemptId });
+  assert.equal(repeatedEffect.status, 'rejected');
+  assert.equal(repeatedEffect.attemptId, result.attemptId);
+  assert.equal((await s.read()).provider.length, 1);
   const audited = (await s.outside.query('SELECT actor_id, outcome FROM gateway_external_reconciliation ORDER BY created_at')).rows;
-  assert.equal(audited.length, 2);
+  assert.equal(audited.length, 3);
   assert.ok(audited.every(row => row.actor_id === allowed.id));
-  assert.deepEqual(audited[1].outcome, settled.json());
+  assert.deepEqual(audited[1].outcome, isolatedAttempt.json());
+  assert.deepEqual(audited[2].outcome, settled.json());
   t.diagnostic('real Fastify handlers and PostgreSQL sessions: 401, 403, 404, CSRF, repeat and private-content checks passed');
 });
 

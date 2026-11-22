@@ -66,6 +66,7 @@ export async function resumeInterruptedResearch(
        AND NOT EXISTS (
          SELECT 1 FROM gateway_attempts a WHERE a.project_id=j.project_id
            AND a.route_id=coalesce(j.payload#>>'{settings,routeId}',b.settings->>'routeId') AND a.state='unknown'
+           AND (NOT a.route_isolated OR a.job_id=j.id OR a.receipt->>'providerId' IS NOT NULL)
        )
      ORDER BY j.created_at,j.id`, [researchKind]);
   for (const { id, reason } of rows) {
@@ -132,7 +133,8 @@ function sessionPorts(
         // project route is still in flight. A known unknown charge stays held.
         const { rows: [unresolved] } = await db.query<{ id: string }>(
           `SELECT id FROM gateway_attempts WHERE project_id=$1 AND route_id=$2 AND state='unknown'
-           ORDER BY created_at LIMIT 1`, [task.projectId, task.job.settings.routeId]);
+           AND (NOT route_isolated OR job_id=$3 OR receipt->>'providerId' IS NOT NULL)
+           ORDER BY created_at LIMIT 1`, [task.projectId, task.job.settings.routeId, lease.jobId]);
         return unresolved ? { ...result, attemptId: unresolved.id }
           : { ...result, retryAt: new Date(Date.now() + 2_000) };
       }

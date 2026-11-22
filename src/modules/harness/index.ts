@@ -143,6 +143,7 @@ export async function startWorker(context: WorkerContext): Promise<void> {
       lanes.push(poll('research continuation', () => resumeResearchStops(db, gateway)));
       lanes.push(poll('research recovery', async () => {
         if ((await external.journal.balance()).frozen) return false;
+        await gateway.syncRouteIsolations();
         await resumeInterruptedResearch(db, gateway, signal);
         return true;
       }, true));
