@@ -28,6 +28,7 @@ type OpenRouterPricingQualification = {
 export type OpenRouterInputEnvelope = {
   evidenceRef: string;
   maxWireBytes: number;
+  maxTextWireBytes?: number;
   maxMessages: number;
   maxTools: number;
   tokensPerWireByte: number;
@@ -84,7 +85,7 @@ const disabledPlugins = ['web', 'file-parser', 'response-healing', 'auto-router'
 
 export type OpenRouterCostBound = {
   input: number;
-  inputEnvelope?: { wireBytes: number; messages: number; tools: number; images: number; inputTokens: number };
+  inputEnvelope?: { wireBytes: number; textWireBytes?: number; messages: number; tools: number; images: number; inputTokens: number };
   outputAndReasoning: number;
   images: number;
   request: number;
@@ -173,29 +174,29 @@ function tokenCount(value: unknown): number | undefined {
   return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0 ? value : undefined;
 }
 
-function validPng(url: unknown, profile: QualifiedOpenRouterProfile): boolean {
-  if (typeof url !== 'string') return false;
+function pngBase64Length(url: unknown, profile: QualifiedOpenRouterProfile): number | null {
+  if (typeof url !== 'string') return null;
   const match = imageUrl.exec(url);
-  if (!match || match[1].length > Math.ceil(profile.maxImageBytes / 3) * 4) return false;
+  if (!match || match[1].length > Math.ceil(profile.maxImageBytes / 3) * 4) return null;
   const png = Buffer.from(match[1], 'base64');
   if (png.length < 33 || png.length > profile.maxImageBytes || png.toString('base64') !== match[1]
     || !png.subarray(0,8).equals(signature) || png.readUInt32BE(8) !== 13
-    || png.toString('ascii',12,16) !== 'IHDR') return false;
+    || png.toString('ascii',12,16) !== 'IHDR') return null;
   const width = png.readUInt32BE(16);
   const height = png.readUInt32BE(20);
   if (!positiveInteger(width, profile.maxImageWidth) || !positiveInteger(height, profile.maxImageHeight)
-    || width * height > profile.maxImagePixels) return false;
+    || width * height > profile.maxImagePixels) return null;
 
   let pixels = false;
   for (let offset = 33; offset + 12 <= png.length;) {
     const size = png.readUInt32BE(offset);
     const type = png.toString('ascii', offset + 4, offset + 8);
     offset += 12 + size;
-    if (offset > png.length || ['acTL','fcTL','fdAT','IHDR'].includes(type)) return false;
+    if (offset > png.length || ['acTL','fcTL','fdAT','IHDR'].includes(type)) return null;
     if (type === 'IDAT') pixels = true;
-    if (type === 'IEND') return pixels && size === 0 && offset === png.length;
+    if (type === 'IEND') return pixels && size === 0 && offset === png.length ? match[1].length : null;
   }
-  return false;
+  return null;
 }
 
 function requireZdr(profile: OpenRouterProfile): boolean {
@@ -279,16 +280,23 @@ function validInputEnvelope(profile: OpenRouterProfile): boolean {
     && nonnegative(envelope.maxTools) && envelope.maxTools <= 1024
     && positiveInteger(envelope.tokensPerWireByte, 128)
     && nonnegative(envelope.templateOverheadTokens)
-    && (envelope.maxTokensPerImage === undefined || positiveInteger(envelope.maxTokensPerImage, 10_000_000)));
+    && (envelope.maxTokensPerImage === undefined || positiveInteger(envelope.maxTokensPerImage, 10_000_000))
+    && (envelope.maxTextWireBytes === undefined || (envelope.maxTokensPerImage !== undefined
+      && positiveInteger(envelope.maxTextWireBytes, envelope.maxWireBytes))));
 }
 
-function boundedInput(profile: OpenRouterProfile, wireBytes: number, messages: number, tools: number, images: number) {
+function boundedInput(profile: OpenRouterProfile, wireBytes: number, pngBase64Bytes: number,
+  messages: number, tools: number, images: number) {
   const envelope = profile.inputEnvelope;
   if (!envelope || wireBytes > envelope.maxWireBytes || messages > envelope.maxMessages || tools > envelope.maxTools
     || (images > 0 && envelope.maxTokensPerImage === undefined)) return undefined;
-  const inputs = envelope.templateOverheadTokens + wireBytes * envelope.tokensPerWireByte
+  const maxTextWireBytes = envelope.maxTextWireBytes;
+  const textWireBytes = wireBytes - pngBase64Bytes;
+  if (maxTextWireBytes !== undefined && textWireBytes > maxTextWireBytes) return undefined;
+  const inputs = envelope.templateOverheadTokens + (maxTextWireBytes === undefined ? wireBytes : textWireBytes) * envelope.tokensPerWireByte
     + images * (envelope.maxTokensPerImage ?? 0);
-  return { wireBytes, messages, tools, images, inputTokens: Math.min(inputs, profile.inputTokenUpperBound) };
+  return { wireBytes, ...(maxTextWireBytes === undefined ? {} : { textWireBytes }), messages, tools, images,
+    inputTokens: Math.min(inputs, profile.inputTokenUpperBound) };
 }
 
 function assignedSources(payload: unknown): Record<string, unknown>[] {
@@ -318,6 +326,7 @@ function requestBody(profile: QualifiedOpenRouterProfile, value: unknown, route:
   if (typeof tokens !== 'number' || !positiveInteger(tokens, profile.outputTokenLimit)
     || (body.max_completion_tokens !== undefined && body.max_tokens !== undefined)) return null;
   let images = 0;
+  let pngBase64Bytes = 0;
   const messages: Record<string, unknown>[] = [];
   for (const candidate of body.messages) {
     const message = record(candidate);
@@ -331,8 +340,12 @@ function requestBody(profile: QualifiedOpenRouterProfile, value: unknown, route:
       if (!part || Object.keys(part).length !== 2) return null;
       if (part.type === 'text' && typeof part.text === 'string') continue;
       const image = record(part.image_url);
-      if (part.type !== 'image_url' || !image || Object.keys(image).length !== 1 || !validPng(image.url, profile)) return null;
+      if (part.type !== 'image_url' || !image || Object.keys(image).length !== 1) return null;
+      const base64Bytes = pngBase64Length(image.url, profile);
+      if (base64Bytes === null) return null;
       images++;
+      // The qualified vision input is a user content part.
+      if (message.role === 'user') pngBase64Bytes += base64Bytes;
     }
   }
   if (images > profile.maxImages) return null;
@@ -361,7 +374,7 @@ function requestBody(profile: QualifiedOpenRouterProfile, value: unknown, route:
   };
   const wireBytes = Buffer.byteLength(JSON.stringify({ ...wire, trace: { trace_id: tracePlaceholder } }));
   if (wireBytes > route.maxRequestBytes) return null;
-  const inputEnvelope = boundedInput(profile, wireBytes, messages.length, Array.isArray(body.tools) ? body.tools.length : 0, images);
+  const inputEnvelope = boundedInput(profile, wireBytes, pngBase64Bytes, messages.length, Array.isArray(body.tools) ? body.tools.length : 0, images);
   const inputTokens = inputEnvelope?.inputTokens ?? profile.inputTokenUpperBound;
   // Wafer Chat Completions may retry without max_tokens if the requested context cannot fit.
   if (wafer && inputTokens + tokens > 1_048_576) {

@@ -261,6 +261,32 @@ test('qualified short-request bounds price the serialized wire and fall back out
     assert.equal(visualBound?.inputEnvelope?.inputTokens, visualBound!.inputEnvelope!.wireBytes * 2 + 256 + 500);
     assert.equal(visualBound?.images, profile.imageNanos);
 
+    const separateImages = { ...envelope, maxTokensPerImage: 500, maxTextWireBytes: 2048 };
+    const visualWithSeparateCharge = estimateOpenRouterRequest({ ...base, inputEnvelope: separateImages }, route, visual);
+    assert.ok(visualWithSeparateCharge?.inputEnvelope?.textWireBytes);
+    const { wireBytes: fullBytes, textWireBytes } = visualWithSeparateCharge.inputEnvelope;
+    const base64Length = onePixel.image_url.url.split(',')[1].length;
+    assert.equal(textWireBytes, fullBytes - base64Length);
+    assert.equal(visualWithSeparateCharge.inputEnvelope.inputTokens, textWireBytes * 2 + 256 + 500);
+    assert.equal(visualWithSeparateCharge.images, profile.imageNanos);
+    const imageOutsideUserRole = { ...visual, messages: [{ role: 'assistant', content: [onePixel] }] };
+    const protectedImage = estimateOpenRouterRequest({ ...base, inputEnvelope: separateImages }, route, imageOutsideUserRole);
+    assert.ok(protectedImage?.inputEnvelope);
+    assert.equal(protectedImage.inputEnvelope.textWireBytes, protectedImage.inputEnvelope.wireBytes);
+    assert.equal(protectedImage.images, profile.imageNanos);
+    const textWithVisualEnvelope = estimateOpenRouterRequest({ ...base, inputEnvelope: separateImages }, route, request);
+    assert.ok(textWithVisualEnvelope?.inputEnvelope);
+    assert.equal(textWithVisualEnvelope.inputEnvelope.textWireBytes, textWithVisualEnvelope.inputEnvelope.wireBytes);
+    assert.equal(textWithVisualEnvelope.ceilingUsdNanos, quote.ceilingUsdNanos);
+    for (const insufficient of [
+      { maxWireBytes: fullBytes - 1, maxTextWireBytes: textWireBytes },
+      { maxTextWireBytes: textWireBytes - 1 },
+    ]) {
+      const limited = { ...base, inputEnvelope: { ...separateImages, ...insufficient } };
+      assert.equal(estimateOpenRouterRequest(limited, route, visual)?.inputEnvelope, undefined);
+    }
+    assert.equal(estimateOpenRouterRequest({ ...base, inputEnvelope: { ...envelope, maxTextWireBytes: 2048 } }, route, visual), null);
+
     if (base.provider === 'wafer/us') {
       const contextRisk = { ...base, inputTokenUpperBound: 1_048_377 };
       assert.equal(estimateOpenRouterRequest(contextRisk, route, request), null);
@@ -611,6 +637,80 @@ test('known 429 permits one explicit retry and concurrent projects share the exa
   assert.equal(state.budget.spentUsdNanos, BUDGET_USD_NANOS);
   t.diagnostic('one known 429 and one explicit retry; a concurrent project is denied at a $10 reserve and again at $10 spent');
   assert.equal(state.budget.reserveUsdNanos, 0);
+});
+
+test('compact visual reserves admit both primary branches against the shared ledger', sqlCase, async t => {
+  const s = await setup(t);
+  const prior = project();
+  await s.gateway.openGeneration(prior);
+  await s.gateway.sealGeneration(prior, manifest);
+  await grant(s.gateway, prior);
+  s.setCost(380_000_000);
+  assert.equal((await s.gateway.call(call(await lease(s.gateway, prior, 'prior', obligationA)))).status, 'paid');
+
+  const ref = project();
+  const rates = { ...fixtureRates, additionalNanos: 250_000_000, inputTokenUpperBound: 1_000_000,
+    outputTokenLimit: 2048, maxImages: 12, imageNanos: 0, requestNanos: 0, cacheWriteNanosPerToken: 0,
+    cacheBilling: 'supplement' as const };
+  const envelope = { evidenceRef: 'fixture:qualified-visual', maxWireBytes: baseRoute.maxRequestBytes,
+    maxTextWireBytes: 8192, maxMessages: 128, maxTools: 16, tokensPerWireByte: 4, templateOverheadTokens: 16_384 };
+  const pricing = {
+    a: { routeId: 'a', revision: baseRoute.revision, model: 'moonshotai/kimi-k3.1-pro',
+      mode: 'strict-zdr', provider: 'wafer/us', expectedResponseProvider: 'Wafer', zdrEvidenceRef: 'fixture:zdr',
+      boundEvidenceRef: 'fixture:rates', validUntil: '2099-01-01T00:00:00Z', knownNoChargeStatuses: [], ...rates,
+      promptNanosPerToken: 253, cacheReadNanosPerToken: 180, completionNanosPerToken: 8800, reasoningNanosPerToken: 8800,
+      inputEnvelope: { ...envelope, maxTokensPerImage: 32_768 } },
+    b: { routeId: 'b', revision: baseRoute.revision, model: 'qwen/qwen4-max',
+      mode: 'synthetic-research', provider: 'alibaba', expectedResponseProvider: 'Alibaba',
+      syntheticScopes: [{ ...ref, approvalRef: 'fixture:scope', originalSha256s: ['a'.repeat(64)] }],
+      boundEvidenceRef: 'fixture:rates', validUntil: '2099-01-01T00:00:00Z', knownNoChargeStatuses: [], ...rates,
+      promptNanosPerToken: 1500, cacheReadNanosPerToken: 75, cacheWriteNanosPerToken: 3000,
+      completionNanosPerToken: 4500, reasoningNanosPerToken: 4500,
+      inputEnvelope: { ...envelope, maxTokensPerImage: 20_480 } },
+  } satisfies Record<string, OpenRouterProfile>;
+  const policies = { a: { ...baseRoute, id: 'a', ceilingUsdNanos: 615_641_728 },
+    b: { ...baseRoute, id: 'b', ceilingUsdNanos: 4_456_841_800 } };
+  const gateway = new Gateway(s.db, s.journal, {
+    ...s.transport,
+    quote(policy, request) {
+      const profile = pricing[policy.id as keyof typeof pricing];
+      const quote = estimateOpenRouterRequest(profile, { ...policy, transport: 'openrouter' }, request);
+      return quote ? { ceilingUsdNanos: quote.ceilingUsdNanos, pricingFingerprint: 'fixture:' + policy.id } : null;
+    },
+  });
+  await gateway.openGeneration(ref);
+  await gateway.sealGeneration(ref, manifest);
+  for (const policy of Object.values(policies)) {
+    await gateway.configureRoute(policy);
+    await grant(gateway, ref, true, policy);
+  }
+  const bothEntered = gate();
+  const responses = gate();
+  t.after(responses.release);
+  let sends = 0;
+  s.setCost(2_000_000);
+  s.setBehavior(async () => {
+    if (++sends === 2) bothEntered.release();
+    await responses.promise;
+    return 'paid';
+  });
+  const attempts = await Promise.all([lease(gateway, ref, 'compact-a', obligationA), lease(gateway, ref, 'compact-b', obligationB)]);
+  const calls = (['a', 'b'] as const).map((id, i) => gateway.call({
+    ...call(attempts[i], id), request: { model: pricing[id].model, max_tokens: 2048,
+      messages: [{ role: 'user', content: [{ type: 'text', text: 'synthetic' }, onePixel] }] },
+  }));
+  await reached(bothEntered, Promise.race(calls));
+  const current = await s.read();
+  const reserves = current.external.filter(row => row.state === 'sending');
+  assert.equal(reserves.length, 2);
+  assert.equal(current.budget.reserveUsdNanos, reserves.reduce((total, row) => total + row.metadata.ceilingUsdNanos, 0));
+  assert.equal(current.budget.spentUsdNanos, 380_000_000);
+  assert.ok(current.budget.reserveUsdNanos < 1_000_000_000);
+  responses.release();
+  for (const result of await Promise.all(calls)) assert.equal(result.status, 'paid');
+  const balance = await s.journal.balance();
+  assert.equal(balance.reserveUsdNanos, 0);
+  assert.equal(balance.remainingUsdNanos, 9_616_000_000);
 });
 
 test('synthetic Alibaba applies explicit retention and no-training evidence to the exact wire request', sqlCase, async t => {
