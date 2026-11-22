@@ -88,7 +88,7 @@ test('partial live configuration uses only independently admitted routes with th
   const catalog = await post('/api/catalogs', {
     key: 'fixture-thickness', name: 'Fixture',
     requirements: [{ key: 'thickness', part: 'Thickness', formats: ['txt'], equivalents: [], applicability: 'all',
-      sourceRoles: ['design'], completenessCriterion: 'Addressed value', addressee: 'customer' }],
+      sourceRoles: ['design', 'specification'], completenessCriterion: 'Addressed value', addressee: 'customer' }],
   });
   const gateway = createGateway(app.db);
   for (const { routeId } of [...Object.values(fixture), wafer, decart]) {
@@ -107,6 +107,9 @@ test('partial live configuration uses only independently admitted routes with th
   const errors = [];
   const warnings = [];
   const unsolicitedClaim = JSON.stringify({ lastToolCall: 'finish_reading', claim: 'Thickness 999 mm' });
+  const compoundTexts = ['Valve RY-804 Thickness 2 mm variant P', 'Record RY-804 revision G7'];
+  const compoundHashes = compoundTexts.map(checksum);
+  let compoundProject;
   let revoke;
   globalThis.fetch = async (url, options) => {
     try {
@@ -140,7 +143,42 @@ test('partial live configuration uses only independently admitted routes with th
       }
       let name = 'extract';
       let args = {};
-      if (outputs.length === 1) {
+      if (projectId === compoundProject) {
+        if (assignment.place.source.sha256 === compoundHashes[1]) {
+          if (outputs.length) {
+            name = 'finish_reading'; args = { status: 'no_match', explanation: 'Revision record carries no measurement.' };
+          }
+        } else if (outputs.length) {
+          const first = outputs[0];
+          const own = JSON.parse(first.content).lines[0];
+          if (outputs.length <= 2) {
+            name = 'save_observation';
+            args = { evidenceId: first.evidence.evidenceId, quote: own.text, lineId: own.id, value: '2', sourceRole: 'design' };
+          } else if (outputs.length === 3) {
+            assert.equal(outputs[2].code, 'repeated_rejected_action');
+            name = 'context_inventory';
+          } else if (outputs.length === 4) {
+            name = 'open_context';
+            args = { contextId: outputs[3].items.find(({ place }) => place.source.sha256 === compoundHashes[1]).id };
+          } else if (outputs.length === 5) {
+            const extra = outputs[4];
+            const external = JSON.parse(extra.content).lines[0];
+            const component = (evidenceId, line, role, literal, link) =>
+              ({ evidenceId, lineId: line.id, quote: line.text, role, literal, link });
+            const local = (role, literal, link) => component(first.evidence.evidenceId, own, role, literal, link);
+            const other = (role, literal, link) => component(extra.evidence.evidenceId, external, role, literal, link);
+            name = 'save_compound_observation';
+            args = { sourceRole: 'specification', components: [local('value', '2', { kind: 'anchor' }),
+              local('unit', 'mm', { kind: 'source_context', to: 0 }), local('variant', 'P', { kind: 'source_context', to: 0 }),
+              local('identifier', 'RY-804', { kind: 'source_context', to: 0 }),
+              other('identifier', 'RY-804', { kind: 'shared_identifier', to: 3 }),
+              other('revision', 'G7', { kind: 'source_context', to: 4 })] };
+          } else {
+            assert.ok(outputs[5].observationId, JSON.stringify(outputs.at(-1)));
+            name = 'finish_reading'; args = { status: 'covered', explanation: 'Anchors confirmed.' };
+          }
+        }
+      } else if (outputs.length === 1) {
         const source = outputs[0];
         const line = JSON.parse(source.content).lines[0];
         name = 'save_observation';
@@ -177,7 +215,8 @@ test('partial live configuration uses only independently admitted routes with th
     const sources = { A: selectedA, B: fixture.B };
     const project = await post('/api/projects', { name: testCase.name, catalogVersionId: catalog.id, scopeName: 'F-A', stage: 'P' });
     const scopeId = project.scopes[0].id;
-    const files = testCase.dispute ? ['Thickness 2 mm', 'Thickness 3 mm'] : ['Thickness 2 mm'];
+    const files = testCase.compound ? compoundTexts : testCase.dispute ? ['Thickness 2 mm', 'Thickness 3 mm'] : ['Thickness 2 mm'];
+    if (testCase.compound) compoundProject = project.id;
     const authorized = { projectId: project.id, scopeId, originalSha256s: files.map(checksum) };
     const approvals = testCase.approvals.map((branch) => formatProfile(sources[branch], authorized));
     for (const branch of ['A', 'B']) await grant(project.id, branch, true);
@@ -208,7 +247,7 @@ test('partial live configuration uses only independently admitted routes with th
       info() {}, warn(message) { warnings.push(message); }, error(message) { warnings.push(message); },
     } });
     const rows = await until(async () => (await app.db.query(
-      'SELECT purpose,state,reason FROM gateway_jobs WHERE project_id=$1 ORDER BY purpose', [project.id])).rows,
+      'SELECT purpose,state,reason FROM gateway_jobs WHERE project_id=$1 ORDER BY purpose,state', [project.id])).rows,
     (rows) => rows.length === testCase.expected.length && rows.every(({ state }) => ['done', 'held'].includes(state)));
     assert.deepEqual(rows.map(({ purpose, state, reason }) => [purpose, state, reason]), testCase.expected);
     const obligations = (await app.db.query(
@@ -256,6 +295,46 @@ test('partial live configuration uses only independently admitted routes with th
     await worker;
     worker = undefined;
 
+    if (testCase.compound) {
+      const path = `/api/projects/${project.id}/research-stops`;
+      const { items: [stopped] } = (await http('GET', `${path}?scopeId=${scopeId}`)).json();
+      assert.equal(stopped.reason, 'repeated_rejected_action');
+      assert.equal(stopped.status, 'held');
+      assert.equal(stopped.lastRequest.tool, 'save_observation');
+      assert.ok(stopped.evidence[0].href);
+      const observationRows = () => app.db.query('SELECT id FROM reader_observations WHERE project_id=$1', [project.id]);
+      assert.equal((await observationRows()).rowCount, 0);
+      await http('POST', `/api/projects/${randomUUID()}/research-stops/${stopped.id}/resume`, {}, {}, [404]);
+      stop = new AbortController();
+      worker = startWorker({ db: app.db, config, signal: stop.signal, logger: {
+        info() {}, warn(message) { warnings.push(message); }, error(message) { warnings.push(message); },
+      } });
+      await delay(1000);
+      assert.equal(calls.filter(({ projectId }) => projectId === project.id).length, testCase.calls.length);
+      await post(`${path}/${stopped.id}/resume`, {});
+      await until(async () => (await app.db.query('SELECT state FROM gateway_jobs WHERE id=$1', [stopped.jobId])).rows[0]?.state,
+        (state) => state === 'done');
+      assert.equal(calls.filter(({ projectId }) => projectId === project.id).length, testCase.calls.length + 4);
+      const { rows: [saved], rowCount } = await observationRows();
+      assert.equal(rowCount, 1);
+      const observation = (await http('GET', `/api/v1/observations/${saved.id}`)).json();
+      assert.deepEqual(observation.components.map(({ role }) => role), ['value', 'unit', 'variant', 'identifier', 'identifier', 'revision']);
+      assert.equal(new Set(observation.components.map(({ evidenceId }) => evidenceId)).size, 2);
+      for (const part of observation.components) {
+        const representation = (await http('GET', `${part.evidenceHref}/content`)).json();
+        assert.ok(representation.lines.some(({ id, text }) => id === part.lineId && text.includes(part.quote)));
+      }
+      const { rows: [finding] } = await app.db.query('SELECT finding FROM harness_observations WHERE observation_id=$1', [saved.id]);
+      assert.deepEqual(finding.finding.citation.components, observation.components);
+      assert.equal(finding.finding.sourceRole, 'specification');
+      assert.ok(!finding.finding.comparisonKey.includes('specification'));
+      const { items: [continued] } = (await http('GET', `${path}?scopeId=${scopeId}`)).json();
+      assert.equal(continued.status, 'continued');
+      stop.abort();
+      await worker;
+      worker = undefined;
+    }
+
     if (testCase.recoverA) {
       process.env.FACADE_HARNESS_PROFILE = JSON.stringify({ A: settings(fixture.A), B: settings(fixture.B) });
       process.env.FACADE_GATEWAY_STEP15_PROFILES = JSON.stringify([
@@ -281,21 +360,26 @@ test('partial live configuration uses only independently admitted routes with th
   }
   const done = (branch) => [`primary_${branch}`, 'done', null];
   const held = (branch, reason) => [`primary_${branch}`, 'held', reason];
-  await runCase({ name: 'Only A', approvals: ['A'], malformed: 'B', calls: ['A', 'A', 'A'],
-    expected: [done('a'), held('b', 'research_route_not_approved')] });
-  await runCase({ name: 'Only B', approvals: ['B'], recoverA: true, settings: { A: { routeId: 'broken' } }, calls: ['B', 'B', 'B'],
-    expected: [held('a', 'research_profile_unavailable'), done('b')] });
-  await runCase({ name: 'No routes', approvals: [], calls: [],
-    expected: [held('a', 'research_route_not_approved'), held('b', 'research_route_not_approved')] });
-  for (const comparison of [wafer, decart]) {
-    await runCase({ name: `Compare ${comparison.provider}`, comparison, approvals: ['A'], calls: ['A', 'A', 'A', 'A'],
+  if (process.env.FACADE_HARNESS_COMPOUND_ONLY !== '1') {
+    await runCase({ name: 'Only A', approvals: ['A'], malformed: 'B', calls: ['A', 'A', 'A'],
       expected: [done('a'), held('b', 'research_route_not_approved')] });
+    await runCase({ name: 'Only B', approvals: ['B'], recoverA: true, settings: { A: { routeId: 'broken' } }, calls: ['B', 'B', 'B'],
+      expected: [held('a', 'research_profile_unavailable'), done('b')] });
+    await runCase({ name: 'No routes', approvals: [], calls: [],
+      expected: [held('a', 'research_route_not_approved'), held('b', 'research_route_not_approved')] });
+    for (const comparison of [wafer, decart]) {
+      await runCase({ name: `Compare ${comparison.provider}`, comparison, approvals: ['A'], calls: ['A', 'A', 'A', 'A'],
+        expected: [done('a'), held('b', 'research_route_not_approved')] });
+    }
+    await runCase({ name: 'Revoke A', approvals: ['A', 'B'], revoke: 'A', calls: ['A', 'B', 'B', 'B'],
+      expected: [held('a', 'route_denied'), done('b')] });
+    await runCase({ name: 'Leader unavailable', approvals: ['A', 'B'], dispute: true,
+      calls: [...Array(6).fill('A'), ...Array(6).fill('B')],
+      expected: [done('a'), done('a'), done('b'), done('b'), ['review', 'held', 'research_profile_unavailable']] });
   }
-  await runCase({ name: 'Revoke A', approvals: ['A', 'B'], revoke: 'A', calls: ['A', 'B', 'B', 'B'],
-    expected: [held('a', 'route_denied'), done('b')] });
-  await runCase({ name: 'Leader unavailable', approvals: ['A', 'B'], dispute: true,
-    calls: [...Array(6).fill('A'), ...Array(6).fill('B')],
-    expected: [done('a'), done('a'), done('b'), done('b'), ['review', 'held', 'research_profile_unavailable']] });
+  await runCase({ name: 'Compound after repeated error', compound: true, approvals: ['A'], calls: Array(5).fill('A'),
+    expected: [done('a'), held('a', 'repeated_rejected_action'),
+      held('b', 'research_route_not_approved'), held('b', 'research_route_not_approved')] });
   const { rows: [ledger] } = await ledgerPool.query(
     `SELECT count(*) FILTER(WHERE state IN ('prepared','sending','unknown'))::int AS open,
             coalesce(sum(spent_usd_nanos),0)::text AS spent FROM gateway_external_attempts`);

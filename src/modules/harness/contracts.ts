@@ -1,5 +1,5 @@
 import type { PoolClient } from 'pg';
-import type { DeliveryStatement } from '../pdf/types.js';
+import type { DeliveryStatement, ReaderComponentInput } from '../pdf/types.js';
 import { z } from 'zod';
 
 export const branchSchema = z.enum(['A', 'B']);
@@ -130,6 +130,7 @@ export interface ObservationInput {
   limitation?: string;
   alternatives?: string[];
   sourceRole?: string;
+  components?: readonly ReaderComponentInput[];
 }
 
 export interface ReaderContext {
@@ -145,6 +146,8 @@ export type ReadRequest =
 export interface ReaderPort {
   inventory(context: ReaderContext): Promise<unknown>;
   next?(context: ReaderContext): Promise<Place | null>;
+  contexts?(context: ReaderContext, offset: number): Promise<{ items: { id: string; place: Place; format: string }[]; nextOffset?: number }>;
+  openContext?(context: ReaderContext, id: string, representation: 'native' | 'ocr'): Promise<Representation>;
   read(context: ReaderContext, request: ReadRequest): Promise<Representation>;
   record(
     tx: PoolClient, context: ReaderContext, observation: ObservationInput

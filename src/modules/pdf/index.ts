@@ -132,7 +132,8 @@ export async function register(
     const { rows } = await app.db.query<{ project_id: string; scope?: string }>(
       table === 'reader_observations'
         ? `SELECT project_id, scope_id AS scope FROM reader_observations WHERE id = $1`
-        : 'SELECT project_id FROM reader_evidence WHERE id = $1', [id],
+        : `SELECT e.project_id,j.scope_id AS scope FROM reader_evidence e
+           LEFT JOIN gateway_jobs j ON j.id=e.run_id AND j.project_id=e.project_id WHERE e.id=$1`, [id],
     );
     if (!rows[0]) throw unavailable();
     const { project_id: projectId, scope } = rows[0];

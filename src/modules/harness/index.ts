@@ -17,6 +17,9 @@ import { publication } from './publication.js';
 import { connectReader } from './reader.js';
 import { executeResearch, researchKind, resumeInterruptedResearch } from './runner.js';
 import { managedTransport } from './transport.js';
+import { resumeResearchStops } from './stops.js';
+
+export { register } from './stops.js';
 
 function configuredApprovals(): OpenRouterProfile[] {
   try {
@@ -137,6 +140,7 @@ export async function startWorker(context: WorkerContext): Promise<void> {
       startImports({ ...context, signal }, { storage }),
     );
     if (hasTransport && external) {
+      lanes.push(poll('research continuation', () => resumeResearchStops(db, gateway)));
       lanes.push(poll('research recovery', async () => {
         if ((await external.journal.balance()).frozen) return false;
         await resumeInterruptedResearch(db, gateway, signal);

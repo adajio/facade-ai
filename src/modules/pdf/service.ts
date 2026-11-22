@@ -5,8 +5,9 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { pipeline } from 'node:stream/promises';
 import type { Pool, PoolClient } from 'pg';
+import { groundComponents } from './components.js';
 import {
-  type ArtifactStore, type Box, type DocumentKey, type Evidence, type Observation,
+  type ArtifactStore, type Box, type DocumentKey, type Evidence, type Observation, type ReaderComponentInput,
   type Original, type PageMap, type PinInput, type ReaderAdapter, type ReaderAddress, type ReaderLine,
   type ReadRequest, type ReadScope, type ResolveOriginal, type SourceRef, contains, ReaderError, validBox,
 } from './types.js';
@@ -345,12 +346,13 @@ export function createReaderService(db: Pool, deps: ReaderDependencies, adapters
     return rows[0]?.payload;
   }
 
-  async function pin(sourceRef: SourceRef, readScope: ReadScope, input: PinInput, tx?: PoolClient): Promise<Observation> {
+  async function pin(sourceRef: SourceRef, readScope: ReadScope, input: PinInput, tx?: PoolClient,
+    parts?: readonly ReaderComponentInput[]): Promise<Observation> {
     const source = checkedSource(sourceRef);
     const scope = checkedScope(readScope);
     const candidate = checkedPin(input);
     const conn = tx ?? db;
-    const requestHash = sha256(JSON.stringify({ source, candidate }));
+    const requestHash = sha256(JSON.stringify({ source, candidate, ...(parts ? { parts } : {}) }));
     const previous = await replay<Observation>(conn, 'reader_observations', source.projectId, scope, requestHash);
     if (previous) return previous;
 
@@ -358,6 +360,9 @@ export function createReaderService(db: Pool, deps: ReaderDependencies, adapters
     if (!evidence || !sameSource(source, evidence.source)
       || evidence.runId !== scope.runId || evidence.branch !== scope.branch) {
       throw new ReaderError('reader_evidence_scope_mismatch', 'Выдача недоступна в этой версии, ветви или запуске', 422);
+    }
+    if (evidence.format === 'ifc' && candidate.value !== undefined && !candidate.limitation && !parts) {
+      throw new ReaderError('reader_ifc_unit_unproven', 'Измерению IFC нужны отдельно закреплённые сущности свойства и единицы', 422);
     }
     const map = await lookupMap(source, evidence.readerVersion, tx);
     const unit = map?.units.find(({ id }) => id === evidence.address.unitId);
@@ -409,9 +414,29 @@ export function createReaderService(db: Pool, deps: ReaderDependencies, adapters
       candidate.lineId = line.id;
       grounding = 'text';
     }
+    let compound: ReturnType<typeof groundComponents> | undefined;
+    if (parts) {
+      const anchor = parts[0];
+      if (!anchor || anchor.evidenceId !== evidence.id || anchor.lineId !== candidate.lineId || anchor.quote !== candidate.quote
+        || anchor.literal !== candidate.value || parts.find(({ role }) => role === 'unit')?.literal !== candidate.unit) {
+        throw new ReaderError('reader_component_anchor_mismatch', 'Якорь должен совпадать с сохранённым значением и адресом', 422);
+      }
+      const deliveredParts = new Map<string, { evidence: Evidence; lines: ReaderLine[] }>();
+      for (const id of new Set(parts.map(({ evidenceId }) => evidenceId))) {
+        const view: Evidence | undefined = id === evidence.id ? evidence : await findEvidence(source.projectId, id, tx);
+        if (!view || view.runId !== scope.runId || view.branch !== scope.branch || view.representation === 'render') {
+          throw new ReaderError('reader_evidence_scope_mismatch', 'Составной опоре нужна собственная адресная текстовая выдача', 422);
+        }
+        const partBytes = view === evidence ? bytes : await content(view);
+        if (view.inputImage && view !== evidence) await content(view, 'ocr-input');
+        deliveredParts.set(id, { evidence: view, lines: JSON.parse(partBytes.toString('utf8')).lines });
+      }
+      compound = groundComponents(parts, deliveredParts);
+    }
     const observation: Observation = {
       ...candidate, id: randomUUID(), source, receiptId: evidence.receiptId, readerVersion: evidence.readerVersion,
       runId: scope.runId, branch: scope.branch, address, grounding,
+      ...(compound ? { components: compound.components, ...(compound.ifcUnit ? { unit: compound.ifcUnit } : {}) } : {}),
     };
     const stored = await conn.query<{ payload: Observation }>(
       `INSERT INTO reader_observations

@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import { decodeText, FormatHold, unit } from "./model.js";
+import { projectLengthAssignment } from './ifc-units.js';
 import type { CadShape, Locator, Parsed, Row, Unit } from "./model.js";
 
 type Group = { code: number; value: string };
@@ -326,9 +327,10 @@ export function parseIfc(input: Buffer): Parsed {
     });
   }
   const units = [];
+  const projectUnits = end === records.length - 2 ? projectLengthAssignment(records.slice(start + 1, end)) : undefined;
   for (let offset = 0; offset < Math.max(1, objects.length); offset += 100) {
     units.push(unit(`entities:${offset + 1}`, `Объекты IFC ${offset + 1}`,
-      { firstObject: offset + 1, schema }, objects.slice(offset, offset + 100), [...limitations]));
+      { firstObject: offset + 1, schema, ...projectUnits }, objects.slice(offset, offset + 100), [...limitations]));
   }
   return { units };
 }

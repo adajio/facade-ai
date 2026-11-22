@@ -1,10 +1,11 @@
+import { randomUUID } from 'node:crypto';
 import type { PoolClient } from 'pg';
 import type {
   Branch, EvidenceRef, ModelResult, ObservationInput, ReaderPort, ResearchOutcome, ResearchSuspension, ResearchTask,
 } from './contracts.js';
 import { ReaderRefusal } from './contracts.js';
 import { contains } from '../pdf/types.js';
-import { isInventoryRole } from '../assessment/domain.js';
+import { canonicalJson, isInventoryRole } from '../assessment/domain.js';
 import { deliveredLines } from '../questions/attribute-aliases.js';
 import { escapeRegex } from '../questions/domain.js';
 import {
@@ -15,14 +16,24 @@ import {
 type AssistantEvent = {
   kind: 'model'; turn: number; attemptId: string; finishReason: string;
   message: AssistantMessage | null; inputRefs: string[]; requestHash: string;
+  compoundContract?: true;
 };
 type RejectionEvent = {
   kind: 'rejected'; turn: number; attemptId: string; code: string; retryable: boolean; retryAt?: string;
 };
 type ToolIntent = { kind: 'intent'; turn: number; index: number; callId: string; effectKey: string };
 type ToolResult = {
-  kind: 'tool'; turn: number; index: number; reply: ToolReply; outcome?: ResearchOutcome;
+  kind: 'tool'; turn: number; index: number; reply: ToolReply; outcome?: ResearchOutcome; stop?: ResearchStop;
 };
+
+export interface ResearchStop {
+  id: string;
+  reason: 'repeated_rejected_action';
+  refusalCode: string;
+  nextAction: string;
+  evidence: (EvidenceRef & { href: string })[];
+  lastRequest: { turn: number; attemptId: string; requestHash: string; toolCallId: string; tool: string; arguments: string };
+}
 
 export type ResearchEvent = AssistantEvent | RejectionEvent | ToolIntent | ToolResult;
 export type FlowState =
@@ -33,6 +44,7 @@ export type FlowState =
 export interface SessionPorts {
   reader: ReaderPort;
   load(): Promise<ResearchEvent[]>;
+  continued?(stopId: string): Promise<boolean>;
   append<T extends ResearchEvent>(
     expectedLength: number, create: (tx: PoolClient) => Promise<T> | T,
   ): Promise<T>;
@@ -61,6 +73,8 @@ function restore(task: ResearchTask, events: ResearchEvent[]) {
   const replies = new Map<string, ToolReply>();
   const delivered = new Set<string>();
   const observations: NonNullable<ToolReply['observation']>[] = [];
+  const failedActions = new Map<string, { turn: number; code: string; nextAction: string; progress: string }>();
+  let stop: ResearchStop | undefined;
   let pending: { model: AssistantEvent; calls: FunctionCall[]; results: ToolResult[]; intent?: ToolIntent } | null = null;
   let latestModel = 0;
   let rejections: RejectionEvent[] = [];
@@ -97,6 +111,12 @@ function restore(task: ResearchTask, events: ResearchEvent[]) {
         pending.results.push(event);
         pending.intent = undefined;
         const { evidence, observation } = event.reply;
+        stop = event.stop ?? stop;
+        const call = pending.calls[event.index];
+        const correction = usefulRefusal(task, event, call);
+        const key = actionKey(call);
+        if (correction) failedActions.set(key, { turn: event.turn, ...correction, progress: progressKey(delivered, observations) });
+        else if (!event.stop) failedActions.delete(key);
         if (evidence) replies.set(evidence.evidenceId, event.reply);
         if (observation) observations.push(observation);
         outcome ??= event.outcome;
@@ -126,7 +146,8 @@ function restore(task: ResearchTask, events: ResearchEvent[]) {
   }
   const render = (replacements: typeof corrections) => messages.map((message, index) => replacements.get(index) ?? message);
   return { messages, currentMessages: render(new Map([...legacyCorrections, ...corrections])),
-    roleMessages: render(legacyCorrections), replies, delivered, observations, pending, latestModel, rejections, outcome };
+    roleMessages: render(legacyCorrections), replies, delivered, observations, pending, latestModel, rejections, outcome,
+    failedActions, stop };
 }
 
 function branchOf(task: ResearchTask): Branch {
@@ -195,6 +216,12 @@ const readerCorrections: Record<string, string> = {
   reader_address_invalid: 'Укажите рамку внутри назначенного окна и полученного представления. Для текста рамка должна включать цитируемую строку.',
   outside_assigned_window: 'Выберите рамку внутри назначенного окна.',
   reader_evidence_scope_mismatch: evidenceCorrection,
+  context_window_unavailable: 'Выберите существующий contextId из описи текущей ветви и задания.',
+  reader_component_quote_mismatch: 'Укажите дословную цитату и lineId каждого компонента из его собственной выдачи.',
+  reader_component_link_invalid: 'Свяжите компоненты по подтверждённой строке, столбцу, идентификатору или ссылке IFC. Не подставляйте недоказуемую связь.',
+  reader_component_anchor_mismatch: 'Начните со значения в назначенном месте и укажите его дословный адрес.',
+  reader_ifc_unit_unproven: 'Откройте локальную единицу свойства IFC либо проект, назначение и единственную проектную единицу длины. Если связь недоказуема, сохраните адресное limitation без числовых полей.',
+  reader_component_unit_required: 'Для числового значения предъявите отдельную опору единицы. Если единица не доказана, сохраните адресное limitation.',
 };
 
 function recordedCorrection(call: FunctionCall, code: unknown, task: ResearchTask): string | undefined {
@@ -207,6 +234,30 @@ function recordedCorrection(call: FunctionCall, code: unknown, task: ResearchTas
     const parsed = commands.finish_reading.safeParse(decodeArguments(call.function.arguments));
     if (parsed.success) return groundingCorrection[parsed.data.status];
   }
+}
+
+const preconditionRefusals = new Set(['evidence_not_delivered', 'survey_required', 'grounding_required',
+  'partial_coverage', 'both_supports_required']);
+const stableRefusals = new Set(['invalid_arguments', 'unknown_tool', 'foreign_branch', 'support_required',
+  'value_not_in_quote', 'unit_not_in_evidence', 'visual_box_required', 'source_role_unassigned',
+  'proposal_pair_mismatch', ...Object.keys(readerCorrections).filter((code) => code !== 'reader_evidence_scope_mismatch')]);
+
+function actionKey(call: FunctionCall) {
+  const args = decodeArguments(call.function.arguments);
+  return canonicalJson([call.function.name, args === undefined ? ['raw', call.function.arguments] : ['json', args]]);
+}
+
+function progressKey(delivered: ReadonlySet<string>, observations: readonly { id: string }[]) {
+  return canonicalJson([[...delivered].sort(), observations.map(({ id }) => id).sort()]);
+}
+
+function usefulRefusal(task: ResearchTask, event: ToolResult, call: FunctionCall) {
+  const body = event.reply.body;
+  if (!body || typeof body !== 'object' || !('code' in body) || typeof body.code !== 'string' ||
+    (!stableRefusals.has(body.code) && !preconditionRefusals.has(body.code))) return undefined;
+  const hint = 'nextAction' in body && typeof body.nextAction === 'string' ? body.nextAction : undefined;
+  const nextAction = hint ?? recordedCorrection(call, body.code, task) ?? readerCorrections[body.code];
+  return nextAction ? { code: body.code, nextAction } : undefined;
 }
 
 function groundedUnit(prior: ToolReply, observation: { quote: string; value: string; unit: string; lineId?: string }) {
@@ -274,6 +325,24 @@ async function executeTool(
   switch (name) {
     case 'inventory':
       return { reply: { body: { ok: true, inventory: await reader.inventory(context) } } };
+    case 'context_inventory': {
+      const { offset } = commands.context_inventory.parse(parsed.data);
+      if (!reader.contexts) return { reply: failedTool('context_window_unavailable', readerCorrections.context_window_unavailable) };
+      return { reply: { body: { ok: true, ...await reader.contexts(context, offset ?? 0) } } };
+    }
+    case 'open_context': {
+      const { contextId, representation } = commands.open_context.parse(parsed.data);
+      if (!reader.openContext) return { reply: failedTool('context_window_unavailable', readerCorrections.context_window_unavailable) };
+      const view = await reader.openContext(context, contextId, representation ?? 'native');
+      if (view.bytes.byteLength > 4 * 1024 * 1024) return { reply: failedTool('representation_limit', 'Откройте более узкое назначенное окно.') };
+      if (view.place.source.projectId !== task.projectId || view.mediaType !== 'application/json' || hashBytes(view.bytes) !== view.sha256) {
+        return { reply: failedTool('evidence_mismatch') };
+      }
+      const { evidenceId, place, readerVersion, sha256 } = view;
+      const evidence = { evidenceId, place, readerVersion, sha256 };
+      return { reply: { body: { ok: true, evidence, content: view.bytes.toString('utf8'), limitations: view.limitations },
+        evidence, readKind: name } };
+    }
     case 'survey': case 'zoom': case 'extract': case 'ocr': case 'search': {
       // Parse by tool name to retain the argument type at the dispatch boundary.
       const input = commands[name].parse(parsed.data);
@@ -303,6 +372,26 @@ async function executeTool(
       const content = image ? undefined : view.bytes.toString('utf8');
       return { reply: { body: { ok: true, evidence, content, transform: view.transform, limitations: view.limitations }, evidence, image, readKind: name, support: input.support } };
     }
+    case 'save_compound_observation': {
+      if (!tx || task.job.mode !== 'primary') throw new Error('Compound observation requires a fenced primary transaction');
+      const { components, sourceRole } = commands.save_compound_observation.parse(parsed.data);
+      const [anchor] = components;
+      if (components.some(({ evidenceId }) => !state.delivered.has(evidenceId) || !state.replies.get(evidenceId)?.evidence)) {
+        return { reply: failedTool('evidence_not_delivered', evidenceCorrection) };
+      }
+      const prior = state.replies.get(anchor.evidenceId)!;
+      if (anchor.role !== 'value' || prior.readKind === 'open_context' || !samePlace(prior.evidence!.place, task.job.place)) {
+        return { reply: failedTool('reader_component_anchor_mismatch', readerCorrections.reader_component_anchor_mismatch) };
+      }
+      if (sourceRole && !task.job.question?.sourceRoles?.includes(sourceRole)) {
+        return { reply: failedTool('source_role_unassigned', 'Используйте подтверждённую роль из назначения либо опустите её.') };
+      }
+      const stored = await reader.record(tx, context, { evidence: prior.evidence!, quote: anchor.quote,
+        lineId: anchor.lineId, value: anchor.literal, unit: components.find(({ role }) => role === 'unit')?.literal,
+        sourceRole, components });
+      return { reply: { body: { ok: true, observationId: stored.observationId, qualified: true },
+        observation: { id: stored.observationId, qualified: true } } };
+    }
     case 'save_observation': {
       if (!tx) throw new Error('Observation requires a fenced transaction');
       const { evidenceId, ...fields } = observationArguments(task.job).parse(parsed.data);
@@ -310,6 +399,9 @@ async function executeTool(
       const prior = state.replies.get(evidenceId);
       if (!prior?.evidence || !state.delivered.has(evidenceId)) {
         return { reply: failedTool('evidence_not_delivered', evidenceCorrection) };
+      }
+      if (prior.readKind === 'open_context') {
+        return { reply: failedTool('reader_component_anchor_mismatch', 'Сохраните значение в назначенном месте. Для отдельных контекстных фрагментов используйте save_compound_observation.') };
       }
       if (task.job.mode !== 'primary') throw new Error('Observation from a non-primary job');
       const inventoryStatement = input.deliveryStatement && input.sourceRole && isInventoryRole(input.sourceRole);
@@ -353,13 +445,14 @@ async function executeTool(
       const observationIds = [...new Set(state.observations.filter(({ qualified }) => qualified).map(({ id }) => id))];
       if (input.status === 'partial') return { reply: failedTool('partial_coverage', groundingCorrection.partial) };
       if (task.job.mode !== 'primary') throw new Error('Reading outcome from a non-primary job');
-      const delivered = [...state.delivered].map((id) => state.replies.get(id));
+      const evidenceIds = [...state.delivered].filter((id) => state.replies.get(id)?.readKind !== 'open_context');
+      const delivered = evidenceIds.map((id) => state.replies.get(id));
       if (task.job.place.page && !delivered.some((reply) => reply?.readKind === 'survey' && reply.image)) {
         return { reply: failedTool('survey_required', 'Откройте и рассмотрите физическое окно.') };
       }
-      if (input.status === 'no_match' && state.delivered.size && !state.observations.length) {
+      if (input.status === 'no_match' && evidenceIds.length && !state.observations.length) {
         return { reply: { body: { ok: true } }, outcome: {
-          kind: 'reviewed_no_match', evidenceIds: [...state.delivered],
+          kind: 'reviewed_no_match', evidenceIds,
         } };
       }
       if (input.status === 'covered' && observationIds.length > 0) {
@@ -398,12 +491,29 @@ async function executeTool(
 export async function advance(task: ResearchTask, ports: SessionPorts): Promise<FlowState> {
   const events = await ports.load();
   const state = restore(task, events);
+  if (state.stop && !await ports.continued?.(state.stop.id)) {
+    return { status: 'suspended', hold: { reason: state.stop.reason, nextAction: state.stop.nextAction } };
+  }
   if (state.outcome && !state.pending) return { status: 'done', outcome: state.outcome };
   if (state.pending) {
     const { model, calls, results, intent: prior } = state.pending;
     const index = results.length;
     const before = events.length;
     const call = calls[index];
+    const refused = state.failedActions.get(actionKey(call));
+    if (model.compoundContract && refused && refused.turn < model.turn && (stableRefusals.has(refused.code)
+      || refused.progress === progressKey(state.delivered, state.observations))) {
+      const reason = 'repeated_rejected_action' as const;
+      const nextAction = `Измените отклонённое действие ${call.function.name}. ${refused.nextAction}`;
+      const stop: ResearchStop = { id: randomUUID(), reason, refusalCode: refused.code, nextAction,
+        evidence: [...state.delivered].flatMap((id) => {
+          const evidence = state.replies.get(id)?.evidence;
+          return evidence ? [{ ...evidence, href: `/api/v1/evidence/${evidence.evidenceId}` }] : [];
+        }), lastRequest: { turn: model.turn, attemptId: model.attemptId, requestHash: model.requestHash,
+          toolCallId: call.id, tool: call.function.name, arguments: call.function.arguments } };
+      await ports.append(before, () => ({ kind: 'tool', turn: model.turn, index, reply: failedTool(reason, nextAction), stop }));
+      return { status: 'suspended', hold: { reason, nextAction } };
+    }
     const intent = prior ?? await ports.append(events.length, () => ({
       kind: 'intent', turn: model.turn, index, callId: call.id,
       effectKey: `${task.jobId}:tool:${model.turn}:${index}`,
@@ -426,7 +536,7 @@ export async function advance(task: ResearchTask, ports: SessionPorts): Promise<
     };
     const sequence = before + (prior ? 0 : 1);
     try {
-      if (call.function.name === 'save_observation') await ports.append(sequence, execute);
+      if (call.function.name === 'save_observation' || call.function.name === 'save_compound_observation') await ports.append(sequence, execute);
       else {
         const receipt = await execute();
         await ports.append(sequence, () => receipt);
@@ -467,7 +577,8 @@ export async function advance(task: ResearchTask, ports: SessionPorts): Promise<
     ...(rejected ? { retryRejectedAttemptId: rejected.attemptId } : {}),
   });
   let result = await send(modelRequest);
-  for (const [wire, messages] of [['role-v1', state.roleMessages], ['shared-v1', state.messages]] as const) {
+  let compoundContract = true;
+  for (const [wire, messages] of [['observation-v1', state.currentMessages], ['role-v1', state.roleMessages], ['shared-v1', state.messages]] as const) {
     if (result.status !== 'held' || result.code !== 'effect_conflict' || !result.attemptId) break;
     // An existing attempt can only be recovered with its original request hash.
     // The gateway checks that identity before returning a receipt or authorizing a retry.
@@ -476,6 +587,7 @@ export async function advance(task: ResearchTask, ports: SessionPorts): Promise<
     if (Buffer.byteLength(legacyWire) <= 16 * 1024 * 1024) {
       result = await send(legacy);
       serialized = legacyWire;
+      compoundContract = false;
     }
   }
   if (result.status === 'held') return {
@@ -495,6 +607,7 @@ export async function advance(task: ResearchTask, ports: SessionPorts): Promise<
   const decoded = decodeCompletion(result.output);
   await ports.append(events.length, () => ({
     kind: 'model', turn, attemptId: result.attemptId, inputRefs, requestHash: hashBytes(serialized),
+    ...(compoundContract ? { compoundContract: true as const } : {}),
     finishReason: decoded?.finishReason ?? 'invalid_response',
     message: decoded?.message ?? null,
   }));

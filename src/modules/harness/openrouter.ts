@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
 import { z } from 'zod';
 import { boxSchema, branchSchema, type EvidenceRef, type ResearchJob } from './contracts.js';
+import { componentLinks, componentRoles } from '../pdf/types.js';
 
 const shortText = z.string().trim().min(1).max(500);
 const support = branchSchema.optional();
@@ -65,6 +66,13 @@ export const commands = {
   ocr: z.strictObject({ support, ...readArguments.ocr }),
   search: z.strictObject({ support, ...readArguments.search }),
   save_observation: statementObservation,
+  save_compound_observation: z.strictObject({ sourceRole: argumentText.optional(), components: z.array(z.strictObject({
+    role: z.enum(componentRoles), evidenceId: z.string().uuid(), quote: argumentText, lineId: argumentText, literal: argumentText,
+    link: z.union([z.strictObject({ kind: z.literal('anchor') }),
+      z.strictObject({ kind: z.enum(componentLinks), to: z.number().int().min(0).max(10) })]),
+  })).min(2).max(12) }),
+  context_inventory: z.strictObject({ offset: z.number().int().min(0).max(1_000_000).optional() }),
+  open_context: z.strictObject({ contextId: z.string().uuid(), representation: z.enum(['native', 'ocr']).optional() }),
   request_next: z.strictObject({ reason: shortText }),
   finish_reading: z.strictObject({
     status: z.enum(['covered', 'unreadable', 'partial', 'no_match']),
@@ -109,6 +117,9 @@ const toolDescriptions: Record<keyof typeof commands, string> = {
   ocr: 'Read pixels as text with their geometry. Keep letter variants and recognition limits.',
   search: 'Find text in the assigned physical unit. A zero result does not establish absence.',
   save_observation: 'Save a finding from a delivered evidence ID. Preserve exact spelling, quote and units. Record a limitation and alternatives for ambiguous marks.',
+  save_compound_observation: 'Pin separately quoted text fragments from evidence already delivered to your branch. The first component is value with link anchor and must come from the assigned place. Subsequent components link by zero-based index to an earlier component. A unit links directly to the value by same_row, column_header, or source_context, or through explicit IFC references. Use source_context on the very same line. Across documents link two independently addressed identifier components with the same literal via shared_identifier; then link the revision to its own source-local identifier. IFC references connect exact STEP IDs in the same version. Preserve distinct quotes, never join their text. This records evidence and does not establish applicability.',
+  context_inventory: 'List server-assigned context windows in this question, branch, and generation. Use nextOffset when present. No findings from other readers are returned.',
+  open_context: 'Read native text by default or OCR for an image in a contextId from context_inventory. Context supports separately addressed components; the value anchor must remain in the original assignment.',
   request_next: 'Ask to revisit the same unresolved question and assigned place, keeping all accepted work.',
   finish_reading: 'Submit the result for this assigned place. Unreadable or partial work requires a concrete limitation.',
   propose_resolution: 'Propose a resolution naming both assigned observation IDs and the reason.',
@@ -172,10 +183,11 @@ function isReadTool(name: keyof typeof commands): name is typeof readTools[numbe
   return readTools.some((tool) => tool === name);
 }
 
-function enabledTools(job: ResearchJob): Array<keyof typeof commands> {
+function enabledTools(job: ResearchJob, compound = true): Array<keyof typeof commands> {
   const read = ['inventory', ...readTools] as const;
   switch (job.mode) {
-    case 'primary': return [...read, 'save_observation', 'request_next', 'finish_reading'];
+    case 'primary': return [...read, 'save_observation', 'request_next', 'finish_reading',
+      ...(compound ? ['context_inventory', 'open_context', 'save_compound_observation'] as const : [])];
     case 'lead': return [...read, 'propose_resolution'];
     case 'verify': return [...read, 'verify_resolution'];
   }
@@ -202,14 +214,15 @@ export function initialMessages(job: ResearchJob): Message[] {
   ];
 }
 
-export type ToolWire = 'current' | 'role-v1' | 'shared-v1';
+export type ToolWire = 'current' | 'observation-v1' | 'role-v1' | 'shared-v1';
 
 export function request(job: ResearchJob, messages: Message[], wire: ToolWire = 'current') {
+  const hasObservationForms = wire === 'current' || wire === 'observation-v1';
   return {
     model: job.settings.model,
     messages,
-    tools: enabledTools(job).map((name) => {
-      let schema: z.ZodType = wire === 'current' && name !== 'verify_resolution' ? currentCommands[name] : commands[name];
+    tools: enabledTools(job, wire === 'current').map((name) => {
+      let schema: z.ZodType = hasObservationForms && name !== 'verify_resolution' ? currentCommands[name] : commands[name];
       let description = toolDescriptions[name];
       if (name === 'save_observation' && job.mode === 'primary') {
         if (job.observationProtocol === 2) {
@@ -219,13 +232,13 @@ export function request(job: ResearchJob, messages: Message[], wire: ToolWire = 
         }
       }
       if (wire !== 'shared-v1' && isReadTool(name)) {
-        const fields = name === 'search' && wire === 'current' ? { query: argumentText } : readArguments[name];
+        const fields = name === 'search' && hasObservationForms ? { query: argumentText } : readArguments[name];
         schema = job.mode === 'primary' ? z.strictObject(fields) : z.strictObject({ support: branchSchema, ...fields });
         if (job.mode !== 'primary') description += ' Select the assigned citation with support A or B.';
         else if (name === 'survey') description += ' Call with {} to open your assigned page.';
       }
       const parameters = z.toJSONSchema(schema, { io: 'input' });
-      if (wire === 'current') {
+      if (hasObservationForms) {
         if (name === 'save_observation') {
           const forms = z.toJSONSchema(observationArguments(job), { io: 'input' });
           Object.assign(parameters, { anyOf: forms.anyOf });

@@ -162,24 +162,27 @@ test('a reserved old request keeps its original shape and a bad support argument
         assert.ok(!Object.hasOwn(survey.properties ?? {}, 'support'));
         return { status: 'held', code: 'effect_conflict', attemptId: oldReceipt.attemptId, nextAction: 'inspect_original_effect' };
       case 3:
+        assert.ok(!Object.hasOwn(survey.properties ?? {}, 'support'));
+        return { status: 'held', code: 'effect_conflict', attemptId: oldReceipt.attemptId, nextAction: 'inspect_original_effect' };
+      case 4:
         assert.deepEqual(wire, oldRequest);
         return oldReceipt;
-      case 4: {
+      case 5: {
         assert.ok(!Object.hasOwn(survey.properties ?? {}, 'support'));
         assert.deepEqual(wire.messages.at(-1), { role: 'tool', tool_call_id: oldReceipt.output.choices[0].message.tool_calls[0].id,
           content: JSON.stringify({ ok: false, code: 'foreign_branch', nextAction: 'Повторите survey с {}. Страница уже закреплена за вашим заданием.' }) });
         assert.deepEqual(reads, []);
         return receipt('survey', { support: 'B' });
       }
-      case 5:
+      case 6:
         assert.match(String(wire.messages.at(-1)?.content), /Повторите survey с \{\}/);
         assert.deepEqual(reads, []);
         return receipt('survey', { page: 7 });
-      case 6:
+      case 7:
         assert.match(String(wire.messages.at(-1)?.content), /invalid_arguments/);
         assert.deepEqual(reads, []);
         return receipt('survey', {});
-      case 7:
+      case 8:
         assert.equal(reads.length, 1);
         return receipt('finish_reading', { status: 'no_match', explanation: 'Reviewed assigned page.' });
       default: return assert.fail('Unexpected model send');
@@ -191,8 +194,46 @@ test('a reserved old request keeps its original shape and a bad support argument
   assert.equal(result.status === 'done' && result.outcome.kind, 'reviewed_no_match');
   assert.equal(sent[0], sent[1]);
   assert.equal(sent[0], sent[2]);
+  assert.equal(sent[0], sent[3]);
   const first = events[0];
   assert.equal(first.kind === 'model' && first.requestHash, hashBytes(JSON.stringify(oldRequest)));
+});
+
+test('a repeated rejected tool pauses with the exact evidence, and restart waits for a continuation', async () => {
+  const { task, ports, events, textId, recorded } = setup();
+  let authorized: string | undefined;
+  ports.continued = async (id) => authorized === id;
+  const attempt = { evidenceId: textId, quote: 'Толщина 2 мм', value: '2' };
+  let turns = 0;
+  ports.call = async ({ request: wire }) => {
+    switch (++turns) {
+      case 1: return receipt('survey', {});
+      case 2: return receipt('extract', {});
+      case 3: return receipt('save_observation', attempt);
+      case 4:
+        assert.match(String(wire.messages.at(-1)?.content), /Добавьте unit только из источника/);
+        return receipt('save_observation', { value: attempt.value, quote: attempt.quote, evidenceId: textId });
+      case 5:
+        assert.match(String(wire.messages.at(-1)?.content), /repeated_rejected_action/);
+        return receipt('save_observation', { ...attempt, unit: 'мм' });
+      case 6: return receipt('finish_reading', { status: 'covered', explanation: 'Опора сохранена.' });
+      default: return assert.fail('Unexpected model send');
+    }
+  };
+  const signal = new AbortController().signal;
+  const stopped = await runResearchWorkflow(task, ports, signal);
+  assert.equal(stopped.status === 'suspended' && stopped.hold.reason, 'repeated_rejected_action');
+  const event = events.at(-1);
+  const stop = event?.kind === 'tool' && event.stop;
+  assert.ok(stop && stop.evidence.some(({ evidenceId }) => evidenceId === textId));
+  assert.equal(stop.refusalCode, 'invalid_arguments');
+  assert.equal(stop.lastRequest.tool, 'save_observation');
+  assert.equal((await runResearchWorkflow(task, ports, signal)).status, 'suspended');
+  assert.equal(turns, 4);
+  assert.deepEqual(recorded, []);
+  authorized = stop.id;
+  assert.equal((await runResearchWorkflow(task, ports, signal)).status, 'done');
+  assert.equal(recorded.length, 1);
 });
 
 test('published observation forms require grounded measurement fields or an explicit limitation', () => {

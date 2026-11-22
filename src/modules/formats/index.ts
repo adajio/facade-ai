@@ -116,7 +116,8 @@ function rawOutput(parsed: Parsed, current: Unit, request: ReadRequest): ReaderO
 
 function adapter(format: Format): ReaderAdapter {
   const legacy = isLegacy(format) ? format : undefined;
-  const profile = format === "doc" || format === "dwg" || format === "dxf" ? "formats-1.1.1" : readerVersion;
+  const profile = format === 'ifc' ? 'formats-1.1.2'
+    : format === "doc" || format === "dwg" || format === "dxf" ? "formats-1.1.1" : readerVersion;
   let configured: ReturnType<typeof converterFor> | undefined;
   const resolve = () => legacy ? configured ??= converterFor(legacy).catch((error) => {
     configured = undefined;

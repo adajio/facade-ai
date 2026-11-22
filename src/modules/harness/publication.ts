@@ -30,9 +30,13 @@ function addressedSubject(target: TargetQuestion, observation: Observation, cont
 }
 
 const meaningfulRoles = new Set<string>(['design', 'schedule', 'approved_change', 'reference']);
+const inquiryRoles = new Map<string, ObservationPublication['role']>([
+  ['drawing', 'design'], ['model', 'design'], ['specification', 'design'], ['protocol', 'reference'],
+]);
 
 function qualifiedRole(role: string | undefined): ObservationPublication['role'] {
-  return role && meaningfulRoles.has(role) ? role as ObservationPublication['role'] : 'unknown';
+  if (!role) return 'unknown';
+  return meaningfulRoles.has(role) ? role as ObservationPublication['role'] : inquiryRoles.get(role) ?? 'unknown';
 }
 
 function toCitation<B extends Branch>(task: Ref, finding: Finding, branch: B): Citation & { branch: B } {
@@ -247,7 +251,9 @@ export function publication(db: Pool, queue: WorkQueue, profile: ResearchProfile
       if (!metadata) throw new Error('Observation has no dispatch manifest');
       const role = qualifiedRole(input.sourceRole);
       const statement = observation.deliveryStatement;
-      const assessmentRole = statement && input.sourceRole && isInventoryRole(input.sourceRole) ? input.sourceRole : role;
+      const assignmentRole = input.sourceRole && target.sourceRoles?.includes(input.sourceRole) ? input.sourceRole : undefined;
+      const assessmentRole = statement && input.sourceRole && isInventoryRole(input.sourceRole)
+        ? input.sourceRole : assignmentRole ?? 'unknown';
       const nonDelivery: NonDeliveryStatement | undefined = statement?.status === 'not_delivered' ? {
         kind: 'explicit_non_delivery', subjectQuote: statement.item, questionId: target.id, receiptId: observation.receiptId,
       } : undefined;
@@ -261,11 +267,12 @@ export function publication(db: Pool, queue: WorkQueue, profile: ResearchProfile
         subjectVerified = addressedSubject(target, observation, addressed.rows[0]?.content ?? null);
       }
       const sourceInScope = assessmentRole !== 'unknown' && metadata.applicable && activeStatement;
-      const active = sourceInScope && subjectVerified !== false;
-      const comparisonKey = JSON.stringify([target.id, target.variant ?? '', assessmentRole]);
+      const active = sourceInScope && (observation.components ? subjectVerified === true : subjectVerified !== false);
+      const variant = target.variant ?? observation.components?.find(({ role: componentRole }) => componentRole === 'variant')?.literal;
+      const comparisonKey = JSON.stringify([task.scopeId, target.id, variant ?? '']);
       await publishReaderObservation(tx, {
         observation, projectId: task.projectId, scopeId: task.scopeId, readerJobId: task.jobId,
-        subject: target.subject, property: target.property, variant: target.variant,
+        subject: target.subject, property: target.property, variant,
         role, revision: sourceInScope ? 'effective' : 'unknown', priority: role, comparableContext: comparisonKey, subjectVerified,
         assessmentQuestionId: target.id, replacesConfirmed: metadata.applicable,
       });
@@ -280,6 +287,7 @@ export function publication(db: Pool, queue: WorkQueue, profile: ResearchProfile
           receiptId: observation.receiptId, documentId: observation.source.documentId, versionId: observation.source.versionId,
           sha256: observation.source.sha256, address: { ...observation.address }, quote: observation.quote ?? '',
           value: observation.value ?? null, unit: observation.unit ?? null, href: `/api/v1/evidence/${observation.evidenceId}`,
+          ...(observation.components ? { components: observation.components } : {}),
         },
       };
       await tx.query(

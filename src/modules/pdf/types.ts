@@ -131,6 +131,25 @@ export interface DeliveryStatement {
   context?: { lineId: string; quote: string };
 }
 
+export const componentRoles = ['value', 'unit', 'variant', 'revision', 'identifier', 'relationship'] as const;
+export const componentLinks = ['same_row', 'column_header', 'source_context', 'shared_identifier', 'ifc_reference'] as const;
+export interface ReaderComponentInput {
+  role: typeof componentRoles[number];
+  literal: string;
+  quote: string;
+  lineId: string;
+  evidenceId: string;
+  link: { kind: 'anchor' } | { kind: typeof componentLinks[number]; to: number };
+}
+
+export interface ReaderObservationComponent extends ReaderComponentInput {
+  source: SourceRef;
+  receiptId: string;
+  readerVersion: string;
+  address: ReaderAddress;
+  evidenceHref: string;
+}
+
 export interface PinInput {
   evidenceId: string;
   scope: string;
@@ -154,6 +173,7 @@ export interface Observation extends PinInput {
   branch: ReadScope['branch'];
   address: ReaderAddress;
   grounding: 'text' | 'visual' | 'limited';
+  components?: ReaderObservationComponent[];
 }
 
 export class ReaderError extends Error {
