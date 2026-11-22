@@ -1,4 +1,5 @@
 import type { PoolClient } from 'pg';
+import type { VerifiedPairEvidence } from '../assessment/domain.js';
 import type { DeliveryStatement, ReaderComponentInput } from '../pdf/types.js';
 import { z } from 'zod';
 
@@ -96,7 +97,7 @@ export interface ScheduledResearchTask {
   job: ScheduledResearchJob;
 }
 
-export type ResearchTask = ScheduledResearchTask & { job: ResearchJob; earlyPair?: true };
+export type ResearchTask = ScheduledResearchTask & { job: ResearchJob; earlyPair?: true; pairScopeName?: string };
 
 export const pairCriteria = ['variant', 'revision', 'applicability', 'comparability'] as const;
 const pairCheck = z.strictObject({
@@ -181,8 +182,10 @@ export type ResearchOutcome =
   | { kind: 'covered'; observationIds: string[] }
   | { kind: 'reviewed_no_match'; evidenceIds: string[] }
   | { kind: 'final_refusal'; reason: string; evidenceIds: string[] }
-  | { kind: 'proposal'; aObservationId: string; bObservationId: string; explanation: string; checks?: PairChecks; evidenceIds?: string[] }
-  | { kind: 'verification'; verdict: 'supported' | 'unclear'; evidenceIds: string[]; explanation: string; checks?: PairChecks };
+  | { kind: 'proposal'; aObservationId: string; bObservationId: string; explanation: string; checks?: PairChecks;
+      evidenceIds?: string[]; verifiedPair?: VerifiedPairEvidence }
+  | { kind: 'verification'; verdict: 'supported' | 'unclear'; evidenceIds: string[]; explanation: string;
+      checks?: PairChecks; verifiedPair?: VerifiedPairEvidence };
 
 export interface ResearchSuspension {
   reason: string;

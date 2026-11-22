@@ -5,7 +5,7 @@ import type { CatalogRequirement } from "../access/input.js";
 import { publishProjectEvent } from "../supplements/events.js";
 import { getIntakeGate, lockIntakeProject } from "../intake/index.js";
 import {
-  canonicalJson, effectiveOutcome, evaluate,
+  canonicalJson, effectiveOutcome, evaluate, pairProofVersion, pairRevalidationRequired,
   type Citation, type Decision, type Machine, type Requirement, type Review, type Scope,
 } from "./domain.js";
 import { activeResearchMaterials } from "./non-delivery.js";
@@ -293,21 +293,31 @@ export async function synchronize(
     : undefined;
   const changedInventories = new Set(researchProofs.filter(({ machine }) =>
     canonicalJson(machine.inventory?.materials) !== materials).map(({ id }) => id));
-  const affected = (question: Question) => sourceSuperseded(question) || changedInventories.has(question.id);
+  const legacyPair = (question: Question) =>
+    question.review?.confirmedPairs?.some(({ proofVersion }) => proofVersion !== pairProofVersion);
+  const affected = (question: Question) => sourceSuperseded(question) || changedInventories.has(question.id) || legacyPair(question);
+  const currentReview = (question: Question): Review | null => {
+    if (sourceSuperseded(question) || changedInventories.has(question.id)) {
+      return reviewAfterSourceChange(question, superseded, sourceSuperseded(question) ? "source_superseded" : "research_inventory_changed");
+    }
+    const { review } = question;
+    if (!review || !legacyPair(question)) return review;
+    return {
+      ...review, completenessChecked: false, remaining: [...new Set([...review.remaining, pairRevalidationRequired])],
+      confirmedPairs: review.confirmedPairs!.filter(({ proofVersion }) => proofVersion === pairProofVersion),
+    };
+  };
   const expiredIds = new Set(expired.map(({ id }) => id));
 
   if (current?.source_token === sourceToken) {
     const changed = questions.filter((question) => question.active && (expiredIds.has(question.id) || affected(question)));
     if (!changed.length) return current;
     const reason = changed.some(sourceSuperseded) ? "source_superseded" :
-      changedInventories.size ? "research_inventory_changed" : "exclusion_expired";
+      changedInventories.size ? "research_inventory_changed" :
+        changed.some(legacyPair) ? pairRevalidationRequired : "exclusion_expired";
     const revision = await writeRevision(tx, current, current.version + 1, gate, makeChange(reason, changed));
     for (const question of changed) {
-      const review = affected(question)
-        ? reviewAfterSourceChange(question, superseded,
-          sourceSuperseded(question) ? "source_superseded" : "research_inventory_changed")
-        : question.review;
-      await writeQuestion(tx, revision, invalidate(question, review));
+      await writeQuestion(tx, revision, invalidate(question, currentReview(question)));
     }
     await announceAssessment(tx, projectId, revision);
     return revision;
@@ -349,12 +359,7 @@ export async function synchronize(
     if (prior.active && unchanged && !priorAffected && !expiredIds.has(prior.id) && !skippedScopeVersions) continue;
     change.affectedQuestionIds.push(prior.id);
     if (prior.decision) change.previousDecisionIds.push(prior.decision.id);
-    const review = prior.active && unchanged && !skippedScopeVersions
-      ? priorAffected
-        ? reviewAfterSourceChange(prior, superseded,
-          sourceSuperseded(prior) ? "source_superseded" : "research_inventory_changed")
-        : prior.review
-      : null;
+    const review = prior.active && unchanged && !skippedScopeVersions ? currentReview(prior) : null;
     replacements.push(invalidate({ ...prior, active: true, requirement }, review));
   }
   for (const prior of old.values()) {

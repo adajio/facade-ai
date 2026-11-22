@@ -82,12 +82,22 @@ export type InventoryProof = {
   materials?: string[];
 };
 
+export const pairProofVersion = 2;
+export const pairRevalidationRequired = "pair_review_revalidation_required";
+export type VerifiedPairEvidence = {
+  version: typeof pairProofVersion;
+  variant: string;
+  revisionA: string;
+  revisionB: string;
+  scope: string;
+};
+
 export type Review = {
   findings: Finding[];
   remaining: string[];
   completenessChecked: boolean;
   inventory?: InventoryProof;
-  confirmedPairs?: { a: string; b: string }[];
+  confirmedPairs?: { a: string; b: string; proofVersion?: number }[];
 };
 
 export type Machine = {
@@ -227,7 +237,8 @@ export function evaluate(
   }
   if (review?.confirmedPairs?.length) {
     const byId = new Map(values.map((value) => [value.citation.observationId, value]));
-    const supported = review.confirmedPairs.flatMap(({ a, b }) => {
+    const supported = review.confirmedPairs.flatMap(({ a, b, proofVersion }) => {
+      if (proofVersion !== pairProofVersion) return [];
       const left = byId.get(a);
       const right = byId.get(b);
       if (!left || !right || left.citation.branch !== "A" || right.citation.branch !== "B" ||
@@ -237,6 +248,9 @@ export function evaluate(
     });
     if (supported.length) return { ...base, outcome: "confirmed_conflict",
       citations: distinctConflictSources(supported), limitations: review.remaining };
+    if (review.confirmedPairs.some(({ proofVersion }) => proofVersion !== pairProofVersion)) {
+      return { ...base, limitations: [...new Set([...review.remaining, pairRevalidationRequired])] };
+    }
   }
   if (!review || !review.completenessChecked || review.remaining.length ||
       findings.some((finding) => finding.applicability === "unknown" ||

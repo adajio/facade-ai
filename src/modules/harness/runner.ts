@@ -157,12 +157,19 @@ async function runAssignment(
   if (!settings) return {
     status: 'suspended', hold: { reason: 'research_profile_unavailable', nextAction: `Настроить профиль для ${slot}.` },
   };
-  const review = scheduled.job.mode === 'primary' ? 'standard' :
-    await transaction(db, tx => reviewPairAdmission(tx, work));
-  if (review === 'stale') return {
+  const { review, scopeName } = scheduled.job.mode === 'primary' ? { review: 'standard', scopeName: undefined } :
+    await transaction(db, async (tx) => {
+      const review = await reviewPairAdmission(tx, work);
+      if (review !== 'early') return { review, scopeName: undefined };
+      const { rows: [scope] } = await tx.query<{ name: string }>('SELECT name FROM project_scopes WHERE id=$1 AND project_id=$2',
+        [work.scopeId, work.projectId]);
+      return { review, scopeName: scope?.name };
+    });
+  if (review === 'stale' || (review === 'early' && !scopeName)) return {
     status: 'suspended', hold: { reason: 'review_pair_stale', nextAction: 'Откройте актуальные опоры вопроса.' },
   };
-  let task: ResearchTask = { ...scheduled, job: { ...scheduled.job, settings }, ...(review === 'early' ? { earlyPair: true } : {}) };
+  let task: ResearchTask = { ...scheduled, job: { ...scheduled.job, settings },
+    ...(review === 'early' ? { earlyPair: true, pairScopeName: scopeName } : {}) };
   const hold = services.admit?.(task);
   if (hold) return { status: 'suspended', hold };
   if (!scheduled.job.settings && !binding) {

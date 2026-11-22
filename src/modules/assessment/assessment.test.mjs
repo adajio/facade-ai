@@ -181,8 +181,11 @@ test("only a current independently verified conflict can bypass unrelated covera
   const b = sample("B", "19");
   const unrelated = { ...sample("extra", "21"), applicability: "unknown" };
   const waiting = { findings: [a, b, unrelated], completenessChecked: false, remaining: ["primary_coverage_pending"] };
-  const proof = { ...waiting, confirmedPairs: [{ a: "A", b: "B" }] };
+  const proof = { ...waiting, confirmedPairs: [{ a: "A", b: "B", proofVersion: 2 }] };
   assert.equal(evaluate(requirement, waiting).outcome, "needs_review");
+  const stale = evaluate(requirement, { ...waiting, completenessChecked: true, remaining: [], confirmedPairs: [{ a: "A", b: "B" }] });
+  assert.equal(stale.outcome, "needs_review");
+  assert.deepEqual(stale.limitations, ["pair_review_revalidation_required"]);
   assert.deepEqual(evaluate(requirement, proof).citations, [a.citation, b.citation]);
   assert.equal(evaluate(requirement, proof).outcome, "confirmed_conflict");
   assert.deepEqual(evaluate(requirement, proof).limitations, waiting.remaining);

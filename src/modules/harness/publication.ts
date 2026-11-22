@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import type { Pool, PoolClient } from 'pg';
-import { canonicalJson, evaluate, isInventoryRole, type Finding, type NonDeliveryStatement, type Requirement } from '../assessment/domain.js';
+import { canonicalJson, evaluate, isInventoryRole, pairProofVersion, pairRevalidationRequired,
+  type Finding, type NonDeliveryStatement, type Requirement, type Review } from '../assessment/domain.js';
 import { getLockedGate, getQuestions, normalizeFormat, synchronize } from '../assessment/store.js';
 import { applyAssessmentUpdate, type AssessmentChange } from '../assessment/updates.js';
 import type { WorkQueue } from '../gateway/queue.js';
@@ -175,17 +176,30 @@ async function updateQuestion(
      ORDER BY d.id`, [ref.generationId, target.id, findings.map(({ citation }) => citation.observationId)]);
   const activeValues = new Set(findings.filter(({ kind, applicability }) => kind === 'value' && applicability === 'active')
     .map(({ citation }) => citation.observationId));
-  const confirmedPairs = pairs.filter(({ a, b, independent, lead, left, right }) =>
-    independent && activeValues.has(a) && activeValues.has(b) &&
-    lead?.kind === 'proposal' && lead.aObservationId === a && lead.bObservationId === b && pairConfirmed(lead.checks) &&
-    left?.kind === 'verification' && left.verdict === 'supported' && pairConfirmed(left.checks) &&
-    right?.kind === 'verification' && right.verdict === 'supported' && pairConfirmed(right.checks))
-    .map(({ a, b }) => ({ a, b }));
+  const pairLimits = new Set<string>();
+  const confirmedPairs: NonNullable<Review['confirmedPairs']> = [];
+  for (const { a, b, independent, lead, left, right } of pairs) {
+    if (!independent || !lead?.checks || !pairConfirmed(lead.checks)) continue;
+    if (lead.verifiedPair?.version !== pairProofVersion ||
+      [left, right].some((side) => side?.verdict === 'supported' && side.verifiedPair?.version !== pairProofVersion)) {
+      pairLimits.add(pairRevalidationRequired);
+      continue;
+    }
+    if (left?.verdict !== 'supported' || right?.verdict !== 'supported' ||
+      !pairConfirmed(left.checks) || !pairConfirmed(right.checks)) continue;
+    const proof = canonicalJson(lead.verifiedPair);
+    if (canonicalJson(left.verifiedPair) !== proof || canonicalJson(right.verifiedPair) !== proof) {
+      pairLimits.add('pair_source_checks_disagree');
+      continue;
+    }
+    if (lead.aObservationId === a && lead.bObservationId === b && activeValues.has(a) && activeValues.has(b)) {
+      confirmedPairs.push({ a, b, proofVersion: pairProofVersion });
+    }
+  }
   const pending = pairs.some(({ lead, left, right }) => !lead ||
     ((!lead.checks || pairConfirmed(lead.checks)) && (!left || !right)));
   const unclear = pairs.some(({ lead, left, right }) => lead?.checks && !pairConfirmed(lead.checks) ||
     left?.verdict === 'unclear' || right?.verdict === 'unclear');
-  const pairLimits = new Set<string>();
   for (const { lead, left, right } of pairs) {
     for (const result of [lead, left, right]) {
       if (!result?.checks) continue;

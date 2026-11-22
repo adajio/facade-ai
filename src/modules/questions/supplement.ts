@@ -1,5 +1,6 @@
 import type { Pool, PoolClient } from "pg";
 import { transaction } from "../access/commands.js";
+import { pairProofVersion } from "../assessment/domain.js";
 import { publishProjectEvent } from "../supplements/events.js";
 import { lockScopes, resolveSupplementImpact } from "../supplements/holds.js";
 
@@ -64,6 +65,10 @@ async function readyHold(db: Pool | PoolClient, id?: string): Promise<ReadyHold 
          ORDER BY assessment_version DESC LIMIT 1
        ) assessment ON assessment.active AND assessment.review->'completenessChecked'='true'::jsonb
          AND assessment.machine->>'outcome' IN ('covered','confirmed_conflict','confirmed_missing')
+         AND NOT EXISTS (
+           SELECT 1 FROM jsonb_array_elements(coalesce(assessment.review->'confirmedPairs','[]'::jsonb)) pair
+           WHERE pair->>'proofVersion' IS DISTINCT FROM '${pairProofVersion}'
+         )
        WHERE EXISTS (
          SELECT 1 FROM jsonb_array_elements(assessment.review->'findings') f
          WHERE f->>'applicability'='active' AND f#>>'{citation,observationId}'=link.observation_id::text

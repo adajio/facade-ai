@@ -193,7 +193,7 @@ test('ordinary upload runs two Mastra readers through PostgreSQL, the reader, qu
             evidenceId: reply.evidence.evidenceId,
             quote: JSON.parse(reply.content).lines[0].text,
           }));
-          assert.ok(titleSources.every(({ quote }) => /Revision R1/.test(quote)));
+          assert.deepEqual(titleSources.map(({ quote }) => /Revision (R[12])/.exec(quote)?.[1]).sort(), ['R1', 'R2']);
           const check = { status: 'confirmed', reason: 'Both original title pages identify the same current assembly.', sources: titleSources };
           const checks = { variant: check, revision: check, applicability: check, comparability: check };
           const evidenceIds = completed.slice(0, 2).map((reply) => reply.evidence.evidenceId);
@@ -414,8 +414,8 @@ test('ordinary upload runs two Mastra readers through PostgreSQL, the reader, qu
     });
   }
   const incoming = (await command('POST', `/api/projects/${large.id}/receipts`, { source: 'upload' })).json();
-  const fillA = await attach(large.id, largeScope, incoming.receiptId, 'one.pdf', syntheticPdfPages([['F-A R1 Thickness (mm) 2'], ['Revision R1 F-A Variant A']]));
-  const fillB = await attach(large.id, largeScope, incoming.receiptId, 'two.pdf', syntheticPdfPages([['F-A R1 Thickness (mm) 3'], ['Revision R1 F-A Variant A']]));
+  const fillA = await attach(large.id, largeScope, incoming.receiptId, 'one.pdf', syntheticPdfPages([['F-A R1 Thickness (mm) 2'], ['Current Revision R1 | Scope: F-A | Variant A']]));
+  const fillB = await attach(large.id, largeScope, incoming.receiptId, 'two.pdf', syntheticPdfPages([['F-A R1 Thickness (mm) 3'], ['Current Revision R2 | Scope: F-A | Variant A']]));
   const remaining = syntheticPdf('F-A R1 Layout only');
   delayedSha = sha256(remaining);
   const fillRemaining = await attach(large.id, largeScope, incoming.receiptId, 'three.pdf', remaining);
@@ -508,6 +508,21 @@ sys.stdout.write('\\n'.join(''.join(t.text or '' for t in p.findall('.//w:t', ns
       assert.equal(python.stdout, fullText);
     }
   }
+
+  // Simulate the old projection after it has already admitted a letter. The frozen records stay readable.
+  await app.db.query(
+    `UPDATE assessment_question_revisions SET review=jsonb_set(review,'{confirmedPairs,0}',
+       (review#>'{confirmedPairs,0}') - 'proofVersion')
+     WHERE question_id=$1 AND version=$2`, [question.id, decision.version],
+  );
+  const staleBasis = (await command('GET', `/api/projects/${large.id}/letters/eligible?scopeId=${largeScope}`)).json();
+  assert.deepEqual(staleBasis.items, []);
+  const revalidation = (await assessLarge()).questions.find(({ id }) => id === question.id);
+  assert.equal(revalidation.outcome, 'needs_review');
+  assert.equal(revalidation.previousDecisionId, decision.id);
+  assert.ok(revalidation.machine.limitations.includes('pair_review_revalidation_required'));
+  const blockedText = await command('GET', `/api/letters/${letter.id}/current-text`, undefined, versionHeader, [412]);
+  assert.equal(blockedText.statusCode, 412);
 
   if (process.env.FACADE_HARNESS_EARLY_PAIR_ONLY === '1') {
     assert.deepEqual(providerErrors, []);

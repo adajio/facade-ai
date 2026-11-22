@@ -165,11 +165,11 @@ test('a lead cannot confirm a revision without quoted evidence of its revision m
   const { task, ports, events } = setup();
   if (task.job.mode !== 'primary') assert.fail();
   const a = { branch: 'A' as const, observationId: randomUUID(), evidenceId: randomUUID(),
-    quote: 'Thickness 12 mm', value: '12', unit: 'mm', place: task.job.place };
+    quote: 'Thickness 12 mm · Variant A', value: '12', unit: 'mm', place: task.job.place };
   const b = { ...a, branch: 'B' as const, observationId: randomUUID(), evidenceId: randomUUID(),
-    quote: 'Thickness 19 mm', value: '19', place: { ...a.place,
+    quote: 'Thickness 19 mm · Variant A', value: '19', place: { ...a.place,
       source: { ...a.place.source, documentId: randomUUID(), versionId: randomUUID(), sha256: 'b'.repeat(64) } } };
-  const lead: ResearchTask = { ...task, earlyPair: true, job: { mode: 'lead', settings: task.job.settings, dispute: {
+  const lead: ResearchTask = { ...task, earlyPair: true, pairScopeName: 'North face', job: { mode: 'lead', settings: task.job.settings, dispute: {
     id: randomUUID(), question: { id: randomUUID(), subject: 'Assembly', property: 'Thickness' }, a, b,
   } } };
   const refs = { A: randomUUID(), B: randomUUID() };
@@ -197,6 +197,83 @@ test('a lead cannot confirm a revision without quoted evidence of its revision m
   assert.equal(state.outcome.kind, 'proposal');
   assert.equal(state.outcome.checks?.revision.status, 'unclear');
   assert.ok(events.some((event) => event.kind === 'tool' && JSON.stringify(event.reply.body).includes('pair_revision_not_addressed')));
+});
+
+async function verifyPrintedPair(titleA: string, titleB: string, afterRefusal?: string, recoverPrior = false) {
+  const { task, ports, events } = setup();
+  if (task.job.mode !== 'primary') assert.fail();
+  const a = { branch: 'A' as const, observationId: randomUUID(), evidenceId: randomUUID(),
+    quote: 'Thickness 12 mm', value: '12', unit: 'mm', place: task.job.place };
+  const b = { ...a, branch: 'B' as const, observationId: randomUUID(), evidenceId: randomUUID(),
+    quote: 'Thickness 19 mm', value: '19', place: { ...a.place,
+      source: { ...a.place.source, documentId: randomUUID(), versionId: randomUUID(), sha256: 'b'.repeat(64) } } };
+  const verify: ResearchTask = { ...task, earlyPair: true, pairScopeName: 'North face', job: { mode: 'verify', branch: 'B', settings: task.job.settings,
+    proposal: { aObservationId: a.observationId, bObservationId: b.observationId, explanation: 'Potential conflict.' },
+    dispute: { id: randomUUID(), question: { id: randomUUID(), subject: 'Assembly', property: 'Thickness' }, a, b },
+  } };
+  const refs = { A: randomUUID(), B: randomUUID() };
+  ports.reader.read = async (_context, { support }) => {
+    const side = support === 'A' ? a : b;
+    const bytes = Buffer.from(JSON.stringify({ lines: [
+      { text: side.quote }, { text: support === 'A' ? titleA : titleB },
+    ] }));
+    return { evidenceId: refs[side.branch], place: side.place, readerVersion: 'test', mediaType: 'application/json',
+      sha256: hashBytes(bytes), bytes };
+  };
+  const selected = { status: 'confirmed', reason: 'The two sources establish the same applicable assertion.',
+    sources: [{ evidenceId: refs.A, quote: titleA }, { evidenceId: refs.B, quote: titleB }] };
+  let turn = 0;
+  const legacy = request(verify.job, initialMessages(verify.job), 'current', { legacy: true });
+  let priorInspected = false;
+  const prior = receipt('extract', { support: 'A' });
+  ports.call = async ({ request: wire, effectKey }) => {
+    if (recoverPrior && turn === 0) {
+      assert.equal(effectKey, `${verify.jobId}:model:1`);
+      if (!priorInspected) {
+        priorInspected = true;
+        assert.notDeepEqual(wire, legacy);
+        return { status: 'held', code: 'effect_conflict', attemptId: prior.attemptId, nextAction: 'inspect_original_effect' };
+      }
+      assert.deepEqual(wire, legacy);
+      turn++;
+      return prior;
+    }
+    turn++;
+    if (turn < 3) return receipt('extract', { support: turn === 1 ? 'A' : 'B' });
+    if (turn === 4) {
+      assert.ok(afterRefusal);
+      assert.match(String(wire.messages.at(-1)?.content), new RegExp(afterRefusal));
+    }
+    const check = turn === 3 ? selected : { ...selected, status: 'unclear' };
+    return receipt('verify_resolution', { verdict: turn === 3 ? 'supported' : 'unclear', explanation: 'Verified the titles.',
+      evidenceIds: [refs.A, refs.B], checks: { variant: check, revision: check, applicability: check, comparability: check } });
+  };
+  let state = await advance(verify, ports);
+  for (let steps = 0; steps < 20 && state.status === 'continue'; steps++) state = await advance(verify, ports);
+  assert.equal(state.status, 'done');
+  assert.equal(state.outcome.kind, 'verification');
+  if (recoverPrior) assert.equal(events[0]?.kind === 'model' && events[0].attemptId, prior.attemptId);
+  return { outcome: state.outcome, events };
+}
+
+test('literal quotes of visibly different variants and revisions cannot support the pair', async () => {
+  const { outcome } = await verifyPrintedPair('Variant A · Revision R1 · Scope: North face',
+    'Variant B · Revision R2 · Scope: North face', 'pair_variant_conflict');
+  assert.equal(outcome.verdict, 'unclear');
+  assert.equal(outcome.verifiedPair, undefined);
+});
+
+test('matching variants with different revision labels require separate evidence of current applicability', async () => {
+  const unsupported = await verifyPrintedPair('Variant A · Revision R1 · Scope: North face',
+    'Variant A · Revision R2 · Scope: North face', 'pair_revision_applicability_unproven');
+  assert.equal(unsupported.outcome.verdict, 'unclear');
+  const equivalent = await verifyPrintedPair('Variant A · Current revision R1 · Scope: North face',
+    'Variant A · Revision R2 is effective · Scope: North face', undefined, true);
+  assert.equal(equivalent.outcome.verdict, 'supported');
+  assert.deepEqual(equivalent.outcome.verifiedPair, { version: 2, variant: 'a', revisionA: 'r1', revisionB: 'r2', scope: 'north face' });
+  const wrongScope = await verifyPrintedPair('Variant A · Current revision R1 · Scope: North face',
+    'Variant A · Current revision R2 · Scope: South face', 'pair_scope_conflict');
+  assert.equal(wrongScope.outcome.verdict, 'unclear');
 });
 
 test('visual and text tools advertise only arguments accepted in their assigned role', () => {

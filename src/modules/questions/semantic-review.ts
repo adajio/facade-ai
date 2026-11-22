@@ -7,6 +7,7 @@ import { loadResearchProfile } from "../harness/profile.js";
 import { researchKind } from "../harness/runner.js";
 import { publishProjectEvent } from "../supplements/events.js";
 import { lockScopes } from "../supplements/holds.js";
+import { pairProofVersion } from "../assessment/domain.js";
 import { makePair } from "./domain.js";
 import type { InquirySearchContext, ObservationPublication } from "./domain.js";
 import { enqueue } from "./store.js";
@@ -99,13 +100,13 @@ export async function hasVerifiedMeaning(db: Pool, context: InquirySearchContext
   if (!source.assessmentQuestionId) return false;
   const result = await db.query(
     `SELECT 1
-     FROM inquiries i JOIN harness_disputes d ON d.question_id=i.assessment_question_id
-     JOIN gateway_generations g ON g.generation_id=d.generation_id AND g.current
+     FROM inquiries i JOIN harness_live_review_pairs d ON d.question_id=i.assessment_question_id
      JOIN harness_review_results a ON a.generation_id=d.generation_id AND a.dispute_id=d.id AND a.stage='A'
      JOIN harness_review_results b ON b.generation_id=d.generation_id AND b.dispute_id=d.id AND b.stage='B'
+     LEFT JOIN harness_review_results lead ON lead.generation_id=d.generation_id AND lead.dispute_id=d.id AND lead.stage='lead'
      JOIN inquiry_observations candidate ON candidate.id=$4 AND candidate.scope_id=i.scope_id AND NOT candidate.superseded
      WHERE i.id=$1 AND i.search_version=$2 AND i.assessment_question_id=$3
-       AND g.project_id=i.project_id AND g.scope_id=i.scope_id
+       AND d.project_id=i.project_id AND d.scope_id=i.scope_id
        AND EXISTS (
          SELECT 1 FROM inquiry_observations reviewed
          WHERE reviewed.id IN (d.a_observation_id,d.b_observation_id) AND NOT reviewed.superseded
@@ -118,7 +119,11 @@ export async function hasVerifiedMeaning(db: Pool, context: InquirySearchContext
        )
        AND NOT EXISTS (SELECT 1 FROM inquiry_observations old
           WHERE old.id IN (d.a_observation_id,d.b_observation_id) AND old.superseded)
-       AND a.result->>'verdict'='supported' AND b.result->>'verdict'='supported' LIMIT 1`,
+       AND a.result->>'verdict'='supported' AND b.result->>'verdict'='supported'
+       AND (NOT (a.result ? 'checks' OR b.result ? 'checks' OR coalesce(lead.result ? 'checks',false))
+         OR (lead.result#>>'{verifiedPair,version}'='${pairProofVersion}'
+           AND a.result->'verifiedPair'=lead.result->'verifiedPair' AND b.result->'verifiedPair'=lead.result->'verifiedPair'))
+     LIMIT 1`,
     [context.inquiryId, context.searchVersion, source.assessmentQuestionId, source.observationId],
   );
   return Boolean(result.rowCount);
@@ -134,7 +139,8 @@ export async function refreshCompletedSemanticReview(db: Pool): Promise<boolean>
      WHERE t.settled_at IS NULL AND (
        NOT g.current OR EXISTS (
          SELECT 1 FROM harness_review_results lead WHERE lead.generation_id=t.generation_id
-           AND lead.dispute_id=t.dispute_id AND lead.stage='lead' AND lead.result->>'kind'<>'proposal'
+           AND lead.dispute_id=t.dispute_id AND lead.stage='lead'
+           AND (lead.result->>'kind'<>'proposal' OR (lead.result ? 'checks' AND NOT (lead.result ? 'verifiedPair')))
        ) OR
        (SELECT count(*) FROM harness_review_results r WHERE r.generation_id=t.generation_id
         AND r.dispute_id=t.dispute_id AND r.stage IN ('A','B'))=2
@@ -153,10 +159,14 @@ export async function refreshCompletedSemanticReview(db: Pool): Promise<boolean>
     const { rows: [revised] } = await tx.query<{ search_version: number }>(
       `UPDATE inquiries i SET search_version=search_version+1, version=version+1
        WHERE i.id=$1 AND EXISTS (
-         SELECT 1 FROM gateway_generations g JOIN harness_review_results r ON r.generation_id=g.generation_id
-         WHERE g.generation_id=$2 AND g.current AND r.dispute_id=$3 AND r.stage IN ('A','B')
-           AND r.result->>'verdict'='supported'
-         GROUP BY g.generation_id HAVING count(*)=2
+         SELECT 1 FROM harness_live_review_pairs d
+         JOIN harness_review_results a ON a.generation_id=d.generation_id AND a.dispute_id=d.id AND a.stage='A'
+         JOIN harness_review_results b ON b.generation_id=d.generation_id AND b.dispute_id=d.id AND b.stage='B'
+         LEFT JOIN harness_review_results lead ON lead.generation_id=d.generation_id AND lead.dispute_id=d.id AND lead.stage='lead'
+         WHERE d.generation_id=$2 AND d.id=$3 AND a.result->>'verdict'='supported' AND b.result->>'verdict'='supported'
+           AND (NOT (a.result ? 'checks' OR b.result ? 'checks' OR coalesce(lead.result ? 'checks',false))
+             OR (lead.result#>>'{verifiedPair,version}'='${pairProofVersion}'
+               AND a.result->'verifiedPair'=lead.result->'verifiedPair' AND b.result->'verifiedPair'=lead.result->'verifiedPair'))
        ) AND NOT EXISTS (SELECT 1 FROM inquiry_jobs j WHERE j.inquiry_id=i.id) RETURNING search_version`,
       [next.id, next.generation_id, next.dispute_id],
     );

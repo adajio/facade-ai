@@ -7,6 +7,7 @@ import { pairConfirmed, pairCriteria, ReaderRefusal, type PairChecks } from './c
 import { contains } from '../pdf/types.js';
 import { canonicalJson, isInventoryRole } from '../assessment/domain.js';
 import { deliveredLines } from '../questions/attribute-aliases.js';
+import { pairSourceEvidence, type PairQuote } from './pair-evidence.js';
 import { escapeRegex } from '../questions/domain.js';
 import {
   checkToolArguments, commands, decodeCompletion, hashBytes, imageMessage, initialMessages, observationArguments, permittedTool, request,
@@ -176,31 +177,49 @@ function reviewEvidence(state: State, evidenceIds: readonly string[], citations:
   };
 }
 
-function checkPairEvidence(state: State, checks: PairChecks): ToolReply | null {
+function checkPairEvidence(
+  task: ResearchTask, state: State, checks: PairChecks, evidenceIds: readonly string[],
+) {
+  if (task.job.mode === 'primary') throw Error('Pair evidence from a primary job');
+  const addressed = new Map<typeof pairCriteria[number], PairQuote[]>();
   for (const criterion of pairCriteria) {
     const check = checks[criterion];
-    const supports = new Set<Branch>();
+    const quotes: PairQuote[] = [];
     for (const { evidenceId, quote } of check.sources) {
       const reply = state.delivered.has(evidenceId) ? state.replies.get(evidenceId) : undefined;
-      if (!reply?.evidence || !reply.support) return failedTool('evidence_not_delivered', evidenceCorrection);
+      if (!reply?.evidence || !reply.support) return { refusal: failedTool('evidence_not_delivered', evidenceCorrection) };
       const body = reply.body as { content?: unknown };
       const lines = typeof body.content === 'string' ? deliveredLines(body.content) : [];
-      if (!lines.some(({ text }) => text.includes(quote))) {
-        return failedTool('pair_quote_not_found', 'Укажите дословную цитату из открытой текстовой опоры или OCR.');
-      }
-      if (criterion === 'revision' && check.status === 'confirmed' &&
-          !/(?:^|[^\p{L}\p{N}])(?:revision|rev\.?|редакция|ревизия|ред\.?)\s*[:№]?\s*[\p{L}\p{N}][\p{L}\p{N}_.-]*/iu.test(quote)) {
-        return failedTool('pair_revision_not_addressed',
-          'Цитата должна содержать явное обозначение редакции в открытом оригинале. Если редакцию подтвердить нельзя, укажите unclear.');
-      }
-      supports.add(reply.support);
+      const matched = [...new Set(lines.filter(({ text }) => text.includes(quote)).map(({ text }) => text))];
+      if (matched.length !== 1) return { refusal: failedTool(matched.length ? 'pair_quote_ambiguous' : 'pair_quote_not_found',
+        'Укажите дословную цитату, однозначно адресующую одну строку открытой опоры или OCR.') };
+      quotes.push({ support: reply.support, evidenceId, quote, line: matched[0] });
     }
-    if (check.status === 'confirmed' && supports.size !== 2) {
-      return failedTool('pair_check_evidence_required',
-        `Для проверки ${criterion} укажите открытые опоры обеих сторон или оставьте результат неопределённым.`);
+    if (check.status === 'confirmed' && new Set(quotes.map(({ support }) => support)).size !== 2) {
+      return { refusal: failedTool('pair_check_evidence_required',
+        `Для проверки ${criterion} укажите открытые опоры обеих сторон или оставьте результат неопределённым.`) };
+    }
+    addressed.set(criterion, quotes);
+  }
+  const { a, b, question } = task.job.dispute;
+  const anchors = { A: [a.quote], B: [b.quote] };
+  for (const id of evidenceIds) {
+    const reply = state.replies.get(id);
+    if (reply?.support && reply.readKind !== 'open_context') {
+      const { content } = reply.body as { content?: unknown };
+      const quote = reply.support === 'A' ? a.quote : b.quote;
+      if (typeof content === 'string') anchors[reply.support].push(
+        ...deliveredLines(content).filter(({ text }) => text.includes(quote)).map(({ text }) => text));
     }
   }
-  return null;
+  if (!task.pairScopeName) return { refusal: failedTool('review_pair_stale', 'Откройте актуальную область вопроса.') };
+  const result = pairSourceEvidence({ variants: addressed.get('variant')!, revisions: addressed.get('revision')!,
+    applicability: addressed.get('applicability')!, anchors, scopeName: task.pairScopeName,
+    assignedVariant: question.variant, confirmVariant: checks.variant.status === 'confirmed',
+    confirmRevision: checks.revision.status === 'confirmed', confirmApplicability: checks.applicability.status === 'confirmed',
+  });
+  if ('failure' in result) return { refusal: failedTool(result.failure.code, result.failure.nextAction) };
+  return { proof: pairConfirmed(checks) ? result.proof : undefined };
 }
 
 function supportPlace(task: ResearchTask, support: Branch) {
@@ -535,8 +554,9 @@ async function executeTool(
         if (pairConfirmed(proposal.checks) && !evidence.both) {
           return { reply: failedTool('both_supports_required', 'Сначала откройте обе опоры с support A и B.') };
         }
-        const missing = checkPairEvidence(state, proposal.checks);
-        if (missing) return { reply: missing };
+        const verified = checkPairEvidence(task, state, proposal.checks, proposal.evidenceIds);
+        if (verified.refusal) return { reply: verified.refusal };
+        if (verified.proof) proposal.verifiedPair = verified.proof;
       }
       return { reply: { body: { ok: true } }, outcome: { kind: 'proposal', ...proposal } };
     }
@@ -552,8 +572,9 @@ async function executeTool(
         return { reply: failedTool('pair_check_unresolved', 'Если хотя бы одна проверка остаётся открытой или несовместимой, выберите unclear.') };
       }
       if (input.checks) {
-        const missing = checkPairEvidence(state, input.checks);
-        if (missing) return { reply: missing };
+        const verified = checkPairEvidence(task, state, input.checks, input.evidenceIds);
+        if (verified.refusal) return { reply: verified.refusal };
+        if (input.verdict === 'supported' && verified.proof) input.verifiedPair = verified.proof;
       }
       return { reply: { body: { ok: true } }, outcome: { kind: 'verification', ...input } };
     }
@@ -635,7 +656,8 @@ export async function advance(task: ResearchTask, ports: SessionPorts): Promise<
     };
   }
   const turn = state.latestModel + 1;
-  const modelRequest = request(task.job, state.currentMessages, 'current', task.earlyPair);
+  const modelRequest = request(task.job, state.currentMessages, 'current',
+    task.earlyPair && task.pairScopeName ? { scopeName: task.pairScopeName } : undefined);
   let serialized = JSON.stringify(modelRequest);
   if (Buffer.byteLength(serialized) > 16 * 1024 * 1024) {
     return {
@@ -651,6 +673,14 @@ export async function advance(task: ResearchTask, ports: SessionPorts): Promise<
   let result = await send(modelRequest);
   let compoundContract = true;
   let pairContract = task.earlyPair;
+  if (task.earlyPair && result.status === 'held' && result.code === 'effect_conflict' && result.attemptId) {
+    const previous = request(task.job, state.currentMessages, 'current', { legacy: true });
+    const wire = JSON.stringify(previous);
+    if (Buffer.byteLength(wire) <= 16 * 1024 * 1024) {
+      result = await send(previous);
+      serialized = wire;
+    }
+  }
   // The unfiltered history is still needed to identify requests already recorded in the gateway.
   const previouslySent = state.currentMessages === state.previousCurrentMessages ? []
     : [['current', state.previousCurrentMessages] as const];

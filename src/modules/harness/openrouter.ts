@@ -225,18 +225,25 @@ export function initialMessages(job: ResearchJob): Message[] {
 
 export type ToolWire = 'current' | 'compound-v1' | 'observation-v1' | 'role-v1' | 'shared-v1';
 
-export function request(job: ResearchJob, messages: Message[], wire: ToolWire = 'current', earlyPair = false) {
+type PairWire = { scopeName: string } | { legacy: true };
+
+export function request(job: ResearchJob, messages: Message[], wire: ToolWire = 'current', pair?: PairWire) {
+  const earlyPair = pair !== undefined;
   const hasCompound = wire === 'current' || wire === 'compound-v1';
   const hasObservationForms = hasCompound || wire === 'observation-v1';
   return {
     model: job.settings.model,
-    messages,
+    messages: pair && 'scopeName' in pair ? messages.map((message, index) =>
+      index === 1 && message.role === 'user' && typeof message.content === 'string'
+        ? { ...message, content: JSON.stringify({ ...JSON.parse(message.content), scopeName: pair.scopeName }) }
+        : message) : messages,
     tools: [...enabledTools(job, hasCompound), ...(earlyPair ? ['context_inventory', 'open_context'] as const : [])].map((name) => {
       let schema: z.ZodType = hasObservationForms && name !== 'verify_resolution' ? currentCommands[name] : commands[name];
       let description = toolDescriptions[name];
       if (earlyPair && isPairCommand(name)) {
         schema = pairCommands[name];
         description += ' Reopen both assigned originals independently. Check the same implementation (variant), effective revision of each source, scope and applicability to the assigned subject, and whether units and measured properties are comparable. For each confirmed check, provide a verbatim quote linked to freshly opened evidence from each support. For revision use the printed revision and explain why it is effective here. Look for titles and adjacent windows with context_inventory. Mark unclear when the relevant revision or variant cannot be established. The top-level evidenceIds must contain fresh reads of both original measurement windows. Never infer applicability merely from unequal numbers.';
+        if (pair && 'scopeName' in pair) description += ' Cite each printed variant code. Different variants are incompatible. If revision codes differ, cite where each source explicitly states that its revision is current for the scopeName in the assignment. Cite the scope itself in the same opened place. A revision code alone does not authorize differing revisions. Use unclear when either statement is missing.';
       }
       if (earlyPair && name === 'context_inventory') {
         description = 'List navigable windows in the two assigned immutable versions, including title pages. Use nextOffset to continue.';
