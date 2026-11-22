@@ -70,6 +70,7 @@ function restore(task: ResearchTask, events: ResearchEvent[]) {
   const messages = initialMessages(task.job);
   const corrections = new Map<number, ReturnType<typeof toolMessage>>();
   const legacyCorrections = new Map<number, ReturnType<typeof toolMessage>>();
+  const emptyTruncations = new Set<number>();
   const replies = new Map<string, ToolReply>();
   const delivered = new Set<string>();
   const observations: NonNullable<ToolReply['observation']>[] = [];
@@ -91,8 +92,15 @@ function restore(task: ResearchTask, events: ResearchEvent[]) {
         rejections = [];
         latestModel = event.turn;
         event.inputRefs.forEach((id) => delivered.add(id));
-        if (event.message) messages.push(event.message);
         const calls = event.message?.tool_calls ?? [];
+        if (event.message) {
+          const { content, refusal } = event.message;
+          // An unfinished reasoning-only response has no assistant answer or tool turn to replay.
+          if (event.finishReason === 'length' && content == null && !calls.length && !refusal) {
+            emptyTruncations.add(messages.length);
+          }
+          messages.push(event.message);
+        }
         if (calls.length > 0) {
           pending = { model: event, calls, results: [] };
         } else {
@@ -145,7 +153,10 @@ function restore(task: ResearchTask, events: ResearchEvent[]) {
     }
   }
   const render = (replacements: typeof corrections) => messages.map((message, index) => replacements.get(index) ?? message);
-  return { messages, currentMessages: render(new Map([...legacyCorrections, ...corrections])),
+  const previousCurrentMessages = render(new Map([...legacyCorrections, ...corrections]));
+  const currentMessages = emptyTruncations.size
+    ? previousCurrentMessages.filter((_, index) => !emptyTruncations.has(index)) : previousCurrentMessages;
+  return { messages, currentMessages, previousCurrentMessages,
     roleMessages: render(legacyCorrections), replies, delivered, observations, pending, latestModel, rejections, outcome,
     failedActions, stop };
 }
@@ -582,8 +593,11 @@ export async function advance(task: ResearchTask, ports: SessionPorts): Promise<
   });
   let result = await send(modelRequest);
   let compoundContract = true;
-  for (const [wire, messages] of [['compound-v1', state.currentMessages], ['observation-v1', state.currentMessages],
-    ['role-v1', state.roleMessages], ['shared-v1', state.messages]] as const) {
+  // The unfiltered history is still needed to identify requests already recorded in the gateway.
+  const previouslySent = state.currentMessages === state.previousCurrentMessages ? []
+    : [['current', state.previousCurrentMessages] as const];
+  for (const [wire, messages] of [...previouslySent, ['compound-v1', state.previousCurrentMessages],
+    ['observation-v1', state.previousCurrentMessages], ['role-v1', state.roleMessages], ['shared-v1', state.messages]] as const) {
     if (result.status !== 'held' || result.code !== 'effect_conflict' || !result.attemptId) break;
     // An existing attempt can only be recovered with its original request hash.
     // The gateway checks that identity before returning a receipt or authorizing a retry.
@@ -592,7 +606,7 @@ export async function advance(task: ResearchTask, ports: SessionPorts): Promise<
     if (Buffer.byteLength(legacyWire) <= 16 * 1024 * 1024) {
       result = await send(legacy);
       serialized = legacyWire;
-      compoundContract = wire === 'compound-v1';
+      compoundContract = wire === 'current' || wire === 'compound-v1';
     }
   }
   if (result.status === 'held') return {

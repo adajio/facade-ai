@@ -4,7 +4,7 @@ import { randomUUID } from 'node:crypto';
 import type { PoolClient } from 'pg';
 import type { ModelResult, ResearchTask } from './contracts.js';
 import { hashBytes, initialMessages, observationArguments, request } from './openrouter.js';
-import type { ResearchEvent, SessionPorts } from './session.js';
+import { advance, type ResearchEvent, type SessionPorts } from './session.js';
 import { runResearchWorkflow } from './workflow.js';
 
 const receipt = (name: string, args: unknown, finishReason = 'tool_calls') => ({
@@ -112,6 +112,53 @@ test('Mastra sends exact tool content, holds an unsettled turn and resumes only 
   assert.equal(reads.length, 2);
   assert.equal(recorded.length, 1);
   assert.equal(events.filter(({ kind }) => kind === 'model').length, 5);
+});
+
+test('a new turn omits a truncated reasoning-only assistant and can replay an existing pre-fix request', async () => {
+  const { task, ports, events } = setup();
+  const empty = { role: 'assistant', content: null, refusal: null, reasoning: 'partial reasoning' } as const;
+  events.push({ kind: 'model', turn: 1, attemptId: randomUUID(), finishReason: 'length',
+    message: empty, inputRefs: [], requestHash: 'fixture', compoundContract: true });
+  const original = request(task.job, [...initialMessages(task.job), empty, {
+    role: 'user', content: 'Ответ усечён. Продолжите назначенный вопрос с последнего неподтверждённого места.',
+  }]);
+  const oldAttempt = receipt('inventory', {});
+  const hashes: string[] = [];
+  ports.call = async ({ request: wire, effectKey }) => {
+    assert.equal(effectKey, `${task.jobId}:model:2`);
+    hashes.push(hashBytes(JSON.stringify(wire)));
+    if (hashes.length === 1) {
+      assert.deepEqual(wire, { ...original, messages: original.messages.filter(({role}) => role !== 'assistant') });
+      return { status: 'held', code: 'effect_conflict', attemptId: oldAttempt.attemptId, nextAction: 'inspect_original_effect' };
+    }
+    assert.deepEqual(wire, original);
+    return oldAttempt;
+  };
+  assert.deepEqual(await advance(task, ports), { status: 'continue' });
+  assert.equal(hashes.length, 2);
+  assert.notEqual(hashes[0], hashes[1]);
+  const last = events.at(-1);
+  assert.equal(last?.kind, 'model');
+  assert.equal(last.attemptId, oldAttempt.attemptId);
+  assert.equal(last.requestHash, hashes[1]);
+  assert.equal(last.compoundContract, true);
+});
+
+test('truncation preserves real assistant text, its reasoning, and an explicit refusal', async () => {
+  const { task, ports, events } = setup();
+  const messages = [
+    { role: 'assistant', content: 'Часть ответа', reasoning: 'partial reasoning' } as const,
+    { role: 'assistant', content: null, refusal: 'explicit refusal' } as const,
+  ];
+  events.push(...messages.map((message, index) => ({
+    kind: 'model' as const, turn: index + 1, attemptId: randomUUID(), finishReason: 'length',
+    message, inputRefs: [], requestHash: 'fixture',
+  })));
+  ports.call = async ({ request: wire }) => {
+    assert.deepEqual(wire.messages.filter(({ role }) => role === 'assistant'), messages);
+    return { status: 'held', code: 'unknown_charge', attemptId: randomUUID(), nextAction: 'reconcile' };
+  };
+  assert.equal((await advance(task, ports)).status, 'suspended');
 });
 
 test('visual and text tools advertise only arguments accepted in their assigned role', () => {
