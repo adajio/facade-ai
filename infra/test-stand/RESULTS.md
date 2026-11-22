@@ -210,3 +210,29 @@ HTTP 206 для того же Range. Снятие копии, восстанов
 Стендовый валидатор отклонил произвольную политику, чужой endpoint и `NODE_OPTIONS`.
 В worker подтверждены TLS 1.3 до журнала и остаток $10 перед запуском владельцем серии. Платных запросов в проверках шага 14 было 0.
 [Сухой preflight](</Volumes/ADATA SE920/OrbStack/facade-ai-test-server/step15/policy-dry.CovQioho/qwen-preflight.json>) · [Канал worker](</Volumes/ADATA SE920/OrbStack/facade-ai-test-server/step15/worker-native-preflight.json>)
+
+## Финальный кодовый снимок и адресный повтор писем
+
+Команда `stand build reader 201dc935748f2f7f1c3525273b652f8f775866ca` сверила все 238 файлов с манифестом интегратора
+`0149bb6f963eaa8695a92e63d136e92a79c0d332e8f4d39a0deb7e0100bb759a`. Образ Linux arm64
+`sha256:718559d76800364e629ee4f19feae42503e543b52f4f0b9453d93a136a62ba71` развёрнут на основном HTTPS для API и worker
+и через `step15 offline-api` для API на `18085`. Схемы обеих БД актуальны. Общие PostgreSQL, S3 и брокер сохранили ID
+контейнеров и время старта. На HTTPS проверены 10 маршрутов и хэши выданных JS/CSS, на offline API доступен `/readyz`.
+[Манифест интегратора](</Volumes/cargo/facade-ai-integration-20261122/logs/manifest-final-code.sha256>) · [Развёртывание и smoke](</Volumes/ADATA SE920/OrbStack/facade-ai-test-server/logs/deploy-final-code.log>)
+
+Две адресные проверки в том же образе прошли. Тест письма привязал редакцию к закреплённой опоре, а тест `routerDiagnostic`
+на локальной подмене HTTP различил два варианта 404 и подтвердил удержание резерва до сверки.
+[Изолированные тесты](</Volumes/ADATA SE920/OrbStack/facade-ai-test-server/step15/delivery-check.iAD0iC5Z/final-controlled-tests.log>)
+
+Точный `test/acceptance/managed.mjs` из того же Git-снимка повторил пакеты `missing,conflict` в отдельной БД, бакете и журнале
+через управляемый loopback-транспорт. Для непередачи подтверждены две опоры A/B на строке 2 реестра N05. Для конфликта
+подтверждены PDF, стр. 1, 19 мм, и DOCX, таблица 1, строка 2, столбец 2, 26 мм. Обе опоры конфликта содержат N05.
+Сходятся исходные SHA-256. В холодной и тёплой фазах для каждого пакета создан один пункт запроса, текст TXT совпал
+с DOCX. Полные формулировки обоих писем отличаются от предварительного эталона.
+[Адресный протокол](</Volumes/ADATA SE920/OrbStack/facade-ai-test-server/step15/delivery-check.iAD0iC5Z/letters/verified-addresses.json>)
+
+После остановки управляемого транспорта для обоих пакетов воспроизведены те же `attemptId` и `requestHash` и проверены
+неизменные хэши TXT/DOCX. Новых обращений к управляемому транспорту при повторе 0. Платный worker и его прокси оставались
+выключенными. Побайтовая сверка отпечатка до обновления и после проверки писем подтвердила тот же нативный ledger,
+отозванный допуск и одну неизвестную попытку. Резерв $9,084216, доступный остаток $0,915784, новых живых эффектов 0.
+[Контроль журнала](</Volumes/ADATA SE920/OrbStack/facade-ai-test-server/step15/delivery-check.iAD0iC5Z/after-letters.json>)
