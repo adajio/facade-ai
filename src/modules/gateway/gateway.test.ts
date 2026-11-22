@@ -37,6 +37,8 @@ const onePixel = {
   type: 'image_url',
   image_url: { url: 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aRxoAAAAASUVORK5CYII=' },
 };
+const expectedDisabledPlugins = ['web', 'file-parser', 'response-healing', 'auto-router', 'pareto-router', 'armor']
+  .map(id => ({ id, enabled: false }));
 const actor = { authority: 'gateway:reconcile', actorId: 'synthetic-operator' } as const;
 const obligationA = { id: 'a', branch: 'A', place: 'page-1' } as const;
 const obligationB = { id: 'b', branch: 'B', place: 'page-1' } as const;
@@ -187,14 +189,14 @@ test('both OpenRouter route families quote bounded synthetic image tool turns wi
       validUntil: '2099-01-01T00:00:00Z', knownNoChargeStatuses: [],
       ...fixtureRates, cacheBilling: 'supplement', reasoningBilling: 'supplement' },
   ];
-  const ceilings = [206_100, 361_100];
+  const ceilings = [206_100, 366_100];
   for (const [i, profile] of fixtures.entries()) {
     const route = { ...baseRoute, id: profile.routeId, transport: 'openrouter' as const };
     const request = { model: profile.model, max_tokens: 200, messages: [
       { role: 'tool', tool_call_id: 'call-1', content: 'synthetic result' },
       { role: 'user', content: [{ type: 'text', text: 'one synthetic pixel' }, onePixel] },
     ] };
-    const expected = { input: i === 0 ? 125_000 : 240_000, outputAndReasoning: i === 0 ? 60_000 : 100_000,
+    const expected = { input: i === 0 ? 125_000 : 240_000, outputAndReasoning: i === 0 ? 60_000 : 105_000,
       images: 20_000, request: 1_000, additional: 100, ceilingUsdNanos: ceilings[i] };
     assert.deepEqual(estimateOpenRouterRequest(profile, { ...route, ceilingUsdNanos: ceilings[i] }, request), expected);
     assert.equal(estimateOpenRouterRequest(profile, { ...route, ceilingUsdNanos: ceilings[i] - 1 }, request), null);
@@ -205,6 +207,123 @@ test('both OpenRouter route families quote bounded synthetic image tool turns wi
       { role: 'user', content: [onePixel, onePixel] },
     ] }), null);
   }
+});
+
+test('qualified short-request bounds price the serialized wire and fall back outside the certified shape', () => {
+  const ref = project();
+  const profiles: OpenRouterProfile[] = [
+    { routeId: 'estimate-wafer', model: 'moonshotai/kimi-k3.1-pro', provider: 'wafer/us',
+      expectedResponseProvider: 'Wafer', mode: 'strict-zdr', zdrEvidenceRef: 'fixture:zdr',
+      revision: 'v1', boundEvidenceRef: 'fixture:price', validUntil: '2099-01-01T00:00:00Z', knownNoChargeStatuses: [],
+      ...fixtureRates, inputTokenUpperBound: 1_048_376 },
+    { routeId: 'estimate-alibaba', model: 'qwen/qwen4-max', provider: 'alibaba',
+      expectedResponseProvider: 'Alibaba', mode: 'synthetic-research', revision: 'v1',
+      syntheticScopes: [{ projectId: ref.projectId, scopeId: ref.scopeId, approvalRef: 'fixture:scope',
+        originalSha256s: ['a'.repeat(64)] }],
+      boundEvidenceRef: 'fixture:price', validUntil: '2099-01-01T00:00:00Z', knownNoChargeStatuses: [],
+      ...fixtureRates, inputTokenUpperBound: 1_000_000 },
+  ];
+  const envelope = { evidenceRef: 'fixture:hard-transform-bound', maxWireBytes: 8192, maxMessages: 3,
+    maxTools: 1, tokensPerWireByte: 2, templateOverheadTokens: 256 };
+  for (const base of profiles) {
+    const profile = { ...base, inputEnvelope: envelope };
+    const route = { ...baseRoute, id: base.routeId, transport: 'openrouter' as const };
+    const text = { role: 'user', content: 'Синтетический ввод, UTF-8' };
+    const tool = { type: 'function', function: { name: 'find', parameters: { type: 'object' } } };
+    const request = { model: base.model, messages: [text], tools: [tool], tool_choice: 'required', max_tokens: 200 };
+    assert.equal(estimateOpenRouterRequest(profile, route, { ...request, parallel_tool_calls: true }), null);
+    assert.equal(estimateOpenRouterRequest(profile, route, { ...request, tool_choice: 'unexpected' }), null);
+    assert.equal(estimateOpenRouterRequest({ ...profile, completionParameter: 'max_completion_tokens' }, route, request), null);
+    const full = estimateOpenRouterRequest(base, route, request);
+    const quote = estimateOpenRouterRequest(profile, route, request);
+    assert.ok(full && quote?.inputEnvelope);
+    assert.deepEqual(estimateOpenRouterRequest(profile, route, { ...request, parallel_tool_calls: false }), quote);
+    const { wireBytes, inputTokens } = quote.inputEnvelope;
+    assert.equal(inputTokens, wireBytes * envelope.tokensPerWireByte + envelope.templateOverheadTokens);
+    assert.equal(quote.input, inputTokens * 125);
+    assert.equal(quote.outputAndReasoning, base.provider === 'alibaba' ? 63_000 : 60_000);
+    assert.ok(quote.ceilingUsdNanos < full.ceilingUsdNanos);
+    assert.equal(estimateOpenRouterRequest({ ...profile, inputEnvelope: { ...envelope, evidenceRef: '' } }, route, request), null);
+
+    const tooManyTools = { ...request, tools: [tool, tool] };
+    const tooManyMessages = { ...request, messages: [text, text, text, text] };
+    const larger = { ...request, messages: [{ ...text, content: 'я'.repeat(5000) }] };
+    for (const outside of [tooManyTools, tooManyMessages, larger]) {
+      const protectedQuote = estimateOpenRouterRequest(profile, route, outside);
+      assert.equal(protectedQuote?.inputEnvelope, undefined);
+      assert.equal(protectedQuote?.input, full.input);
+    }
+
+    const visual = { ...request, messages: [{ role: 'user', content: [onePixel] }] };
+    assert.equal(estimateOpenRouterRequest(profile, route, visual)?.inputEnvelope, undefined);
+    const visualBound = estimateOpenRouterRequest({ ...profile, inputEnvelope: { ...envelope, maxTokensPerImage: 500 } }, route, visual);
+    assert.equal(visualBound?.inputEnvelope?.images, 1);
+    assert.equal(visualBound?.inputEnvelope?.inputTokens, visualBound!.inputEnvelope!.wireBytes * 2 + 256 + 500);
+    assert.equal(visualBound?.images, profile.imageNanos);
+
+    if (base.provider === 'wafer/us') {
+      const contextRisk = { ...base, inputTokenUpperBound: 1_048_377 };
+      assert.equal(estimateOpenRouterRequest(contextRisk, route, request), null);
+      const fallbackCost = (943_718 - request.max_tokens) * 300;
+      assert.equal(estimateOpenRouterRequest({ ...contextRisk, additionalNanos: fallbackCost - 1 }, route, request), null);
+      assert.equal(estimateOpenRouterRequest({ ...contextRisk, additionalNanos: fallbackCost }, route, request)?.additional,
+        fallbackCost);
+      const bounded = { ...contextRisk, inputEnvelope: envelope };
+      assert.equal(estimateOpenRouterRequest(bounded, route, request)?.ceilingUsdNanos, quote.ceilingUsdNanos);
+      assert.equal(estimateOpenRouterRequest(bounded, route, larger), null);
+    }
+  }
+});
+
+test('Decart is scoped to the qualified synthetic Kimi route and requires a supported tool choice', async t => {
+  const ref = project();
+  const route = { ...baseRoute, id: 'decart-comparison', transport: 'openrouter' } as const;
+  const profile = {
+    routeId: route.id, revision: route.revision, model: 'moonshotai/kimi-k3.1-pro',
+    provider: 'decart/mxfp4', expectedResponseProvider: 'Decart', mode: 'synthetic-research',
+    zdrEvidenceRef: 'fixture:decart-zdr', boundEvidenceRef: 'fixture:decart-rates', validUntil: '2099-01-01T00:00:00Z',
+    syntheticScopes: [{ ...ref, approvalRef: 'fixture:decart-scope', originalSha256s: ['a'.repeat(64)] }],
+    ...fixtureRates, knownNoChargeStatuses: [],
+  } as const;
+  const approval = { qualification: 'step-15', endpoint: 'https://openrouter.ai', apiKey: 'fixture-key' } as const;
+  for (const excluded of [{ ...profile, mode: 'strict-zdr' as const }, { ...profile, zdrEvidenceRef: '' },
+    { ...profile, provider: 'decart' }, { ...profile, model: 'moonshotai/kimi-other' }]) {
+    assert.throws(() => openRouterTransport({ ...approval, profiles: [excluded] }), /invalid_openrouter_profile/);
+  }
+  const transport = openRouterTransport({ ...approval, profiles: [profile] });
+  const tool = { type: 'function', function: { name: 'fixture_tool', parameters: { type: 'object' } } };
+  const request = { model: profile.model, messages: [{ role: 'user', content: 'synthetic' }], max_tokens: 200,
+    tools: [tool], tool_choice: 'auto', parallel_tool_calls: false };
+  assert.equal(transport.requestBlock?.(route, { ...request, tool_choice: 'required' }), 'route_parameters_unsupported');
+  assert.equal(transport.requestBlock?.(route, { ...request, parallel_tool_calls: true }), 'route_parameters_unsupported');
+  assert.ok(transport.quote?.(route, { ...request, tool_choice: { type: 'function', function: { name: 'fixture_tool' } } }));
+  const quote = transport.quote?.(route, request);
+  assert.ok(quote);
+  const attempt: Attempt = { ...ref, ...quote, id: randomUUID(), jobId: randomUUID(), purpose: 'primary_a',
+    effectKey: 'fixture:decart', requestHash: 'fixture:request', routeId: route.id, revision: route.revision,
+    dataClass: 'synthetic', previousRejectedId: null };
+  const fetchSpy = t.mock.method(globalThis, 'fetch', async (_url: string, options: RequestInit) => {
+    const wire = JSON.parse(options.body as string);
+    assert.deepEqual(wire.provider.only, ['decart/mxfp4']);
+    assert.deepEqual(wire.provider.order, ['decart/mxfp4']);
+    assert.equal(wire.provider.allow_fallbacks, false);
+    assert.equal(wire.provider.require_parameters, true);
+    assert.equal(wire.provider.zdr, true);
+    assert.equal(wire.provider.data_collection, 'deny');
+    assert.deepEqual(wire.plugins, expectedDisabledPlugins);
+    assert.equal(wire.parallel_tool_calls, undefined);
+    assert.equal(wire.tool_choice, 'auto');
+    assert.equal(wire.max_tokens, 200);
+    assert.deepEqual(wire.tools, [tool]);
+    return Response.json({ id: 'gen-fixture-decart', model: profile.model, provider: 'Decart', usage: { cost: 0 }, choices: [] });
+  });
+  const signal = new AbortController().signal;
+  assert.equal((await transport.send({ ...attempt, dataClass: 'client' }, route, request, signal)).receipt.state, 'rejected');
+  assert.equal((await transport.send({ ...attempt, scopeId: randomUUID() }, route, request, signal)).receipt.state, 'rejected');
+  assert.equal((await transport.send(attempt, route, { ...request, tool_choice: 'required' }, signal)).receipt.state, 'rejected');
+  assert.equal(fetchSpy.mock.callCount(), 0);
+  assert.equal((await transport.send(attempt, route, request, signal)).receipt.state, 'paid');
+  assert.equal(fetchSpy.mock.callCount(), 1);
 });
 
 test('journal failure after local reserve and permission revocation both prevent transmission', sqlCase, async t => {
@@ -576,6 +695,7 @@ test('synthetic Alibaba applies explicit retention and no-training evidence to t
     assert.equal(wire.provider.zdr, false);
     assert.equal(wire.provider.data_collection, 'allow');
     assert.equal(wire.provider.require_parameters, true);
+    assert.deepEqual(wire.plugins, expectedDisabledPlugins);
     assert.equal(wire.parallel_tool_calls, undefined);
     assert.equal(wire.tool_choice, 'required');
     assert.equal(wire.tools[0].function.name, 'fixture_tool');
@@ -605,6 +725,8 @@ test('synthetic Alibaba applies explicit retention and no-training evidence to t
     ...approval, endpoint: 'https://eu.openrouter.ai', profiles: [profile],
   }));
   isHeld(await regional.call(input), 'route_endpoint_unverified');
+  isHeld(await gateway.call({ ...input, request: { ...input.request, plugins: [{ id: 'web', enabled: true }] } }),
+    'route_bound_unavailable');
   isHeld(await gateway.call({ ...input, request: { ...input.request, parallel_tool_calls: true } }),
     'route_parameters_unsupported');
   isHeld(await gateway.call({ ...input, dataClass: 'client' }), 'route_data_unapproved');
@@ -634,15 +756,15 @@ test('synthetic Alibaba applies explicit retention and no-training evidence to t
   const undecided = isHeld(await gateway.call(unresolved), 'unknown_charge');
   assert.equal(isHeld(await gateway.call(unresolved), 'unknown_charge').attemptId, undecided.attemptId);
   const state = await s.journal.balance();
-  assert.equal(state.reserveUsdNanos, 206_100);
-  assert.equal(state.remainingUsdNanos, 43_900);
+  assert.equal(state.reserveUsdNanos, 209_100);
+  assert.equal(state.remainingUsdNanos, 40_900);
 
   await s.db.query('INSERT INTO intake_originals VALUES($1,$2,$3)',
     [randomUUID(), ref.projectId, 'b'.repeat(64)]);
   isHeld(await gateway.call({ ...input, effectKey: 'after-unknown-input' }), 'route_data_unapproved');
   assert.equal(mockFetch.mock.callCount(), 2);
   assert.equal((await s.read()).external.length, 3);
-  t.diagnostic('multimodal quote 206100 nUSD fits; 296100 nUSD refused against 250000 nUSD; unknown holds 206100 nUSD');
+  t.diagnostic('multimodal quote 209100 nUSD fits; 299100 nUSD refused against 250000 nUSD; unknown holds 209100 nUSD');
 });
 
 test('operator API authorizes organization and CSRF, stores an audit receipt and returns only diagnostics', sqlCase, async t => {
@@ -755,6 +877,12 @@ test('OpenRouter 404 diagnostics distinguish a pre-provider refusal from an unpr
     const wire = JSON.parse(options.body as string);
     traces.push(wire.trace.trace_id);
     assert.deepEqual(wire.provider.only, ['wafer/us']);
+    assert.deepEqual(wire.plugins, expectedDisabledPlugins);
+    assert.equal(wire.parallel_tool_calls, undefined);
+    assert.equal(wire.tool_choice, 'required');
+    assert.equal(wire.max_tokens, 200);
+    assert.equal(wire.max_completion_tokens, undefined);
+    assert.equal(wire.provider.require_parameters, true);
     assert.equal(wire.provider.zdr, true);
     assert.equal(wire.provider.data_collection, 'deny');
     assert.equal(wire.provider.allow_fallbacks, false);
@@ -774,7 +902,10 @@ test('OpenRouter 404 diagnostics distinguish a pre-provider refusal from an unpr
       error: { code: 404, message: document, metadata: { error_type: secret, failed_routing_step: document } },
     }, { status: 404, headers: { 'X-Request-Id': secret } });
   });
-  const request = { model: profile.model, messages: [{ role: 'user', content: document }], max_tokens: 200 };
+  const request = { model: profile.model, messages: [{ role: 'user', content: document }], max_tokens: 200,
+    tool_choice: 'required', parallel_tool_calls: false,
+    tools: [{ type: 'function', function: { name: 'fixture_tool', parameters: { type: 'object' } } }],
+  };
   const firstInput = { ...call(firstWorker, route.id), inputRefs: [], request };
   const first = isHeld(await gateway.call(firstInput), 'unknown_charge');
   const second = isHeld(await gateway.call({ ...call(secondWorker, secondRoute.id), inputRefs: [], request }),

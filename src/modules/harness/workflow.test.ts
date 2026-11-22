@@ -114,6 +114,28 @@ test('Mastra sends exact tool content, holds an unsettled turn and resumes only 
   assert.equal(events.filter(({ kind }) => kind === 'model').length, 5);
 });
 
+test('text-only auto replies exhaust the assigned turns without executing an alleged tool call', async () => {
+  const { task, ports, events, reads, recorded } = setup();
+  task.job.settings = { ...task.job.settings, toolChoice: 'auto', maxTurns: 2 };
+  const plainText = JSON.stringify({ lastToolCall: 'finish_reading', claim: 'Толщина 2 мм' });
+  ports.call = async ({ request, inputRefs }) => {
+    assert.equal(request.tool_choice, 'auto');
+    assert.deepEqual(inputRefs, []);
+    if (events.length > 0) {
+      assert.equal(request.messages.at(-2)?.content, plainText);
+      assert.match(String(request.messages.at(-1)?.content), /Продолжите с помощью доступных инструментов/);
+    }
+    return { status: 'paid', attemptId: randomUUID(), output: {
+      choices: [{ finish_reason: 'stop', message: { role: 'assistant', content: plainText } }],
+    } };
+  };
+  const final = await runResearchWorkflow(task, ports, new AbortController().signal);
+  assert.equal(final.status === 'suspended' && final.hold.reason, 'turn_limit');
+  assert.deepEqual(events.map(({ kind }) => kind), ['model', 'model']);
+  assert.deepEqual(reads, []);
+  assert.deepEqual(recorded, []);
+});
+
 test('lost tool reply is recovered by the same operation key; known 429 retries with its original attempt', async () => {
   const { task, ports, reads, events } = setup();
   const rejectedId = randomUUID();

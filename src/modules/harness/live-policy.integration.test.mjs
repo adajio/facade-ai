@@ -13,13 +13,16 @@ const fixture = {
   A: { routeId: 'fixture-kimi', model: 'moonshotai/kimi-fixture', provider: 'wafer/us', responseProvider: 'Wafer' },
   B: { routeId: 'fixture-qwen', model: 'qwen/qwen-fixture', provider: 'alibaba', responseProvider: 'Alibaba' },
 };
-const settings = ({ routeId, model }) => ({
+const wafer = { ...fixture.A, model: 'moonshotai/kimi-k3.1-pro', routeId: 'fixture-wafer-comparison', toolChoice: 'auto' };
+const decart = { ...wafer, routeId: 'fixture-decart-comparison', provider: 'decart/mxfp4', responseProvider: 'Decart' };
+const settings = ({ routeId, model, toolChoice }) => ({
   routeId, model, dataClass: 'synthetic', maxTokens: 512, maxTurns: 16, maxKnownRejections: 1,
+  ...(toolChoice && { toolChoice }),
 });
 const formatProfile = (source, authorized) => ({
   routeId: source.routeId, model: source.model, revision: 'local-test', provider: source.provider,
   expectedResponseProvider: source.responseProvider,
-  mode: 'synthetic-research', zdrEvidenceRef: source === fixture.A ? 'fixture-zdr' : undefined,
+  mode: 'synthetic-research', zdrEvidenceRef: source === fixture.B ? undefined : 'fixture-zdr',
   boundEvidenceRef: 'fixture-pricing', validUntil: '2099-01-01T00:00:00Z',
   inputTokenUpperBound: 10000, outputTokenLimit: 512,
   maxImages: 0, maxImagePixels: 0, maxImageWidth: 0, maxImageHeight: 0, maxImageBytes: 0,
@@ -88,37 +91,52 @@ test('partial live configuration uses only independently admitted routes with th
       sourceRoles: ['design'], completenessCriterion: 'Addressed value', addressee: 'customer' }],
   });
   const gateway = createGateway(app.db);
-  for (const { routeId } of Object.values(fixture)) {
+  for (const { routeId } of [...Object.values(fixture), wafer, decart]) {
     await gateway.configureRoute({
       id: routeId, revision: 'local-test', transport: 'openrouter', enabled: true,
       maxRequestBytes: 2 * 1024 * 1024, ceilingUsdNanos: 1, timeoutMs: 8000,
     });
   }
+  let selectedA = fixture.A;
   async function grant(projectId, branch, allowed) {
-    await gateway.grantRoute({ projectId, routeId: fixture[branch].routeId, revision: 'local-test',
+    await gateway.grantRoute({ projectId, routeId: (branch === 'A' ? selectedA : fixture.B).routeId, revision: 'local-test',
       dataClass: 'synthetic', purpose: branch === 'A' ? 'primary_a' : 'primary_b', allowed });
   }
 
   const calls = [];
   const errors = [];
   const warnings = [];
+  const unsolicitedClaim = JSON.stringify({ lastToolCall: 'finish_reading', claim: 'Thickness 999 mm' });
   let revoke;
   globalThis.fetch = async (url, options) => {
     try {
       assert.equal(String(url), endpoint);
       const input = JSON.parse(options.body);
-      const branch = input.model === fixture.A.model ? 'A' : 'B';
-      const selected = fixture[branch];
+      const branch = input.model === fixture.B.model ? 'B' : 'A';
+      const selected = branch === 'A' ? selectedA : fixture.B;
       assert.equal(input.model, selected.model);
       assert.deepEqual(input.provider.only, [selected.provider]);
+      assert.deepEqual(input.provider.order, [selected.provider]);
       assert.equal(input.provider.allow_fallbacks, false);
+      assert.equal(input.provider.require_parameters, true);
+      assert.equal(input.provider.data_collection, 'deny');
       assert.equal(input.provider.zdr, branch === 'A');
+      assert.equal(input.tool_choice, selected.toolChoice ?? 'required');
       const assignment = JSON.parse(input.messages[1].content);
       const projectId = assignment.place.source.projectId;
       calls.push({ projectId, branch });
       const outputs = input.messages.filter(({ role }) => role === 'tool').map(({ content }) => JSON.parse(content));
       if (revoke?.projectId === projectId && revoke.branch === branch && outputs.length === 0) {
         await grant(projectId, branch, false);
+      }
+      const receipt = { id: `gen-${randomUUID()}`, model: selected.model, provider: selected.responseProvider, usage: { cost: 0 } };
+      if (selected.toolChoice === 'auto' && input.messages.length === 2) {
+        return Response.json({ ...receipt, choices: [{ finish_reason: 'stop',
+          message: { role: 'assistant', content: unsolicitedClaim } }] });
+      }
+      if (selected.toolChoice === 'auto' && outputs.length === 0) {
+        assert.equal(input.messages.at(-2)?.content, unsolicitedClaim);
+        assert.match(input.messages.at(-1)?.content, /Продолжите с помощью доступных инструментов/);
       }
       let name = 'extract';
       let args = {};
@@ -133,8 +151,7 @@ test('partial live configuration uses only independently admitted routes with th
         name = 'finish_reading';
         args = { status: 'covered', explanation: 'Checked a synthetic line.' };
       }
-      return Response.json({ id: `gen-${randomUUID()}`, model: selected.model, provider: selected.responseProvider,
-        usage: { cost: 0 }, choices: [{ finish_reason: 'tool_calls', message: { role: 'assistant', content: null,
+      return Response.json({ ...receipt, choices: [{ finish_reason: 'tool_calls', message: { role: 'assistant', content: null,
           tool_calls: [{ id: randomUUID(), type: 'function', function: { name, arguments: JSON.stringify(args) } }] } }] });
     } catch (error) {
       errors.push(error.message);
@@ -156,14 +173,16 @@ test('partial live configuration uses only independently admitted routes with th
   delete process.env.FACADE_GATEWAY_OPENROUTER_ENDPOINT;
 
   async function runCase(testCase) {
+    selectedA = testCase.comparison ?? fixture.A;
+    const sources = { A: selectedA, B: fixture.B };
     const project = await post('/api/projects', { name: testCase.name, catalogVersionId: catalog.id, scopeName: 'F-A', stage: 'P' });
     const scopeId = project.scopes[0].id;
     const files = testCase.dispute ? ['Thickness 2 mm', 'Thickness 3 mm'] : ['Thickness 2 mm'];
     const authorized = { projectId: project.id, scopeId, originalSha256s: files.map(checksum) };
-    const approvals = testCase.approvals.map((branch) => formatProfile(fixture[branch], authorized));
+    const approvals = testCase.approvals.map((branch) => formatProfile(sources[branch], authorized));
     for (const branch of ['A', 'B']) await grant(project.id, branch, true);
     process.env.FACADE_HARNESS_PROFILE = JSON.stringify({
-      A: settings(fixture.A), B: settings(fixture.B),
+      A: settings(sources.A), B: settings(sources.B),
       ...(testCase.settings ?? {}),
     });
     process.env.FACADE_GATEWAY_STEP15_PROFILES = JSON.stringify([
@@ -199,6 +218,28 @@ test('partial live configuration uses only independently admitted routes with th
       .filter(([purpose]) => purpose !== 'review')
       .map(([purpose, state]) => [purpose.endsWith('_a') ? 'A' : 'B', state === 'done' ? 'completed' : 'pending']));
     assert.deepEqual(calls.filter(({ projectId }) => project.id === projectId).map(({ branch }) => branch).sort(), testCase.calls);
+    if (testCase.comparison) {
+      const { rows: trail } = await app.db.query(
+        `SELECT e.event FROM harness_research_events e JOIN gateway_jobs j ON j.id=e.job_id
+         WHERE j.project_id=$1 AND j.purpose='primary_a' ORDER BY e.sequence`, [project.id]);
+      const events = trail.map(({ event }) => event);
+      assert.deepEqual(events.map(({ kind }) => kind), ['model', 'model', 'intent', 'tool', 'model', 'intent', 'tool', 'model', 'intent', 'tool']);
+      assert.equal(events[0].message.content, unsolicitedClaim);
+      assert.equal(events[0].message.tool_calls, undefined);
+      for (const i of [1, 4, 7]) assert.equal(events[i].message.tool_calls[0].id, events[i+1].callId);
+      assert.deepEqual(events.slice(1).filter(({ kind }) => kind === 'model')
+        .map(({ message }) => message.tool_calls[0].function.name), ['extract', 'save_observation', 'finish_reading']);
+      const { rows: observations } = await app.db.query(
+        'SELECT id,evidence_id,branch FROM reader_observations WHERE project_id=$1', [project.id]);
+      const observationId = events[6].reply.body.observationId;
+      const evidenceId = events[3].reply.evidence.evidenceId;
+      assert.deepEqual(observations, [{ id: observationId, evidence_id: evidenceId, branch: 'A' }]);
+      const claim = (await http('GET', `/api/v1/observations/${observationId}`)).json();
+      assert.equal(claim.quote, 'Thickness 2 mm');
+      assert.equal(claim.evidenceHref, `/api/v1/evidence/${evidenceId}`);
+      const evidence = (await http('GET', `${claim.evidenceHref}/content`)).json();
+      assert.ok(evidence.lines.some(({ text }) => text === claim.quote));
+    }
     const response = (await http('GET', `/api/projects/${project.id}/assessments/current?scopeId=${scopeId}`)).json();
     assert.equal(response.questions[0].machine.outcome, 'needs_review');
     if (testCase.dispute) {
@@ -246,6 +287,10 @@ test('partial live configuration uses only independently admitted routes with th
     expected: [held('a', 'research_profile_unavailable'), done('b')] });
   await runCase({ name: 'No routes', approvals: [], calls: [],
     expected: [held('a', 'research_route_not_approved'), held('b', 'research_route_not_approved')] });
+  for (const comparison of [wafer, decart]) {
+    await runCase({ name: `Compare ${comparison.provider}`, comparison, approvals: ['A'], calls: ['A', 'A', 'A', 'A'],
+      expected: [done('a'), held('b', 'research_route_not_approved')] });
+  }
   await runCase({ name: 'Revoke A', approvals: ['A', 'B'], revoke: 'A', calls: ['A', 'B', 'B', 'B'],
     expected: [held('a', 'route_denied'), done('b')] });
   await runCase({ name: 'Leader unavailable', approvals: ['A', 'B'], dispute: true,

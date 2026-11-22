@@ -1,16 +1,17 @@
-import type { OpenRouterProfile } from '../gateway/index.js';
-import type { ResearchSuspension, ResearchTask } from './contracts.js';
+import { matchesKimiEndpoint, type OpenRouterProfile } from '../gateway/index.js';
+import type { ResearchSettings, ResearchSuspension, ResearchTask } from './contracts.js';
 import { profileHold, researchSlot, researchSlots, type ResearchProfile, type ResearchSlot } from './profile.js';
 
 export type LiveRoute = Pick<OpenRouterProfile,
   'routeId' | 'model' | 'provider' | 'mode' | 'zdrEvidenceRef' | 'syntheticScopes'>;
 
-function matchesPolicy(route: LiveRoute, dataClass: string, policy: string) {
+function matchesPolicy(route: LiveRoute, { dataClass, toolChoice }: ResearchSettings, policy: string) {
   if (typeof route.provider !== 'string' || (route.mode !== 'strict-zdr' && route.mode !== 'synthetic-research')) return false;
   const hasZdr = typeof route.zdrEvidenceRef === 'string' && Boolean(route.zdrEvidenceRef.trim());
-  if (route.model.startsWith('moonshotai/kimi-') && (route.provider !== 'wafer/us' || !hasZdr)) {
+  if (route.model.startsWith('moonshotai/kimi-') && (!hasZdr || !matchesKimiEndpoint(route.model, route.provider, route.mode))) {
     return false;
   }
+  if (route.provider === 'decart/mxfp4' && toolChoice !== 'auto') return false;
   if (policy === 'strict-zdr' && (route.mode !== 'strict-zdr' || !hasZdr)) return false;
   if (policy === 'synthetic-research' &&
       (dataClass !== 'synthetic' || (route.model.startsWith('qwen/') && !/^alibaba(?:\/|$)/.test(route.provider)))) {
@@ -32,7 +33,7 @@ export function validateLivePolicy<T extends LiveRoute>(
     const settings = configuration[slot];
     if (!settings) continue;
     const matching = approvals.filter((route) => route?.routeId === settings.routeId && route.model === settings.model);
-    if (matching.length === 1 && usable(matching[0]) && matchesPolicy(matching[0], settings.dataClass, policy)) {
+    if (matching.length === 1 && matchesPolicy(matching[0], settings, policy) && usable(matching[0])) {
       routes.set(slot, matching[0]);
     }
   }

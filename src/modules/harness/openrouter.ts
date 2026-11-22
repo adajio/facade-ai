@@ -157,7 +157,7 @@ export function request(job: ResearchJob, messages: Message[]) {
         ),
       },
     })),
-    tool_choice: 'required',
+    tool_choice: job.settings.toolChoice ?? 'required',
     parallel_tool_calls: false,
     max_tokens: job.settings.maxTokens,
     stream: false,

@@ -12,6 +12,11 @@ evidence="${4:?evidence directory}"
 [[ -s "$run/runtime.env" && -d "$evidence" ]]
 docker_bin="$(command -v docker)"
 docker_cmd=("$docker_bin" --context orbstack)
+broker_args=()
+if [[ "${FACADE_STAND_WITH_BROKER:-0}" == 1 ]]; then
+  broker_args=(-e FACADE_CONVERTER_SOCKET=/run/facade-ai-stand-converters/broker.sock
+    --mount type=volume,source=facade-ai-test-server_converter-socket,target=/run/facade-ai-stand-converters,readonly)
+fi
 
 "${docker_cmd[@]}" run -d --name "$container" --pull=never --init --read-only \
   --network facade-ai-test-server_private --cpuset-cpus 0-3 --memory 512m \
@@ -21,6 +26,7 @@ docker_cmd=("$docker_bin" --context orbstack)
   --mount "type=bind,source=$run/runtime.env,target=/run/test.env,readonly" \
   --mount "type=bind,source=$run/objects,target=/data/objects" \
   --mount "type=bind,source=$run/tmp,target=/data/tmp" \
+  ${broker_args[@]+"${broker_args[@]}"} \
   "$image" --env-file=/run/test.env dist/apps/api/src/main.js
 
 python3 - "$evidence" "$stage" "$(command -v node)" "$here/follow-up-relay.mjs" "$docker_bin" "$container" "$port" <<'PY'

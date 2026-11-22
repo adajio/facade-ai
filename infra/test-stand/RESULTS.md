@@ -286,3 +286,25 @@ DWG с незавершённым DXF дал частичную карту Model
 идентификаторы. Ресурсные испытания переиспользованы. Live worker и прокси оставались выключенными. Контрольный отпечаток
 нативного журнала совпал до и после, сохранились одна попытка `unknown`, отозванный допуск и резерв $9,084216.
 [Закреплённые образы](</Volumes/ADATA SE920/OrbStack/facade-ai-test-server/step15/n06-replacement.AxfXE9wg/converters-after.env>) · [Отпечаток журнала](</Volumes/ADATA SE920/OrbStack/facade-ai-test-server/step15/n06-replacement.AxfXE9wg/after-smoke.json>)
+
+## Инфраструктура слепого прогона на двух маршрутах
+
+На действующем reader из `aa973a4` проверены маршрут Kimi → `wafer/us` со строгим ZDR и Qwen → `alibaba` в исследовательском
+синтетическом профиле. Два запроса перехвачены локальной подменой транспорта в контейнере без сети. В каждом запросе закреплён
+один поставщик, fallback отключён. Подмена ветви, чужая область и неразрешённый endpoint отклонены. Временный отдельный прокси
+подтвердил TLS 1.3 с проверкой сертификата для `openrouter.ai:443`, без HTTP-запроса к провайдеру и без ключа.
+Чужой хост, другой порт и loopback получили `403`.
+[Маршруты](</Volumes/ADATA SE920/OrbStack/facade-ai-test-server/backups/blind-infra.YsWGI7TF/dual-route.json>) · [TLS](</Volumes/ADATA SE920/OrbStack/facade-ai-test-server/backups/blind-infra.YsWGI7TF/proxy-positive-tls.json>) · [Отказы прокси](</Volumes/ADATA SE920/OrbStack/facade-ai-test-server/backups/blind-infra.YsWGI7TF/proxy-denials.json>)
+
+Хэши десяти оригиналов, публичного манифеста и каталога `mixed` совпали с зафиксированным выбором шага 15. Семь опубликованных
+манифестов прошли проверку байтов и состава, закрытый эталон оставался вне проверки. Через штатный API с отдельной синтетической
+БД и бакетом приняты, запечатаны и повторно скачаны все десять оригиналов с прежними SHA-256. Анонимные скачивания вернули
+`401` в десяти случаях из десяти. Закрытый worker сформировал карты DOC → DOCX, XLS → XLSX и DWG → DWG JSON. API выдал
+все три карты с `200` через штатный интерфейс reader. Каждому процессу был смонтирован только Unix-сокет брокера на чтение.
+[Состав пакета](</Volumes/ADATA SE920/OrbStack/facade-ai-test-server/backups/blind-infra.YsWGI7TF/operator-input-match.json>) · [Доступ к оригиналам](</Volumes/ADATA SE920/OrbStack/facade-ai-test-server/backups/blind-infra.YsWGI7TF/access-summary.json>) · [Карты reader](</Volumes/ADATA SE920/OrbStack/facade-ai-test-server/backups/blind-infra.YsWGI7TF/legacy-reader-summary.json>)
+
+Для смешанного пакета в `infra/test-stand/step15` добавлен `FACADE_STAND_WITH_BROKER=1`. Начиная с выбора этого профиля,
+существующий здоровый брокер доступен и API, и worker. Изменение признака пересоздаёт API при следующем операторском запуске,
+поэтому переключение оставлено владельцу шага 15. Действующие `18443` и `18085` сохранили контейнеры и ответ `/readyz`.
+Сетевые и адресные тесты не удостоверяют живой допуск, тарификацию и расчёт резерва. Расход и журнал принадлежат шагу 15.
+[Режим запуска](README.md#серия-шага-15-с-нативным-журналом) · [Состояние стенда](</Volumes/ADATA SE920/OrbStack/facade-ai-test-server/backups/blind-infra.YsWGI7TF/stand-after.log>)

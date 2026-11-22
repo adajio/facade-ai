@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import { test } from 'node:test';
-import type { Branch, ResearchTask } from './contracts.js';
+import type { Branch, ResearchSettings, ResearchTask } from './contracts.js';
 import { validateLivePolicy, type LiveRoute } from './live-policy.js';
 import { loadResearchProfile } from './profile.js';
 
@@ -20,15 +20,33 @@ const settings = ({ routeId, model }: LiveRoute) =>
   ({ routeId, model, dataClass: 'synthetic', maxTokens: 600, maxTurns: 12, maxKnownRejections: 1 });
 const profile = { A: settings(kimi), B: settings(qwen), lead: settings(kimi) };
 const env = { FACADE_HARNESS_LIVE_POLICY: 'synthetic-research' };
-function task(branch: Branch): ResearchTask {
+function task(branch: Branch, assigned: ResearchSettings = profile[branch]): ResearchTask {
   return {
     jobId: randomUUID(), generationId: randomUUID(), projectId, scopeId,
-    job: { mode: 'primary', branch, settings: profile[branch], place: {
+    job: { mode: 'primary', branch, settings: assigned, place: {
       source: { projectId, documentId: randomUUID(), versionId: randomUUID(), sha256: approvedHash },
       unitId: '1', page: 1,
     } },
   };
 }
+
+test('the Decart endpoint requires the exact synthetic Kimi route, ZDR approval and auto', () => {
+  const decart = { ...kimi, routeId: 'kimi-decart', model: 'moonshotai/kimi-k3.1-pro', provider: 'decart/mxfp4' };
+  const assigned = { ...settings(decart), toolChoice: 'auto' as const };
+  const selected = { ...profile, A: assigned };
+  assert.equal(validateLivePolicy(selected, [decart, qwen], env).hold(task('A', assigned)), null);
+  assert.deepEqual(validateLivePolicy(selected, [{ ...decart, zdrEvidenceRef: undefined }, qwen], env).approvals, [qwen]);
+  assert.deepEqual(validateLivePolicy(selected, [{ ...decart, provider: 'decart' }, qwen], env).approvals, [qwen]);
+  assert.deepEqual(validateLivePolicy(selected, [{ ...decart, mode: 'strict-zdr' }], {}).approvals, []);
+  assert.deepEqual(validateLivePolicy({ ...selected, A: settings(decart) }, [decart, qwen], env).approvals, [qwen]);
+  assert.equal(validateLivePolicy(selected, [decart], env).hold(task('A', settings(decart)))?.reason,
+    'research_profile_changed');
+  const wafer = { ...decart, routeId: 'kimi-wafer', provider: 'wafer/us' };
+  const waferAuto = { ...settings(wafer), toolChoice: 'auto' as const };
+  assert.deepEqual(validateLivePolicy({ ...profile, A: waferAuto }, [wafer], env).approvals, [wafer]);
+  assert.deepEqual(loadResearchProfile({ FACADE_HARNESS_PROFILE: JSON.stringify({ A: waferAuto, B: assigned }) }),
+    { A: null, B: null, lead: null });
+});
 
 test('synthetic authorization follows the exact approved project, scope, route and original', () => {
   const { hold } = validateLivePolicy(profile, [kimi, qwen], env);

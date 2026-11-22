@@ -48,6 +48,7 @@ export const settingsSchema = z.strictObject({
   routeId: z.string().min(1),
   model: z.string().min(1),
   dataClass: z.string().min(1),
+  toolChoice: z.enum(['required', 'auto']).optional(),
   maxTokens: z.number().int().positive().max(16_384),
   maxTurns: z.number().int().positive().max(40),
   maxKnownRejections: z.number().int().min(0).max(5),

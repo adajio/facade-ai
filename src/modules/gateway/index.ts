@@ -8,7 +8,7 @@ import { registerOperatorRoutes } from './operator.js';
 
 export { Gateway } from './gateway.js';
 export { PostgresIntentJournal, type ReconciliationInput, type OperatorAuthorization } from './journal.js';
-export { estimateOpenRouterRequest, type OpenRouterCostBound, type OpenRouterProfile, type QualifiedOpenRouterProfile, type Step15Approval } from './openrouter.js';
+export { estimateOpenRouterRequest, matchesKimiEndpoint, type OpenRouterCostBound, type OpenRouterInputEnvelope, type OpenRouterProfile, type QualifiedOpenRouterProfile, type Step15Approval } from './openrouter.js';
 export { type LeasedJob } from './queue.js';
 export * from './types.js';
 

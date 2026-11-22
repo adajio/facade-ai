@@ -42,7 +42,8 @@ export function profileHold(profile: ResearchProfile, task: ResearchTask): Resea
   const expected = profile[slot];
   const actual = task.job.settings;
   if (!expected) return { reason: 'research_profile_unavailable', nextAction: `Настроить профиль для ${slot}.` };
-  if (expected.routeId !== actual.routeId || expected.model !== actual.model || expected.dataClass !== actual.dataClass) {
+  if (expected.routeId !== actual.routeId || expected.model !== actual.model || expected.dataClass !== actual.dataClass
+    || (expected.toolChoice ?? 'required') !== (actual.toolChoice ?? 'required')) {
     return { reason: 'research_profile_changed', nextAction: `Восстановить назначенный маршрут для ${slot}.` };
   }
   return null;

@@ -109,6 +109,12 @@ ENV
   start|offline|offline-api)
     image=${2:?Use the approved reader image tag}
     [[ "$image" =~ ^facade-ai-test-server:[0-9a-f]{64}$ ]]
+    broker=${FACADE_STAND_WITH_BROKER:-0}
+    [[ "$broker" == 0 || "$broker" == 1 ]]
+    if [[ "$broker" == 1 && "$("${d[@]}" inspect -f '{{.State.Health.Status}}' facade-ai-test-server-converter-broker-1 2>/dev/null)" != healthy ]]; then
+      echo 'Запрошенный брокер конвертеров стенда недоступен.' >&2
+      exit 1
+    fi
     "${d[@]}" image inspect "$image" >/dev/null
     db_env=$(cat "$root/database-env-path")
     run_dir=$(dirname -- "$db_env")
@@ -140,9 +146,16 @@ ENV
       --mount "type=bind,source=$root/journal-ca.pem,target=/run/facade/journal-ca.pem,readonly"
       --mount "type=bind,source=$run_dir/objects,target=/data/objects"
       --mount "type=bind,source=$run_dir/tmp,target=/data/tmp")
-    if [[ "$("${d[@]}" inspect -f '{{.Config.Image}} {{.State.Running}}' facade-ai-step15-api 2>/dev/null)" != "$image true" ]]; then
+    if [[ "$broker" == 1 ]]; then
+      common+=(-e FACADE_CONVERTER_SOCKET=/run/facade-ai-stand-converters/broker.sock
+        --mount type=volume,source=facade-ai-test-server_converter-socket,target=/run/facade-ai-stand-converters,readonly)
+    fi
+    api_broker=$("${d[@]}" inspect -f '{{index .Config.Labels "io.facade.step15.converter-broker"}}' facade-ai-step15-api 2>/dev/null || true)
+    if [[ "$("${d[@]}" inspect -f '{{.Config.Image}} {{.State.Running}}' facade-ai-step15-api 2>/dev/null)" != "$image true" ||
+      "${api_broker:-0}" != "$broker" ]]; then
       remove facade-ai-step15-api
       "${d[@]}" run -d --name facade-ai-step15-api --memory 512m "${common[@]}" \
+        --label "io.facade.step15.converter-broker=$broker" \
         -e HOST=127.0.0.1 -e PORT=3000 -e FACADE_PUBLIC_ORIGIN=http://127.0.0.1:18085 \
         -e FACADE_GATEWAY_LIVE_MODE= "$image" "${runtime_env[@]}" dist/apps/api/src/main.js >/dev/null
     fi

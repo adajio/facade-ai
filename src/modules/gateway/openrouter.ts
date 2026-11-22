@@ -25,6 +25,16 @@ type OpenRouterPricingQualification = {
   completionParameter: 'max_tokens' | 'max_completion_tokens';
 };
 
+export type OpenRouterInputEnvelope = {
+  evidenceRef: string;
+  maxWireBytes: number;
+  maxMessages: number;
+  maxTools: number;
+  tokensPerWireByte: number;
+  templateOverheadTokens: number;
+  maxTokensPerImage?: number;
+};
+
 export type OpenRouterProfile = {
   routeId: string;
   revision: string;
@@ -37,6 +47,7 @@ export type OpenRouterProfile = {
   boundEvidenceRef: string;
   validUntil: string;
   inputTokenUpperBound: number;
+  inputEnvelope?: OpenRouterInputEnvelope;
   outputTokenLimit: number;
   maxImages: number;
   maxImagePixels: number;
@@ -68,9 +79,12 @@ const uuid = /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/;
 const sha256 = /^[a-f0-9]{64}$/;
 const signature = Buffer.from('89504e470d0a1a0a', 'hex');
 const tracePlaceholder = '00000000-0000-0000-0000-000000000000';
+const disabledPlugins = ['web', 'file-parser', 'response-healing', 'auto-router', 'pareto-router', 'armor']
+  .map(id => ({ id, enabled: false }));
 
 export type OpenRouterCostBound = {
   input: number;
+  inputEnvelope?: { wireBytes: number; messages: number; tools: number; images: number; inputTokens: number };
   outputAndReasoning: number;
   images: number;
   request: number;
@@ -191,7 +205,8 @@ function requireZdr(profile: OpenRouterProfile): boolean {
 function approvedProfile(profile: OpenRouterProfile): boolean {
   const kimi = profile.model.startsWith('moonshotai/kimi-');
   const qwen = profile.model.startsWith('qwen/');
-  if ((kimi && profile.provider !== 'wafer/us') || (requireZdr(profile) && !profile.zdrEvidenceRef?.trim())) return false;
+  if ((kimi && !matchesKimiEndpoint(profile.model, profile.provider, profile.mode))
+    || (requireZdr(profile) && !profile.zdrEvidenceRef?.trim())) return false;
   if (profile.mode === 'strict-zdr') return true;
   if (profile.mode !== 'synthetic-research' || (!kimi && !qwen)
     || (qwen && !/^alibaba(?:\/|$)/.test(profile.provider))
@@ -204,6 +219,19 @@ function approvedProfile(profile: OpenRouterProfile): boolean {
 
 function isAlibabaQwen4Max(profile: OpenRouterProfile): boolean {
   return profile.model === 'qwen/qwen4-max' && profile.provider === 'alibaba';
+}
+
+function isWaferKimiK31Pro(profile: OpenRouterProfile): boolean {
+  return profile.model === 'moonshotai/kimi-k3.1-pro' && profile.provider === 'wafer/us';
+}
+
+function isDecartKimiK31Pro(model: string, provider: string): boolean {
+  return model === 'moonshotai/kimi-k3.1-pro' && provider === 'decart/mxfp4';
+}
+
+export function matchesKimiEndpoint(model: string, provider: string, mode: OpenRouterProfile['mode']): boolean {
+  return model.startsWith('moonshotai/kimi-') && (provider === 'wafer/us'
+    || (mode === 'synthetic-research' && isDecartKimiK31Pro(model, provider)));
 }
 
 function syntheticScope(profile: OpenRouterProfile, projectId: string, scopeId: string): SyntheticScope | undefined {
@@ -223,20 +251,44 @@ function retentionBlock(scope: SyntheticScope): string | null {
 }
 
 function endpointBlock(profile: QualifiedOpenRouterProfile, request: unknown, endpoint: Step15Approval['endpoint']): string | null {
-  if (!isAlibabaQwen4Max(profile)) return null;
-  if (requireZdr(profile)) return 'route_zdr_unavailable';
-  if (endpoint !== 'https://openrouter.ai') return 'route_endpoint_unverified';
+  const alibaba = isAlibabaQwen4Max(profile);
+  const decart = isDecartKimiK31Pro(profile.model, profile.provider);
+  if (!alibaba && !decart && !isWaferKimiK31Pro(profile)) return null;
+  if (alibaba && requireZdr(profile)) return 'route_zdr_unavailable';
+  if (alibaba && endpoint !== 'https://openrouter.ai') return 'route_endpoint_unverified';
 
   const body = record(request);
   const choice = body?.tool_choice;
   const named = record(choice);
-  const choiceSupported = choice === undefined || choice === 'none' || choice === 'auto' || choice === 'required'
+  const choiceSupported = choice === undefined || choice === 'none' || choice === 'auto' || (!decart && choice === 'required')
     || (named?.type === 'function' && typeof record(named.function)?.name === 'string');
   if (profile.completionParameter !== 'max_tokens' || !choiceSupported
     || (body?.parallel_tool_calls !== undefined && body.parallel_tool_calls !== false)) {
     return 'route_parameters_unsupported';
   }
   return null;
+}
+
+function validInputEnvelope(profile: OpenRouterProfile): boolean {
+  const envelope = profile.inputEnvelope;
+  if (envelope === undefined) return true;
+  return Boolean(envelope && (isAlibabaQwen4Max(profile) || isWaferKimiK31Pro(profile) || isDecartKimiK31Pro(profile.model, profile.provider))
+    && typeof envelope.evidenceRef === 'string' && envelope.evidenceRef.trim()
+    && positiveInteger(envelope.maxWireBytes, 32 * 1024 * 1024)
+    && positiveInteger(envelope.maxMessages, 1024)
+    && nonnegative(envelope.maxTools) && envelope.maxTools <= 1024
+    && positiveInteger(envelope.tokensPerWireByte, 128)
+    && nonnegative(envelope.templateOverheadTokens)
+    && (envelope.maxTokensPerImage === undefined || positiveInteger(envelope.maxTokensPerImage, 10_000_000)));
+}
+
+function boundedInput(profile: OpenRouterProfile, wireBytes: number, messages: number, tools: number, images: number) {
+  const envelope = profile.inputEnvelope;
+  if (!envelope || wireBytes > envelope.maxWireBytes || messages > envelope.maxMessages || tools > envelope.maxTools
+    || (images > 0 && envelope.maxTokensPerImage === undefined)) return undefined;
+  const inputs = envelope.templateOverheadTokens + wireBytes * envelope.tokensPerWireByte
+    + images * (envelope.maxTokensPerImage ?? 0);
+  return { wireBytes, messages, tools, images, inputTokens: Math.min(inputs, profile.inputTokenUpperBound) };
 }
 
 function assignedSources(payload: unknown): Record<string, unknown>[] {
@@ -290,18 +342,14 @@ function requestBody(profile: QualifiedOpenRouterProfile, value: unknown, route:
   const outputRate = profile.reasoningBilling === 'replaces-output'
     ? Math.max(profile.completionNanosPerToken, profile.reasoningNanosPerToken)
     : profile.completionNanosPerToken + profile.reasoningNanosPerToken;
-  const input = BigInt(profile.inputTokenUpperBound) * BigInt(inputRate);
-  const outputAndReasoning = BigInt(tokens) * BigInt(outputRate);
-  const imageCharge = BigInt(images) * BigInt(profile.imageNanos);
-  const total = input + outputAndReasoning + imageCharge + BigInt(profile.requestNanos) + BigInt(profile.additionalNanos);
-  const ceilingUsdNanos = Math.max(1, Number(total));
-  if (!positiveInteger(ceilingUsdNanos, route.ceilingUsdNanos)) return null;
-
   const { max_tokens: _legacy, max_completion_tokens: _completion, parallel_tool_calls: parallelTools, ...approved } = body;
   const alibaba = isAlibabaQwen4Max(profile);
+  const wafer = isWaferKimiK31Pro(profile);
+  const decart = isDecartKimiK31Pro(profile.model, profile.provider);
   const wire = {
     ...approved, messages, [profile.completionParameter]: tokens, stream: false, usage: { include: true },
-    ...(!alibaba && parallelTools !== undefined ? { parallel_tool_calls: parallelTools } : {}),
+    plugins: disabledPlugins,
+    ...(!alibaba && !wafer && !decart && parallelTools !== undefined ? { parallel_tool_calls: parallelTools } : {}),
     provider: {
       only: [profile.provider], order: [profile.provider], allow_fallbacks: false,
       require_parameters: true, data_collection: alibaba && !requireZdr(profile) ? 'allow' : 'deny', zdr: requireZdr(profile),
@@ -311,17 +359,35 @@ function requestBody(profile: QualifiedOpenRouterProfile, value: unknown, route:
       },
     },
   };
-  if (Buffer.byteLength(JSON.stringify({ ...wire, trace: { trace_id: tracePlaceholder } })) > route.maxRequestBytes) return null;
+  const wireBytes = Buffer.byteLength(JSON.stringify({ ...wire, trace: { trace_id: tracePlaceholder } }));
+  if (wireBytes > route.maxRequestBytes) return null;
+  const inputEnvelope = boundedInput(profile, wireBytes, messages.length, Array.isArray(body.tools) ? body.tools.length : 0, images);
+  const inputTokens = inputEnvelope?.inputTokens ?? profile.inputTokenUpperBound;
+  // Wafer Chat Completions may retry without max_tokens if the requested context cannot fit.
+  if (wafer && inputTokens + tokens > 1_048_576) {
+    const extraOutputTokens = Math.max(0, 943_718 - tokens);
+    const fallbackCost = BigInt(extraOutputTokens) * BigInt(outputRate);
+    if (BigInt(profile.additionalNanos) < fallbackCost) return null;
+  }
+  // Alibaba documents a tolerance of ten generated tokens on the equivalent completion cap.
+  const billedOutputTokens = tokens + (alibaba ? 10 : 0);
+  const input = BigInt(inputTokens) * BigInt(inputRate);
+  const outputAndReasoning = BigInt(billedOutputTokens) * BigInt(outputRate);
+  const imageCharge = BigInt(images) * BigInt(profile.imageNanos);
+  const total = input + outputAndReasoning + imageCharge + BigInt(profile.requestNanos) + BigInt(profile.additionalNanos);
+  const ceilingUsdNanos = Math.max(1, Number(total));
+  if (!positiveInteger(ceilingUsdNanos, route.ceilingUsdNanos)) return null;
+
   return {
     wire,
-    cost: { input: Number(input), outputAndReasoning: Number(outputAndReasoning), images: Number(imageCharge),
+    cost: { input: Number(input), ...(inputEnvelope ? { inputEnvelope } : {}), outputAndReasoning: Number(outputAndReasoning), images: Number(imageCharge),
       request: profile.requestNanos, additional: profile.additionalNanos, ceilingUsdNanos },
   };
 }
 
 function validProfile(profile: OpenRouterProfile): profile is QualifiedOpenRouterProfile {
   return Boolean(profile.routeId && profile.revision && allowedModel.test(profile.model) && allowedProvider.test(profile.provider)
-    && profile.expectedResponseProvider?.trim() && approvedProfile(profile)
+    && profile.expectedResponseProvider?.trim() && approvedProfile(profile) && validInputEnvelope(profile)
     && profile.boundEvidenceRef?.trim() && Number.isFinite(Date.parse(profile.validUntil))
     && positiveInteger(profile.inputTokenUpperBound, 10_000_000) && positiveInteger(profile.outputTokenLimit, 1_000_000)
     && profile.completionCapIncludesReasoning === true
@@ -420,9 +486,11 @@ export function openRouterTransport(approval: Step15Approval): ModelTransport {
         || selected.fingerprint !== attempt.pricingFingerprint || body.cost.ceilingUsdNanos !== attempt.ceilingUsdNanos) {
         return { receipt: { state: 'rejected', code: 'invalid_request', evidenceRef: 'gateway:no-network' } };
       }
-      if (isAlibabaQwen4Max(profile)) {
+      const alibaba = isAlibabaQwen4Max(profile);
+      if (alibaba || isDecartKimiK31Pro(profile.model, profile.provider)) {
         const scope = syntheticScope(profile, attempt.projectId, attempt.scopeId);
-        const block = attempt.dataClass === 'synthetic' && scope ? retentionBlock(scope) : 'route_data_unapproved';
+        const block = attempt.dataClass === 'synthetic' && scope
+          ? (alibaba ? retentionBlock(scope) : null) : 'route_data_unapproved';
         if (block) return { receipt: { state: 'rejected', code: block, evidenceRef: 'gateway:no-network' } };
       }
       const response = await fetch(url, {
