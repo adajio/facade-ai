@@ -1,4 +1,5 @@
 import type { PoolClient } from "pg";
+import type { ResearchStop as ReaderStop } from "../harness/session.js";
 import type { SourceRef } from "../pdf/types.js";
 import type { Revision } from "./store.js";
 
@@ -30,18 +31,21 @@ export type ResearchStop = {
   place: Place;
   nextAction: string;
   continuationRequested?: boolean;
+  evidence?: ReaderStop["evidence"];
+  lastRequest?: ReaderStop["lastRequest"];
   lastRejectedTool?: { name: string; code: string; turn: number };
 };
 
 export async function currentResearchStops(tx: PoolClient, revision: Revision, inputGeneration: string) {
   const { rows } = await tx.query<{
     questionId: string; jobId: string; branch: "A" | "B"; reason: ResearchStopReason; place: Place;
-    tool: string | null; code: string | null; turn: string | null; stopId: string | null; requested: boolean;
+    tool: string | null; code: string | null; turn: string | null; stop: ReaderStop | null; requested: boolean;
   }>(`SELECT p.question_id AS "questionId", j.id AS "jobId",p.branch,j.reason,p.place,
          coalesce(last.event#>>'{stop,lastRequest,tool}',
            model.event->'message'->'tool_calls'->((last.event->>'index')::int)->'function'->>'name') AS tool,
          coalesce(last.event#>>'{stop,refusalCode}',last.event#>>'{reply,body,code}') AS code,last.event->>'turn' AS turn,
-         stopped.id AS "stopId", stopped.resume_requested_at IS NOT NULL AS requested
+         CASE WHEN stopped.id IS NOT NULL THEN last.event->'stop' END AS stop,
+         stopped.resume_requested_at IS NOT NULL AS requested
        FROM harness_generations h JOIN gateway_generations g ON g.generation_id=h.id AND g.current
        JOIN harness_primary_places p ON p.generation_id=g.generation_id
        JOIN gateway_jobs j ON j.generation_id=g.generation_id AND j.obligation_id=p.obligation_id::text
@@ -60,11 +64,11 @@ export async function currentResearchStops(tx: PoolClient, revision: Revision, i
          AND p.question_id IS NOT NULL AND j.state='held' AND j.reason=ANY($4::text[])
        ORDER BY p.question_id,p.branch,j.id`, [revision.scope_id, inputGeneration, revision.source_token, internalReasons]);
   const byQuestion = new Map<string, ResearchStop[]>();
-  for (const { questionId, jobId, branch, reason, place, tool, code, turn, stopId, requested } of rows) {
+  for (const { questionId, jobId, branch, reason, place, tool, code, turn, stop, requested } of rows) {
     const stops = byQuestion.get(questionId) ?? [];
     stops.push({
-      jobId, branch, reason, place, nextAction: continuation[reason],
-      ...(stopId ? { id: stopId, continuationRequested: requested } : {}),
+      jobId, branch, reason, place, nextAction: stop?.nextAction ?? continuation[reason],
+      ...(stop ? { id: stop.id, continuationRequested: requested, evidence: stop.evidence, lastRequest: stop.lastRequest } : {}),
       ...(tool && code && turn && /^[a-z][a-z0-9_]{0,79}$/.test(tool) && /^[a-z][a-z0-9_]{0,79}$/.test(code)
         ? { lastRejectedTool: { name: tool, code, turn: Number(turn) } } : {}),
     });

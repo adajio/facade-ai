@@ -1,7 +1,8 @@
 import type { Observation, ReaderLine, ReaderObservationComponent } from "../pdf/types.js";
+import { ifcLengthProperty, stepEntity } from "../formats/ifc-units.js";
 import { escapeRegex, normalize } from "./domain.js";
 
-type AssignedSubject = { subject: string; property: string; aliases?: readonly string[]; variant?: string };
+type AssignedSubject = { subject: string; property: string; aliases?: readonly string[]; variant?: string; scopeName?: string };
 type Measure = Pick<Observation, "value" | "unit">;
 
 function words(text: string): string[] {
@@ -14,12 +15,12 @@ function containsWords(text: string, required: readonly string[]): boolean {
   return required.every((word) => found.has(word));
 }
 
-function measureLabel(text: string, { value, unit }: Measure): string | undefined {
+function measureLabel(text: string, { value, unit }: Measure, requireUnit = false): string | undefined {
   if (!value) return;
   const boundary = "(?<![\\p{L}\\p{N}.,+-])";
   const end = "(?![\\p{L}\\p{N}]|[.,]\\d)";
   const measure = new RegExp(`${boundary}[+-]?\\d+(?:[,.]\\d+)?(?:\\s*${escapeRegex(unit ?? "")})?${end}`, "gu");
-  const literal = new RegExp(`^${escapeRegex(value.trim())}(?:\\s*${escapeRegex(unit ?? "")})?$`, "u");
+  const literal = new RegExp(`^${escapeRegex(value.trim())}(?:\\s*${escapeRegex(unit ?? "")})${requireUnit ? "" : "?"}$`, "u");
   let previous = 0;
   const labels: string[] = [];
   for (const part of text.matchAll(measure)) {
@@ -45,9 +46,10 @@ export function hasAddressedSubject(
   lines: readonly ReaderLine[],
 ): boolean {
   if (observation.grounding !== "text" || !observation.lineId) return false;
-  if (observation.components?.length) return hasCompoundSubject(target, observation.components);
   const valueLine = lines.find(({ id }) => id === observation.lineId);
+  if (observation.components?.length) return hasCompoundSubject(target, observation, lines);
   if (!valueLine || !observation.quote || !valueLine.text.includes(observation.quote)) return false;
+  if (!matchesPrintedScope(target.scopeName, [valueLine.text])) return false;
   const names = [`${target.subject} ${target.property}`, ...target.aliases ?? []];
   return names.some((name) => bindsAttribute([...new Set(words(name))], observation, valueLine, lines));
 }
@@ -64,30 +66,93 @@ function engineeringWords(text: string): string[] {
   });
 }
 
-function hasCompoundSubject(target: AssignedSubject, components: ReaderObservationComponent[]) {
-  const [value] = components;
+function matchesPrintedScope(scopeName: string | undefined, sources: readonly string[]): boolean {
+  if (!scopeName) return true;
+  const pattern = /(?:^|[|·;\n])\s*(?:участок|область|зона|scope|zone)(?:\s*[:№]\s*|\s+)([^|·;\n]+)/giu;
+  return sources.every((text) => Array.from(text.matchAll(pattern)).every((match) =>
+    normalize(match[1].trim().replace(/[.:]+$/u, "")) === normalize(scopeName)));
+}
+
+const variantSuffix = /(?:исполнени[ея]|variant)\s*[:№]?\s*([a-zа-я]\d*)(?=$|[^\p{L}\p{N}])/iu;
+
+function tableColumnHeading(lines: readonly ReaderLine[], line: ReaderLine): ReaderLine | undefined {
+  const { row, column } = line.locator ?? {};
+  if (typeof row !== "number" || typeof column !== "number") return;
+  return lines.filter((other) => sameTable(other, line) && other.locator?.column === column &&
+    typeof other.locator.row === "number" && other.locator.row < row &&
+    !/^\s*[+-]?\d+(?:[.,]\d+)?(?:\s+[^\d\s]+)?\s*$/u.test(other.text))
+    .sort((a, b) => Number(b.locator?.row) - Number(a.locator?.row))[0];
+}
+
+function hasAssignedVariant(
+  variant: string, local: readonly ReaderObservationComponent[], value: ReaderObservationComponent,
+  lines: readonly ReaderLine[], label: string,
+): boolean {
+  const named = local.find((part) => part.role === "variant");
+  if (named && normalize(named.literal) !== variant) return false;
+  if (named?.binding?.kind === "variant_field") return true;
+  const markedVariant = (text: string) => normalize(variantSuffix.exec(text)?.[1] ?? "") === variant;
+  if (markedVariant(label)) return true;
+  const namedPrefix = `[|/]\\s*${escapeRegex(variant)}\\s*(?=[|,';)]|$)`;
+  if (new RegExp(namedPrefix, "iu").test(label)) return true;
+  if (local.some((part) => part.role === "identifier" && part.link.kind === "ifc_reference" &&
+      new RegExp(`${escapeRegex(part.literal)}/${escapeRegex(variant)}(?=['"|;,)]|$)`, "iu").test(part.quote))) return true;
+  const own = named?.evidenceId === value.evidenceId && lines.find(({ id }) => id === named.lineId);
+  if (!own || named.link.kind !== "same_row") return false;
+  if (markedVariant(own.text)) return true;
+  const heading = tableColumnHeading(lines, own);
+  return Boolean(heading && /^(?:исполнение|вариант|variant)\s*[:№]?\s*$/iu.test(heading.text.trim()) &&
+    normalize(own.text) === variant);
+}
+
+function hasCompoundSubject(
+  target: AssignedSubject,
+  observation: Pick<Observation, "value" | "unit" | "components">,
+  lines: readonly ReaderLine[],
+) {
+  const [value] = observation.components ?? [];
   if (!value || value.role !== "value" || value.link.kind !== "anchor") return false;
-  const local = components.filter((part) => part.source.versionId === value.source.versionId && part.source.sha256 === value.source.sha256);
-  const variantSuffix = /(?:исполнени[ея]|variant)\s*[:№]?\s*([a-zа-я]\d*)(?=$|[^\p{L}\p{N}])/iu;
-  const names = [target.subject + " " + target.property, ...target.aliases ?? []];
-  const variant = normalize(target.variant ?? variantSuffix.exec(names[0]!)?.[1] ?? "");
-  if (variant) {
-    const named = local.find((part) => part.role === "variant");
-    const identifier = local.filter((part) => part.role === "identifier" || part.role === "value");
-    const variantCode = escapeRegex(variant);
-    const explicitVariant = new RegExp(`(?:исполнени[ея]|variant)\\s*[:№]?\\s*${variantCode}(?=$|[^\\p{L}\\p{N}])|[|/]\\s*${variantCode}\\s*(?=[|\\s,'";)]|$)`, "iu");
-    if (named ? normalize(named.literal) !== variant : !identifier.some(({ quote }) => explicitVariant.test(quote))) return false;
-  }
-  const row = typeof value.address.locator?.row === "number";
-  const headers = local.filter((part) => part.link.kind === "column_header");
-  const usesHeading = row && headers.length > 0;
-  const text = local.filter((part) => part.role !== "revision" && part.role !== "variant" &&
-    (!usesHeading || part.role !== "unit" || part.link.kind === "column_header")).map(({ quote }) => quote);
-  if (usesHeading && typeof value.address.locator?.sheet === "string") text.push(value.address.locator.sheet);
-  const supported = new Set(engineeringWords(text.join(" ")));
+  const local = observation.components!.filter((part) => part.source.versionId === value.source.versionId && part.source.sha256 === value.source.sha256);
+  const anchor = lines.find(({ id }) => id === value.lineId);
+  if (!anchor?.text.includes(value.quote)) return false;
+  const archived = /(?:\b(?:change\s*log|(?:revision|reference|change)\s+history|previous\s+revision)\b|истори[яи]\s+(?:изменений|редакций)|предыдущая\s+редакция)/iu;
+  if (archived.test(anchor.text) || (typeof anchor.locator?.section === "string" && archived.test(anchor.locator.section))) return false;
+  const localText = (part: ReaderObservationComponent) => part.evidenceId === value.evidenceId
+    ? lines.find(({ id }) => id === part.lineId)?.text ?? part.quote : part.quote;
+  const identifiers = local.filter((part) => part.role === "identifier" && part.link.kind !== "column_header");
+  if (!matchesPrintedScope(target.scopeName, [anchor.text, ...identifiers.map(localText)])) return false;
+
+  const unit = local.find((part) => part.role === "unit");
+  if (unit?.link.kind === "source_context" && !unit.binding && unit.lineId === value.lineId && observation.unit &&
+      measureLabel(anchor.text, { ...observation, value: value.literal }, true) === undefined) return false;
+
+  const entity = stepEntity(anchor.text);
+  const primaryLabel = value.binding?.kind === "value_context" ? value.binding.text
+    : ifcLengthProperty(entity) ? entity?.args[0] : measureLabel(anchor.text, { ...observation, value: value.literal });
+  if (primaryLabel === undefined) return false;
+  const fallbackHeader = local.find((part) => part.link.kind === "column_header");
+  const heading = tableColumnHeading(lines, anchor)?.text ?? (fallbackHeader && localText(fallbackHeader));
+  const preceding = identifiers.filter((part) => part.link.kind === "same_row" && part.lineId !== value.lineId &&
+    (typeof anchor.locator?.column === "number" ? Number(part.address.locator?.column) < anchor.locator.column
+      : !anchor.box || !part.address.box || part.address.box.x < anchor.box.x));
+  const label = [primaryLabel, heading ?? preceding.map(localText).join(" ")].join(" ");
+  const attributeWords = new Set(engineeringWords(label));
+  const identityWords = new Set([...attributeWords, ...identifiers.flatMap((part) => engineeringWords(part.literal))]);
+  const inlineCodes = new Set(engineeringWords(anchor.text).filter(isIdentifier));
+  if (inlineCodes.size === 1) for (const code of inlineCodes) identityWords.add(code);
+  const expected = `${target.subject} ${target.property}`;
+  const variant = normalize(target.variant ?? variantSuffix.exec(expected)?.[1] ?? "");
+  if (variant && !hasAssignedVariant(variant, local, value, lines, primaryLabel)) return false;
+  const removeVariant = (name: string) => name.replace(new RegExp(variantSuffix.source, "giu"), "");
+  const properties = new Set(engineeringWords(removeVariant(target.property)));
+  const names = [expected, ...target.aliases ?? []];
   return names.some((name) => {
-    const required = engineeringWords(name.replace(new RegExp(variantSuffix.source, "giu"), ""));
-    return required.length > 0 && required.every((word) => supported.has(word));
+    const required = engineeringWords(removeVariant(name));
+    const sheet = anchor.locator?.sheet;
+    // A dimensions sheet qualifies a column already labelled as length.
+    const dimensions = typeof sheet === "string" && engineeringWords(sheet).includes("габарит") && attributeWords.has("длина");
+    return required.length > 0 && required.every((word) => isIdentifier(word) || (name === expected && !properties.has(word)) ? identityWords.has(word)
+      : attributeWords.has(word) || (word === "габарит" && dimensions));
   });
 }
 

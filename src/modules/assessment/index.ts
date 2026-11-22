@@ -70,9 +70,10 @@ function registerRoutes(app: FastifyInstance, prefix: string) {
       const projectId = identifier(request.params.projectId);
       const result = await transaction(db, async (tx) => {
         const scopeId = await scopeFromQuery(tx, request, projectId, request.query);
-        await authorize(tx, await readSession(tx, request), { action: "project:read", projectId, scopeId });
+        const actor = await authorize(tx, await readSession(tx, request), { action: "project:read", projectId, scopeId });
         const gate = await getLockedGate(tx, projectId, scopeId);
-        return snapshot(tx, await synchronize(tx, projectId, scopeId, gate), gate);
+        return snapshot(tx, await synchronize(tx, projectId, scopeId, gate), gate,
+          actor.role === "engineer" || actor.role === "project_manager");
       });
       return reply.header("ETag", `"${result.version}"`).send(result);
     },

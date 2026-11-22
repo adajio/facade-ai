@@ -40,10 +40,7 @@ export function createDocumentRevisionReader(
   return async (tx, projectId, stage, citation) => {
     const component = citation.components?.find((part) => part.role === "revision" &&
       part.source.projectId === projectId && part.source.documentId === citation.documentId &&
-      part.source.versionId === citation.versionId && part.source.sha256 === citation.sha256 &&
-      revisionCode.test(part.literal) && explicitRevision.exec(part.quote)?.[1] === part.literal);
-    if (component) return { label: component.literal, quote: component.quote, address: { ...component.address },
-      evidenceId: component.evidenceId };
+      part.source.versionId === citation.versionId && part.source.sha256 === citation.sha256);
     // The printed revision belongs to the same original as this citation.
     const locator = citation.address.locator as Record<string, unknown> | undefined;
     const page = locator?.page ?? citation.address.page ?? citation.address.unitId;
@@ -57,12 +54,14 @@ export function createDocumentRevisionReader(
          AND e.payload->>'representation' = 'native' AND e.payload->>'mediaType' = 'application/json'
          AND (e.payload->>'size')::bigint BETWEEN 1 AND 1048576
          AND (
+           e.id = $7::uuid OR
            (m.format = 'pdf' AND e.payload#>>'{address,locator,page}' = $5 AND e.payload#>>'{address,box}' IS NULL)
            OR (m.format IN ('doc', 'docx') AND e.payload#>>'{address,locator,firstParagraph}' = '1')
            OR (m.format = 'txt' AND e.payload#>>'{address,locator,firstLine}' = '1')
          )
        ORDER BY e.payload->>'sha256', e.created_at, e.id`,
-      [projectId, citation.versionId, citation.sha256, citation.documentId, page == null ? null : String(page), citation.branch],
+      [projectId, citation.versionId, citation.sha256, citation.documentId, page == null ? null : String(page), citation.branch,
+        component?.evidenceId ?? null],
     );
     // Conversion metadata can give identical headers different artifact hashes across reads.
     const totalBytes = rows.reduce((sum, { evidence }) => sum + evidence.size, 0);

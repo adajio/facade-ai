@@ -91,6 +91,9 @@ export type AssessmentQuestion = {
     id?: string; jobId: string; branch: 'A' | 'B'; reason: string; nextAction: string; continuationRequested?: boolean;
     place: { unitId: string; page?: number; source: { documentId: string; versionId: string } };
     lastRejectedTool?: { name: string; code: string; turn: number };
+    evidence?: { evidenceId: string; place: { unitId: string; page?: number; box?: RecordData;
+      source: { documentId: string; versionId: string; sha256: string } } }[];
+    lastRequest?: { turn: number; attemptId: string; tool: string; arguments: string };
   }[];
   requirement: {
     positionId: string; partId: string; subject: string; part: string;

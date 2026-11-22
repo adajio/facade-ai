@@ -3,7 +3,7 @@
   import { conflictMessage } from '../lib/conflict';
   import { date, label } from '../lib/format';
   import { describe, id, interrupted, query, type Api } from '../lib/http';
-  import { V1, projectApi, projectV1, scopedUrl, type Assessment, type AssessmentQuestion, type OpenEvidence, type WorkspaceProps } from '../lib/workspace';
+  import { V1, projectApi, projectV1, scopedUrl, type Assessment, type AssessmentQuestion, type Citation, type OpenEvidence, type WorkspaceProps } from '../lib/workspace';
   import EvidenceButtons from '../lib/EvidenceButtons.svelte';
   import Notice from '../lib/Notice.svelte';
   import ScopeRequirements from './ScopeRequirements.svelte';
@@ -32,6 +32,14 @@
   let saving = $state(false);
   let operationStatus = $state('');
   let operationError = $state('');
+
+  function openStoppedEvidence(stop: NonNullable<AssessmentQuestion['researchStops']>[number], index: number, event: MouseEvent) {
+    const entries: Citation[] = (stop.evidence ?? []).map(({ evidenceId, place }) => ({
+      evidenceId, ...place.source, branch: stop.branch,
+      address: { unitId: place.unitId, page: place.page, box: place.box },
+    }));
+    open(entries, index, event.currentTarget as HTMLElement);
+  }
 
   $effect(() => {
     const scopeId = context.scopeId;
@@ -228,6 +236,17 @@
                     {#if stop.lastRejectedTool}
                       <p class="meta">Ход {stop.lastRejectedTool.turn} · {stop.lastRejectedTool.name} · {label(stop.lastRejectedTool.code)}</p>
                     {/if}
+                    {#if stop.lastRequest}
+                      <details>
+                        <summary>Аргументы отклонённого запроса</summary>
+                        <pre class="request-arguments">{stop.lastRequest.arguments}</pre>
+                      </details>
+                    {/if}
+                    {#each stop.evidence ?? [] as saved, index (saved.evidenceId)}
+                      <button type="button" onclick={(event) => openStoppedEvidence(stop, index, event)}>
+                        Открыть прочитанное место {saved.place.page ? 'на стр. ' + saved.place.page : saved.place.unitId}
+                      </button>
+                    {/each}
                     <a href={'/api/documents/' + id(stop.place.source.documentId) + '/versions/' + id(stop.place.source.versionId) + '/content'} target="_blank" rel="noopener">Открыть оригинал остановленного задания</a>
                     {#if stop.continuationRequested}
                       <p class="meta">Продолжение запрошено.</p>
@@ -309,3 +328,7 @@
     {/if}
   {/if}
 {/if}
+
+<style>
+  .request-arguments { white-space: pre-wrap; overflow-wrap: anywhere; }
+</style>

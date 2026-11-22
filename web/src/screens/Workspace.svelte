@@ -31,6 +31,7 @@
   let refreshKey = $state(0);
   let refs = $state<Citation[]>([]);
   let selected = $state(0);
+  let componentIndex = $state<number>();
   let trigger: HTMLElement | undefined;
   let scopeName = $state('');
   let stage = $state('');
@@ -123,9 +124,11 @@
     void scopeId;
     void route.objectId;
     const evidence = route.params.get('evidence');
+    const component = route.params.get('component');
     untrack(() => {
       refs = evidence ? [{ evidenceId: evidence, observationId: route.params.get('observation') ?? undefined }] : [];
       selected = 0;
+      componentIndex = component && /^\d{1,2}$/u.test(component) ? Number(component) : undefined;
       trigger = undefined;
     });
   });
@@ -137,9 +140,12 @@
       url.searchParams.set('evidence', ref.evidenceId);
       if (ref.observationId) url.searchParams.set('observation', ref.observationId);
       else url.searchParams.delete('observation');
+      if (ref.observationId && componentIndex !== undefined) url.searchParams.set('component', String(componentIndex));
+      else url.searchParams.delete('component');
     } else {
       url.searchParams.delete('evidence');
       url.searchParams.delete('observation');
+      url.searchParams.delete('component');
     }
     history.replaceState(history.state, '', url);
   }
@@ -147,12 +153,14 @@
   function openEvidence(entries: Citation[], index: number, source: HTMLElement) {
     refs = entries;
     selected = index;
+    componentIndex = undefined;
     trigger = source;
     address(index);
   }
 
   function closeEvidence() {
     refs = [];
+    componentIndex = undefined;
     address();
     void tick().then(() => (trigger?.isConnected ? trigger : document.getElementById('main'))?.focus());
   }
@@ -259,8 +267,9 @@
         {/key}
       </div>
       {#if refs.length}
-        <EvidenceViewer {api} {refs} index={selected} close={closeEvidence} verify={() => refresh(true)}
-          select={(index) => { selected = index; address(index); }} />
+        <EvidenceViewer {api} {refs} index={selected} {componentIndex} close={closeEvidence} verify={() => refresh(true)}
+          select={(index) => { selected = index; componentIndex = undefined; address(index); }}
+          selectComponent={(index) => { componentIndex = index; address(selected); }} />
       {/if}
     </div>
   </main>

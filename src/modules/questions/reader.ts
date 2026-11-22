@@ -147,9 +147,19 @@ export function createRuntimeInquiryPorts(
       }
     },
     async checkMeaning(question, candidate, support, signal, context) {
-      if (candidate.components?.length && candidate.subjectVerified && candidate.measurement &&
-          hasAddressedSubject(question, { ...candidate.measurement, quote: candidate.quote,
-            lineId: support.lineId, grounding: support.grounding ?? "limited", components: candidate.components }, [])) return "same";
+      if (candidate.components?.length) {
+        if (support.content.kind !== "text" || !candidate.measurement || candidate.components.some((part) => !part.binding)) return "unclear";
+        const { rows: [scope] } = await (tx ?? db).query<{ name: string }>(
+          "SELECT name FROM project_scopes WHERE project_id=$1 AND id=$2", [context.projectId, context.scopeId]);
+        if (!scope) return "unclear";
+        const aliases = candidate.assessmentQuestionId && candidate.assessmentQuestionId === context.assessmentQuestionId
+          ? await readAttributeAliases(tx ?? db, candidate.assessmentQuestionId) : [];
+        const supported = hasAddressedSubject({ ...question, scopeName: scope.name, aliases: [...question.aliases ?? [], ...aliases] }, {
+          ...candidate.measurement, quote: candidate.quote, lineId: support.lineId,
+          grounding: support.grounding ?? "limited", components: candidate.components,
+        }, deliveredLines(support.content.text));
+        return supported ? "same" : "unclear";
+      }
       if (candidate.subjectVerified === false) {
         if (!candidate.assessmentQuestionId || candidate.assessmentQuestionId !== context.assessmentQuestionId ||
           support.content.kind !== "text" ||

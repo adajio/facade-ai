@@ -93,10 +93,17 @@ for (const [job, format] of [[xls, 'xls'], [xlsx, 'xlsx']]) {
   known.push(bind(job, [value('1860', byCell('B3', '1860')), part('unit', byCell('B2', 'Длина, мм'), 'мм', 'column_header', 0),
     part('identifier', byCell('A3', 'QF-91'), 'QF-91', 'same_row', 0)], format, 'schedule'));
 }
+const cadVariantRefusals = [];
 for (const [job, format] of [[dwg, 'dwg'], [dxf, 'dxf']]) {
   const line = literal('QF-91 | hinge bracket | A | 18.7 mm');
-  known.push(bind(job, [value('18.7', line), part('unit', line, 'mm', 'source_context', 0),
-    part('variant', line, 'A', 'source_context', 0)], format, 'drawing', false));
+  const dimensionalParts = [value('18.7', line), part('unit', line, 'mm', 'source_context', 0)];
+  assert.throws(() => bind(job, [...dimensionalParts, part('variant', line, 'A', 'source_context', 0)], format, 'drawing', false),
+    (error) => {
+      assert.equal(error.code, 'reader_component_variant_unbound');
+      cadVariantRefusals.push({ file: job.file, literal: 'A', code: error.code });
+      return true;
+    });
+  known.push(bind(job, dimensionalParts, format, 'drawing', false));
 }
 
 const recordedIfc = ifc.reads.find(({ lines }) => lines.some(({ text }) => text.includes("'AnchorSpacing'") && text.includes('172.')) &&
@@ -211,6 +218,6 @@ console.log(JSON.stringify({ sourceProject: main.projectId, networkRequests: 0,
   compound: known.map(({ finding: { citation }, established }) => ({ label: citation.label, branch: citation.branch,
     sourceHash: citation.sha256, value: citation.value, unit: citation.unit, address: citation.address,
     questionEstablished: established, components: citation.components })),
-  ifc: replayedIfc, syntheticConflictReplay: ground, repeatedRejectedAction: { stopped: stop, resumed },
+  cadVariantRefusals, ifc: replayedIfc, syntheticConflictReplay: ground, repeatedRejectedAction: { stopped: stop, resumed },
   foreignEvidence: { issuedTo: pdf.branch, assignedTo: dwg.branch, code: foreign.at(-1).reply.body.code },
 }, null, 2));

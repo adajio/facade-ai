@@ -10,6 +10,68 @@ const fromBuild = (file) => import(pathToFileURL(resolve(root, file)).href);
 const api = "/api";
 const origin = "http://127.0.0.1";
 
+test("compound evidence keeps the addressed field, scope and active header", async () => {
+  const { hasAddressedSubject } = await fromBuild("src/modules/questions/subject-evidence.js");
+  const { createDocumentRevisionReader } = await fromBuild("src/modules/assessment/document-revision.js");
+  const { evaluate } = await fromBuild("src/modules/assessment/domain.js");
+  const source = { projectId: randomUUID(), documentId: randomUUID(), versionId: randomUUID(), sha256: "a".repeat(64) };
+  const evidenceId = randomUUID();
+  const cell = (id, text, row, column, sheet = "Parts") => ({ id, text, locator: { sheet, row, column } });
+  const component = (line, role, literal, kind, quote = line.text) => ({
+    role, literal, quote, source, lineId: line.id, evidenceId, address: { unitId: "fixture", locator: line.locator },
+    link: kind === "anchor" ? { kind } : { kind, to: 0 },
+  });
+  const assigned = { subject: "P-17", property: "thickness", scopeName: "Север" };
+  const matches = (target, components, lines) => hasAddressedSubject(target, {
+    grounding: "text", quote: components[0].quote, value: components[0].literal, lineId: components[0].lineId,
+    unit: components[1].literal, components,
+  }, lines);
+  const inline = { id: "row", text: "Участок Север · P-17 | length 36 cm | thickness 2 mm", locator: { line: 2 } };
+  const correct = [component(inline, "value", "2", "anchor"), component(inline, "unit", "mm", "source_context", "2 mm")];
+  const wrong = [component(inline, "value", "36", "anchor"), component(inline, "unit", "mm", "source_context", "2 mm")];
+  const length = [wrong[0], component(inline, "unit", "cm", "source_context", "36 cm")];
+  assert.equal(matches(assigned, correct, [inline]), true);
+  assert.equal(matches(assigned, length, [inline]), false);
+  assert.equal(matches({ ...assigned, property: "length" }, length, [inline]), true);
+  assert.equal(matches({ ...assigned, property: "length" }, wrong, [inline]), false);
+  assert.equal(matches({ ...assigned, scopeName: "Юг" }, correct, [inline]), false);
+
+  const id = cell("id", "P-17", 2, 1, "Thickness");
+  const reading = cell("weight", "37", 2, 2, "Thickness");
+  const header = cell("weight-label", "Weight (kg)", 1, 2, "Thickness");
+  const table = [component(reading, "value", "37", "anchor"), component(header, "unit", "kg", "column_header"),
+    component(id, "identifier", "P-17", "same_row")];
+  assert.equal(matches(assigned, table, [id, reading, header]), false);
+  assert.equal(matches({ ...assigned, property: "weight" }, table, [id, reading, header]), true);
+  const trueVariant = cell("variant", "B", 2, 3, "Thickness");
+  const wrongVariant = cell("coating", "A", 2, 4, "Thickness");
+  const cells = [id, reading, header, trueVariant, wrongVariant,
+    cell("variant-label", "Variant", 1, 3, "Thickness"), cell("coating-label", "Coating type", 1, 4, "Thickness")];
+  assert.equal(matches({ ...assigned, property: "weight", variant: "A" },
+    [...table, component(wrongVariant, "variant", "A", "same_row")], cells), false);
+  assert.equal(matches({ ...assigned, property: "weight", variant: "B" },
+    [...table, component(trueVariant, "variant", "B", "same_row")], cells), true);
+
+  const wrongFacts = ["A", "B"].map((branch) => ({ kind: "value", format: "txt", sourceRole: "design",
+    applicability: matches(assigned, wrong, [inline]) ? "active" : "unknown", comparisonKey: "same",
+    citation: { ...source, branch, value: "36", unit: "mm", evidenceId, address: { unitId: "fixture" } },
+  }));
+  assert.equal(evaluate({ formats: ["txt"], sourceRoles: ["design"], applicability: "applicable" }, {
+    findings: wrongFacts, remaining: [], completenessChecked: true,
+  }).outcome, "needs_review");
+
+  const history = { id: "revision-history", text: "Revision R1; old value", locator: { line: 17 } };
+  const active = { id: "revision-title", text: "P-17 · design · R2", locator: { line: 1 } };
+  const metadata = { format: "txt", size: 200, address: { unitId: "fixture" } };
+  const reader = createDocumentRevisionReader({ content: async ({ id }) => Buffer.from(JSON.stringify({
+    lines: [id === "header" ? active : history],
+  })) });
+  const tx = { query: async () => ({ rows: ["header", evidenceId].map((id) => ({ evidence: { ...metadata, id } })) }) };
+  const actual = await reader(tx, source.projectId, "design", { ...source, branch: "A", address: { unitId: "fixture" },
+    components: [component(history, "revision", "R1", "source_context")] });
+  assert.equal(actual.label, "R2");
+});
+
 function pdf(lines) {
   const text = (Array.isArray(lines) ? lines : [lines]).map((line) => `(${line}) Tj`).join(" 0 -24 Td ");
   const contents = `BT /F1 12 Tf 30 130 Td ${text} ET\n`;

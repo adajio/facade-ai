@@ -20,8 +20,9 @@
   };
   type Observation = Citation & { scope?: string; box?: Box; limitation?: string; address?: Evidence['address'] };
 
-  let { api, refs, index, select, close, verify }: {
+  let { api, refs, index, componentIndex, select, selectComponent, close, verify }: {
     api: Api; refs: Citation[]; index: number; select: (i: number) => void; close: () => void; verify: () => void;
+    componentIndex?: number; selectComponent: (index?: number) => void;
   } = $props();
 
   const componentLabel = {
@@ -29,9 +30,12 @@
     identifier: 'Обозначение', relationship: 'Связь источников',
   } as const;
   let parent = $derived(refs[index]);
-  let selected = $state<{ citation: Citation; index: number }>();
-  let components = $derived(parent?.components ?? []);
-  let component = $derived(selected?.citation === parent ? components[selected?.index ?? -1] : undefined);
+  let loadedObservation = $state<{ id: string; evidenceId: string; observation: Observation }>();
+  let parentObservation = $derived(loadedObservation?.id === parent?.observationId &&
+    loadedObservation?.evidenceId === parent?.evidenceId ? loadedObservation?.observation : undefined);
+  let components = $derived(parent?.components ?? parentObservation?.components ?? []);
+  let component = $derived(components[componentIndex ?? -1]);
+  let observation = $derived(component ? undefined : parentObservation);
   let citation: Citation = $derived(component ? {
     evidenceId: component.evidenceId, quote: component.quote, address: component.address,
     ...component.source, branch: parent.branch,
@@ -39,7 +43,6 @@
   let root: HTMLElement;
   let closeButton: HTMLButtonElement;
   let evidence = $state<Evidence>();
-  let observation = $state<Observation>();
   let rows = $state<{ text: string; box?: Box }[]>([]);
   let image = $state('');
   let transform = $state<Transform>();
@@ -54,10 +57,24 @@
   let box = $derived(observation?.box ?? observation?.address?.box ?? selectedAddress?.box ?? evidence?.address?.box);
 
   $effect(() => {
+    const ref = parent;
+    if (!ref?.observationId) return;
+    const key = ref.observationId;
+    const stop = new AbortController();
+    void api.json<Observation>(V1 + '/observations/' + id(key), { signal: stop.signal }).then((value) => {
+      if (!stop.signal.aborted && value.evidenceId === ref.evidenceId) {
+        loadedObservation = { id: key, evidenceId: ref.evidenceId, observation: value };
+      }
+    }).catch((problem) => {
+      if (!stop.signal.aborted && denied(problem)) verify();
+    });
+    return () => stop.abort();
+  });
+
+  $effect(() => {
     const ref = citation;
     if (!ref) return;
     evidence = undefined;
-    observation = undefined;
     transform = undefined;
     rows = [];
     image = '';
@@ -76,9 +93,6 @@
           throw new Error('Открытое место не совпадает с закреплённой версией оригинала.');
         }
         evidence = meta;
-        if (ref.observationId) {
-          observation = await api.json<Observation>(V1 + '/observations/' + id(ref.observationId), { signal });
-        }
         const response = await api.response(meta.contentUrl ?? path + '/content', { signal });
         if (response.headers.get('Content-Type')?.startsWith('image/')) {
           const body = await response.blob();
@@ -104,7 +118,6 @@
         if (evidence && !denied(problem)) previewError = describe(problem);
         else {
           evidence = undefined;
-          observation = undefined;
           error = describe(problem);
         }
       } finally {
@@ -186,9 +199,9 @@
   {/if}
   {#if components.length}
     <div class="actions fragment-nav" aria-label="Компоненты доказательства">
-      <button type="button" aria-pressed={!component} onclick={() => selected = undefined}>Основная цитата</button>
-      {#each components as part, componentIndex (`${part.evidenceId}:${part.lineId}:${componentIndex}`)}
-        <button type="button" aria-pressed={component === part} onclick={() => selected = { citation: parent, index: componentIndex }}>
+      <button type="button" aria-pressed={!component} onclick={() => selectComponent()}>Основная цитата</button>
+      {#each components as part, partIndex (`${part.evidenceId}:${part.lineId}:${partIndex}`)}
+        <button type="button" aria-pressed={component === part} onclick={() => selectComponent(partIndex)}>
           {componentLabel[part.role]} · {part.literal}
         </button>
       {/each}

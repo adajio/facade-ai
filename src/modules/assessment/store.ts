@@ -383,10 +383,10 @@ export function assessmentHref(projectId: string, scopeId: string): string {
   return `/api/v1/projects/${projectId}/assessments/current?scopeId=${scopeId}`;
 }
 
-export async function snapshot(tx: PoolClient, revision: Revision, gate?: Gate) {
+export async function snapshot(tx: PoolClient, revision: Revision, gate?: Gate, includeResearchStops = false) {
   const historical = gate === undefined;
   const when = historical ? revision.created_at : new Date();
-  const stops = gate && await currentResearchStops(tx, revision, gate.generation);
+  const stops = gate && includeResearchStops && await currentResearchStops(tx, revision, gate.generation);
   const questions = (await getQuestions(tx, revision.scope_id, revision.version)).filter((item) => item.active)
     .map((question) => ({
       id: question.id,
