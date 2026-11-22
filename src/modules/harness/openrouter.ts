@@ -4,6 +4,13 @@ import { boxSchema, branchSchema, type EvidenceRef, type ResearchJob } from './c
 
 const shortText = z.string().trim().min(1).max(500);
 const support = branchSchema.optional();
+const readArguments = {
+  survey: {},
+  zoom: { box: boxSchema },
+  extract: { box: boxSchema.optional() },
+  ocr: { box: boxSchema.optional() },
+  search: { query: shortText },
+};
 const observationFields = z.strictObject({
   evidenceId: z.string().uuid(),
   quote: shortText.optional(),
@@ -33,11 +40,11 @@ const statementObservation = observationFields.extend({
 
 export const commands = {
   inventory: z.strictObject({}),
-  survey: z.strictObject({ support }),
-  zoom: z.strictObject({ support, box: boxSchema }),
-  extract: z.strictObject({ support, box: boxSchema.optional() }),
-  ocr: z.strictObject({ support, box: boxSchema.optional() }),
-  search: z.strictObject({ support, query: shortText }),
+  survey: z.strictObject({ support, ...readArguments.survey }),
+  zoom: z.strictObject({ support, ...readArguments.zoom }),
+  extract: z.strictObject({ support, ...readArguments.extract }),
+  ocr: z.strictObject({ support, ...readArguments.ocr }),
+  search: z.strictObject({ support, ...readArguments.search }),
   save_observation: statementObservation,
   request_next: z.strictObject({ reason: shortText }),
   finish_reading: z.strictObject({
@@ -109,8 +116,14 @@ type Message = AssistantMessage
     { type: 'text'; text: string } | { type: 'image_url'; image_url: { url: string } }
   > };
 
+const readTools = ['survey', 'zoom', 'extract', 'ocr', 'search'] as const;
+
+function isReadTool(name: keyof typeof commands): name is typeof readTools[number] {
+  return readTools.some((tool) => tool === name);
+}
+
 function enabledTools(job: ResearchJob): Array<keyof typeof commands> {
-  const read: Array<keyof typeof commands> = ['inventory', 'survey', 'zoom', 'extract', 'ocr', 'search'];
+  const read = ['inventory', ...readTools] as const;
   switch (job.mode) {
     case 'primary': return [...read, 'save_observation', 'request_next', 'finish_reading'];
     case 'lead': return [...read, 'propose_resolution'];
@@ -139,24 +152,28 @@ export function initialMessages(job: ResearchJob): Message[] {
   ];
 }
 
-export function request(job: ResearchJob, messages: Message[]) {
+export function request(job: ResearchJob, messages: Message[], legacyToolSchema = false) {
   return {
     model: job.settings.model,
     messages,
-    tools: enabledTools(job).map((name) => ({
-      type: 'function',
-      function: {
-        name,
-        description: name === 'save_observation' && job.mode === 'primary' && job.observationProtocol === 2
-          ? toolDescriptions[name] + ' For an explicit delivery or non-delivery statement, send deliveryStatement with its verbatim item, quote and sourceRole (inventory for a transmittal). A context quote may cite another line of the same representation. Leave value and unit empty. A blank result or missing OCR text cannot establish non-delivery.'
-          : toolDescriptions[name],
-        parameters: z.toJSONSchema(
-          name === 'save_observation' && job.mode === 'primary' && job.observationProtocol !== 2
-            ? legacyObservation : commands[name],
-          { io: 'input' },
-        ),
-      },
-    })),
+    tools: enabledTools(job).map((name) => {
+      let schema: z.ZodType = commands[name];
+      let description = toolDescriptions[name];
+      if (name === 'save_observation' && job.mode === 'primary') {
+        if (job.observationProtocol === 2) {
+          description += ' For an explicit delivery or non-delivery statement, send deliveryStatement with its verbatim item, quote and sourceRole (inventory for a transmittal). A context quote may cite another line of the same representation. Leave value and unit empty. A blank result or missing OCR text cannot establish non-delivery.';
+        } else {
+          schema = legacyObservation;
+        }
+      }
+      if (!legacyToolSchema && isReadTool(name)) {
+        schema = job.mode === 'primary' ? z.strictObject(readArguments[name])
+          : z.strictObject({ support: branchSchema, ...readArguments[name] });
+        if (job.mode !== 'primary') description += ' Select the assigned citation with support A or B.';
+        else if (name === 'survey') description += ' Call with {} to open your assigned page.';
+      }
+      return { type: 'function', function: { name, description, parameters: z.toJSONSchema(schema, { io: 'input' }) } };
+    }),
     tool_choice: job.settings.toolChoice ?? 'required',
     parallel_tool_calls: false,
     max_tokens: job.settings.maxTokens,

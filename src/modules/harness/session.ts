@@ -54,6 +54,7 @@ type State = ReturnType<typeof restore>;
 
 function restore(task: ResearchTask, events: ResearchEvent[]) {
   const messages = initialMessages(task.job);
+  const corrections = new Map<number, ReturnType<typeof toolMessage>>();
   const replies = new Map<string, ToolReply>();
   const delivered = new Set<string>();
   const observations: NonNullable<ToolReply['observation']>[] = [];
@@ -98,7 +99,15 @@ function restore(task: ResearchTask, events: ResearchEvent[]) {
         outcome ??= event.outcome;
         if (pending.results.length === pending.calls.length) {
           const { model, calls, results } = pending;
-          results.forEach((result, index) => messages.push(toolMessage(calls[index], result.reply)));
+          results.forEach(({ reply }, index) => {
+            const call = calls[index];
+            const { body } = reply;
+            if (body && typeof body === 'object' && 'code' in body && !('nextAction' in body)) {
+              const nextAction = argumentCorrection(call.function.name, body.code);
+              if (nextAction) corrections.set(messages.length, toolMessage(call, { body: { ...body, nextAction } }));
+            }
+            messages.push(toolMessage(call, reply));
+          });
           results.forEach((result) => messages.push(...imageMessage(result.reply)));
           if (model.finishReason === 'length') {
             appendContinuation('Ответ усечён. Продолжите этот же вопрос по сохранённым квитанциям и неподтверждённым местам.');
@@ -109,7 +118,7 @@ function restore(task: ResearchTask, events: ResearchEvent[]) {
       }
     }
   }
-  return { messages, replies, delivered, observations, pending, latestModel, rejections, outcome };
+  return { messages, corrections, replies, delivered, observations, pending, latestModel, rejections, outcome };
 }
 
 function branchOf(task: ResearchTask): Branch {
@@ -131,6 +140,13 @@ function samePlace(a: EvidenceRef['place'], b: EvidenceRef['place']) {
 }
 
 const failedTool = (code: string, nextAction?: string): ToolReply => ({ body: { ok: false, code, nextAction } });
+
+function argumentCorrection(name: string, code: unknown): string | undefined {
+  if (code === 'foreign_branch') return name === 'survey'
+    ? 'Повторите survey с {}. Страница уже закреплена за вашим заданием.'
+    : `Повторите ${name} без support. Место уже закреплено за вашим заданием.`;
+  if (code === 'support_required') return `Повторите ${name} с support A или B для назначенной опоры.`;
+}
 
 class WorkPaused extends Error {
   constructor(public readonly hold: ResearchSuspension) {
@@ -154,7 +170,7 @@ async function executeTool(
   const name = call.function.name;
   if (!permittedTool(task.job, name)) return { reply: failedTool('unknown_tool') };
   const parsed = commands[name].safeParse(decodeArguments(call.function.arguments));
-  if (!parsed.success) return { reply: failedTool('invalid_arguments') };
+  if (!parsed.success) return { reply: failedTool('invalid_arguments', `Повторите ${name} с аргументами из схемы инструмента.`) };
   const context = { task, branch: branchOf(task), effectKey };
   const terminal = name === 'finish_reading' || name === 'propose_resolution' || name === 'verify_resolution';
   if (terminal && state.pending?.model.finishReason === 'length') {
@@ -168,10 +184,10 @@ async function executeTool(
       // Parse by tool name to retain the argument type at the dispatch boundary.
       const input = commands[name].parse(parsed.data);
       if (task.job.mode === 'primary' && input.support !== undefined) {
-        return { reply: failedTool('foreign_branch') };
+        return { reply: failedTool('foreign_branch', argumentCorrection(name, 'foreign_branch')) };
       }
       if (task.job.mode !== 'primary' && input.support === undefined) {
-        return { reply: failedTool('support_required') };
+        return { reply: failedTool('support_required', argumentCorrection(name, 'support_required')) };
       }
       const place = supportPlace(task, input.support ?? context.branch);
       const view = await reader.read(context, name === 'search'
@@ -341,8 +357,9 @@ export async function advance(task: ResearchTask, ports: SessionPorts): Promise<
     };
   }
   const turn = state.latestModel + 1;
-  const modelRequest = request(task.job, state.messages);
-  const serialized = JSON.stringify(modelRequest);
+  const modelRequest = request(task.job, state.corrections.size
+    ? state.messages.map((message, index) => state.corrections.get(index) ?? message) : state.messages);
+  let serialized = JSON.stringify(modelRequest);
   if (Buffer.byteLength(serialized) > 16 * 1024 * 1024) {
     return {
       status: 'suspended',
@@ -350,10 +367,21 @@ export async function advance(task: ResearchTask, ports: SessionPorts): Promise<
     };
   }
   const inputRefs = [...state.replies.keys()];
-  const result = await ports.call({
-    effectKey: `${task.jobId}:model:${turn}`, request: modelRequest, inputRefs,
+  const send = (request: typeof modelRequest) => ports.call({
+    effectKey: `${task.jobId}:model:${turn}`, request, inputRefs,
     ...(rejected ? { retryRejectedAttemptId: rejected.attemptId } : {}),
   });
+  let result = await send(modelRequest);
+  if (result.status === 'held' && result.code === 'effect_conflict' && result.attemptId) {
+    // An existing attempt can only be recovered with its original request hash.
+    // The gateway checks that identity before returning a receipt or authorizing a retry.
+    const legacy = request(task.job, state.messages, true);
+    const legacyWire = JSON.stringify(legacy);
+    if (Buffer.byteLength(legacyWire) <= 16 * 1024 * 1024) {
+      result = await send(legacy);
+      serialized = legacyWire;
+    }
+  }
   if (result.status === 'held') return {
     status: 'suspended', hold: {
       reason: result.code,

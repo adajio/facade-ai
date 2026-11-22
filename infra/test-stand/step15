@@ -52,6 +52,10 @@ egress_up() {
       --mount "type=bind,source=$here/connect-proxy.mjs,target=/proxy.mjs,readonly" \
       "$helper_image" node /proxy.mjs openrouter >/dev/null
   fi
+  "${d[@]}" exec -i facade-ai-step15-openrouter node --input-type=module - < "$here/proxy-ready.mjs" || {
+    echo 'CONNECT-прокси шага 15 не принимает TCP на приватном интерфейсе.' >&2
+    return 1
+  }
 }
 
 runtime_env=(--env-file=/run/facade/runtime.env --env-file=/run/facade/journal.env)

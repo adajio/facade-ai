@@ -114,6 +114,78 @@ test('Mastra sends exact tool content, holds an unsettled turn and resumes only 
   assert.equal(events.filter(({ kind }) => kind === 'model').length, 5);
 });
 
+test('visual and text tools advertise only arguments accepted in their assigned role', () => {
+  const { task } = setup();
+  const primary = request(task.job, initialMessages(task.job));
+  for (const name of ['survey', 'zoom', 'extract', 'ocr', 'search']) {
+    const schema = primary.tools.find(({ function: tool }) => tool.name === name)!.function.parameters;
+    assert.equal(schema.additionalProperties, false);
+    assert.ok(!Object.hasOwn(schema.properties ?? {}, 'support'), name);
+  }
+  const place = task.job.mode === 'primary' ? task.job.place : assert.fail();
+  const citation = { observationId: randomUUID(), evidenceId: randomUUID(), place, quote: '2 мм', value: '2', unit: 'мм' };
+  const dispute = { id: randomUUID(), question: { id: randomUUID(), subject: 'Test', property: 'Thickness' },
+    a: { ...citation, branch: 'A' as const }, b: { ...citation, observationId: randomUUID(), branch: 'B' as const } };
+  for (const job of [
+    { mode: 'lead' as const, dispute, settings: task.job.settings },
+    { mode: 'verify' as const, branch: 'B' as const, dispute, settings: task.job.settings,
+      proposal: { aObservationId: dispute.a.observationId, bObservationId: dispute.b.observationId, explanation: 'Test' } },
+  ]) {
+    const review = request(job, initialMessages(job));
+    for (const name of ['survey', 'zoom', 'extract', 'ocr', 'search']) {
+      const schema = review.tools.find(({ function: tool }) => tool.name === name)!.function.parameters;
+      assert.equal(schema.additionalProperties, false);
+      assert.ok(Object.hasOwn(schema.properties ?? {}, 'support'), name);
+      assert.ok(Array.isArray(schema.required) && schema.required.includes('support'), name);
+    }
+  }
+});
+
+test('a reserved old request keeps its original shape and a bad support argument receives a safe retry', async () => {
+  const { task, ports, events, reads } = setup();
+  const oldReceipt = receipt('survey', { support: 'A' });
+  const oldRequest = request(task.job, initialMessages(task.job), true);
+  const sent: string[] = [];
+  ports.call = async ({ effectKey, request: wire }) => {
+    sent.push(effectKey);
+    const survey = wire.tools.find(({ function: tool }) => tool.name === 'survey')!.function.parameters;
+    switch (sent.length) {
+      case 1:
+        assert.ok(!Object.hasOwn(survey.properties ?? {}, 'support'));
+        return { status: 'held', code: 'effect_conflict', attemptId: oldReceipt.attemptId, nextAction: 'inspect_original_effect' };
+      case 2:
+        assert.deepEqual(wire, oldRequest);
+        return oldReceipt;
+      case 3: {
+        assert.ok(!Object.hasOwn(survey.properties ?? {}, 'support'));
+        assert.deepEqual(wire.messages.at(-1), { role: 'tool', tool_call_id: oldReceipt.output.choices[0].message.tool_calls[0].id,
+          content: JSON.stringify({ ok: false, code: 'foreign_branch', nextAction: 'Повторите survey с {}. Страница уже закреплена за вашим заданием.' }) });
+        assert.deepEqual(reads, []);
+        return receipt('survey', { support: 'B' });
+      }
+      case 4:
+        assert.match(String(wire.messages.at(-1)?.content), /Повторите survey с \{\}/);
+        assert.deepEqual(reads, []);
+        return receipt('survey', { page: 7 });
+      case 5:
+        assert.match(String(wire.messages.at(-1)?.content), /invalid_arguments/);
+        assert.deepEqual(reads, []);
+        return receipt('survey', {});
+      case 6:
+        assert.equal(reads.length, 1);
+        return receipt('finish_reading', { status: 'no_match', explanation: 'Reviewed assigned page.' });
+      default: return assert.fail('Unexpected model send');
+    }
+  };
+  const signal = new AbortController().signal;
+  let result = await runResearchWorkflow(task, ports, signal);
+  if (result.status === 'continue') result = await runResearchWorkflow(task, ports, signal);
+  assert.equal(result.status === 'done' && result.outcome.kind, 'reviewed_no_match');
+  assert.equal(sent[0], sent[1]);
+  const first = events[0];
+  assert.equal(first.kind === 'model' && first.requestHash, hashBytes(JSON.stringify(oldRequest)));
+});
+
 test('text-only auto replies exhaust the assigned turns without executing an alleged tool call', async () => {
   const { task, ports, events, reads, recorded } = setup();
   task.job.settings = { ...task.job.settings, toolChoice: 'auto', maxTurns: 2 };
