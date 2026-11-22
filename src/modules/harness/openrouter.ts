@@ -214,14 +214,15 @@ export function initialMessages(job: ResearchJob): Message[] {
   ];
 }
 
-export type ToolWire = 'current' | 'observation-v1' | 'role-v1' | 'shared-v1';
+export type ToolWire = 'current' | 'compound-v1' | 'observation-v1' | 'role-v1' | 'shared-v1';
 
 export function request(job: ResearchJob, messages: Message[], wire: ToolWire = 'current') {
-  const hasObservationForms = wire === 'current' || wire === 'observation-v1';
+  const hasCompound = wire === 'current' || wire === 'compound-v1';
+  const hasObservationForms = hasCompound || wire === 'observation-v1';
   return {
     model: job.settings.model,
     messages,
-    tools: enabledTools(job, wire === 'current').map((name) => {
+    tools: enabledTools(job, hasCompound).map((name) => {
       let schema: z.ZodType = hasObservationForms && name !== 'verify_resolution' ? currentCommands[name] : commands[name];
       let description = toolDescriptions[name];
       if (name === 'save_observation' && job.mode === 'primary') {
@@ -249,6 +250,9 @@ export function request(job: ResearchJob, messages: Message[], wire: ToolWire = 
         }
         const guidance = currentGuidance[name];
         if (guidance) description += ` ${guidance}`;
+      }
+      if (wire === 'current' && name === 'save_compound_observation') {
+        description += ' For text, quote only the selected measurement. Its same-line unit must be adjacent to that number. Cite the applicable header in the same numeric column or a dedicated adjacent unit cell. Use an identifier from the row heading or an explicitly named identifier column. For a variant, cite an explicitly labelled field or a cell under its Variant heading. If these links cannot be established, save an addressed limitation.';
       }
       return { type: 'function', function: { name, description, parameters } };
     }),

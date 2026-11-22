@@ -148,6 +148,11 @@ export interface ReaderObservationComponent extends ReaderComponentInput {
   readerVersion: string;
   address: ReaderAddress;
   evidenceHref: string;
+  binding?: {
+    kind: 'value_context' | 'column_header' | 'row_context' | 'variant_field' | 'context';
+    lineId: string;
+    text: string;
+  };
 }
 
 export interface PinInput {

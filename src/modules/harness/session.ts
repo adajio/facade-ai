@@ -222,6 +222,10 @@ const readerCorrections: Record<string, string> = {
   reader_component_anchor_mismatch: 'Начните со значения в назначенном месте и укажите его дословный адрес.',
   reader_ifc_unit_unproven: 'Откройте локальную единицу свойства IFC либо проект, назначение и единственную проектную единицу длины. Если связь недоказуема, сохраните адресное limitation без числовых полей.',
   reader_component_unit_required: 'Для числового значения предъявите отдельную опору единицы. Если единица не доказана, сохраните адресное limitation.',
+  reader_component_measure_ambiguous: 'Сузьте quote до одного значения и его подписи в этой строке. Не включайте соседнее измерение.',
+  reader_component_unit_unbound: 'Возьмите единицу, относящуюся к этому числу. Откройте его подпись, соседнюю ячейку единицы или заголовок того же столбца.',
+  reader_component_identifier_unbound: 'Используйте обозначение строки или ячейку из явно названного столбца обозначений. Не берите обозначение из соседнего измерения.',
+  reader_component_variant_unbound: 'Используйте явно подписанное исполнение или его ячейку под заголовком исполнения той же таблицы.',
 };
 
 function recordedCorrection(call: FunctionCall, code: unknown, task: ResearchTask): string | undefined {
@@ -578,7 +582,8 @@ export async function advance(task: ResearchTask, ports: SessionPorts): Promise<
   });
   let result = await send(modelRequest);
   let compoundContract = true;
-  for (const [wire, messages] of [['observation-v1', state.currentMessages], ['role-v1', state.roleMessages], ['shared-v1', state.messages]] as const) {
+  for (const [wire, messages] of [['compound-v1', state.currentMessages], ['observation-v1', state.currentMessages],
+    ['role-v1', state.roleMessages], ['shared-v1', state.messages]] as const) {
     if (result.status !== 'held' || result.code !== 'effect_conflict' || !result.attemptId) break;
     // An existing attempt can only be recovered with its original request hash.
     // The gateway checks that identity before returning a receipt or authorizing a retry.
@@ -587,7 +592,7 @@ export async function advance(task: ResearchTask, ports: SessionPorts): Promise<
     if (Buffer.byteLength(legacyWire) <= 16 * 1024 * 1024) {
       result = await send(legacy);
       serialized = legacyWire;
-      compoundContract = false;
+      compoundContract = wire === 'compound-v1';
     }
   }
   if (result.status === 'held') return {

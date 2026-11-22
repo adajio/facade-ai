@@ -156,33 +156,32 @@ test('a reserved old request keeps its original shape and a bad support argument
     const survey = wire.tools.find(({ function: tool }) => tool.name === 'survey')!.function.parameters;
     switch (sent.length) {
       case 1:
+      case 3:
+      case 4:
         assert.ok(!Object.hasOwn(survey.properties ?? {}, 'support'));
         return { status: 'held', code: 'effect_conflict', attemptId: oldReceipt.attemptId, nextAction: 'inspect_original_effect' };
       case 2:
-        assert.ok(!Object.hasOwn(survey.properties ?? {}, 'support'));
+        assert.deepEqual(wire, request(task.job, initialMessages(task.job), 'compound-v1'));
         return { status: 'held', code: 'effect_conflict', attemptId: oldReceipt.attemptId, nextAction: 'inspect_original_effect' };
-      case 3:
-        assert.ok(!Object.hasOwn(survey.properties ?? {}, 'support'));
-        return { status: 'held', code: 'effect_conflict', attemptId: oldReceipt.attemptId, nextAction: 'inspect_original_effect' };
-      case 4:
+      case 5:
         assert.deepEqual(wire, oldRequest);
         return oldReceipt;
-      case 5: {
+      case 6: {
         assert.ok(!Object.hasOwn(survey.properties ?? {}, 'support'));
         assert.deepEqual(wire.messages.at(-1), { role: 'tool', tool_call_id: oldReceipt.output.choices[0].message.tool_calls[0].id,
           content: JSON.stringify({ ok: false, code: 'foreign_branch', nextAction: 'Повторите survey с {}. Страница уже закреплена за вашим заданием.' }) });
         assert.deepEqual(reads, []);
         return receipt('survey', { support: 'B' });
       }
-      case 6:
+      case 7:
         assert.match(String(wire.messages.at(-1)?.content), /Повторите survey с \{\}/);
         assert.deepEqual(reads, []);
         return receipt('survey', { page: 7 });
-      case 7:
+      case 8:
         assert.match(String(wire.messages.at(-1)?.content), /invalid_arguments/);
         assert.deepEqual(reads, []);
         return receipt('survey', {});
-      case 8:
+      case 9:
         assert.equal(reads.length, 1);
         return receipt('finish_reading', { status: 'no_match', explanation: 'Reviewed assigned page.' });
       default: return assert.fail('Unexpected model send');
@@ -195,6 +194,7 @@ test('a reserved old request keeps its original shape and a bad support argument
   assert.equal(sent[0], sent[1]);
   assert.equal(sent[0], sent[2]);
   assert.equal(sent[0], sent[3]);
+  assert.equal(sent[0], sent[4]);
   const first = events[0];
   assert.equal(first.kind === 'model' && first.requestHash, hashBytes(JSON.stringify(oldRequest)));
 });

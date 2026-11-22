@@ -53,6 +53,95 @@ test('split unit, variant and linked revision keep independent opening addresses
   assert.throws(() => groundComponents(inputs, lookup(proof, replaced)));
 });
 
+test('a same-line unit belongs to the selected number and the bound text excludes other measurements', () => {
+  const line = { id: 'multi', text: 'P-17 | length 36 cm | thickness 2 mm' };
+  const evidence = view([line], 'txt');
+  const value = { ...part(evidence, line, 'value', '36', { kind: 'anchor' }), quote: 'length 36 cm' };
+  const unit = { ...part(evidence, line, 'unit', 'cm', { kind: 'source_context', to: 0 }), quote: '36 cm' };
+  const row = { ...part(evidence, line, 'identifier', 'P-17', { kind: 'source_context', to: 0 }), quote: 'P-17' };
+  const { components } = groundComponents([value, unit, row], lookup(evidence));
+  assert.deepEqual(components[0].binding, { kind: 'value_context', lineId: line.id, text: 'length 36' });
+  assert.deepEqual(components[2].binding, { kind: 'row_context', lineId: line.id, text: 'P-17' });
+  assert.throws(() => groundComponents([{ ...value, quote: line.text }, unit], lookup(evidence)),
+    { code: 'reader_component_measure_ambiguous' });
+  assert.throws(() => groundComponents([{ ...value, quote: '36 cm | thickness' }, unit], lookup(evidence)),
+    { code: 'reader_component_measure_ambiguous' });
+  assert.throws(() => groundComponents([value, { ...unit, literal: 'mm', quote: '2 mm' }], lookup(evidence)),
+    { code: 'reader_component_unit_unbound' });
+  assert.throws(() => groundComponents([value, unit, { ...row, literal: 'thickness', quote: 'thickness' }], lookup(evidence)),
+    { code: 'reader_component_identifier_unbound' });
+  const compact = { id: 'compact', text: 'rate 2N/mm²' };
+  const printed = view([compact], 'txt');
+  const amount = part(printed, compact, 'value', '2', { kind: 'anchor' });
+  const compound = part(printed, compact, 'unit', 'N/mm²', { kind: 'source_context', to: 0 });
+  assert.equal(groundComponents([amount, compound], lookup(printed)).components[0].binding?.text, 'rate 2');
+  assert.throws(() => groundComponents([amount, { ...compound, literal: 'N' }], lookup(printed)),
+    { code: 'reader_component_unit_unbound' });
+});
+
+test('a variant needs its own field and an identifier cannot come from a neighboring measurement', () => {
+  const table = 'parts';
+  const id = cell(table, 2, 1, 'P-17');
+  const heading = cell(table, 1, 2, 'Variant');
+  const variant = cell(table, 2, 2, 'B');
+  const length = cell(table, 1, 3, 'Thickness (mm)');
+  const value = cell(table, 2, 3, '36');
+  const coating = cell(table, 2, 4, 'A');
+  const another = cell(table, 2, 5, 'Bracket 9');
+  const evidence = view([id, cell(table, 1, 1, 'Designation'), heading, variant, length, value,
+    cell(table, 1, 4, 'Coating type'), coating, another]);
+  const anchor = part(evidence, value, 'value', '36', { kind: 'anchor' });
+  const unit = part(evidence, length, 'unit', 'mm', { kind: 'column_header', to: 0 });
+  const row = part(evidence, id, 'identifier', 'P-17', { kind: 'same_row', to: 0 });
+  const typed = part(evidence, variant, 'variant', 'B', { kind: 'same_row', to: 0 });
+  const { components } = groundComponents([anchor, unit, row, typed], lookup(evidence));
+  assert.deepEqual(components[3].binding, { kind: 'variant_field', lineId: heading.id, text: 'Variant' });
+  assert.deepEqual(components[1].binding, { kind: 'column_header', lineId: length.id, text: length.text });
+  assert.throws(() => groundComponents([anchor, unit, part(evidence, coating, 'variant', 'A', typed.link)], lookup(evidence)),
+    { code: 'reader_component_variant_unbound' });
+  assert.throws(() => groundComponents([anchor, unit, part(evidence, another, 'identifier', 'Bracket', typed.link)], lookup(evidence)),
+    { code: 'reader_component_identifier_unbound' });
+  const deceptive = { ...coating, text: 'Coating variant A' };
+  const altered = { ...evidence, lines: evidence.lines.map((line) => line.id === coating.id ? deceptive : line) };
+  assert.throws(() => groundComponents([anchor, unit, part(altered, deceptive, 'variant', 'A', typed.link)], lookup(altered)),
+    { code: 'reader_component_variant_unbound' });
+  const mislabelled = { ...evidence, lines: evidence.lines.map((line) => line.text === 'Designation' ? { ...line, text: 'Coating type' } : line) };
+  assert.throws(() => groundComponents([anchor, unit, row], lookup(mislabelled)), { code: 'reader_component_identifier_unbound' });
+});
+
+test('a column header cannot cross an intervening header or another sheet with the same visible name', () => {
+  const older = cell('table', 1, 2, 'Length (mm)');
+  const nearer = cell('table', 3, 2, 'Height (cm)');
+  const value = cell('table', 4, 2, '36');
+  const line = view([older, cell('table', 2, 2, '12'), nearer, value]);
+  const anchor = part(line, value, 'value', '36', { kind: 'anchor' });
+  const headLink = { kind: 'column_header', to: 0 } as const;
+  assert.equal(groundComponents([anchor, part(line, nearer, 'unit', 'cm', headLink)], lookup(line)).components[1].binding?.text, nearer.text);
+  assert.throws(() => groundComponents([anchor, part(line, older, 'unit', 'mm', headLink)], lookup(line)));
+  const duplicate = { ...nearer, locator: { ...nearer.locator, sheetId: 'another' } };
+  const spread = { ...line, lines: line.lines.map((item) => item.id === nearer.id ? duplicate : item) };
+  assert.throws(() => groundComponents([anchor, part(spread, duplicate, 'unit', 'cm', headLink)], lookup(spread)));
+  const conflicting = { ...line, lines: [...line.lines, { ...nearer, id: 'second-heading', text: 'Length (mm)' }] };
+  assert.throws(() => groundComponents([anchor, part(conflicting, nearer, 'unit', 'cm', headLink)], lookup(conflicting)));
+});
+
+test('geometric rows cannot borrow the previous unit or a header spanning two value columns', () => {
+  const box = (id: string, text: string, x: number, y: number, width = 12) => ({
+    id, text, box: { x, y, width, height: 8 },
+  });
+  const left = box('left', '36', 10, 30);
+  const leftUnit = box('left-unit', 'cm', 28, 30);
+  const right = box('right', '2', 48, 30);
+  const rightUnit = box('right-unit', 'mm', 66, 30);
+  const broad = box('broad', 'Measurements (mm)', 8, 15, 55);
+  const evidence = view([left, leftUnit, right, rightUnit, broad], 'pdf');
+  const anchor = part(evidence, right, 'value', '2', { kind: 'anchor' });
+  const row = { kind: 'same_row', to: 0 } as const;
+  assert.equal(groundComponents([anchor, part(evidence, rightUnit, 'unit', 'mm', row)], lookup(evidence)).components.length, 2);
+  assert.throws(() => groundComponents([anchor, part(evidence, leftUnit, 'unit', 'cm', row)], lookup(evidence)));
+  assert.throws(() => groundComponents([anchor, part(evidence, broad, 'unit', 'mm', { kind: 'column_header', to: 0 })], lookup(evidence)));
+});
+
 test('IFC joins actual STEP references within one version, excluding quoted lookalikes', () => {
   const value = { id: '1', text: "#100=IFCPROPERTYSINGLEVALUE('Clearance',$,IFCLENGTHMEASURE(18.),#105);", locator: { step: '#100' } };
   const relation = { id: '2', text: "#101=IFCPROPERTYSET('Q',$,'Dimensions',$,(#100));", locator: { step: '#101' } };

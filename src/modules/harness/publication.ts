@@ -22,11 +22,12 @@ type Ref = Pick<ScheduledResearchTask, 'projectId' | 'scopeId' | 'generationId'>
 
 type FindingRow = {
   finding: Finding; subjectVerified: boolean | null; revision: ObservationPublication['revision'];
-  observation: Observation; content: string | null;
+  observation: Observation; content: string | null; scopeName: string;
 };
 
-function addressedSubject(target: TargetQuestion, observation: Observation, content: string | null, aliases?: string[]): boolean {
-  return hasAddressedSubject({ ...target, aliases }, observation, deliveredLines(content));
+function addressedSubject(target: TargetQuestion, observation: Observation, content: string | null, scopeName: string, aliases?: string[]): boolean {
+  const assigned = { ...target, aliases, scopeName };
+  return hasAddressedSubject(assigned, observation, deliveredLines(content));
 }
 
 const meaningfulRoles = new Set<string>(['design', 'schedule', 'approved_change', 'reference']);
@@ -95,7 +96,7 @@ async function scheduleDisputes(
 async function findingsFor(tx: PoolClient, ref: Ref, target: TargetQuestion, requirement: Requirement) {
   const { rows } = await tx.query<FindingRow>(
     `SELECT h.finding, (i.source->>'subjectVerified')::boolean AS "subjectVerified", i.source->>'revision' AS revision,
-       o.payload AS observation, delivered.content
+       o.payload AS observation, delivered.content, s.name AS "scopeName"
      FROM harness_observations h
      JOIN inquiry_observations i ON i.id=h.observation_id
      JOIN reader_observations o ON o.id=h.observation_id
@@ -115,9 +116,12 @@ async function findingsFor(tx: PoolClient, ref: Ref, target: TargetQuestion, req
      ORDER BY h.observation_id LIMIT 501`, [ref.generationId, target.id]);
   const aliases = rows.some(({ finding, subjectVerified }) => finding.kind === 'value' && subjectVerified !== true)
     ? await readAttributeAliases(tx, target.id) : [];
-  return rows.flatMap(({ finding, revision, subjectVerified, observation, content }) => {
+  return rows.flatMap(({ finding, revision, subjectVerified, observation, content, scopeName }) => {
+    if (finding.kind === 'value' && observation.components?.some(({ binding }) => !binding)) {
+      return [{ ...finding, applicability: 'unknown' as const }];
+    }
     if (finding.kind !== 'value' || subjectVerified) return [finding];
-    if (addressedSubject(target, observation, content, aliases)) {
+    if (addressedSubject(target, observation, content, scopeName, aliases)) {
       return [{ ...finding, applicability: revision === 'effective' ? 'active' as const : finding.applicability }];
     }
     // An unresolved value of an inadmissible format remains available by address in the inquiry.
@@ -240,13 +244,14 @@ export function publication(db: Pool, queue: WorkQueue, profile: ResearchProfile
       if (task.job.mode !== 'primary' || !task.job.question) return;
       const target = task.job.question;
       await getLockedGate(tx, task.projectId, task.scopeId);
-      const { rows: [metadata] } = await tx.query<{ applicable: boolean; format: string }>(
-        `SELECT m.format,EXISTS(
+      const { rows: [metadata] } = await tx.query<{ applicable: boolean; format: string; scopeName: string }>(
+        `SELECT m.format,s.name AS "scopeName",EXISTS(
            SELECT 1 FROM intake_occurrences c
            ${occurrenceScopeJoin}
            WHERE c.version_id=m.version_id AND $2=ANY(${occurrenceScope})
          ) AS applicable
-         FROM harness_document_maps m WHERE m.version_id=$1`,
+         FROM harness_document_maps m JOIN project_scopes s ON s.id=$2 AND s.project_id=m.project_id
+         WHERE m.version_id=$1`,
         [observation.source.versionId, task.scopeId]);
       if (!metadata) throw new Error('Observation has no dispatch manifest');
       const role = qualifiedRole(input.sourceRole);
@@ -264,7 +269,7 @@ export function publication(db: Pool, queue: WorkQueue, profile: ResearchProfile
           `SELECT event#>>'{reply,body,content}' AS content FROM harness_research_events
            WHERE job_id=$1 AND event#>>'{reply,evidence,evidenceId}'=$2 ORDER BY sequence LIMIT 1`,
           [task.jobId, observation.evidenceId]);
-        subjectVerified = addressedSubject(target, observation, addressed.rows[0]?.content ?? null);
+        subjectVerified = addressedSubject(target, observation, addressed.rows[0]?.content ?? null, metadata.scopeName);
       }
       const sourceInScope = assessmentRole !== 'unknown' && metadata.applicable && activeStatement;
       const active = sourceInScope && (observation.components ? subjectVerified === true : subjectVerified !== false);
@@ -351,6 +356,11 @@ export function publication(db: Pool, queue: WorkQueue, profile: ResearchProfile
          JOIN harness_generations now ON now.id=$1 AND now.source_token=prev.source_token
          WHERE old.project_id=$2 AND old.scope_id=$3 AND old.state='done' AND old.generation_id<>$1
            AND old.payload=$4::jsonb AND old.result->>'kind' IN ('covered','reviewed_no_match')
+           AND NOT EXISTS (
+             SELECT 1 FROM jsonb_array_elements_text(coalesce(old.result->'observationIds','[]'::jsonb)) AS saved(id)
+             JOIN reader_observations o ON o.id=saved.id::uuid AND o.project_id=old.project_id
+             CROSS JOIN LATERAL jsonb_array_elements(coalesce(o.payload->'components','[]'::jsonb)) AS c(part)
+             WHERE NOT (c.part ? 'binding'))
          ORDER BY prev.input_generation DESC, old.created_at DESC LIMIT 1`,
         [task.generationId, task.projectId, task.scopeId, task.job]);
       return prior?.result ?? null;
