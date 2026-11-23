@@ -18,13 +18,15 @@ async function listen(server) {
   return 'http://127.0.0.1:' + server.address().port;
 }
 
-function responseTool(attempt, name, args) {
+function responseTools(attempt, calls) {
   return {
-    choices: [{ finish_reason: 'tool_calls', message: { role: 'assistant', tool_calls: [{
-      id: 'call-' + attempt.id, type: 'function', function: { name, arguments: JSON.stringify(args) },
-    }] } }],
+    choices: [{ finish_reason: 'tool_calls', message: { role: 'assistant', tool_calls: calls.map(([name, args], index) => ({
+      id: 'call-' + attempt.id + (index ? '-' + index : ''), type: 'function', function: { name, arguments: JSON.stringify(args) },
+    })) } }],
   };
 }
+
+const responseTool = (attempt, name, args) => responseTools(attempt, [[name, args]]);
 
 test('engineer question reopens originals through the gateway and restricted search honors publication revocation', {
   skip: !databaseUrl || !journalUrl, timeout: 300_000,
@@ -203,6 +205,26 @@ test('engineer question reopens originals through the gateway and restricted sea
         if (question === 'UNKNOWN') return { receipt: { state: 'unknown', code: 'fixture_unknown' } };
         const toolReplies = request.messages.filter(({ role }) => role === 'tool').map(({ content }) => JSON.parse(content));
         const research = question === 'OCR';
+        const paid = (output) => ({
+          output,
+          receipt: { state: 'paid', costUsdNanos: 0, providerId: 'fixture-' + attempt.id, evidenceRef: 'fixture:' + attempt.id },
+        });
+        if (question === 'MULTIPLE_OPENS') {
+          if (!toolReplies.length) return paid(responseTool(attempt, 'search_sources', { query: 'QUANTUM' }));
+          if (toolReplies.length === 1) {
+            assert.equal(toolReplies[0].sources.length, 3);
+            return paid(responseTools(attempt, toolReplies[0].sources.map(({ sourceId }) => ['open_source', { sourceId }])));
+          }
+          const openTurn = request.messages.find(({ tool_calls }) => tool_calls?.length === 3);
+          const replies = request.messages.slice(request.messages.indexOf(openTurn) + 1);
+          assert.deepEqual(replies.map(({ tool_call_id }) => tool_call_id), openTurn.tool_calls.map(({ id }) => id));
+          const opened = replies.map(({ content }) => JSON.parse(content).source);
+          assert.deepEqual(opened.map(({ text }) => text), ['QUANTUM-A', 'QUANTUM-B', 'QUANTUM-C']);
+          return paid(responseTool(attempt, 'submit_answer', {
+            claims: [{ text: 'Сверены три строки синтетического документа.', sources: opened.map(({ sourceId }) => sourceId) }],
+            limitations: [],
+          }));
+        }
         let name, args;
         if (question === 'OCR_QUANTUM') {
           const turn = sent.filter((item) => item.request.messages[1].content === question).length;
@@ -248,10 +270,7 @@ test('engineer question reopens originals through the gateway and restricted sea
               limitations: ['Применимость к другим фасадам требует сверки.'] };
           }
         }
-        return {
-          output: responseTool(attempt, name, args),
-          receipt: { state: 'paid', costUsdNanos: 0, providerId: 'fixture-' + attempt.id, evidenceRef: 'fixture:' + attempt.id },
-        };
+        return paid(responseTool(attempt, name, args));
       },
     },
   });
@@ -443,6 +462,28 @@ test('engineer question reopens originals through the gateway and restricted sea
   });
   console.info('Copilot fixture: eighth turn, two originals, checkpoint replay, budget and no-progress hold checked');
   console.info('Copilot fixture: already leased primary task and its cursor preserved');
+
+  const multiId = (await ask('MULTIPLE_OPENS')).json().id;
+  assert.equal(await next({ route }), true);
+  const { rows: [{ job_id: multiJob }] } = await db.query('SELECT job_id FROM copilot_questions WHERE id=$1', [multiId]);
+  const interruptedBatch = new Proxy(gateway, { get(target, property) {
+    if (property === 'checkpoint') return async (lease, cursor, tx) => {
+      if (cursor.turn === 2) throw new Error('fixture stops before saving the three read replies');
+      return target.checkpoint(lease, cursor, tx);
+    };
+    const member = target[property];
+    return typeof member === 'function' ? member.bind(target) : member;
+  }});
+  await assert.rejects(next({ route, gateway: interruptedBatch }), /fixture stops before saving the three read replies/);
+  await db.query("UPDATE gateway_jobs SET lease_until=clock_timestamp()-interval '1 second' WHERE id=$1 AND state='leased'", [multiJob]);
+  assert.equal(await next({ route, workerId: id() }), true);
+  const multiAnswer = await get(base + '/questions/' + multiId);
+  assert.equal(multiAnswer.state, 'answered');
+  assert.deepEqual(multiAnswer.citations.map(({ text }) => text), ['QUANTUM-A', 'QUANTUM-B', 'QUANTUM-C']);
+  assert.equal(sent.filter(({ attempt }) => attempt.jobId === multiJob).length, 3);
+  assert.equal((await db.query('SELECT count(*)::int AS value FROM gateway_attempts WHERE job_id=$1', [multiJob])).rows[0].value, 3);
+  console.info('Copilot fixture: three read calls in one model turn returned three citations with no duplicate send');
+
   const unknownKey = id();
   const unknownId = (await ask('UNKNOWN', unknownKey)).json().id;
   assert.equal(await next({ route }), true);

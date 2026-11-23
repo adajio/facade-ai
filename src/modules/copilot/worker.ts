@@ -7,7 +7,7 @@ import { hash } from '../gateway/types.js';
 import type { ResearchAdmission } from '../gateway/gateway.js';
 import type { CopilotMemory, MemorySource, SourceIdentity, StoredAnswer } from './contracts.js';
 import { copilotKind, maxCopilotInputRefs, verifyCopilotInputs } from './admission.js';
-import { decodeAction, messagesFor, requestFor, type Message } from './protocol.js';
+import { decodeTurn, messagesFor, requestFor, recentTranscript, type Message } from './protocol.js';
 
 export { copilotKind } from './admission.js';
 const leaseMs = 30_000;
@@ -178,12 +178,6 @@ function advance(progress: Progress, madeProgress: boolean) {
   progress.stagnantTurns = madeProgress ? 0 : (progress.stagnantTurns ?? 0) + 1;
 }
 
-function wireMessages(messages: Message[]) {
-  const history = (turnsPerLease - 1) * 2;
-  // Keep complete assistant/tool pairs and the original instructions/question.
-  return messages.length <= history + 2 ? messages : [...messages.slice(0, 2), ...messages.slice(-history)];
-}
-
 function metadata(source: MemorySource) {
   return {
     sourceId: source.id, document: source.label, documentId: source.documentId, versionId: source.versionId,
@@ -306,80 +300,84 @@ async function run(work: LeasedJob, runtime: CopilotRuntime, signal: AbortSignal
       if (active.aborted) return;
       const outcome = await gateway.call({
         lease, effectKey: `copilot/turn/${progress.turn}`, routeId: route.routeId, dataClass: route.dataClass,
-        request: requestFor(route, wireMessages(progress.messages), Boolean(runtime.research)), inputRefs: progress.found.map(({ id }) => id),
+        request: requestFor(route, recentTranscript(progress.messages, (turnsPerLease - 1) * 2), Boolean(runtime.research)), inputRefs: progress.found.map(({ id }) => id),
       });
       if (active.aborted) return;
       if (outcome.status === 'held') {
-        await suspend(outcome.code, retryable.has(outcome.code) ? new Date(Date.now() + 2500) : undefined);
+        await suspend(outcome.code, outcome.retryAt ?? (retryable.has(outcome.code) ? new Date(Date.now() + 2500) : undefined));
         return;
       }
-      const decoded = outcome.status === 'paid' ? decodeAction(outcome.output) : null;
+      const decoded = outcome.status === 'paid' ? decodeTurn(outcome.output) : null;
       if (!decoded) {
         await finish([], [], outcome.status === 'rejected' ? 'model_rejected' : 'model_response_invalid');
         return;
       }
-      const { action, call, message } = decoded;
+      const { actions, message } = decoded;
       progress.turn += 1;
       progress.messages.push(message);
       const before = progress.found.length + progress.opened.length;
       let lastResearchSource: string | undefined;
-      switch (action.name) {
-        case 'search_sources': {
-          const found = await withOwner(db, question, (session) => memory.search(session, work.projectId, action.args.query));
-          if (!found) { await suspend('access_changed'); return; }
-          const selected: MemorySource[] = [];
-          for (const source of [...found.sources.slice(0, 4), ...found.windows.slice(0, 2)]) {
-            if (selected.length >= 6) break;
-            if (progress.found.length >= maxFound && !progress.found.some(({ id }) => id === source.id)) continue;
-            include(progress, source);
-            selected.push(source);
-          }
-          searchLimits(progress, found.limitations);
-          // Search descriptions contain metadata only. Open the original before using a claim.
-          reply(progress, call.id, { sources: selected.filter(({ window }) => !window).map(metadata),
-            unresolvedWindows: selected.filter(({ window }) => window).map(metadata), limitations: found.limitations });
-          break;
-        }
-        case 'open_source': {
-          const key = action.args.sourceId;
-          if (!progress.opened.includes(key) && progress.opened.length >= maxOpened) {
-            reply(progress, call.id, { code: 'source_limit' });
+      const availableSources = new Set(progress.found.map(({ id }) => id));
+      for (const { action, callId } of actions) {
+        if (active.aborted) return;
+        switch (action.name) {
+          case 'search_sources': {
+            const found = await withOwner(db, question, (session) => memory.search(session, work.projectId, action.args.query));
+            if (!found) { await suspend('access_changed'); return; }
+            const selected: MemorySource[] = [];
+            for (const source of [...found.sources.slice(0, 4), ...found.windows.slice(0, 2)]) {
+              if (selected.length >= 6) break;
+              if (progress.found.length >= maxFound && !progress.found.some(({ id }) => id === source.id)) continue;
+              include(progress, source);
+              selected.push(source);
+            }
+            searchLimits(progress, found.limitations);
+            // Search descriptions contain metadata only. Open the original before using a claim.
+            reply(progress, callId, { sources: selected.filter(({ window }) => !window).map(metadata),
+              unresolvedWindows: selected.filter(({ window }) => window).map(metadata), limitations: found.limitations });
             break;
           }
-          const original = await authorizedSource(key);
-          if (original) {
-            if (original.source.text && !progress.opened.includes(key)) progress.opened.push(key);
-            reply(progress, call.id, { source: opened(original.source) });
-          } else {
-            reply(progress, call.id, { code: 'source_unavailable' });
-          }
-          break;
-        }
-        case 'research_source': {
-          const key = action.args.sourceId;
-          const original = runtime.research ? await authorizedSource(key) : null;
-          if (!original || original.source.representation !== 'native' || typeof original.source.address.locator?.page !== 'number') {
-            reply(progress, call.id, { code: 'research_unavailable' });
+          case 'open_source': {
+            const key = action.args.sourceId;
+            if (!progress.opened.includes(key) && progress.opened.length >= maxOpened) {
+              reply(progress, callId, { code: 'source_limit' });
+              break;
+            }
+            const original = availableSources.has(key) ? await authorizedSource(key) : null;
+            if (original) {
+              if (original.source.text && !progress.opened.includes(key)) progress.opened.push(key);
+              reply(progress, callId, { source: opened(original.source) });
+            } else {
+              reply(progress, callId, { code: 'source_unavailable' });
+            }
             break;
           }
-          const addressKey = addressKeyFor(original.source);
-          if (attempted.includes(addressKey)) {
-            lastResearchSource = key;
-            reply(progress, call.id, { code: 'research_already_attempted' });
-            break;
-          }
-          progress.research = { sourceId: key, reason: action.args.reason, callId: call.id, finished: false, addressKey };
-          if (await save(key, true)) await suspend('addressed_research', new Date());
-          return;
-        }
-        case 'submit_answer': {
-          const { claims, limitations } = action.args;
-          if (claims.every(({ sources }) => sources.every((key) => progress.opened.includes(key)))) {
-            await finish(claims, limitations, null);
+          case 'research_source': {
+            const key = action.args.sourceId;
+            const original = runtime.research ? await authorizedSource(key) : null;
+            if (!original || original.source.representation !== 'native' || typeof original.source.address.locator?.page !== 'number') {
+              reply(progress, callId, { code: 'research_unavailable' });
+              break;
+            }
+            const addressKey = addressKeyFor(original.source);
+            if (attempted.includes(addressKey)) {
+              lastResearchSource = key;
+              reply(progress, callId, { code: 'research_already_attempted' });
+              break;
+            }
+            progress.research = { sourceId: key, reason: action.args.reason, callId, finished: false, addressKey };
+            if (await save(key, true)) await suspend('addressed_research', new Date());
             return;
           }
-          reply(progress, call.id, { code: 'unopened_citation' });
-          break;
+          case 'submit_answer': {
+            const { claims, limitations } = action.args;
+            if (claims.every(({ sources }) => sources.every((key) => progress.opened.includes(key)))) {
+              await finish(claims, limitations, null);
+              return;
+            }
+            reply(progress, callId, { code: 'unopened_citation' });
+            break;
+          }
         }
       }
       advance(progress, progress.found.length + progress.opened.length > before);
