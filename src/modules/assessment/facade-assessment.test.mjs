@@ -276,12 +276,14 @@ test("ordinary intake publishes a local conflict, then keeps sent history after 
         const { lease, projectId, scopeId, generationId, payload: job } = work;
         const task = { jobId: lease.jobId, projectId, scopeId, generationId, job };
         assert.ok(job.mode === "lead" || job.mode === "verify");
-        const quotes = [job.dispute.a, job.dispute.b].map((citation) => ({
-          support: citation.branch, evidenceId: citation.evidenceId, quote: citation.quote, line: citation.quote,
-        }));
+        const quotes = [];
         for (const citation of [job.dispute.a, job.dispute.b]) {
-          const exact = await reader.findEvidence(projectId, citation.evidenceId);
-          assert.ok(JSON.parse((await reader.content(exact)).toString()).lines.some(({ text }) => text.includes(citation.quote)));
+          const opened = await reader.open(citation.place.source, {
+            runId: lease.jobId, branch: citation.branch, operationKey: `review-${citation.branch}`,
+          }, { representation: "native", address: { unitId: citation.place.unitId } });
+          const line = JSON.parse(opened.bytes.toString()).lines.find(({ text }) => text.includes(citation.quote));
+          assert.ok(line);
+          quotes.push({ support: citation.branch, evidenceId: opened.evidence.id, quote: citation.quote, line: line.text });
         }
         const { proof } = pairSourceEvidence({ variants: quotes, revisions: quotes, applicability: quotes,
           anchors: { A: [quotes[0].quote], B: [quotes[1].quote] }, scopeName: job.packageReview.scopeLabel,
