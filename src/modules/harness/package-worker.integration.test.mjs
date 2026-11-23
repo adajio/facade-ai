@@ -258,6 +258,12 @@ test('ordinary intake publishes independent package evidence before questions an
   assert.equal(contextual.revision.toUpperCase(), 'R2');
   assert.equal(contextual.variant, 'v9');
   await command('GET', contextual.basis.revisionEvidence.href, undefined);
+  const assessment = (await command('GET', `/api/v1/projects/${project.id}/facade-assessment`, undefined)).json();
+  assert.equal(assessment.catalog, null);
+  assert.equal(assessment.completedWindows, 2);
+  assert.equal(assessment.observations.counts.common, 2);
+  assert.deepEqual(assessment.contexts.filter(({ kind }) => kind === 'facade').map(({ name }) => name).sort(), ['K-47', 'M-18']);
+  assert.ok(assessment.limitations.includes('catalog_unassigned'));
   assert.ok(complete.windows.every(({ branches }) => branches.A.jobId !== branches.B.jobId));
   const fact = complete.facts[0];
   await command('GET', fact.evidenceHref, undefined);
