@@ -153,10 +153,10 @@ test('ordinary intake publishes independent package evidence before questions an
         if(!plan)output=tool('inspect_structure',{});
         else if(!survey)output=tool('survey',{});
         else if(!native)output=tool('extract',{});
-        else if(review&&fixture.unknown)output=tool('finish_reading',{status:'no_match',explanation:'The register heading has no actual entry.'});
-        else if(!review&&!recorded)output=tool('record_blocks',{checks:plan.blocks.map(({id,kind})=>({
+        else if(!recorded)output=tool('record_blocks',{checks:plan.blocks.map(({id,kind})=>({
           blockId:id,evidenceId:(kind==='native'?native:survey).evidence.evidenceId,status:'reviewed',reason:'Opened the assigned block.',
         }))});
+        else if(review&&fixture.unknown)output=tool('finish_reading',{status:'no_match',explanation:'The register heading has no actual entry.'});
         else if(!saved.length||review&&fixture.type&&saved.length<3) {
           const lines=JSON.parse(native.content).lines;
           const rejectedTypes=['Facade type: not applicable','Facade type: historic screen'];
@@ -389,8 +389,8 @@ test('ordinary intake publishes independent package evidence before questions an
         assert.deepEqual(discoveryOpens.map((pair)=>pair.join('/')).sort(),[
           'PX-621/primary_a','PX-621/primary_b','ZR-908/primary_a','ZR-908/primary_b',
         ]);
-        const surveyed={mark:'HM-525',prequalified:true,
-          heading:'Drawing | Stage: RD | current revision E52 | project facade ID: HM-525 | Facade type: ribbed panel'};
+        const surveyed={mark:'HM-525',prequalified:true,type:'Facade type: ribbed panel',
+          heading:'Drawing | Stage: RD | current revision E52 | project facade ID: HM-525'};
         const confirmedReceipt=(await command('POST',`/api/projects/${fresh.id}/receipts`,{source:'upload'})).json();
         const confirmedTarget=`/api/receipts/${confirmedReceipt.receiptId}`;
         const confirmed=await uploadFixture('qualified-in-primary.pdf',surveyed,confirmedTarget);
@@ -403,7 +403,8 @@ test('ordinary intake publishes independent package evidence before questions an
           label===surveyed.mark&&attributes.facadeKind?.[0]?.evidence.length===2),'primary type is qualified in both branches');
         await delay(1300);
         assert.equal((await app.db.query(`SELECT count(*)::int AS count FROM harness_package_followups f JOIN gateway_jobs j ON j.id=f.job_id
-          WHERE j.project_id=$1 AND j.subject_id=$2 AND f.plan_key='facade-profile-scan:1'`,[fresh.id,confirmed.versionId])).rows[0].count,0);
+          WHERE j.project_id=$1 AND j.subject_id=$2 AND (f.plan_key LIKE 'facade-profile-scan:%' OR f.plan_key LIKE 'facade:%')`,
+          [fresh.id,confirmed.versionId])).rows[0].count,0);
         const fencedReceipt=(await command('POST',`/api/projects/${fresh.id}/receipts`,{source:'upload'})).json();
         const fencedTarget=`/api/receipts/${fencedReceipt.receiptId}`;
         const empty=await uploadFixture('empty-register.pdf',{mark:'empty-register',heading:'Facade register | No entries',unknown:true},fencedTarget);

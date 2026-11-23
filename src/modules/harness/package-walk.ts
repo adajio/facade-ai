@@ -8,6 +8,7 @@ import { deliveredLines } from '../questions/attribute-aliases.js';
 import { ReaderRefusal, jobSchema, type BlockCheck, type PackageBlock, type PackageDiscovery, type PackageSemanticCheck, type Place, type ReaderContext } from './contracts.js';
 import type { ReaderService } from './reader.js';
 import { memoryVersion } from '../project-memory/contracts.js';
+import { currentProfileHintLines,profileHintPatterns } from './facade-profile-hints.js';
 
 export const packageFollowupKind = 'harness_package_followup';
 
@@ -129,12 +130,16 @@ export async function packageStructure(db: Pool | PoolClient, context: ReaderCon
   if (!row) throw new ReaderRefusal('package_structure_pending','temporary');
   const followup=task.job.packageWindow.followup;
   const targets=followup?.blocks;
+  const pinned=!followup&&task.job.packageWindow.profileInspection;
+  const profileInspectionLines=pinned&&(pinned.lineIds.length?pinned.lineIds:await currentProfileHintLines(db,task.projectId,
+    task.job.place.source.versionId,task.job.packageWindow.readerVersion,task.job.place.unitId));
   const {rows:prior}=followup?await db.query<{blockId:string;evidenceId:string}>(
     `SELECT DISTINCT ON (c.block_id) c.block_id AS "blockId",c.evidence_id AS "evidenceId"
      FROM harness_package_block_checks c WHERE c.window_id=$1 AND c.reviewed AND
        (c.job_id=$2 OR EXISTS(SELECT 1 FROM harness_package_followups f WHERE f.root_job_id=$2 AND f.job_id=c.job_id))
      ORDER BY c.block_id,c.job_id`,[task.job.packageWindow.id,followup.rootJobId]):{rows:[]};
   const structure={...row,blocks:targets?row.blocks.filter(({id})=>targets.includes(id)):row.blocks,
+    ...(profileInspectionLines&&profileInspectionLines.length?{profileInspectionLines}:{}),
     ...(prior.length?{earlierBranchChecks:prior}:{})};
   const project = await getProject(db,task.projectId);
   if(!project.stage||!project.catalogVersionId) return structure;
@@ -330,18 +335,11 @@ async function putFollowup(tx:PoolClient,queue:WorkQueue,row:FollowupTarget,plan
   return true;
 }
 
-// These patterns select places to review. They never supply a label or a type to the reader.
-const profileTypeHint=String.raw`(^|[|;·]\s*)(facade (kind|type)|тип фасада)\s*[:=№–—]\s*(?!not\y|no\y|none\y|n/a\y|unknown\y|unspecified\y|не\y|нет\y|отсутств|неприменим)\S`;
-const profileHeadingHint=String.raw`^\s*(?:(?:project facade (?:identifier|id|reference|ref)|идентификатор фасада проекта|код фасада проекта|ссылка на (?:код|идентификатор) фасада проекта|facade (?:mark|designation|id)|марка фасада|обозначение фасада|фасад)\s*[:№=]\s*\S|(?:facade (?:schedule|register|list)|list of facades|(?:ведомость|реестр|перечень) фасадов)\y|(?:facade|фасад)\s+\S+\s+(?:in|at|в|по)\s)`;
-const profileDocumentHeader=String.raw`^\s*(?:drawing|schedule|elevation|specification|detail|inventory|черт[её]ж|ведомость|спецификация|опись)\s*[|;·].*(project facade (?:identifier|id|reference|ref)|идентификатор фасада проекта|код фасада проекта|(?:facade|фасад)\s*[:№=])`;
-const profileInactive=String.raw`(?:\y(?:superseded|withdrawn|obsolete|draft|not[ -]+current)\y|\y(?:отмен[её]н|архивн|замен[её]н|черновик|недействующ|неактуальн|не\s+действующ))`;
-const compass=String.raw`(?:north(?:east|west)?|south(?:east|west)?|east|west)(?:ern)?|(?:северо-восточн|северо-западн|юго-восточн|юго-западн|северн|южн|восточн|западн)(?:ый|ого|ому|ым|ом)`;
-const profileCompassHint=String.raw`^\s*(?:(?:${compass})\s+(?:facade|фасад[аеу]?)|(?:facade|фасад)\s+(?:${compass}))\y`;
-const profileScanPlan='facade-profile-scan:1';
+const profileScanPlan='facade-profile-scan';
 
 async function dispatchUnseededFacadeScan(tx:PoolClient,queue:WorkQueue) {
-  const {rows}=await tx.query<FollowupTarget>(`SELECT j.id AS "rootId",w.id AS "windowId",w.project_id AS "projectId",
-      j.generation_id AS "generationId",j.payload,targets.blocks
+  const {rows}=await tx.query<FollowupTarget&{round:number;candidateBlocks:string[]}>(`SELECT j.id AS "rootId",w.id AS "windowId",w.project_id AS "projectId",
+      j.generation_id AS "generationId",j.payload,targets.blocks,targets.candidates AS "candidateBlocks",coalesce(history.round,0)+1 AS round
     FROM ${activeWindows}
     JOIN projects project ON project.id=w.project_id
     JOIN harness_package_structures s ON s.window_id=w.id
@@ -351,14 +349,23 @@ async function dispatchUnseededFacadeScan(tx:PoolClient,queue:WorkQueue) {
     JOIN project_memory_versions v ON v.version_id=w.version_id AND v.project_id=w.project_id AND v.contract=$1 AND v.reader_version=m.reader_version
     JOIN project_memory_blocks mb ON mb.project_id=v.project_id AND mb.version_id=v.version_id AND mb.contract=v.contract AND mb.unit_id=w.place->>'unitId'
       AND mb.ordinal<v.next_ordinal AND mb.artifact_sha256 IS NOT NULL AND NOT ('native'=ANY(mb.remaining))
+    LEFT JOIN LATERAL (
+      SELECT f.job_id,f.blocks,step.state,step.reason,step.result,split_part(f.plan_key,':',2)::int AS round
+      FROM harness_package_followups f JOIN gateway_jobs step ON step.id=f.job_id
+      WHERE f.root_job_id=j.id AND f.plan_key LIKE $7||':%'
+      ORDER BY round DESC LIMIT 1
+    ) history ON true
     JOIN LATERAL (
-      SELECT array_agg(id ORDER BY ordinal) AS blocks FROM (
+      SELECT candidates,candidates[1:3] AS blocks FROM (
+        SELECT array_agg(id ORDER BY priority DESC,ordinal) AS candidates FROM (
         SELECT p.id,p.ordinal,max(CASE WHEN cue.is_type THEN 1 ELSE 0 END) AS priority
         FROM project_memory_lines l
         CROSS JOIN LATERAL (SELECT l.folded~$2 AS is_type) cue
         JOIN LATERAL (SELECT block->>'id' AS id,ordinal,jsonb_array_elements_text(block->'lineIds') AS line_id
           FROM jsonb_array_elements(s.blocks) WITH ORDINALITY p(block,ordinal)) p ON p.line_id=l.line_id
         WHERE l.block_id=mb.id AND (cue.is_type OR l.folded~$3 OR l.folded~$4 OR l.folded~$6) AND l.folded!~$5
+          AND NOT EXISTS (SELECT 1 FROM harness_package_followups prior WHERE prior.root_job_id=j.id
+            AND prior.plan_key LIKE $7||':%' AND prior.blocks?p.id)
           AND NOT (cue.is_type AND EXISTS (SELECT 1 FROM project_memory_lines preceding
             WHERE preceding.block_id=l.block_id AND preceding.ordinal=l.ordinal-1 AND preceding.folded~$5
               AND (preceding.folded~$3 OR preceding.folded~$4 OR preceding.folded~$6)))
@@ -381,7 +388,8 @@ async function dispatchUnseededFacadeScan(tx:PoolClient,queue:WorkQueue) {
                   WHERE mark->>'kind' IN ('registry','context','reference') AND
                     (mark->>'lineId'=l.line_id OR mark->>'quote'=l.literal OR mark->>'contextQuote'=l.literal))
               ))
-        GROUP BY p.ordinal,p.id ORDER BY priority DESC,p.ordinal LIMIT 3
+        GROUP BY p.ordinal,p.id
+        ) hints
       ) selected
     ) targets ON targets.blocks IS NOT NULL
     WHERE ${activeSource} AND m.refusal IS NULL AND j.payload#>>'{packageWindow,walkProtocol}'='1'
@@ -392,15 +400,17 @@ async function dispatchUnseededFacadeScan(tx:PoolClient,queue:WorkQueue) {
           AND grant_row.data_class=j.payload#>>'{settings,dataClass}')
       AND NOT EXISTS(SELECT 1 FROM harness_package_facts f LEFT JOIN harness_facade_discovery d ON d.fact_id=f.id
         WHERE f.project_id=w.project_id AND f.window_id=w.id AND f.job_id=j.id AND NOT coalesce(d.resolved,false))
-      AND NOT EXISTS(SELECT 1 FROM harness_package_followups f WHERE f.root_job_id=j.id AND f.plan_key=$7)
+      AND (history.job_id IS NULL OR (history.state='done' AND history.result->>'kind' IN ('covered','reviewed_no_match')
+          OR history.state='held' AND history.reason='turn_limit_final') AND EXISTS (
+          SELECT 1 FROM harness_package_block_checks c WHERE c.job_id=history.job_id AND c.reviewed AND history.blocks?c.block_id))
       AND NOT EXISTS(SELECT 1 FROM gateway_attempts a WHERE a.state IN ('reserved','prepared','sending','unknown')
         AND (a.job_id=j.id OR EXISTS(SELECT 1 FROM harness_package_followups child WHERE child.root_job_id=j.id AND child.job_id=a.job_id)))
       AND NOT EXISTS(SELECT 1 FROM harness_package_followups f JOIN gateway_jobs x ON x.id=f.job_id
         WHERE x.project_id=w.project_id AND x.state IN ('ready','leased'))
       AND 4>(SELECT count(*) FROM harness_package_followups f JOIN gateway_jobs x ON x.id=f.job_id WHERE x.state IN ('ready','leased'))
-    ORDER BY j.created_at,j.project_id,b.branch LIMIT 8`,[memoryVersion,profileTypeHint,profileHeadingHint,profileDocumentHeader,profileInactive,profileCompassHint,profileScanPlan]);
+    ORDER BY j.created_at,j.project_id,b.branch LIMIT 8`,[memoryVersion,...profileHintPatterns,profileScanPlan]);
   for(const row of rows) {
-    if(await putFollowup(tx,queue,row,profileScanPlan,undefined,{kind:'profile_scan'}))return true;
+    if(await putFollowup(tx,queue,row,`${profileScanPlan}:${row.round}`,undefined,{kind:'profile_scan',candidateBlocks:row.candidateBlocks}))return true;
   }
   return false;
 }
@@ -446,6 +456,8 @@ async function dispatchFacadeFollowup(tx:PoolClient,queue:WorkQueue) {
           AND lower(trim(coalesce((SELECT o.payload->>'quote' FROM reader_observations o WHERE o.id=f.id),'')))
             ~'(facade (type|kind)|тип фасада)\\s*[:№=]')
       AND NOT EXISTS(SELECT 1 FROM harness_package_followups f WHERE f.root_job_id=j.id AND f.plan_key='facade:'||md5(demand.key))
+      AND NOT EXISTS(SELECT 1 FROM harness_package_facts f LEFT JOIN harness_facade_discovery proof ON proof.fact_id=f.id
+        WHERE f.project_id=w.project_id AND f.window_id=w.id AND f.job_id=j.id AND NOT coalesce(proof.resolved,false))
       AND NOT EXISTS(SELECT 1 FROM gateway_attempts a WHERE a.job_id=j.id AND a.state IN ('reserved','prepared','sending','unknown'))
       AND NOT EXISTS(SELECT 1 FROM harness_package_followups f JOIN gateway_jobs x ON x.id=f.job_id
         WHERE x.project_id=w.project_id AND x.state IN ('ready','leased'))

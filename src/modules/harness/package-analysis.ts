@@ -53,6 +53,7 @@ export interface PackageWalkState {
     complete:boolean;
     followup:{jobId:string;status:string;reason:string|null}|null;
     completedFollowupId:string|null;
+    profileScan?:{reviewed:string[];remaining:string[]};
   }>;
 }
 
@@ -339,12 +340,13 @@ export async function readPackageAnalysis(db: Pool | PoolClient, projectId: stri
   const windows = projectWindows(windowRows);
   const walkIds=[...new Set(windowRows.filter(({walk})=>walk).map(({id})=>id))];
   const {rows:walkRows}=walkIds.length?await db.query<{
-    id:string;blocks:PackageBlock[]|null;limitation:string|null;branch:Branch;checks:{blockId:string;evidenceId:string;reviewed:boolean;reason:string}[];
+    id:string;blocks:PackageBlock[]|null;limitation:string|null;branch:Branch;
+    checks:{blockId:string;evidenceId:string;reviewed:boolean;reason:string;profileScan:boolean}[];profileBlocks:string[]|null;
     childId:string|null;childState:string|null;childReason:string|null;completedFollowupId:string|null;
   }>(
     `SELECT b.window_id AS id,s.blocks,s.limitation,b.branch,
        coalesce(checked.items,'[]') AS checks,child.id AS "childId",child.state AS "childState",child.reason AS "childReason",
-       closed.id AS "completedFollowupId"
+       closed.id AS "completedFollowupId",scan.blocks AS "profileBlocks"
      FROM harness_package_branches b LEFT JOIN harness_package_structures s ON s.window_id=b.window_id
      LEFT JOIN LATERAL (
        SELECT j.id,j.state,j.reason FROM harness_package_followups f JOIN gateway_jobs j ON j.id=f.job_id
@@ -365,10 +367,17 @@ export async function readPackageAnalysis(db: Pool | PoolClient, projectId: stri
        ORDER BY j.created_at DESC,j.id LIMIT 1
      ) closed ON true
      LEFT JOIN LATERAL (
-       SELECT jsonb_agg(jsonb_build_object('blockId',block_id,'evidenceId',evidence_id,'reviewed',reviewed,'reason',reason)
-         ORDER BY job_id IS DISTINCT FROM child.id,reviewed DESC) AS items
-       FROM harness_package_block_checks c WHERE c.job_id=b.job_id OR EXISTS (
-         SELECT 1 FROM harness_package_followups history WHERE history.root_job_id=b.job_id AND history.job_id=c.job_id)
+       SELECT array_agg(DISTINCT block_id ORDER BY block_id) AS blocks FROM harness_package_followups f
+       JOIN gateway_jobs j ON j.id=f.job_id
+       CROSS JOIN LATERAL jsonb_array_elements_text(coalesce(j.payload#>'{packageWindow,followup,discovery,candidateBlocks}',f.blocks)) block_id
+       WHERE f.root_job_id=b.job_id AND f.plan_key LIKE 'facade-profile-scan:%'
+     ) scan ON true
+     LEFT JOIN LATERAL (
+       SELECT jsonb_agg(jsonb_build_object('blockId',c.block_id,'evidenceId',c.evidence_id,'reviewed',c.reviewed,'reason',c.reason,
+         'profileScan',coalesce(history.plan_key LIKE 'facade-profile-scan:%' AND history.blocks?c.block_id,false))
+         ORDER BY c.job_id IS DISTINCT FROM child.id,c.reviewed DESC) AS items
+       FROM harness_package_block_checks c LEFT JOIN harness_package_followups history
+         ON history.root_job_id=b.job_id AND history.job_id=c.job_id WHERE c.job_id=b.job_id OR history.job_id IS NOT NULL
      ) checked ON true WHERE b.active AND b.window_id=ANY($1::uuid[])`,[walkIds]):{rows:[]};
   const byWindow=new Map(windows.map((window)=>[window.id,window]));
   for(const row of walkRows) {
@@ -384,9 +393,12 @@ export async function readPackageAnalysis(db: Pool | PoolClient, projectId: stri
       blockId:id,reason:row.checks.find((check)=>check.blockId===id)?.reason??'block_not_reviewed',
     }));
     const complete=structure.status==='ready'&&Boolean(structure.blocks.length)&&!remaining.length&&!structure.limitation;
+    const profileReviewed=row.profileBlocks?.filter((blockId)=>row.checks.some((check)=>check.blockId===blockId&&check.reviewed&&check.profileScan));
     structure.branches[row.branch]={reviewed,remaining,complete,
       followup:row.childId?{jobId:row.childId,status:row.childState!,reason:row.childReason}:null,
-      completedFollowupId:complete?row.completedFollowupId:null};
+      completedFollowupId:complete?row.completedFollowupId:null,
+      ...(row.profileBlocks&&profileReviewed?{profileScan:{reviewed:profileReviewed,
+        remaining:row.profileBlocks.filter((blockId)=>!profileReviewed.includes(blockId))}}:{})};
   }
   const {rows:semanticChecks}=walkIds.length?await db.query<PackageSemanticCheck>(
     `SELECT s.window_id AS "windowId",s.branch,s.job_id AS "jobId",b.job_id AS "primaryJobId",s.reader_version AS "readerVersion",

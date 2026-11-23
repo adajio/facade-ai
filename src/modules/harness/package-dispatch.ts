@@ -15,6 +15,8 @@ import { authorizedPackageReview } from './package-review.js';
 import { jobSchema } from './contracts.js';
 import { packageFollowupKind } from './package-walk.js';
 import { researchKind } from './runner.js';
+import { memoryVersion } from '../project-memory/contracts.js';
+import { profileHintLines,profileHintPatterns } from './facade-profile-hints.js';
 
 const branches = ['A', 'B'] as const;
 const mapContract = 'overlapping-windows-v1';
@@ -182,19 +184,31 @@ export async function dispatchPackagePair(db: Pool, queue: WorkQueue, profile: R
     if (count > packagePrimaryGlobalLimit - 2) return false;
     const { rows: [next] } = await tx.query<{
       projectId: string; generationId: string; windowId: string; place: Place; readerVersion: string; walkDefault: boolean;
+      firstLook: boolean; inspectionLines: string[];
     }>(
       `SELECT p.project_id AS "projectId",p.generation_id AS "generationId",candidate.*,
         (project.intake_mode AND project.package_walk_default) AS "walkDefault"
        FROM harness_package_projects p
        JOIN projects project ON project.id=p.project_id
        JOIN LATERAL (
-         SELECT w.id AS "windowId",w.place,m.reader_version AS "readerVersion"
+         SELECT w.id AS "windowId",w.place,m.reader_version AS "readerVersion",
+           config.walk AND NOT observed.visited AS "firstLook",coalesce(hints.line_ids,'{}'::text[]) AS "inspectionLines"
          FROM ${selectedWindows}
+         CROSS JOIN LATERAL (SELECT coalesce($6::boolean,project.intake_mode AND project.package_walk_default) AS walk) config
+         CROSS JOIN LATERAL (SELECT EXISTS (SELECT 1 FROM harness_package_windows earlier
+           JOIN harness_package_branches assigned ON assigned.window_id=earlier.id AND assigned.active AND assigned.job_id IS NOT NULL
+           WHERE earlier.project_id=w.project_id AND earlier.version_id=w.version_id AND earlier.map_fingerprint=w.map_fingerprint) AS visited) observed
+         LEFT JOIN LATERAL (SELECT ARRAY(${profileHintLines('w.project_id','w.version_id','m.reader_version',"w.place->>'unitId'",7)}) AS line_ids)
+           hints ON config.walk AND NOT observed.visited
+         CROSS JOIN LATERAL (SELECT min(o.created_at) AS accepted_at FROM intake_occurrences o
+           WHERE o.project_id=w.project_id AND o.version_id=w.version_id AND o.state='accepted') original
          WHERE w.project_id=p.project_id AND m.refusal IS NULL AND ${currentSource}
            AND (SELECT count(*) FROM harness_package_branches b WHERE b.window_id=w.id AND b.active
              AND (b.job_id IS NOT NULL OR EXISTS (SELECT 1 FROM gateway_attempts a WHERE a.job_id=b.blocker_job_id
                    AND a.state IN ('reserved','prepared','sending','unknown','paid'))))<2
-         ORDER BY w.version_id,w.ordinal LIMIT 1
+         ORDER BY (config.walk AND NOT observed.visited) DESC,
+           (coalesce(cardinality(hints.line_ids),0)>0) DESC,
+           CASE WHEN config.walk AND NOT observed.visited THEN original.accepted_at END,w.version_id,w.ordinal LIMIT 1
        ) candidate ON true
        WHERE (SELECT count(*) FROM ${runnablePackagePrimary} AND w.project_id=p.project_id)<=$1-2
          AND (SELECT count(*) FROM gateway_grants g JOIN gateway_routes r ON r.id=g.route_id AND r.revision=g.revision AND r.enabled
@@ -202,7 +216,8 @@ export async function dispatchPackagePair(db: Pool, queue: WorkQueue, profile: R
               ((g.route_id=$2 AND g.data_class=$3 AND g.purpose='primary_a') OR
                (g.route_id=$4 AND g.data_class=$5 AND g.purpose='primary_b')))=2
        ORDER BY p.last_turn,p.project_id LIMIT 1`,
-      [packagePrimaryProjectLimit, profile.A!.routeId, profile.A!.dataClass, profile.B!.routeId, profile.B!.dataClass]);
+      [packagePrimaryProjectLimit, profile.A!.routeId, profile.A!.dataClass, profile.B!.routeId, profile.B!.dataClass,
+        walkOverride??null,memoryVersion,...profileHintPatterns]);
     if (!next) return false;
     await lockIntakeProject(tx, next.projectId);
     // A blocked sibling can be issued later, after a worker's option changes.
@@ -223,8 +238,10 @@ export async function dispatchPackagePair(db: Pool, queue: WorkQueue, profile: R
         const key = hash([next.windowId, branchHash]);
         await queue.declarePrimary(ref, { id: key + ':' + branch, branch, place: key }, tx);
         const payload: PrimaryJob = { mode: 'primary', branch, settings, place: next.place, observationProtocol: 2,
-          packageWindow: { id: next.windowId, readerVersion: next.readerVersion, routeRevision: revision, ...(walk ? { walkProtocol: 1 as const } : {}) } };
+          packageWindow: { id: next.windowId, readerVersion: next.readerVersion, routeRevision: revision,
+            ...(walk ? { walkProtocol: 1 as const,profileInspection:{lineIds:next.inspectionLines} } : {}) } };
         jobId = await queue.enqueue({ ...ref, key: 'package:' + key + ':' + branch, kind: researchKind,
+          ...(walk&&next.firstLook?{priority:next.inspectionLines.length?2:1}:{}),
           subjectId: next.place.source.versionId, obligationId: key + ':' + branch,
           purpose: branch === 'A' ? 'primary_a' : 'primary_b', payload }, tx);
       }

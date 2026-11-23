@@ -3,7 +3,7 @@ import { z } from 'zod';
 import { hash } from '../gateway/types.js';
 import { deliveredLines } from '../questions/attribute-aliases.js';
 import type { Observation } from '../pdf/types.js';
-import { type ObservationInput, type ReaderContext } from './contracts.js';
+import { supportsFacadeHeader, type ObservationInput, type ReaderContext } from './contracts.js';
 import { packageRoles, type PackageBinding, type PackageSourceRole } from './package-analysis.js';
 import { hasPrintedRevision } from './pair-evidence.js';
 import { adjacentFacadeTypeHeader } from './facade-type-evidence.js';
@@ -180,9 +180,8 @@ export async function publishPackageObservation(
   }
   const anchor={evidenceId:observation.evidenceId,lineId:observation.lineId,quote:observation.quote,
     address:observation.address};
-  const discovery=task.job.packageWindow.followup?.discovery;
   const opened=issued.find(({id})=>id===observation.evidenceId);
-  const headerLine=discovery&&'kind' in discovery&&discovery.kind==='profile_scan'&&details.facadeHeaderLineId&&anchor.lineId&&anchor.quote&&
+  const headerLine=supportsFacadeHeader(task.job)&&details.facadeHeaderLineId&&anchor.lineId&&anchor.quote&&
     opened?.readKind==='extract'&&!opened.box&&details.binding?.state==='identified'&&details.binding.labels.length===1
     ? adjacentFacadeTypeHeader(deliveredLines(opened.content),anchor.lineId,details.facadeHeaderLineId,anchor.quote) : undefined;
   const header=headerLine&&!inactive.test(headerLine.text)?{...anchor,lineId:headerLine.id,quote:headerLine.text,

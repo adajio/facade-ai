@@ -58,8 +58,15 @@ export const settingsSchema = z.strictObject({
 
 const packageReviewSchema = z.strictObject({ scopeId: text, scopeLabel: text,
   readerVersions: z.strictObject({ A: text, B: text }), routeRevision: text, catalogVersionId:id.optional(), stage:text.optional() });
-const packageDiscovery = z.union([z.strictObject({ label: text }), z.strictObject({ kind: z.literal('profile_scan') })]);
+const packageDiscovery = z.union([z.strictObject({ label: text }), z.strictObject({ kind: z.literal('profile_scan'),
+  candidateBlocks: z.array(z.string().min(1).max(60)).max(4096).optional() })]);
 export type PackageDiscovery = z.infer<typeof packageDiscovery>;
+
+export function supportsFacadeHeader(job:ResearchJob) {
+  if(job.mode!=='primary'||!job.packageWindow)return false;
+  const {followup,profileInspection}=job.packageWindow;
+  return followup ? followup.discovery&&'kind' in followup.discovery&&followup.discovery.kind==='profile_scan' : Boolean(profileInspection);
+}
 export const jobSchema = z.discriminatedUnion('mode', [
   z.strictObject({
     mode: z.literal('primary'),
@@ -69,6 +76,7 @@ export const jobSchema = z.discriminatedUnion('mode', [
     localRefusal: text.optional(),
     observationProtocol: z.literal(2).optional(),
     packageWindow: z.strictObject({ id, readerVersion: text, routeRevision: text,
+      profileInspection: z.strictObject({ lineIds: z.array(text).max(8) }).optional(),
       walkProtocol: z.literal(1).optional(), followup: z.strictObject({ rootJobId: id,
         blocks: z.array(z.string().min(1).max(60)).min(1).max(4096),
         discovery: packageDiscovery.optional(),
