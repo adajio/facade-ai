@@ -172,14 +172,15 @@ function scopedViewClaim(line: string, quote: string) {
     const owner=viewName.test(prefix)||otherViewName.test(prefix)||designation.test(prefix)||registered.test(prefix)||
       referred.test(prefix)||inlineDesignation.test(prefix)||Boolean(directionalMark(prefix)?.heading);
     return [{text,at:part.index+part[0].length-part[0].trimStart().length,owner,reference,
-      boundary:owner||Boolean(reference&&prefix)}];
+      ownerLength:prefix.length,boundary:owner||Boolean(reference&&prefix)}];
   });
   const starts=parts.flatMap(({boundary},index)=>boundary?[index]:[]);
   for(const [index,from] of starts.entries()) {
     const to=starts[index+1]??parts.length;
     const first=parts[from];
     const boundary=parts[to]?.at??line.length;
-    if((index>0&&start<first.at)||end<=first.at||end>boundary)continue;
+    if(end<=first.at||end>boundary)continue;
+    if(start<first.at&&(index>0||end<first.at+first.ownerLength))continue;
     if(!first.owner)return;
     const selected=parts.slice(from,to);
     const firstUnscoped=selected.findIndex(({text,reference},part)=>part>0&&

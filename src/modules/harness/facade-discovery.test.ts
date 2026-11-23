@@ -189,4 +189,7 @@ test('a cropped quotation cannot take a following view’s facade reference',()=
   ]);
   assert.equal(pinned.label,'MX-61');
   assert.equal(pinned.lineId,ref.lineId);
+  const prefix='An unlabelled object | View:';
+  const clipped=mentions(prefix,`An unlabelled object | ${second} | Refers to MX-61`);
+  assert.equal(resolveFacadeMentions(projectId,[registry,...clipped]).size,1);
 });
