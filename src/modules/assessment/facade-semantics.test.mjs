@@ -16,7 +16,8 @@ test("completed windows, missing semantic checks, and complete position proof re
   const [requirement] = requirementsFor([fixtureRow], context, "P");
   const typed = { ...context, facadeType: { state: "confirmed", kind: "panel" } };
   const proof = (windowId, branch) => ({
-    windowId, branch, jobId: `${windowId}-${branch}`, readerVersion: "reader-1", facadeId: "f1", positionId: "spacing",
+    windowId, branch, jobId: `${windowId}-${branch}`, primaryJobId: `${windowId}-${branch}`, readerVersion: "reader-1",
+    facadeId: "f1", positionId: "spacing",
     catalogVersionId: "catalog-1", stage: "P", disposition: "alternatives_checked", basisIds: [`evidence-${windowId}-${branch}`],
   });
   const paired = (windowId) => ["A", "B"].map((branch) => proof(windowId, branch));

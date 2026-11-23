@@ -1,24 +1,8 @@
-import type { PackageWindow } from "../harness/package-analysis.js";
+import type { PackageAnalysis, PackageWindow } from "../harness/package-analysis.js";
 import type { Box } from "../pdf/types.js";
 import { requirementSubjectKey, type Machine, type Requirement } from "./domain.js";
 import type { FacadeContext, FacadeCoverage } from "./facade-model.js";
 import { normalizeFormat } from "./store.js";
-
-export interface FacadeSemanticCheck {
-  windowId: string;
-  branch: "A" | "B";
-  jobId: string;
-  primaryJobId?: string;
-  readerVersion: string;
-  facadeId: string | null;
-  facadeKind?: string;
-  positionId: string;
-  catalogVersionId: string;
-  stage: string;
-  basisIds: string[];
-  disposition?: "supported" | "alternatives_checked";
-  subject?: string | null;
-}
 
 const resumeReading = "Открыть адрес и продолжить чтение нужной ветвью.";
 const checkContent = "Проверить применимые блоки, оговорки и допустимые альтернативы по этому вопросу.";
@@ -61,8 +45,7 @@ export function completedReaderJob(window: PackageWindow, branch: "A" | "B") {
   const root = window.branches[branch];
   if (terminal.has(root.status)) return root.jobId;
   if (root.status !== "held" || !root.jobId || root.reason !== "turn_limit_final") return null;
-  const structure: (NonNullable<PackageWindow["structure"]>["branches"][typeof branch] &
-    { completedFollowupId?: string | null }) | undefined = window.structure?.branches[branch];
+  const structure = window.structure?.branches[branch];
   if (!structure?.complete) return null;
   return structure.completedFollowupId ?? null;
 }
@@ -70,7 +53,7 @@ export function completedReaderJob(window: PackageWindow, branch: "A" | "B") {
 const identity = (catalog: string | null, facade: string | null, position: string, stage: string) =>
   JSON.stringify([catalog, facade, position, requirementSubjectKey(stage)]);
 
-export function indexSemanticInput(windows: PackageWindow[], checks: readonly FacadeSemanticCheck[], unmappedVersionIds: string[]) {
+export function indexSemanticInput(windows: PackageWindow[], checks: PackageAnalysis["semanticChecks"], unmappedVersionIds: string[]) {
   return {
     windows,
     byWindow: new Map(windows.map((window) => [window.id, window])),
@@ -95,9 +78,7 @@ export function assessSemanticRemainder(input: {
   const contextCurrent = !requirement.facadeKinds?.length || context.facadeType?.state === "confirmed";
   const relevant = (stage && contextCurrent && requirement.evidenceRule
     ? index.checks.get(identity(catalogVersionId, context.facadeId, requirement.positionId, stage)) ?? [] : []).filter((check) =>
-    check.disposition === "alternatives_checked" && !check.subject &&
-    (!check.facadeKind || (context.facadeType?.state === "confirmed" &&
-      requirementSubjectKey(check.facadeKind) === requirementSubjectKey(context.facadeType.kind))));
+    check.disposition === "alternatives_checked" && !check.subject);
   const byWindow = Map.groupBy(relevant, ({ windowId }) => windowId);
   const basisIds = new Set<string>();
   const items: SemanticItem[] = index.unmappedVersionIds.slice(0, maxItems).map((versionId) => ({
@@ -112,8 +93,7 @@ export function assessSemanticRemainder(input: {
         branches.some((branch) => !completedReaderJob(window, branch) || !window.structure?.branches[branch].complete)) continue;
     const options = (branch: "A" | "B") => proofs.filter((check) =>
       check.branch === branch && check.readerVersion === window.readerVersion && check.basisIds.length &&
-      (check.primaryJobId ? check.primaryJobId === window.branches[branch].jobId :
-        check.jobId === window.branches[branch].jobId || check.jobId === window.structure?.branches[branch].followup?.jobId));
+      check.primaryJobId === window.branches[branch].jobId);
     const right = options("B");
     const left = options("A");
     const a = left.find((candidate) => right.some((b) => candidate.jobId !== b.jobId &&

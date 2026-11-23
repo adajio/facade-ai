@@ -248,7 +248,7 @@ export async function readFacadeInput(tx: PoolClient, projectId: string) {
   const mappedVersionIds = [...new Set(windows.map(({ place }) => place.source.versionId))].sort();
   const versionIds = versions.map(({ id }) => id);
   const mapped = new Set(mappedVersionIds);
-  const semantic = indexSemanticInput(windows, analysis.semanticChecks ?? [], versionIds.filter((id) => !mapped.has(id)));
+  const semantic = indexSemanticInput(windows, analysis.semanticChecks, versionIds.filter((id) => !mapped.has(id)));
   const reading = windows.length > 0 && coveredWindows.length === windows.length &&
     canonicalJson(mappedVersionIds) === canonicalJson(versionIds) ?
     { versionIds, basisIds: coveredWindows.flat().sort() } : null;
