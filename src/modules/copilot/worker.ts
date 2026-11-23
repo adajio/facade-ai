@@ -304,7 +304,8 @@ async function run(work: LeasedJob, runtime: CopilotRuntime, signal: AbortSignal
       });
       if (active.aborted) return;
       if (outcome.status === 'held') {
-        await suspend(outcome.code, outcome.retryAt ?? (retryable.has(outcome.code) ? new Date(Date.now() + 2500) : undefined));
+        const routeRetryAt = 'retryAt' in outcome && outcome.retryAt instanceof Date ? outcome.retryAt : undefined;
+        await suspend(outcome.code, routeRetryAt ?? (retryable.has(outcome.code) ? new Date(Date.now() + 2500) : undefined));
         return;
       }
       const decoded = outcome.status === 'paid' ? decodeTurn(outcome.output) : null;
