@@ -8,6 +8,9 @@ export function checkRuntimeInvocation(): void {
   if (process.env.FACADE_HARNESS_MANAGED_URL?.trim()) {
     throw new StartupError('Managed model endpoints require the isolated test entrypoint')
   }
+  if (process.env.NODE_TLS_REJECT_UNAUTHORIZED === '0') {
+    throw new StartupError('Runtime requires TLS certificate verification')
+  }
 }
 
 export async function toolHash(file: URL): Promise<string> {

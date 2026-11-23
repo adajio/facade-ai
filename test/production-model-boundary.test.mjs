@@ -18,6 +18,11 @@ test('production invocation rejects managed environment and arguments before ope
     const cli = spawnSync(process.execPath, [main, '--managed'], { env: { PATH: process.env.PATH }, encoding: 'utf8' });
     assert.equal(cli.status, 1);
     assert.match(cli.stderr, /Unexpected runtime arguments/);
+    const insecure = spawnSync(process.execPath, [main], {
+      env: { PATH: process.env.PATH, NODE_TLS_REJECT_UNAUTHORIZED: '0' }, encoding: 'utf8',
+    });
+    assert.equal(insecure.status, 1);
+    assert.match(insecure.stderr, /Runtime requires TLS certificate verification/);
   }
   assert.deepEqual(loadResearchProfile({}), { A: null, B: null, lead: null });
 });
