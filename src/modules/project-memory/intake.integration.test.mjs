@@ -214,9 +214,20 @@ test('accepted and restored originals materialize with isolated reads, progress,
   await drain();
   assert.equal((await find('тёмное')).hits[0].versionId, replacement.versionId);
   assert.deepEqual((await find('лазурное')).hits.map(({ versionId }) => versionId), [duplicate.versionId]);
-  const historical = await readProjectMemory(db, reader, session, { ...project, snapshot: found.snapshot, blockId: found.hits[0].blockId });
+  const originalObject = objects.get(source.objectKey);
+  objects.delete(source.objectKey);
+  const historicalAddress = { ...project, snapshot: found.snapshot, blockId: found.hits[0].blockId };
+  const historical = await readProjectMemory(db, reader, session, historicalAddress);
+  objects.set(source.objectKey, originalObject);
   assert.equal(historical.block.versionId, source.versionId);
   assert.equal(historical.lines.at(-1).text, 'Лазурное покрытие L7');
+  const artifactKey = `reader-evidence/${projectId}/${native.evidence.sha256}`;
+  const canonical = objects.get(artifactKey);
+  const corrupted = Buffer.from(canonical.bytes);
+  corrupted[0] ^= 1;
+  objects.set(artifactKey, { ...canonical, bytes: corrupted });
+  await assert.rejects(readProjectMemory(db, reader, session, historicalAddress), { code: 'reader_artifact_mismatch' });
+  objects.set(artifactKey, canonical);
   assert.ok([...objectWrites.values()].every((writes) => writes === 1));
 
   const lateOld = await accepted('race.txt', Buffer.from('Race fixture obsolete'));
