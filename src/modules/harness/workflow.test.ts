@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { randomUUID } from 'node:crypto';
-import { complementaryNativeCrops } from '../pdf/native-line.js';
+import { verifiedNativeLineCrops } from '../pdf/native-line.js';
 import type { PoolClient } from 'pg';
 import type { ModelResult, ResearchTask } from './contracts.js';
 import { hashBytes, initialMessages, observationArguments, request } from './openrouter.js';
@@ -556,7 +556,7 @@ test('split delivery verifies against this branch’s delivered crops and keeps 
   ports.reader.verifyDeliveryLine = async (_tx, { branch }, input, issued) => {
     assert.equal(branch, 'A');
     assert.deepEqual(issued.map(({ evidenceId }) => evidenceId), [textId, secondId]);
-    const proof = complementaryNativeCrops(full, crops, input.evidence.evidenceId, quote)!;
+    const proof = verifiedNativeLineCrops(full, crops, input.evidence.evidenceId, quote)!;
     return { ...proof, line: full, canonicalSha256: '8'.repeat(64), submittedEvidenceId: textId };
   };
   ports.reader.record = async (_tx, _context, input) => {
@@ -580,6 +580,82 @@ test('split delivery verifies against this branch’s delivered crops and keeps 
   };
   assert.deepEqual(await runResearchWorkflow(task, ports, new AbortController().signal),
     { status: 'done', outcome: { kind: 'covered', observationIds: [observationId] } });
+});
+
+test('a single PDF crop requires a canonical line and holds contradictions on the submitted item', async () => {
+  const quote = 'Inventory | Anchor layout not delivered';
+  const lineId = '1.0.2.0';
+  const box = (x: number, width: number) => ({ x, y: 20, width, height: 10 });
+  for (const [suffix, accepted] of [
+    [undefined, false],
+    [' | Anchor layout delivered', false],
+    [' | Seal schedule delivered', true],
+    [' | Supplemental Anchor layout delivered', true],
+    ['', true],
+  ] as const) {
+    const { task, ports, events, textId, observationId } = setup();
+    if (task.job.mode !== 'primary') assert.fail();
+    task.scopeId = null;
+    task.job.packageWindow = { id: randomUUID(), readerVersion: 'test', routeRevision: 'known', walkProtocol: 1 };
+    task.job.observationProtocol = 2;
+    const { place } = task.job;
+    const crop = { evidenceId: textId, frame: box(0, 230), line: { id: lineId, text: quote, box: box(10, 200) } };
+    const bytes = Buffer.from(JSON.stringify({ lines: [crop.line] }));
+    const read = ports.reader.read;
+    ports.reader.read = async (context, request) => request.kind === 'extract' ? {
+      place: { ...place, box: crop.frame }, evidenceId: textId, readerVersion: 'test',
+      sha256: hashBytes(bytes), mediaType: 'application/json', bytes,
+    } : read(context, request);
+    let verified = 0;
+    let saved = 0;
+    ports.reader.verifyDeliveryLine = async (_tx, { branch }, input, issued) => {
+      verified++;
+      assert.equal(branch, 'A');
+      assert.equal(input.lineId, lineId);
+      assert.deepEqual(issued.map(({ evidenceId }) => evidenceId), [textId]);
+      if (suffix === undefined) return;
+      const full = { ...crop.line, text: quote + suffix, box: suffix ? box(10, 400) : crop.line.box };
+      const proof = verifiedNativeLineCrops(full, [crop], textId, quote);
+      assert.ok(proof);
+      assert.equal(proof.crops.length, 1);
+      return { ...proof, line: full, canonicalSha256: '8'.repeat(64), submittedEvidenceId: textId };
+    };
+    ports.reader.record = async (_tx, _context, input) => {
+      saved++;
+      assert.ok(accepted, 'A raw crop must not publish an unproved negative claim');
+      assert.equal(input.verifiedDelivery?.line.text, quote + suffix);
+      return { observationId };
+    };
+    let turn = 0;
+    ports.call = async ({ request }) => {
+      switch (++turn) {
+        case 1: return receipt('survey', {});
+        case 2: return receipt('extract', {});
+        case 3: return receipt('save_observation', { evidenceId: textId, quote, sourceRole: 'inventory',
+          package: { role: { value: 'inventory', quote: 'Inventory' } },
+          deliveryStatement: { status: 'not_delivered', item: 'Anchor layout' } });
+        case 4: {
+          const last = request.messages.filter((message) => message.role === 'tool').at(-1);
+          const result = JSON.parse(last!.content);
+          if (accepted) {
+            assert.equal(result.observationId, observationId);
+            return receipt('finish_reading', { status: 'covered', explanation: 'Наблюдение сохранено.' });
+          }
+          assert.equal(result.code, 'package_non_delivery_unproven');
+          assert.match(result.nextAction, suffix ? /оба статуса/i : /каноническ/i);
+          return { status: 'held', code: 'fixture_stop', nextAction: 'Stop after checking the stored refusal' };
+        }
+        default: return assert.fail('Unexpected model turn');
+      }
+    };
+    const result = await runResearchWorkflow(task, ports, new AbortController().signal);
+    assert.equal(result.status, accepted ? 'done' : 'suspended');
+    assert.equal(verified, 1);
+    assert.equal(saved, Number(accepted));
+    const reading = events.find((event) => event.kind === 'tool' && event.reply.evidence?.evidenceId === textId);
+    assert.ok(reading?.kind === 'tool');
+    assert.equal((reading.reply.body as { content: string }).content, bytes.toString());
+  }
 });
 
 test('both package save tools give field-specific feedback on the next model turn', async () => {

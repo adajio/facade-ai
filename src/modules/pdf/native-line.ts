@@ -6,14 +6,14 @@ export type VerifiedNativeDeliveryLine = {
   canonicalSha256: string;
   submittedEvidenceId: string;
   anchorEvidenceId: string;
-  crops: [NativeLineCrop, NativeLineCrop];
+  crops: [NativeLineCrop] | [NativeLineCrop, NativeLineCrop];
 };
 
-// A native crop retains original PDF coordinates. Confirm two horizontal
-// fragments against one canonical line before using any text outside one crop.
-export function complementaryNativeCrops(
+// Verify text and original PDF coordinates against the canonical line. The
+// pair must cover the whole line to use positive evidence from both crops.
+export function verifiedNativeLineCrops(
   line: ReaderLine, crops: NativeLineCrop[], submittedEvidenceId: string, quote: string,
-) {
+): Pick<VerifiedNativeDeliveryLine, 'crops' | 'anchorEvidenceId'> | undefined {
   const full = line.box;
   if (!full || !validBox(full)) return;
   const end = (box: Box) => box.x + box.width;
@@ -40,4 +40,6 @@ export function complementaryNativeCrops(
       if (anchor) return { crops: pair, anchorEvidenceId: anchor.evidenceId };
     }
   }
+  const submitted = fragments.find(({ crop }) => crop.evidenceId === submittedEvidenceId && crop.line.text.includes(quote));
+  if (submitted) return { crops: [submitted.crop], anchorEvidenceId: submittedEvidenceId };
 }

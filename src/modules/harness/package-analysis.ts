@@ -37,6 +37,13 @@ export interface PackageFact {
   basis: { role?: string; stage?: string; revision?: string;
     revisionEvidence?: { evidenceId: string; quote: string; lineId?: string; href: string };
     valueRole?: {kind:'design'|'as_built'|'limit';quote:string};
+    deliveryLine?: {
+      text: string; canonicalSha256: string; source: Observation['source'];
+      runId: string; branch: Branch; readerVersion: string; unitId: string; lineId: string;
+      box: NonNullable<Observation['address']['box']>; anchorEvidenceId: string; submittedEvidenceId: string;
+      crops: { evidenceId: string; text: string; frame: NonNullable<Observation['address']['box']>;
+        box: NonNullable<Observation['address']['box']> }[];
+    };
     parts?: Partial<Record<'attribute'|'role'|'stage'|'revision'|'binding'|'valueRole',
       {evidenceId:string;lineId:string;quote:string;address?:Observation['address']}>> };
   binding: PackageBinding;

@@ -5,9 +5,10 @@ import type { Pool, PoolClient } from 'pg';
 import { groundComponents } from '../pdf/components.js';
 import { createReaderService, sha256 } from '../pdf/service.js';
 import type { Evidence, Observation, ReaderComponentInput, ReaderLine } from '../pdf/types.js';
-import { complementaryNativeCrops, type NativeLineCrop } from '../pdf/native-line.js';
+import { verifiedNativeLineCrops, type NativeLineCrop } from '../pdf/native-line.js';
 import { packageCommonGrounded, packageNonDeliveryGrounded, publishPackageObservation, verifiedNativeInventoryRole } from './package-observation.js';
 import type { ObservationInput, ReaderContext } from './contracts.js';
+import type { PackageFact } from './package-analysis.js';
 
 const item = 'Теплотехнический расчёт';
 const input = (quote: string): Omit<ObservationInput, 'evidence'> => ({
@@ -70,14 +71,14 @@ test('a split native line verifies only the submitted non-delivery and inventory
     { evidenceId: left, frame: box(0, 230), line: { ...full, text: 'Inventory | Item: Torsion test', box: box(10, 210) } },
     { evidenceId, frame: box(198, 245), line: { ...full, text: 'Item: Torsion test report | ' + quote, box: box(200, 210) } },
   ];
-  const pair = complementaryNativeCrops(full, crops, left, quote);
+  const pair = verifiedNativeLineCrops(full, crops, left, quote);
   assert.equal(pair?.anchorEvidenceId, evidenceId);
-  assert.equal(complementaryNativeCrops(full, crops.slice(0, 1), left, quote), undefined);
+  assert.equal(verifiedNativeLineCrops(full, crops.slice(0, 1), left, quote), undefined);
   for (const line of [
     { ...crops[1].line, id: 'adjacent' },
     { ...crops[1].line, box: box(225, 185) },
     { ...crops[1].line, text: 'Item: Altered test report | ' + quote },
-  ]) assert.equal(complementaryNativeCrops(full, [crops[0], { ...crops[1], line }], left, quote), undefined);
+  ]) assert.equal(verifiedNativeLineCrops(full, [crops[0], { ...crops[1], line }], left, quote), undefined);
   const proof = { ...pair!, line: full, canonicalSha256: 'd'.repeat(64), submittedEvidenceId: left };
   const claim = { evidence: f.evidence, sourceRole: 'inventory', quote, lineId,
     deliveryStatement: { status: 'not_delivered' as const, item: 'Torsion test report',
@@ -96,9 +97,14 @@ test('a split native line verifies only the submitted non-delivery and inventory
     { ...f.observation, deliveryStatement: claim.deliveryStatement });
   assert.deepEqual(f.facts[0].slice(4, 9), ['Torsion test report', 'inventory', null, null, 'unknown']);
   assert.deepEqual(result?.confirmed.map(({ field, evidenceId }) => [field, evidenceId]), [['sourceRole', left]]);
-  const basis = f.facts[0][9] as { deliveryLine: { submittedEvidenceId: string; crops: { evidenceId: string }[] } };
-  assert.equal(basis.deliveryLine.submittedEvidenceId, left);
-  assert.deepEqual(basis.deliveryLine.crops.map((entry) => entry.evidenceId), [left, evidenceId]);
+  const basis = f.facts[0][9] as PackageFact['basis'];
+  assert.deepEqual(basis.deliveryLine, {
+    text: full.text, canonicalSha256: proof.canonicalSha256, source: f.observation.source,
+    runId: f.observation.runId, branch: f.observation.branch, readerVersion: f.observation.readerVersion,
+    unitId: f.observation.address.unitId, lineId, box: full.box,
+    anchorEvidenceId: evidenceId, submittedEvidenceId: left,
+    crops: crops.map((entry) => ({ evidenceId: entry.evidenceId, text: entry.line.text, frame: entry.frame, box: entry.line.box })),
+  });
 });
 
 test('reader checks stored PDF bytes and excludes a crop from another run or branch', async () => {
@@ -126,6 +132,7 @@ test('reader checks stored PDF bytes and excludes a crop from another run or bra
     files.set(receipted.sha256, bytes);
   }
   const db = { query: async (sql: string, params: string[]) => {
+    if (sql.includes('FROM reader_observations')) return { rows: [] };
     if (sql.includes('project_memory_blocks')) {
       assert.equal(params[1], source.projectId);
       assert.equal(params[2], source.versionId);
@@ -134,6 +141,7 @@ test('reader checks stored PDF bytes and excludes a crop from another run or bra
       return { rows: params[5] === readerVersion ? [identity] : [] };
     }
     assert.match(sql, /reader_evidence/);
+    assert.equal(params[0], source.projectId);
     const payload = evidence.get(params[1]);
     return { rows: payload ? [{ payload }] : [] };
   } };
@@ -149,12 +157,19 @@ test('reader checks stored PDF bytes and excludes a crop from another run or bra
     readerVersion, unitId: '1', lineId, submittedEvidenceId: ids[1].evidenceId,
     quote: 'Panel report not supplied', issued: ids,
   }, db as unknown as PoolClient);
+  await assert.rejects(reader.pin(source, scope, {
+    evidenceId: ids[1].evidenceId, scope: null, lineId, quote: 'Panel report not supplied',
+    deliveryStatement: { status: 'not_delivered', item: 'Panel report' },
+  }), { code: 'package_non_delivery_unproven' });
   assert.equal((await verify())?.canonicalSha256, identity.sha256);
   const left = evidence.get(ids[0].evidenceId)!;
   for (const changed of [{ runId: randomUUID() }, { branch: 'A' as const }, { readerVersion: 'different' },
-    { source: { ...source, versionId: randomUUID() } }]) {
+    { source: { ...source, versionId: randomUUID() } }, { source: { ...source, projectId: randomUUID() } }]) {
     evidence.set(left.id, { ...left, ...changed });
-    assert.equal(await verify(), undefined);
+    const verified = await verify();
+    assert.deepEqual(verified?.crops.map(({ evidenceId }) => evidenceId), [ids[1].evidenceId]);
+    assert.equal(verifiedNativeInventoryRole({ sourceRole: 'inventory', quote: 'Panel report not supplied',
+      deliveryStatement: { status: 'not_delivered', item: 'Panel report' } }, verified!), undefined);
   }
   evidence.set(left.id, left);
   files.set(identity.sha256, Buffer.from('damaged'));

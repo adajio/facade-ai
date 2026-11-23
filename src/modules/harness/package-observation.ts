@@ -5,7 +5,7 @@ import { deliveredLines } from '../questions/attribute-aliases.js';
 import type { Observation } from '../pdf/types.js';
 import type { VerifiedNativeDeliveryLine } from '../pdf/native-line.js';
 import { supportsFacadeHeader, type ObservationInput, type ReaderContext } from './contracts.js';
-import { packageRoles, type PackageBinding, type PackageSourceRole } from './package-analysis.js';
+import { packageRoles, type PackageBinding, type PackageFact, type PackageSourceRole } from './package-analysis.js';
 import { hasPrintedRevision } from './pair-evidence.js';
 import { adjacentFacadeTypeHeader } from './facade-type-evidence.js';
 
@@ -66,11 +66,11 @@ export function verifiedNativeInventoryRole(input: Omit<ObservationInput, 'evide
   const claim = input.deliveryStatement;
   const role = input.package?.role;
   const full = proof.line.text;
-  if (claim?.status !== 'not_delivered' || input.sourceRole !== 'inventory' || (role && role.value !== 'inventory')
+  if (claim?.status !== 'not_delivered' || (input.sourceRole ?? role?.value) !== 'inventory' || (role && role.value !== 'inventory')
     || input.package?.references?.role !== undefined || input.package?.facadeHeaderLineId
     || !input.quote || !full.includes(input.quote)
     || !(directlyNotDelivered(input.quote, claim.item) || directlyNotDelivered(claim.context?.quote ?? '', claim.item))
-    || !directlyNotDelivered(full, claim.item) || delivered.test(full.replace(new RegExp(absent.source, 'giu'), ''))
+    || !directlyNotDelivered(full, claim.item) || canonicalDeliveryContradicts(full, claim.item)
     || (claim.context && (claim.context.lineId !== proof.line.id ||
       !proof.crops.some(({ line }) => line.text.includes(claim.context!.quote))))) return;
   const segments = roleSegments(full);
@@ -100,6 +100,25 @@ function directlyNotDelivered(quote: string, item: string) {
 
 function directlyDelivered(quote: string, item: string) {
   return statementAbout(quote, item, delivered, absent, true);
+}
+
+export function canonicalDeliveryContradicts(line: string, item: string) {
+  const compact = (value: string) => value.normalize('NFKC').trim().replace(/\s+/gu, ' ');
+  const name = compact(item).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  if (!name) return false;
+  const subject = `(?:the )?(?:(?:document|file|item|материал|документ|файл|позиция) )?[«"“]?${name}[»"”]?`;
+  const auxiliary = '(?:(?:is|was|has been|бы(?:л|ла|ло|ли)) )?';
+  const predicate = delivered.source;
+  const implicit = new RegExp(`^(?:(?:it|он|она|оно|они) )?${auxiliary}${predicate}[.!?]?$`, 'iu');
+  const explicit = new RegExp(`^(?:${subject}(?: [–—-] |: | )${auxiliary}${predicate}` +
+    `(?: in (?:this|the|current) (?:package|submission|delivery)| в (?:текущем )?(?:пакете|комплекте|составе))?` +
+    `|${predicate}[: ]+${subject})[.!?]?$`, 'iu');
+  const subjectLabel = /^(?:item|subject|position|document|предмет|позиция|документ)\s*:\s*/iu;
+  const negative = new RegExp(absent.source, 'giu');
+  return line.split(statementSeparator).some((clause) => clause.split(negative).some((span) => {
+    const text = compact(span).replace(subjectLabel, '');
+    return implicit.test(text) || explicit.test(text);
+  }));
 }
 
 function statementAbout(quote: string, item: string, expression: RegExp, excluding?: RegExp, allowOmittedSubject = false) {
@@ -271,11 +290,18 @@ export async function publishPackageObservation(
     return qualified[name]&&(references[name]!==undefined||header&&headerFields.has(name)||verifiedRole)&&part?.lineId&&part.quote?
       [[name,{lineId:part.lineId,evidenceId:part.evidenceId,quote:part.quote,...(part===header||verifiedRole?{address:part.address}:{})}]]:[];
   }));
-  const basis = { role: confirmedRole?.quote, stage: stage?.quote, revision: revision?.quote,
+  const lineBox = verified?.line.box;
+  const crops = verified?.crops.flatMap(({ evidenceId, frame, line }) =>
+    line.box ? [{ evidenceId, text: line.text, frame, box: line.box }] : []);
+  const deliveryLine: PackageFact['basis']['deliveryLine'] = verified && lineBox && crops?.length === verified.crops.length
+    ? { text: verified.line.text, canonicalSha256: verified.canonicalSha256, source: observation.source,
+      runId: observation.runId, branch: observation.branch, readerVersion: observation.readerVersion,
+      unitId: observation.address.unitId, lineId: verified.line.id, box: lineBox,
+      anchorEvidenceId: verified.anchorEvidenceId, submittedEvidenceId: verified.submittedEvidenceId, crops }
+    : undefined;
+  const basis: PackageFact['basis'] = { role: confirmedRole?.quote, stage: stage?.quote, revision: revision?.quote,
     valueRole,...(Object.keys(parts).length?{parts}:{}),
-    ...(verified ? { deliveryLine: { canonicalSha256: verified.canonicalSha256, lineId: verified.line.id,
-      box: verified.line.box, submittedEvidenceId: verified.submittedEvidenceId,
-      crops: verified.crops.map(({ evidenceId, frame, line }) => ({ evidenceId, frame, box: line.box })) } } : {}) };
+    ...(deliveryLine ? { deliveryLine } : {}) };
   const saved = await tx.query(
     `INSERT INTO harness_package_facts(id,project_id,window_id,job_id,attribute,source_role,design_stage,revision,revision_status,basis,subject_register,materials)
      VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) ON CONFLICT(id) DO NOTHING RETURNING id`,
@@ -299,7 +325,7 @@ export async function publishPackageObservation(
   }
   for (const field of fields) {
     if (field === 'role' && verified && rolePart) {
-      confirm('sourceRole', rolePart);
+      if (input.sourceRole) confirm('sourceRole', rolePart);
       if (details.role) confirm('role', rolePart);
       continue;
     }

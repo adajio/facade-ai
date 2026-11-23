@@ -8,7 +8,7 @@ import { contains } from '../pdf/types.js';
 import { canonicalJson, isInventoryRole } from '../assessment/domain.js';
 import { deliveredLines } from '../questions/attribute-aliases.js';
 import { currentRevision, hasPrintedPairScope, locatePairQuote, pairSourceEvidence, type PairQuote } from './pair-evidence.js';
-import { packageCommonGrounded, packageNonDeliveryGrounded, verifiedNativeInventoryRole } from './package-observation.js';
+import { canonicalDeliveryContradicts, packageCommonGrounded, packageNonDeliveryGrounded, verifiedNativeInventoryRole } from './package-observation.js';
 import { escapeRegex } from '../questions/domain.js';
 import {
   checkToolArguments, commands, parseCompound, parseContext, decodeCompletion, hashBytes, imageMessage, initialMessages, observationArguments, permittedTool, request,
@@ -556,14 +556,18 @@ async function executeTool(
       }
       if (task.job.mode !== 'primary') throw new Error('Observation from a non-primary job');
       const representation = prior.body as { content?: string };
-      const fullLine = input.deliveryStatement && input.quote ? deliveredLines(representation.content ?? null)
-        .find(({ id, text }) => (!input.lineId || id === input.lineId) && text.includes(input.quote!))?.text : undefined;
+      const matchingLines = input.deliveryStatement && input.quote ? deliveredLines(representation.content ?? null)
+        .filter(({ id, text }) => (!input.lineId || id === input.lineId) && text.includes(input.quote!)) : [];
+      const literal = matchingLines.length === 1 ? matchingLines[0] : undefined;
       let evidence = prior.evidence;
       let verifiedDelivery: ObservationInput['verifiedDelivery'];
-      if (task.job.packageWindow && !packageNonDeliveryGrounded(input, Boolean(prior.image), fullLine)) {
-        if (reader.verifyDeliveryLine && !prior.image && evidence.place.box && input.lineId && input.quote &&
-          input.sourceRole === 'inventory' && input.deliveryStatement?.status === 'not_delivered') {
-          const lineId = input.lineId;
+      const needsCanonical = input.deliveryStatement?.status === 'not_delivered' && Boolean(evidence.place.box)
+        && Boolean(evidence.place.page ?? task.job.place.page);
+      if (needsCanonical || task.job.packageWindow && !packageNonDeliveryGrounded(input, Boolean(prior.image), literal?.text)) {
+        let nextAction = 'Не удалось подтвердить непередачу по канонической строке. Дождитесь готовности нативного индекса либо откройте целую строку без обрезки в допущенном адресе. Укажите дословную роль описи в package.role и однозначное отрицание по этой позиции.';
+        const lineId = input.lineId ?? literal?.id;
+        if (reader.verifyDeliveryLine && !prior.image && evidence.place.box && lineId && input.quote &&
+          (input.sourceRole ?? input.package?.role?.value) === 'inventory' && input.deliveryStatement?.status === 'not_delivered') {
           const issued = [evidence, ...[...state.delivered].flatMap((id) => {
             const view = state.replies.get(id);
             const candidate = view?.evidence;
@@ -572,18 +576,19 @@ async function executeTool(
               && candidate.readerVersion === prior.evidence!.readerVersion
               && deliveredLines(body?.content ?? null).some((line) => line.id === lineId) ? [candidate] : [];
           })].slice(0, 16);
-          if (issued.length > 1) {
-            const proof = await reader.verifyDeliveryLine(tx, context, { ...input, evidence }, issued);
-            const role = proof && verifiedNativeInventoryRole(input, proof);
-            const anchor = proof && issued.find(({ evidenceId: id }) => id === proof.anchorEvidenceId);
-            if (proof && role && anchor) {
+          const proof = await reader.verifyDeliveryLine(tx, context, { ...input, evidence, lineId }, issued);
+          if (proof && canonicalDeliveryContradicts(proof.line.text, input.deliveryStatement.item)) {
+            nextAction = 'В канонической строке указаны оба статуса этой позиции. Сверьте противоречие по оригиналу и оставьте непередачу на уточнении.';
+          } else if (proof) {
+            const role = verifiedNativeInventoryRole(input, proof);
+            const anchor = issued.find(({ evidenceId: id }) => id === proof.anchorEvidenceId);
+            if (role && anchor) {
               evidence = anchor;
               verifiedDelivery = { ...proof, role };
             }
           }
         }
-        if (!verifiedDelivery) return { reply: failedTool('package_non_delivery_unproven',
-          'Откройте нативную строку целиком или обе допущенные рамки той же строки. Укажите дословную роль описи в package.role и однозначное отрицание по этой позиции. Если опоры относятся к разным строкам или статус расходится, оставьте место на уточнении.') };
+        if (!verifiedDelivery) return { reply: failedTool('package_non_delivery_unproven', nextAction) };
       }
       const inventoryStatement = input.deliveryStatement && input.sourceRole && isInventoryRole(input.sourceRole);
       if (input.sourceRole && !inventoryStatement && !task.job.packageWindow && !task.job.question?.sourceRoles?.includes(input.sourceRole)) {

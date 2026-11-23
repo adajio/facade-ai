@@ -7,7 +7,7 @@ import { pipeline } from 'node:stream/promises';
 import type { Pool, PoolClient } from 'pg';
 import { blockId, fingerprint, memoryVersion } from '../project-memory/contracts.js';
 import { groundComponents } from './components.js';
-import { complementaryNativeCrops, type NativeLineCrop, type VerifiedNativeDeliveryLine } from './native-line.js';
+import { verifiedNativeLineCrops, type NativeLineCrop, type VerifiedNativeDeliveryLine } from './native-line.js';
 import {
   type ArtifactStore, type Box, type DocumentKey, type Evidence, type Observation, type ReaderComponentInput,
   type NativeArtifact, type NativeBlock, type NativePresentation, type ReaderOutput,
@@ -525,7 +525,7 @@ export function createReaderService(db: Pool, deps: ReaderDependencies, adapters
       const lines = body.lines.filter((line) => line.id === lineId);
       if (lines.length === 1) crops.push({ evidenceId, frame, line: lines[0] });
     }
-    const proof = complementaryNativeCrops(full[0], crops, submittedEvidenceId, quote);
+    const proof = verifiedNativeLineCrops(full[0], crops, submittedEvidenceId, quote);
     if (proof) return { ...proof, line: full[0], canonicalSha256: cached.artifact.sha256, submittedEvidenceId };
   }
 
@@ -543,6 +543,10 @@ export function createReaderService(db: Pool, deps: ReaderDependencies, adapters
     if (!evidence || !sameSource(source, evidence.source)
       || evidence.runId !== scope.runId || evidence.branch !== scope.branch) {
       throw new ReaderError('reader_evidence_scope_mismatch', 'Выдача недоступна в этой версии, ветви или запуске', 422);
+    }
+    if (evidence.format === 'pdf' && evidence.address.box && candidate.deliveryStatement?.status === 'not_delivered'
+      && verifiedLine?.anchorEvidenceId !== evidence.id) {
+      throw new ReaderError('package_non_delivery_unproven', 'Для отрицания по рамке PDF нужна сверенная каноническая строка', 422);
     }
     if (evidence.format === 'ifc' && candidate.value !== undefined && !candidate.limitation && !parts) {
       throw new ReaderError('reader_ifc_unit_unproven', 'Измерению IFC нужны отдельно закреплённые сущности свойства и единицы', 422);

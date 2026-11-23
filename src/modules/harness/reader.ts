@@ -216,9 +216,9 @@ export function connectReader(
       }
     },
     async verifyDeliveryLine(tx, context, input, issued) {
-      const readerVersion = await checkPackage(context, tx);
       const { evidence, lineId, quote } = input;
-      if (!readerVersion || readerVersion !== evidence.readerVersion || !lineId || !quote) return;
+      const readerVersion = await checkPackage(context, tx) ?? evidence.readerVersion;
+      if (readerVersion !== evidence.readerVersion || !lineId || !quote) return;
       try {
         return await service.verifyNativeDeliveryLine(evidence.place.source, executionScope(context), {
           readerVersion, unitId: evidence.place.unitId, lineId, submittedEvidenceId: evidence.evidenceId, quote, issued,
