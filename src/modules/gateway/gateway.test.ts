@@ -590,9 +590,9 @@ test('restored database reconciles the original charge and repeats the operator 
   const audit = (await s.outside.query(
     'SELECT authority,actor_id,reason_ref,previous,outcome FROM gateway_external_reconciliation ORDER BY created_at',
   )).rows;
-  assert.deepEqual(new Set(local.map(row => row.state)), new Set(['paid','cancelled']));
+  assert.deepEqual(local.map(row => row.state), ['paid', 'paid']);
   assert.equal(state.provider.length, 2);
-  assert.equal(state.external.length, 3);
+  assert.equal(state.external.length, 2);
   assert.equal(state.budget.spentUsdNanos, 400_000_000);
   assert.equal(state.budget.reserveUsdNanos, 0);
   assert.equal(audit.length, 2);
