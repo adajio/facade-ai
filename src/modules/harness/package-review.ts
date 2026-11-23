@@ -117,8 +117,8 @@ export async function authorizedPackageReview(db: Pool | PoolClient, projectId: 
 }
 
 export async function publishPackageReviewOutcome(tx: PoolClient, queue: WorkQueue, task: ScheduledResearchTask, outcome: ResearchOutcome) {
-  if (task.job.mode !== 'lead' || !task.job.packageReview || outcome.kind !== 'proposal' || !outcome.verifiedPair) return;
   const { job } = task;
+  if (job.mode !== 'lead' || !job.packageReview || outcome.kind !== 'proposal' || !outcome.verifiedPair) return;
   const { rows: [pair] } = await tx.query<{ profiles: Record<Branch, PinnedRoute>; revisionA: string | null; revisionB: string | null }>(
     `SELECT verification_profiles AS profiles,a.revision AS "revisionA",b.revision AS "revisionB" FROM harness_package_review_pairs p
      JOIN harness_package_facts a ON a.id=p.a_fact_id JOIN harness_package_facts b ON b.id=p.b_fact_id
