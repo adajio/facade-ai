@@ -34,6 +34,9 @@
     inputs_changed: 'Состав источников изменился. Откройте актуальные источники или задайте новый вопрос.',
     access_changed: 'Изменились права доступа к исходным материалам.',
     turn_limit: 'Достигнут предел ходов для этого вопроса.',
+    copilot_turn_budget: 'Исчерпан предел модельных ходов для этого вопроса. Достигнутый результат сохранён.',
+    copilot_research_budget: 'Исчерпан предел адресов или опор. Следующий запрос на дочитывание сохранён.',
+    copilot_no_progress: 'Последние ходы не добавили новых адресов или опор. Помощник приостановлен.',
     model_response_invalid: 'Модель не вернула проверяемый ответ.',
     research_unavailable: 'Дочитывание по этому адресу сейчас недоступно.',
     model_rejected: 'Маршрут отклонил запрос.',
@@ -199,7 +202,9 @@
           <button type="button" onclick={() => questionText = question?.question ?? ''}>Подставить вопрос</button>
         {/if}
         {#if question.researchSourceId}
-          <p><a href={projectLink(question.researchSourceId)}>Открыть адрес дочитывания</a></p>
+          <p><a href={projectLink(question.researchSourceId)}>
+            {question.state === 'research_queued' ? 'Открыть адрес дочитывания' : 'Последний адрес дочитывания'}
+          </a></p>
         {/if}
         {#each question.claims ?? [] as claim}
           <p class="answer">{claim.text}</p>

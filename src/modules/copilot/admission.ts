@@ -6,6 +6,8 @@ const uuid = /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/;
 const digest = /^[0-9a-f]{64}$/;
 
 export const copilotKind = 'copilot_question';
+export const maxCopilotInputRefs = 20;
+export const copilotOcrOperation = 'copilot/addressed/ocr';
 
 async function pinnedRefs(tx: Pool | PoolClient, context: Pick<ModelAuthorization, 'projectId' | 'scopeId' | 'jobId' | 'inputRefs'>) {
   const { rows: [job] } = await tx.query<{ sources: SourceIdentity[] | null }>(
@@ -17,7 +19,7 @@ async function pinnedRefs(tx: Pool | PoolClient, context: Pick<ModelAuthorizatio
   );
   if (!job) return null;
   const sources = job.sources ?? [];
-  if (!Array.isArray(sources) || sources.length > 20 || sources.length !== context.inputRefs.length) return null;
+  if (!Array.isArray(sources) || sources.length > maxCopilotInputRefs || sources.length !== context.inputRefs.length) return null;
   if (!sources.every((source, offset) => source && source.id === context.inputRefs[offset] &&
     uuid.test(source.versionId) && uuid.test(source.documentId) && digest.test(source.sha256) &&
     (source.proof?.kind === 'memory' && digest.test(source.proof.blockId) ||
@@ -51,7 +53,8 @@ export async function verifyCopilotInputs(
               )) OR (r.proof->>'kind'='evidence' AND EXISTS (
                 SELECT 1 FROM reader_evidence e JOIN reader_maps m USING(project_id,version_id,reader_version)
                 WHERE e.project_id=$1 AND e.version_id=v.id AND m.original_sha256=o.sha256
-                  AND e.id::text=r.proof->>'evidenceId' AND e.run_id=$3 AND e.operation_key='copilot/addressed/ocr'
+                  AND e.id::text=r.proof->>'evidenceId' AND e.run_id=$3
+                  AND e.operation_key ~ '^copilot/addressed/ocr(/[0-9a-f]{64})?$'
               ))
             ))=$4
       ) AS authorized`, [context.projectId, JSON.stringify(sources), context.jobId, sources.length, approvedHashes]);

@@ -3,16 +3,20 @@ import { AccessError, transaction } from '../access/index.js';
 import { accountColumns, accessConfig, authorize, type SessionAccount } from '../access/auth.js';
 import { lockOrganization, lockSession } from '../access/commands.js';
 import { GatewayError, type Gateway, type LeasedJob } from '../gateway/index.js';
+import { hash } from '../gateway/types.js';
 import type { ResearchAdmission } from '../gateway/gateway.js';
 import type { CopilotMemory, MemorySource, SourceIdentity, StoredAnswer } from './contracts.js';
-import { copilotKind, verifyCopilotInputs } from './admission.js';
+import { copilotKind, maxCopilotInputRefs, verifyCopilotInputs } from './admission.js';
 import { decodeAction, messagesFor, requestFor, type Message } from './protocol.js';
 
 export { copilotKind } from './admission.js';
 const leaseMs = 30_000;
-const maxTurns = 8;
+const turnsPerLease = 8;
+const maxTurns = 24;
+const maxResearchAddresses = 4;
+const maxStagnantTurns = 4;
 const maxOpened = 6;
-const maxFound = 18;
+const maxFound = maxCopilotInputRefs - maxResearchAddresses;
 const retryable = new Set(['route_busy', 'route_rate_limited', 'primary_barrier', 'dispatch_not_started', 'recovery_required']);
 
 export type CopilotRoute = {
@@ -32,7 +36,7 @@ export type CopilotRuntime = {
   workerId: string;
   route: CopilotRoute | null;
   enqueue?(tx: PoolClient, question: Pick<Question, 'id' | 'projectId'>, route: CopilotRoute): Promise<string | null>;
-  research?(session: SessionAccount, projectId: string, source: MemorySource, jobId: string): Promise<MemorySource | null>;
+  research?(session: SessionAccount, projectId: string, source: MemorySource, jobId: string, addressKey?: string): Promise<MemorySource | null>;
 };
 
 type Progress = {
@@ -41,7 +45,9 @@ type Progress = {
   found: SourceIdentity[];
   opened: string[];
   limitations: string[];
-  research?: { sourceId: string; reason: string; callId: string; finished: boolean };
+  research?: { sourceId: string; reason: string; callId: string; finished: boolean; addressKey?: string };
+  attemptedAddresses?: string[];
+  stagnantTurns?: number;
 };
 
 const questionFields = `id,question,project_id AS "projectId",organization_id AS "organizationId",
@@ -166,6 +172,18 @@ const searchLimits = (progress: Progress, limitations: string[]) => {
   progress.limitations = [...new Set([...progress.limitations, ...limitations])].slice(0, 14);
 };
 
+const addressKeyFor = (source: MemorySource) => hash([source.versionId, source.address.unitId, source.address.box ?? null]);
+
+function advance(progress: Progress, madeProgress: boolean) {
+  progress.stagnantTurns = madeProgress ? 0 : (progress.stagnantTurns ?? 0) + 1;
+}
+
+function wireMessages(messages: Message[]) {
+  const history = (turnsPerLease - 1) * 2;
+  // Keep complete assistant/tool pairs and the original instructions/question.
+  return messages.length <= history + 2 ? messages : [...messages.slice(0, 2), ...messages.slice(-history)];
+}
+
 function metadata(source: MemorySource) {
   return {
     sourceId: source.id, document: source.label, documentId: source.documentId, versionId: source.versionId,
@@ -205,13 +223,13 @@ async function run(work: LeasedJob, runtime: CopilotRuntime, signal: AbortSignal
     void gateway.heartbeat(lease, leaseMs).then((alive) => { if (!alive) controller.abort(); }).catch(() => controller.abort());
   }, leaseMs / 3);
 
-  async function save(researchSourceId?: string) {
+  async function save(researchSourceId?: string, researchPending = false) {
     if (active.aborted) return false;
     return transaction(db, async (tx) => {
       if (!await gateway.checkpoint(lease, progress, tx)) return false;
       if (researchSourceId) {
-        await tx.query('UPDATE copilot_questions SET state=\'research_queued\',research_source_id=$2 WHERE id=$1',
-          [question.id, researchSourceId]);
+        await tx.query('UPDATE copilot_questions SET state=$2,research_source_id=$3 WHERE id=$1',
+          [question.id, researchPending ? 'research_queued' : 'queued', researchSourceId]);
       }
       return true;
     });
@@ -244,30 +262,51 @@ async function run(work: LeasedJob, runtime: CopilotRuntime, signal: AbortSignal
   }
 
   try {
-    if (progress.research && !progress.research.finished) {
-      const research = progress.research;
+    const research = progress.research;
+    const attempted = progress.attemptedAddresses ??= [];
+    if (research && !research.addressKey && research.finished && !attempted.length) {
+      // An earlier version used one job-wide OCR key. Remember its address when resuming its cursor.
+      const legacy = await authorizedSource(research.sourceId);
+      if (!legacy) { await suspend('sources_unavailable'); return; }
+      attempted.push(addressKeyFor(legacy.source));
+    }
+    if (research && !research.finished) {
+      if (!runtime.research) { await suspend('research_unavailable'); return; }
+      if (attempted.length >= maxResearchAddresses || progress.found.length >= maxCopilotInputRefs) {
+        await suspend('copilot_research_budget');
+        return;
+      }
       const original = await authorizedSource(research.sourceId);
       if (!original) { await suspend('sources_unavailable'); return; }
+      const addressKey = addressKeyFor(original.source);
+      if (research.addressKey && research.addressKey !== addressKey) {
+        await suspend('sources_unavailable');
+        return;
+      }
       if (active.aborted) return;
-      const result = await runtime.research?.(original.session, work.projectId, original.source, lease.jobId);
+      const result = await runtime.research(original.session, work.projectId, original.source, lease.jobId, research.addressKey);
       if (result) {
         include(progress, result);
-        progress.opened.push(result.id);
+        if (!progress.opened.includes(result.id)) progress.opened.push(result.id);
         reply(progress, research.callId, { source: opened(result) });
       } else {
         searchLimits(progress, ['Адресное дочитывание не дало доступного текстового представления.']);
         reply(progress, research.callId, { code: 'research_unavailable' });
       }
+      attempted.push(addressKey);
+      advance(progress, Boolean(result));
       research.finished = true;
-      if (!await save()) return;
+      if (!await save(research.sourceId)) return;
     }
-    while (!active.aborted && progress.turn < maxTurns) {
+    const leaseEndsAt = Math.min(progress.turn + turnsPerLease, maxTurns);
+    while (!active.aborted && progress.turn < leaseEndsAt) {
+      if ((progress.stagnantTurns ?? 0) >= maxStagnantTurns) { await suspend('copilot_no_progress'); return; }
       const allowed = await withOwner(db, question, async () => true);
       if (!allowed) { await suspend('access_changed'); return; }
       if (active.aborted) return;
       const outcome = await gateway.call({
         lease, effectKey: `copilot/turn/${progress.turn}`, routeId: route.routeId, dataClass: route.dataClass,
-        request: requestFor(route, progress.messages, Boolean(runtime.research)), inputRefs: progress.found.map(({ id }) => id),
+        request: requestFor(route, wireMessages(progress.messages), Boolean(runtime.research)), inputRefs: progress.found.map(({ id }) => id),
       });
       if (active.aborted) return;
       if (outcome.status === 'held') {
@@ -282,6 +321,8 @@ async function run(work: LeasedJob, runtime: CopilotRuntime, signal: AbortSignal
       const { action, call, message } = decoded;
       progress.turn += 1;
       progress.messages.push(message);
+      const before = progress.found.length + progress.opened.length;
+      let lastResearchSource: string | undefined;
       switch (action.name) {
         case 'search_sources': {
           const found = await withOwner(db, question, (session) => memory.search(session, work.projectId, action.args.query));
@@ -316,14 +357,19 @@ async function run(work: LeasedJob, runtime: CopilotRuntime, signal: AbortSignal
         }
         case 'research_source': {
           const key = action.args.sourceId;
-          const original = runtime.research && !progress.research &&
-            progress.turn < maxTurns && progress.opened.length < maxOpened ? await authorizedSource(key) : null;
+          const original = runtime.research ? await authorizedSource(key) : null;
           if (!original || original.source.representation !== 'native' || typeof original.source.address.locator?.page !== 'number') {
             reply(progress, call.id, { code: 'research_unavailable' });
             break;
           }
-          progress.research = { sourceId: key, reason: action.args.reason, callId: call.id, finished: false };
-          if (await save(key)) await suspend('addressed_research', new Date());
+          const addressKey = addressKeyFor(original.source);
+          if (attempted.includes(addressKey)) {
+            lastResearchSource = key;
+            reply(progress, call.id, { code: 'research_already_attempted' });
+            break;
+          }
+          progress.research = { sourceId: key, reason: action.args.reason, callId: call.id, finished: false, addressKey };
+          if (await save(key, true)) await suspend('addressed_research', new Date());
           return;
         }
         case 'submit_answer': {
@@ -336,9 +382,14 @@ async function run(work: LeasedJob, runtime: CopilotRuntime, signal: AbortSignal
           break;
         }
       }
-      if (!await save()) return;
+      advance(progress, progress.found.length + progress.opened.length > before);
+      if (!await save(lastResearchSource)) return;
     }
-    if (!active.aborted) await finish([], [], 'turn_limit');
+    if (!active.aborted) {
+      if ((progress.stagnantTurns ?? 0) >= maxStagnantTurns) await suspend('copilot_no_progress');
+      else if (progress.turn >= maxTurns) await suspend('copilot_turn_budget');
+      else await suspend('copilot_quantum', new Date());
+    }
   } finally {
     clearInterval(heartbeat);
   }

@@ -138,7 +138,7 @@ export function registerCopilot(app: FastifyInstance, memory: CopilotMemory) {
       if (!result && row.generationCurrent === false) { state = 'held'; reason = 'inputs_changed'; }
       else if (!result && row.queueReason && row.queueReason !== 'addressed_research') { state = 'held'; reason = row.queueReason; }
       if (!result) return { id, question, state, reason,
-        ...(state === 'research_queued' && row.researchSourceId ? { researchSourceId: row.researchSourceId } : {}),
+        ...(row.researchSourceId ? { researchSourceId: row.researchSourceId } : {}),
       };
       const unavailableSources = { id, question, state: 'held', reason: 'sources_unavailable' };
       if (!row.jobId || !await verifyCopilotInputs(db, {

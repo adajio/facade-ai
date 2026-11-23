@@ -1,3 +1,4 @@
+import { copilotOcrOperation } from './admission.js';
 import type { Pool } from 'pg';
 import type { SessionAccount } from '../access/auth.js';
 import { AccessError } from '../access/index.js';
@@ -61,8 +62,11 @@ export function createCopilotMemory(db: Pool, reader: () => Reader): CopilotMemo
   return {
     async search(session, projectId, query) {
       const found = await searchProjectMemory(db, session, { projectId, query, limit: 20 });
-      const pending = found.remaining.filter(({ remaining, address }) =>
-        remaining.includes('ocr') && typeof address.locator?.page === 'number').slice(0, 5);
+      const ocrWindows = found.remaining.filter(({ remaining, address }) =>
+        remaining.includes('ocr') && typeof address.locator?.page === 'number');
+      const byVersion = Map.groupBy(ocrWindows, ({ versionId }) => versionId);
+      const firstWindows = [...byVersion.values()].map(([first]) => first);
+      const pending = [...new Set([...firstWindows, ...ocrWindows])].slice(0, 5);
       const records = [...found.hits, ...pending];
       const documents = await readCopilotVersions(db, projectId, [...new Set(records.flatMap(({ versionId }) => versionId ? [versionId] : []))]);
       const sources = found.hits.flatMap((hit) => {
@@ -157,11 +161,11 @@ export function createCopilotMemory(db: Pool, reader: () => Reader): CopilotMemo
 }
 
 export function createCopilotResearch(db: Pool, reader: Reader) {
-  return async (_session: SessionAccount, projectId: string, source: MemorySource, jobId: string): Promise<MemorySource | null> => {
+  return async (_session: SessionAccount, projectId: string, source: MemorySource, jobId: string, addressKey?: string): Promise<MemorySource | null> => {
     try {
       const result = await reader.open(
         { projectId, documentId: source.documentId, versionId: source.versionId, sha256: source.sha256 },
-        { runId: jobId, branch: 'A', operationKey: 'copilot/addressed/ocr' },
+        { runId: jobId, branch: 'A', operationKey: addressKey ? copilotOcrOperation + '/' + addressKey : copilotOcrOperation },
         { address: source.address, readerVersion: source.readerVersion, representation: 'ocr' },
       );
       return await ocrSource(db, projectId, result.evidence, result.bytes);

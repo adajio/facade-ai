@@ -204,7 +204,29 @@ test('engineer question reopens originals through the gateway and restricted sea
         const toolReplies = request.messages.filter(({ role }) => role === 'tool').map(({ content }) => JSON.parse(content));
         const research = question === 'OCR';
         let name, args;
-        if (!toolReplies.length) {
+        if (question === 'OCR_QUANTUM') {
+          const turn = sent.filter((item) => item.request.messages[1].content === question).length;
+          const last = toolReplies.at(-1);
+          if (turn <= 7) {
+            if (turn % 2) {
+              name = 'search_sources';
+              args = { query: ['Thickness', 'QUANTUM-A', 'QUANTUM-B', 'QUANTUM-C'][(turn - 1) / 2] };
+            } else {
+              name = 'open_source';
+              args = { sourceId: last.sources[0].sourceId };
+            }
+          } else {
+            assert.ok(request.messages.length <= 16);
+            const windows = toolReplies.findLast((entry) => entry.unresolvedWindows?.length === 2)?.unresolvedWindows;
+            if (turn <= 9) assert.equal(new Set(windows?.map(({ versionId }) => versionId)).size, 2);
+            const previous = request.messages.findLast((entry) =>
+              entry.tool_calls?.[0]?.function.name === 'research_source');
+            const sourceId = turn <= 9 ? windows[turn === 8 ? 0 : 1].sourceId
+              : JSON.parse(previous.tool_calls[0].function.arguments).sourceId;
+            name = 'research_source';
+            args = { sourceId, reason: 'Сверить отдельный PDF-адрес' };
+          }
+        } else if (!toolReplies.length) {
           name = 'search_sources';
           args = { query: research ? 'unmatched-ocr-only-target' : 'Thickness' };
         } else if (toolReplies.length === 1) {
@@ -255,7 +277,17 @@ test('engineer question reopens originals through the gateway and restricted sea
 
   const generation = { projectId: project, scopeId: null, generationId: id() };
   await gateway.openGeneration(generation);
-  await gateway.sealGeneration(generation, []);
+  const primaryManifest = [
+    { id: 'copilot-fixture-A', branch: 'A', place: 'fixture-pdf:1' },
+    { id: 'copilot-fixture-B', branch: 'B', place: 'fixture-pdf:1' },
+  ];
+  await gateway.sealGeneration(generation, primaryManifest);
+  const primaryJob = await gateway.enqueue({ ...generation, key: 'fixture-running-primary', kind: 'fixture-primary',
+    purpose: 'primary_a', obligationId: primaryManifest[0].id, subjectId: 'fixture-pdf' });
+  const activePrimary = await gateway.claim({ workerId: id(), kinds: ['fixture-primary'], leaseMs: 600_000 });
+  assert.equal(activePrimary.lease.jobId, primaryJob);
+  const primaryCursor = { researchSequence: 3 };
+  assert.equal(await gateway.checkpoint(activePrimary.lease, primaryCursor), true);
   assert.equal(await next({ route }), true);
   let failCheckpoint = true;
   const interruptedGateway = new Proxy(gateway, { get(target, property) {
@@ -320,6 +352,9 @@ test('engineer question reopens originals through the gateway and restricted sea
   const researchSource = await get(base + '/sources?id=' + inQueue.researchSourceId);
   assert.equal(researchSource.source.versionId, drawing.versionId);
   assert.equal(researchSource.source.address.locator.page, 1);
+  // A pending cursor created before per-address operation keys still uses its original Reader key.
+  await db.query(`UPDATE gateway_jobs SET cursor=cursor #- '{research,addressKey}'
+    WHERE id=(SELECT job_id FROM copilot_questions WHERE id=$1)`, [researchId]);
   assert.equal(await next({ route }), true);  // same queue job reads OCR and returns a limited response
   assert.equal((await get(researchPath)).state, 'limited');
   const evidence = await db.query("SELECT count(*)::int AS value FROM reader_evidence WHERE project_id=$1 AND operation_key='copilot/addressed/ocr'", [project]);
@@ -327,6 +362,87 @@ test('engineer question reopens originals through the gateway and restricted sea
   assert.equal((await db.query("SELECT count(*)::int AS value FROM reader_observations WHERE project_id=$1", [project])).rows[0].value, 0);
 
   console.info('Copilot fixture: addressed OCR persisted');
+  const anotherPdf = await accept('another-drawing.pdf', Buffer.concat([
+    await readFile(new URL('../formats/test/fixtures/mixed-raster.pdf', import.meta.url)),
+    Buffer.from('\n% Synthetic alternate original\n'),
+  ]), 'application/pdf');
+  await accept('quantum.txt', Buffer.from('QUANTUM-A\nQUANTUM-B\nQUANTUM-C\n'), 'text/plain');
+  for (let operation = 0; ; operation++) {
+    assert.ok(operation < 60);
+    if (!await indexNextProjectMemory(db, reader)) break;
+  }
+  const quantumId = (await ask('OCR_QUANTUM')).json().id;
+  const quantumPath = base + '/questions/' + quantumId;
+  assert.equal(await next({ route }), true);
+  const { rows: [{ job_id: quantumJob }] } = await db.query('SELECT job_id FROM copilot_questions WHERE id=$1', [quantumId]);
+  const stopOnce = (method, error) => new Proxy(gateway, { get(target, property) {
+    if (property === method) return async () => { throw new Error(error); };
+    const member = target[property];
+    return typeof member === 'function' ? member.bind(target) : member;
+  }});
+  const expire = () => db.query("UPDATE gateway_jobs SET lease_until=clock_timestamp()-interval '1 second' WHERE id=$1 AND state='leased'",
+    [quantumJob]);
+  const progress = async () => (await db.query('SELECT cursor,state,reason FROM gateway_jobs WHERE id=$1', [quantumJob])).rows[0];
+  const ocrReceipts = async () => (await db.query(
+    "SELECT id,version_id,operation_key FROM reader_evidence WHERE run_id=$1 ORDER BY operation_key", [quantumJob])).rows;
+  const sendsForQuantum = () => sent.filter((item) => item.attempt.jobId === quantumJob);
+  await assert.rejects(next({ route, gateway: stopOnce('suspend', 'fixture stops after saving the eighth tool request') }),
+    /fixture stops after saving the eighth tool request/);
+  const eighth = await progress();
+  assert.equal(eighth.cursor.turn, 8);
+  assert.equal(eighth.cursor.research.finished, false);
+  assert.equal((await get(quantumPath)).researchSourceId, eighth.cursor.research.sourceId);
+  assert.equal(sendsForQuantum().length, 8);
+  await expire();
+  await assert.rejects(next({ route, workerId: id(), research: async (...args) => {
+    await runtime.research(...args);
+    throw new Error('fixture stops after saving the first OCR receipt');
+  } }), /fixture stops after saving the first OCR receipt/);
+  const firstRead = await ocrReceipts();
+  assert.equal(firstRead.length, 1);
+  await expire();
+  const budgetHold = new Proxy(gateway, { get(target, property) {
+    if (property === 'call') return async () => ({ status: 'held', code: 'budget_exhausted', nextAction: 'Inspect budget' });
+    const member = target[property];
+    return typeof member === 'function' ? member.bind(target) : member;
+  }});
+  assert.equal(await next({ route, gateway: budgetHold }), true);
+  const heldJob = await get(quantumPath);
+  assert.equal(heldJob.state, 'held');
+  assert.equal(heldJob.reason, 'budget_exhausted');
+  assert.equal(heldJob.researchSourceId, eighth.cursor.research.sourceId);
+  assert.deepEqual(await ocrReceipts(), firstRead);
+  assert.equal(sendsForQuantum().length, 8);
+  assert.equal(await gateway.resume(quantumJob, ['budget_exhausted']), true);
+  assert.equal(await gateway.resume(quantumJob, ['budget_exhausted']), false);
+  assert.equal(await next({ route, workerId: id() }), true);
+  const ninth = await progress();
+  assert.equal(ninth.cursor.turn, 9);
+  assert.notEqual(ninth.cursor.research.sourceId, eighth.cursor.research.sourceId);
+  assert.equal(ninth.cursor.research.finished, false);
+  assert.equal(await next({ route, workerId: id() }), true);
+  const doneAddresses = await ocrReceipts();
+  assert.equal(doneAddresses.length, 2);
+  assert.deepEqual(new Set(doneAddresses.map(({ version_id }) => version_id)), new Set([drawing.versionId, anotherPdf.versionId]));
+  assert.ok(doneAddresses.some(({ id }) => id === firstRead[0].id));
+  assert.equal(new Set(doneAddresses.map(({ operation_key }) => operation_key)).size, 2);
+  const stalled = await get(quantumPath);
+  assert.equal(stalled.state, 'held');
+  assert.equal(stalled.reason, 'copilot_no_progress');
+  assert.equal((await progress()).cursor.stagnantTurns, 4);
+  assert.equal(stalled.researchSourceId, ninth.cursor.research.sourceId);
+  const sentEffects = sendsForQuantum().map(({ attempt }) => attempt.effectKey);
+  assert.equal(new Set(sentEffects).size, sentEffects.length);
+  assert.equal((await db.query('SELECT count(*)::int AS count FROM gateway_attempts WHERE job_id=$1', [quantumJob])).rows[0].count,
+    sentEffects.length);
+  assert.equal(await next({ route }), false);
+  const { rows: [primary] } = await db.query(
+    'SELECT state,lease_epoch,cursor,worker_id FROM gateway_jobs WHERE id=$1', [primaryJob]);
+  assert.deepEqual(primary, {
+    state: 'leased', cursor: primaryCursor, lease_epoch: activePrimary.lease.epoch, worker_id: activePrimary.lease.workerId,
+  });
+  console.info('Copilot fixture: eighth turn, two originals, checkpoint replay, budget and no-progress hold checked');
+  console.info('Copilot fixture: already leased primary task and its cursor preserved');
   const unknownKey = id();
   const unknownId = (await ask('UNKNOWN', unknownKey)).json().id;
   assert.equal(await next({ route }), true);
