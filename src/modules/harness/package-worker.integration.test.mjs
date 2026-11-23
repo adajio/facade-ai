@@ -630,7 +630,11 @@ test('ordinary intake publishes independent package evidence before questions an
     const switched = { ...map, readerVersion: async () => nextReaderVersion,
       async map(source) { return { ...await map.map(source), readerVersion: nextReaderVersion }; } };
     // The same source and frames are read under a new derived-map contract.
-    for (let index = 0; index < 4; index++) assert.equal(await preparePackageMap(app.db, gateway, switched, [existing.id]), true);
+    const { rows: [{ mappedOriginals }] }=await app.db.query(`SELECT count(*)::int AS "mappedOriginals"
+      FROM harness_package_maps WHERE active`);
+    for (let index = 0; index < mappedOriginals; index++) {
+      assert.equal(await preparePackageMap(app.db, gateway, switched, [existing.id]), true);
+    }
     assert.equal(await preparePackageMap(app.db, gateway, switched, [existing.id]), false);
     for (let index = 0; index < 12; index++) if (!await dispatchPackagePair(app.db, gateway, profile)) break;
     const changed = await readPackageAnalysis(app.db, existing.id);
