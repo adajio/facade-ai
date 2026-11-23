@@ -225,8 +225,15 @@ function checkPairEvidence(
     const { scopeLabel, scopeId } = task.job.packageReview;
     const applicability = addressed.get('applicability')!;
     const revisions = addressed.get('revision')!;
+    const comparability = addressed.get('comparability')!;
     for (const support of ['A', 'B'] as const) {
       const revision = support === 'A' ? result.proof.revisionA : result.proof.revisionB;
+      const citation = support === 'A' ? a : b;
+      if (!comparability.some((quote) => quote.support === support && quote.line.includes(citation.quote) &&
+        state.replies.get(quote.evidenceId)?.readKind !== 'open_context')) {
+        return { refusal: failedTool('package_pair_measurement_unproven',
+          'Для сопоставимости процитируйте само исходное значение из заново открытого адреса каждой опоры.') };
+      }
       if (!applicability.some((quote) => quote.support === support &&
         (hasPrintedPairScope(quote.quote, scopeLabel) || scopeId === 'common' && packageCommonGrounded(quote.quote))) ||
         !revisions.some((quote) => quote.support === support && currentRevision(quote.quote, revision))) {
