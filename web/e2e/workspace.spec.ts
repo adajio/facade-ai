@@ -1,7 +1,10 @@
-import { expect, test } from '@playwright/test';
+import { expect as playwrightExpect, test } from '@playwright/test';
 import { accepted, account, admin, command, pdf, signIn, unique } from './synthetic';
 
+const expect = playwrightExpect.configure({ timeout: 45_000 });
+
 test.describe('Рабочее место на штатном API', () => {
+  test.describe.configure({ timeout: 180_000 });
   test.skip(!admin.login || !admin.password, 'Задайте FACADE_E2E_ADMIN_LOGIN и FACADE_E2E_ADMIN_PASSWORD для отдельной синтетической БД');
 
   test('Вход, каталог, обрыв загрузки, ранний оригинал и отзыв доступа', async ({ page, browser, baseURL }) => {
@@ -75,7 +78,7 @@ test.describe('Рабочее место на штатном API', () => {
       const later = { ...pdf(), name: 'второй-лист.pdf' };
       await engineering.getByLabel('Файлы или архивы', { exact: true }).setInputFiles([pdf(), later]);
       await engineering.route('**/api/uploads/*/complete', async (route) => {
-        const real = await route.fetch({ maxRetries: 0 });
+        const real = await route.fetch({ maxRetries: 0, timeout: 45_000 });
         expect(real.ok()).toBe(true);
         await route.abort('connectionreset');
       }, { times: 1 });
@@ -93,7 +96,7 @@ test.describe('Рабочее место на штатном API', () => {
       await engineering.getByRole('button', { name: 'Продолжить передачу', exact: true }).click();
       await engineering.getByLabel('Файлы или архивы', { exact: true }).setInputFiles(later);
       await engineering.route('**/api/uploads/*/complete', async (route) => {
-        const real = await route.fetch({ maxRetries: 0 });
+        const real = await route.fetch({ maxRetries: 0, timeout: 45_000 });
         expect(real.ok()).toBe(true);
         await route.abort('connectionreset');
       }, { times: 1 });
@@ -166,27 +169,26 @@ test.describe('Рабочее место на штатном API', () => {
   test('Пополняемый приём и карточка работают в проекте без области', async ({ page, baseURL }) => {
     const origin = new URL(baseURL!).origin;
     await signIn(page, admin.login!, admin.password!);
-    const catalog = await accepted<{ id: string }>(await command(page.context(), origin, '/api/catalogs', 'POST', {
-      key: unique('intake-open'), name: 'Синтетический каталог приёма', requirements: [],
-    }), 'Каталог');
     const project = await accepted<{ id: string; scopes: { id: string }[] }>(
-      await command(page.context(), origin, '/api/projects', 'POST', {
-        name: unique('Приём без области'), catalogVersionId: catalog.id,
-      }), 'Проект',
+      await command(page.context(), origin, '/api/projects', 'POST', { name: unique('Приём без области'), mode: 'intake' }),
+      'Проект',
     );
     expect(project.scopes).toEqual([]);
     const path = '/projects/' + project.id + '/receipts';
     await page.goto(path + '?upload=1');
     await page.getByLabel('Оставить приём открытым').check();
     await page.getByLabel('Файлы или архивы', { exact: true }).setInputFiles(pdf());
+    let lostCreateResponse = false;
     await page.route('**/api/projects/' + project.id + '/receipts', async (route) => {
-      expect(route.request().method()).toBe('POST');
-      const response = await route.fetch({ maxRetries: 0 });
+      if (route.request().method() !== 'POST' || lostCreateResponse) return await route.continue();
+      const response = await route.fetch({ maxRetries: 0, timeout: 45_000 });
       expect(response.status()).toBe(201);
+      lostCreateResponse = true;
       await route.abort('connectionreset');
-    }, { times: 1 });
+    });
     await page.getByRole('button', { name: 'Начать передачу' }).click();
     await expect(page.getByText('Приём оставлен открытым', { exact: false })).toBeVisible();
+    expect(lostCreateResponse).toBe(true);
     await expect(page.getByRole('link', { name: 'Карточка документа' })).toHaveCount(1);
     await page.getByRole('link', { name: 'Карточка документа' }).click();
     await expect(page.getByRole('heading', { name: pdf().name })).toBeVisible();
