@@ -345,7 +345,8 @@ test("ordinary intake publishes a local conflict, then keeps sent history after 
   assert.equal(early.contexts.find(({ name }) => name === "F2").counts.needs_review, 2);
   const f2Width = early.contexts.find(({ name }) => name === "F2").questions.find(({ requirement }) => requirement.positionId === "width");
   assert.ok(f2Width.machine.citations.length > 0);
-  assert.ok(f2Width.machine.citations.every(({ deliveryStatement }) => deliveryStatement?.status === "delivered"));
+  assert.ok(f2Width.machine.citations.every(({ deliveryUncertainty }) => deliveryUncertainty === "contradictory_original"));
+  assert.ok(f2Width.machine.limitations.includes("delivery_statement_conflict"));
   assert.equal(early.contexts.find(({ name }) => name === "F1").counts.confirmed_conflict, 1);
   const newObservations = (await request("GET", early.observations.href)).json().items;
   const titled = newObservations.find(({ basis }) => basis.revisionEvidence);

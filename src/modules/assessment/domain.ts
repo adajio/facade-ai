@@ -55,6 +55,7 @@ export type Citation = {
   branch: "A" | "B";
   href: string;
   deliveryStatement?: DeliveryStatement;
+  deliveryUncertainty?: "contradictory_original" | "original_statement_unverified";
   documentRevision?: DocumentRevision;
   verifiedRevision?: string;
   stageConfirmation?: { stage: string; evidenceId: string };

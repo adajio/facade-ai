@@ -49,10 +49,16 @@ function convertFact(fact: PackageFact, accepted: Map<string, AcceptedVersion>, 
   const active = evidenceBound && fact.sourceRole !== "unknown" && fact.revisionStatus === "current";
   const literalInventory = active && fact.observation.grounding === "text" && Boolean(quote) && isInventoryRole(fact.sourceRole);
   const originalLine = originalLines.get(fact.id);
-  const delivered = literalInventory && attribute && originalLine ? exactDeliveryStatement(originalLine, attribute, "delivered") : false;
-  const absence = literalInventory && !delivered && !fact.observation.alternatives?.length &&
+  const absence = literalInventory && !fact.observation.alternatives?.length &&
     deliveryStatement?.status === "not_delivered" && nonDeliveryFromOriginal(quote!, originalLine, deliveryStatement.item);
-  const statement = delivered ? { status: "delivered" as const, item: attribute! } : deliveryStatement;
+  const positiveInOriginal = originalLine && deliveryStatement &&
+    exactDeliveryStatement(originalLine, deliveryStatement.item, "delivered");
+  const negativeInOriginal = originalLine && deliveryStatement &&
+    exactDeliveryStatement(originalLine, deliveryStatement.item, "not_delivered");
+  const deliveryUncertainty = positiveInOriginal && negativeInOriginal ||
+      (positiveInOriginal && deliveryStatement?.status === "not_delivered") ||
+      (negativeInOriginal && deliveryStatement?.status === "delivered") ? "contradictory_original" as const :
+    deliveryStatement?.status === "not_delivered" && !absence ? "original_statement_unverified" as const : undefined;
   const printedStage = fact.basis.stage ? fact.designStage : null;
   const confirmation = stages.get(canonicalJson([source.versionId, address])) ??
     (!printedStage ? stages.get(canonicalJson([source.versionId, null])) : undefined);
@@ -72,7 +78,7 @@ function convertFact(fact: PackageFact, accepted: Map<string, AcceptedVersion>, 
     runId,
     finding: {
       kind: absence ? "absence" : deliveryStatement || value == null ? "delivery" : "value",
-      applicability: fact.revisionStatus === "superseded" ? "superseded" : active ? "active" : "unknown",
+      applicability: fact.revisionStatus === "superseded" ? "superseded" : active && !deliveryUncertainty ? "active" : "unknown",
       sourceRole: fact.sourceRole,
       format,
       representation: evidence.get(evidenceId)?.representation,
@@ -83,7 +89,8 @@ function convertFact(fact: PackageFact, accepted: Map<string, AcceptedVersion>, 
         versionId: source.versionId, sha256: source.sha256, address: { ...address }, label: original.label,
         quote: quote ?? "", value: value ?? null, unit: unit ?? null, href: fact.evidenceHref,
         ...(components ? { components } : {}),
-        ...(statement ? { deliveryStatement: statement } : {}),
+        ...(deliveryStatement ? { deliveryStatement } : {}),
+        ...(deliveryUncertainty ? { deliveryUncertainty } : {}),
         ...(confirmation ? { stageConfirmation: { stage: confirmation.stage, evidenceId: confirmation.evidenceId } } : {}),
         ...(fact.revision && revisionBasis ? { documentRevision: {
           label: fact.revision, ...revisionBasis, address: { ...revisionBasis.address },

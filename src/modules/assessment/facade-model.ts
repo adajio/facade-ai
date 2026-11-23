@@ -135,7 +135,7 @@ export function facadeReview(options: {
     fact.finding.applicability !== "superseded" && fact.finding.kind !== "absence" &&
     (inFacadeContext(fact, context) || ["ambiguous", "unidentified"].includes(fact.membership.kind)) &&
     (fact.finding.sourceRole === "unknown" || requirement.sourceRoles.includes(fact.finding.sourceRole) ||
-      fact.finding.citation.deliveryStatement?.status === "delivered"));
+      fact.finding.citation.deliveryStatement?.status === "delivered" || Boolean(fact.finding.citation.deliveryUncertainty)));
   const plausibleUnknown = sameStage.some((fact) => {
     const { sourceRole, format, applicability, kind } = fact.finding;
     return applicability !== "superseded" && kind !== "absence" &&
@@ -215,6 +215,7 @@ export function facadeReview(options: {
     findings,
     completenessChecked: localChecked,
     remaining: localChecked ? [] : [!requirement.evidenceRule ? "catalog_evidence_rule_unset" :
+      findings.some(({ citation }) => citation.deliveryUncertainty === "contradictory_original") ? "delivery_statement_conflict" :
       verifiedAbsences.length && alternativesOpen ? "alternatives_unverified" : "required_evidence_incomplete"],
     ...(inventory ? { inventory } : {}),
     confirmedPairs,
