@@ -6,6 +6,7 @@ import type { Branch, PackageBlock, PackageSemanticCheck, Place } from './contra
 import type { Observation } from '../pdf/types.js';
 import type { VerifiedPairEvidence } from '../assessment/domain.js';
 import { printedPairVariant } from './pair-evidence.js';
+import { currentFacadeScopes } from './package-walk.js';
 
 export const packageRoles = ['drawing', 'detail', 'schedule', 'specification', 'calculation', 'inventory',
   'correspondence', 'model', 'other', 'unknown'] as const;
@@ -50,6 +51,7 @@ export interface PackageWalkState {
     remaining:{blockId:string;reason:string}[];
     complete:boolean;
     followup:{jobId:string;status:string;reason:string|null}|null;
+    completedFollowupId:string|null;
   }>;
 }
 
@@ -163,7 +165,7 @@ function bindingScope(a: PackageFact, b: PackageFact) {
   return ids.length === 1 ? ids[0] : undefined;
 }
 
-type ComparisonCatalog={versionId:string;stage:string|null;requirements:CatalogRequirement[]};
+type ComparisonCatalog={versionId:string;stage:string|null;requirements:CatalogRequirement[];facadeKinds?:ReadonlyMap<string,string>};
 
 function pairCandidate(a: PackageFact, b: PackageFact, scope: { id: string; label: string } | undefined,
   property:string,catalog?:ComparisonCatalog) {
@@ -182,7 +184,8 @@ function pairCandidate(a: PackageFact, b: PackageFact, scope: { id: string; labe
   const crossRole=a.sourceRole!==b.sourceRole;
   const roles=[a,b].map(({sourceRole,basis})=>({sourceRole,valueRole:basis.valueRole?.kind}));
   if(!allowsCatalogPair(rule?.comparison,roles[0],roles[1]))return;
-  if(crossRole&&(!rule?.comparison||rule.facadeKinds?.length||!catalog?.stage||
+  if(crossRole&&(!rule?.comparison||!catalog?.stage||
+    (rule.facadeKinds?.length&&!rule.facadeKinds.includes(catalog.facadeKinds?.get(scope.id)??''))||
     ![a,b].every(({designStage})=>designStage&&normalizeAttribute(designStage)===normalizeAttribute(catalog.stage!))))return;
   return { a: a.id, b: b.id, scope,...(rule?.comparison&&catalog?.stage?{catalogVersionId:catalog.versionId,stage:catalog.stage}:{}) };
 }
@@ -324,15 +327,30 @@ export async function readPackageAnalysis(db: Pool | PoolClient, projectId: stri
   const walkIds=[...new Set(windowRows.filter(({walk})=>walk).map(({id})=>id))];
   const {rows:walkRows}=walkIds.length?await db.query<{
     id:string;blocks:PackageBlock[]|null;limitation:string|null;branch:Branch;checks:{blockId:string;evidenceId:string;reviewed:boolean;reason:string}[];
-    childId:string|null;childState:string|null;childReason:string|null;
+    childId:string|null;childState:string|null;childReason:string|null;completedFollowupId:string|null;
   }>(
     `SELECT b.window_id AS id,s.blocks,s.limitation,b.branch,
-       coalesce(checked.items,'[]') AS checks,child.id AS "childId",child.state AS "childState",child.reason AS "childReason"
+       coalesce(checked.items,'[]') AS checks,child.id AS "childId",child.state AS "childState",child.reason AS "childReason",
+       closed.id AS "completedFollowupId"
      FROM harness_package_branches b LEFT JOIN harness_package_structures s ON s.window_id=b.window_id
      LEFT JOIN LATERAL (
        SELECT j.id,j.state,j.reason FROM harness_package_followups f JOIN gateway_jobs j ON j.id=f.job_id
        WHERE f.root_job_id=b.job_id ORDER BY j.created_at DESC,j.id LIMIT 1
      ) child ON true
+     LEFT JOIN LATERAL (
+       SELECT j.id FROM harness_package_followups f JOIN gateway_jobs j ON j.id=f.job_id
+       WHERE f.root_job_id=b.job_id AND f.plan_key LIKE 'blocks:%' AND j.state='done'
+         AND j.result->>'kind' IN ('covered','reviewed_no_match')
+         AND NOT EXISTS (SELECT 1 FROM jsonb_array_elements(s.blocks) block WHERE NOT EXISTS (
+           SELECT 1 FROM harness_package_block_checks proof WHERE proof.block_id=block->>'id' AND proof.reviewed
+             AND (proof.job_id=b.job_id OR EXISTS (
+               SELECT 1 FROM harness_package_followups earlier JOIN gateway_jobs step ON step.id=earlier.job_id
+               WHERE earlier.root_job_id=b.job_id AND earlier.job_id=proof.job_id
+                 AND (step.created_at,step.id)<=(j.created_at,j.id)
+                 AND (step.state='done' OR step.state='held' AND step.reason='turn_limit_final')))
+         ))
+       ORDER BY j.created_at DESC,j.id LIMIT 1
+     ) closed ON true
      LEFT JOIN LATERAL (
        SELECT jsonb_agg(jsonb_build_object('blockId',block_id,'evidenceId',evidence_id,'reviewed',reviewed,'reason',reason)
          ORDER BY job_id IS DISTINCT FROM child.id,reviewed DESC) AS items
@@ -342,7 +360,7 @@ export async function readPackageAnalysis(db: Pool | PoolClient, projectId: stri
   const byWindow=new Map(windows.map((window)=>[window.id,window]));
   for(const row of walkRows) {
     const window=byWindow.get(row.id)!;
-    const waiting={reviewed:[],remaining:[],complete:false,followup:null};
+    const waiting={reviewed:[],remaining:[],complete:false,followup:null,completedFollowupId:null};
     const structure=window.structure??={status:row.blocks?'ready':'pending',limitation:row.limitation,blocks:row.blocks??[],
       branches:{A:waiting,B:waiting}};
     const reviewed=structure.blocks.flatMap(({id})=>{
@@ -352,8 +370,10 @@ export async function readPackageAnalysis(db: Pool | PoolClient, projectId: stri
     const remaining=structure.blocks.filter(({id})=>!reviewed.some(({blockId})=>blockId===id)).map(({id})=>({
       blockId:id,reason:row.checks.find((check)=>check.blockId===id)?.reason??'block_not_reviewed',
     }));
-    structure.branches[row.branch]={reviewed,remaining,complete:structure.status==='ready'&&Boolean(structure.blocks.length)&&!remaining.length&&!structure.limitation,
-      followup:row.childId?{jobId:row.childId,status:row.childState!,reason:row.childReason}:null};
+    const complete=structure.status==='ready'&&Boolean(structure.blocks.length)&&!remaining.length&&!structure.limitation;
+    structure.branches[row.branch]={reviewed,remaining,complete,
+      followup:row.childId?{jobId:row.childId,status:row.childState!,reason:row.childReason}:null,
+      completedFollowupId:complete?row.completedFollowupId:null};
   }
   const {rows:semanticChecks}=walkIds.length?await db.query<PackageSemanticCheck>(
     `SELECT s.window_id AS "windowId",s.branch,s.job_id AS "jobId",b.job_id AS "primaryJobId",s.reader_version AS "readerVersion",
@@ -380,8 +400,11 @@ export async function readPackageAnalysis(db: Pool | PoolClient, projectId: stri
   }));
   const candidates = [...new Map(facts.flatMap(({ binding }) => binding.candidates)
     .map((candidate) => [candidate.id, candidate])).values()];
-  const completedWindows = windows.filter(({ branches }) => Object.values(branches)
-    .every(({ status }) => status === 'covered' || status === 'reviewed_no_match')).length;
+  const completedWindows = windows.filter(({ branches,structure }) => (['A','B'] as const).every((key)=>{
+    const {status,reason}=branches[key];
+    return status==='covered'||status==='reviewed_no_match'||
+      (status==='held'&&reason==='turn_limit_final'&&Boolean(structure?.branches[key].completedFollowupId));
+  })).length;
   const structurallyReviewedWindows=windows.filter(({structure})=>structure?.branches.A.complete&&structure.branches.B.complete).length;
   const versionIds = versions.rows.map(({ id }) => id);
   const physicalProof = versionIds.length && versions.rows.every(({ basis }) => basis)
@@ -402,6 +425,12 @@ export async function readPackageAnalysis(db: Pool | PoolClient, projectId: stri
     ? { versionIds, basisIds: [a.id, b.id], facadeIds, commonChecked: true } : null;
   const mappedVersions = new Set(windows.map(({ place }) => place.source.versionId)).size;
   const catalog=facts.length?await approvedComparisonCatalog(db,projectId):undefined;
+  if(catalog?.stage&&catalog.requirements.some(({facadeKinds})=>facadeKinds?.length)) {
+    const {rows:kinds}=await db.query<{id:string;kind:string}>(
+      `SELECT DISTINCT id,kind FROM (${currentFacadeScopes('$1','$2::text')}) facade WHERE kind IS NOT NULL`,
+      [projectId,catalog.stage]);
+    catalog.facadeKinds=new Map(kinds.map(({id,kind})=>[id,kind]));
+  }
   const comparison=comparePackageFacts(facts,catalog&&packageCatalogAliases(catalog.requirements),catalog);
   const reviewed = await db.query<PackageAnalysis['verifiedPairs'][number]>(
     `SELECT p.a_fact_id AS a,p.b_fact_id AS b,p.proof,

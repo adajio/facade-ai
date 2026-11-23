@@ -17,6 +17,31 @@ const activeSource = `EXISTS (SELECT 1 FROM intake_occurrences o WHERE o.project
   WHERE v.project_id=w.project_id AND v.replaces_version_id=w.version_id)`;
 const activeWindows = `harness_package_windows w JOIN harness_package_maps m
   ON m.version_id=w.version_id AND m.fingerprint=w.map_fingerprint AND m.active`;
+const activeFacts = `harness_package_facts fact
+  LEFT JOIN harness_package_followups child ON child.job_id=fact.job_id
+  JOIN harness_package_branches primary_branch ON primary_branch.job_id=coalesce(child.root_job_id,fact.job_id) AND primary_branch.active
+  JOIN ${activeWindows} ON w.id=fact.window_id
+  JOIN LATERAL (SELECT version,state,candidates FROM harness_package_bindings b
+    WHERE b.fact_id=fact.id ORDER BY version DESC LIMIT 1) binding ON true`;
+
+export function currentFacadeScopes(project: string, stage: string) {
+  return `SELECT detected.id,detected.label,confirmed.kind FROM (
+    SELECT DISTINCT (candidate->>'id')::uuid AS id,candidate->>'label' AS label
+    FROM ${activeFacts} CROSS JOIN LATERAL jsonb_array_elements(binding.candidates) candidate
+    WHERE fact.project_id=${project} AND ${activeSource}
+  ) detected
+  LEFT JOIN facade_assessment_contexts ctx ON ctx.project_id=${project} AND ctx.facade_id=detected.id AND ctx.kind='facade'
+  LEFT JOIN LATERAL (
+    SELECT latest.kind FROM (SELECT * FROM facade_type_assignments t
+      WHERE t.context_id=ctx.id ORDER BY t.version DESC LIMIT 1) latest
+    JOIN ${activeFacts} ON fact.id=latest.observation_id
+    WHERE ${activeSource} AND w.version_id=latest.original_version_id AND fact.revision_status='current'
+      AND fact.revision=latest.basis->>'revision'
+      AND (fact.design_stage IS NULL OR lower(fact.design_stage)=lower(${stage}))
+      AND binding.version=latest.binding_version AND binding.state='identified'
+      AND jsonb_array_length(binding.candidates)=1 AND binding.candidates->0->>'id'=detected.id::text
+  ) confirmed ON true`;
+}
 
 export function structureFromLines(format:string,lines:{id:string;locator?:Record<string,string|number>}[],
   limitations:string[],frame?:Place['box']) {
@@ -117,17 +142,14 @@ export async function packageStructure(db: Pool | PoolClient, context: ReaderCon
          ON b.fact_id=f.id AND b.version=1 AND b.state='identified'
        CROSS JOIN LATERAL jsonb_array_elements(b.candidates) item WHERE f.job_id=$1
        UNION ALL
-       SELECT candidate FROM facade_assessment_contexts c
-       JOIN LATERAL (SELECT observation_id,binding_version FROM facade_type_assignments t
-         WHERE t.context_id=c.id ORDER BY version DESC LIMIT 1) selected ON true
-       JOIN LATERAL (SELECT version,candidates FROM harness_package_bindings b
-         WHERE b.fact_id=selected.observation_id ORDER BY version DESC LIMIT 1) b ON b.version=selected.binding_version
-       CROSS JOIN LATERAL jsonb_array_elements(b.candidates) candidate
-       WHERE c.project_id=$2 AND candidate->>'id'=c.facade_id::text
-     ) available`,[task.jobId,task.projectId]);
+       SELECT jsonb_build_object('id',id,'label',label) FROM (${currentFacadeScopes('$2','$3::text')}) facade
+       WHERE kind IS NOT NULL OR id=ANY($4::uuid[])
+     ) available`,[task.jobId,task.projectId,project.stage,followup?.semantic?.positions.flatMap(({facadeId})=>facadeId??[])??[]]);
+  const assigned=followup?.semantic?.positions.map(({positionId})=>positionId);
   return {...structure,catalog:{
     catalogVersionId:catalog.id,stage:project.stage,facades:own.facades,
-    positions:catalog.requirements.slice(0,64).map(({key,part,aliases,level,evidenceRule})=>({positionId:key,part,aliases,level,
+    positions:(assigned?catalog.requirements.filter(({key})=>assigned.includes(key)):catalog.requirements.slice(0,64))
+      .map(({key,part,aliases,level,evidenceRule})=>({positionId:key,part,aliases,level,
       subjects:[...new Set(evidenceRule?.allOf.flatMap(({anyOf})=>anyOf.map(({subject})=>subject).filter(Boolean))??[])]})),
   }};
 }
@@ -185,6 +207,13 @@ export async function saveSemanticCheck(tx: PoolClient, context: ReaderContext,
   if(check.subject&&![...primaryNames,...options.map(normalize)].includes(normalize(check.subject))) {
     throw new ReaderRefusal('package_semantic_subject_unapproved','permanent');
   }
+  if(check.facadeId) {
+    const recognized=await tx.query(
+      `SELECT 1 FROM (${currentFacadeScopes('$1','$2::text')}) facade
+       WHERE id=$3 AND (cardinality($4::text[])=0 OR kind=ANY($4)) LIMIT 1`,
+      [task.projectId,check.stage,check.facadeId,position.facadeKinds??[]]);
+    if(!recognized.rowCount) throw new ReaderRefusal('package_semantic_facade_unconfirmed','permanent');
+  }
   if(check.disposition==='alternatives_checked') {
     const {rows:[review]}=await tx.query<{covered:boolean;relevant:boolean}>(
       `WITH branch_proofs AS (
@@ -199,14 +228,6 @@ export async function saveSemanticCheck(tx: PoolClient, context: ReaderContext,
        FROM harness_package_structures s WHERE s.window_id=$1`,
       [window.id,window.followup?.rootJobId??task.jobId,check.basisIds,new Set(check.basisIds).size]);
     if(!review?.covered||!review.relevant||!check.reason?.trim()) throw new ReaderRefusal('package_semantic_blocks_unreviewed','permanent');
-    if(check.facadeId && position.facadeKinds?.length) {
-      const recognized=await tx.query(
-        `SELECT 1 FROM facade_assessment_contexts c JOIN facade_type_assignments t ON t.context_id=c.id
-         WHERE c.project_id=$1 AND c.facade_id=$2 AND t.kind=ANY($3::text[])
-         AND t.version=(SELECT max(x.version) FROM facade_type_assignments x WHERE x.context_id=c.id) LIMIT 1`,
-        [task.projectId,check.facadeId,position.facadeKinds]);
-      if(!recognized.rowCount) throw new ReaderRefusal('package_semantic_facade_unconfirmed','permanent');
-    }
   } else {
     const { rows } = await tx.query<{ id:string; attribute:string; role:string; stage:string; revision:string; states:string; candidates:{id:string}[] }>(
       `SELECT f.id,f.attribute,f.source_role AS role,f.design_stage AS stage,f.revision_status AS revision,b.state AS states,b.candidates
@@ -307,7 +328,7 @@ async function dispatchCatalogFollowup(tx:PoolClient,queue:WorkQueue) {
     `SELECT j.id AS "rootId",w.id AS "windowId",w.project_id AS "projectId",j.generation_id AS "generationId",j.payload,
       ARRAY(SELECT item->>'id' FROM jsonb_array_elements(s.blocks) item) AS blocks,
       c.id AS "catalogVersionId",p.project_stage AS stage,missing.positions,coalesce(epoch.epoch,0)::text AS epoch,
-      key."scopeKey" 
+      plan."scopeKey"
      FROM ${activeWindows}
      JOIN harness_package_structures s ON s.window_id=w.id AND s.limitation IS NULL AND jsonb_array_length(s.blocks)>0
      JOIN harness_package_branches b ON b.window_id=w.id AND b.active
@@ -317,48 +338,37 @@ async function dispatchCatalogFollowup(tx:PoolClient,queue:WorkQueue) {
      JOIN catalog_versions c ON c.id=p.catalog_version_id AND c.organization_id=p.organization_id
      LEFT JOIN harness_semantic_epochs epoch ON epoch.project_id=p.id
      JOIN LATERAL (
-       SELECT jsonb_agg(DISTINCT jsonb_build_object('facadeId',scopes.id,'positionId',requirement->>'key',
-         'scopeEpoch',coalesce(scope_epoch.epoch,0)::text)
-         ORDER BY jsonb_build_object('facadeId',scopes.id,'positionId',requirement->>'key',
-           'scopeEpoch',coalesce(scope_epoch.epoch,0)::text)) AS positions
+       SELECT jsonb_agg(jsonb_build_object('facadeId',next.facade_id,'positionId',next.position_id,'scopeEpoch',next.scope_epoch::text)
+         ORDER BY next.facade_id,next.position_id) AS positions FROM (
+       SELECT DISTINCT scopes.id AS facade_id,requirement->>'key' AS position_id,coalesce(scope_epoch.epoch,0) AS scope_epoch
        FROM jsonb_array_elements(c.requirements) requirement
        JOIN LATERAL (
          SELECT NULL::uuid AS id,'common' AS level,NULL::text AS kind
          UNION ALL
-         SELECT ctx.facade_id,'facade',confirmed.kind FROM facade_assessment_contexts ctx
-         LEFT JOIN LATERAL (SELECT kind,observation_id,binding_version,original_version_id FROM facade_type_assignments a
-           WHERE a.context_id=ctx.id ORDER BY version DESC LIMIT 1) confirmed ON true
-         LEFT JOIN LATERAL (SELECT version,candidates FROM harness_package_bindings x
-           WHERE x.fact_id=confirmed.observation_id ORDER BY version DESC LIMIT 1) binding ON binding.version=confirmed.binding_version
-         WHERE ctx.project_id=w.project_id AND ctx.kind='facade'
-           AND (confirmed.observation_id IS NULL OR EXISTS(SELECT 1 FROM jsonb_array_elements(binding.candidates) f WHERE f->>'id'=ctx.facade_id::text)
-           AND EXISTS(SELECT 1 FROM harness_package_windows active
-             JOIN harness_package_maps am ON am.version_id=active.version_id AND am.fingerprint=active.map_fingerprint AND am.active
-             WHERE active.version_id=confirmed.original_version_id))
+         SELECT facade.id,'facade',facade.kind FROM (${currentFacadeScopes('p.id','p.project_stage')}) facade
        ) scopes ON scopes.level=requirement->>'level'
        LEFT JOIN harness_semantic_scope_epochs scope_epoch ON scope_epoch.project_id=p.id
          AND scope_epoch.scope_key=coalesce(scopes.id::text,'common')
        WHERE (lower(trim(requirement->>'applicability')) IN ('all','applicable','*','все','для всех','все фасады')
          OR lower(regexp_replace(requirement->>'applicability','^stage:[[:space:]]*','stage:'))='stage:'||lower(p.project_stage))
-         AND (NOT(requirement?'facadeKinds') OR requirement->'facadeKinds'?scopes.kind)
-     ) available ON available.positions IS NOT NULL
-     JOIN LATERAL(SELECT md5(available.positions::text) AS "scopeKey") key ON true
-     JOIN LATERAL (
-       SELECT jsonb_agg(item) AS positions FROM jsonb_array_elements(available.positions) item
-       WHERE NOT EXISTS (
+         AND (coalesce(jsonb_array_length(requirement->'facadeKinds'),0)=0 OR requirement->'facadeKinds'?scopes.kind)
+         AND NOT EXISTS (
          SELECT 1 FROM harness_package_semantic_checks check_row
          LEFT JOIN harness_package_followups child ON child.job_id=check_row.job_id
          WHERE coalesce(child.root_job_id,check_row.job_id)=j.id AND check_row.catalog_version_id=c.id
            AND check_row.stage=p.project_stage AND check_row.disposition='alternatives_checked'
-           AND check_row.applicability_epoch=coalesce(epoch.epoch,0) AND check_row.scope_epoch=(item->>'scopeEpoch')::bigint
-           AND check_row.position_id=item->>'positionId' AND check_row.facade_id IS NOT DISTINCT FROM (item->>'facadeId')::uuid
+           AND check_row.applicability_epoch=coalesce(epoch.epoch,0) AND check_row.scope_epoch=coalesce(scope_epoch.epoch,0)
+           AND check_row.position_id=requirement->>'key' AND check_row.facade_id IS NOT DISTINCT FROM scopes.id
            AND check_row.subject IS NULL
-       )
+         )
+       ORDER BY facade_id,position_id LIMIT 3
+       ) next
      ) missing ON missing.positions IS NOT NULL
+     JOIN LATERAL(SELECT md5(missing.positions::text) AS "scopeKey") plan ON true
      WHERE ${activeSource} AND j.payload#>>'{packageWindow,walkProtocol}'='1'
        AND (NOT p.intake_mode OR c.default_stage=p.project_stage AND c.default_facade_kinds=p.confirmed_facade_kinds)
        AND NOT EXISTS(SELECT 1 FROM harness_package_followups f WHERE f.root_job_id=j.id AND
-         f.plan_key='catalog:'||c.id::text||':'||p.project_stage||':'||coalesce(epoch.epoch,0)::text||':'||key."scopeKey")
+         f.plan_key='catalog:'||c.id::text||':'||p.project_stage||':'||coalesce(epoch.epoch,0)::text||':'||plan."scopeKey")
        AND NOT EXISTS(SELECT 1 FROM gateway_attempts a WHERE a.job_id=j.id AND a.state IN ('reserved','prepared','sending','unknown'))
        AND NOT EXISTS (SELECT 1 FROM harness_package_followups f JOIN gateway_jobs x ON x.id=f.job_id
          WHERE x.project_id=w.project_id AND x.state IN ('ready','leased'))
@@ -366,7 +376,6 @@ async function dispatchCatalogFollowup(tx:PoolClient,queue:WorkQueue) {
      ORDER BY j.created_at,j.project_id,b.branch LIMIT 8`);
   for(const row of targets) {
     const {catalogVersionId,stage,positions,epoch,scopeKey}=row;
-    if(positions.length>4096)continue;
     if(await putFollowup(tx,queue,row,`catalog:${catalogVersionId}:${stage}:${epoch}:${scopeKey}`,{catalogVersionId,stage,epoch,positions}))return true;
   }
   return false;
