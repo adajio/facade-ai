@@ -247,15 +247,17 @@ test("ordinary intake publishes a local conflict, then keeps sent history after 
           stops.push(lease.jobId);
           continue;
         }
-        const grounded = { evidenceId: evidence.id, scope: null, lineId: line.id, quote: line.text,
-          ...(fixture.value ? { value: fixture.value, unit: "mm" } : {}) };
+        const grounded = { evidenceId: evidence.id, scope: null, lineId: line.id, quote: fixture.savedQuote ?? line.text,
+          ...(fixture.value ? { value: fixture.value, unit: "mm" } : {}),
+          ...(fixture.statement ? { deliveryStatement: fixture.statement } : {}) };
         const details = {
-          attribute: fixture.attribute, role: { value: fixture.role ?? "drawing", quote: "Drawing" },
-          stage: { value: "P", quote: line.text }, revision: { value: fixture.revision, quote: line.text, status: "current" },
+          attribute: fixture.attribute, role: { value: fixture.role ?? "drawing", quote: fixture.roleQuote ?? "Drawing" },
+          stage: { value: "P", quote: grounded.quote },
+          revision: { value: fixture.revision, quote: grounded.quote, status: "current" },
           binding: fixture.facade ? {
-            state: "identified", labels: [fixture.facade], quote: line.text, reason: "Explicit address",
-            projectIdentifiers: [{ label: fixture.facade, quote: line.text }],
-          } : { state: fixture.common ? "common" : "unidentified", labels: [], quote: line.text, reason: "Printed scope" },
+            state: "identified", labels: [fixture.facade], quote: grounded.quote, reason: "Explicit address",
+            projectIdentifiers: [{ label: fixture.facade, quote: grounded.quote }],
+          } : { state: fixture.common ? "common" : "unidentified", labels: [], quote: grounded.quote, reason: "Printed scope" },
         };
         await transaction(db, async (tx) => {
           await tx.query("INSERT INTO harness_research_events(job_id,sequence,event) VALUES ($1,1,$2)", [
@@ -309,6 +311,8 @@ test("ordinary intake publishes a local conflict, then keeps sent history after 
     filename, attribute, value, revision, facade,
     quote: `Drawing ${attribute} ${value} mm | Stage P | Revision ${revision} current | Variant V1 | Scope: ${facade} | Project facade id: ${facade}`,
   });
+  // A persisted result from the earlier publisher retained only the negative part of a contradictory line.
+  const savedQuote = "Width not delivered | Stage P | Revision R9 current | Scope: F2 | Project facade id: F2 | Inventory";
   const initial = await uploadReceipt([
     drawing("first.pdf", "Thickness", "10", "R1"), drawing("second.pdf", "Thickness", "20", "R2"),
     drawing("width.pdf", "Width", "100", "R3"),
@@ -316,6 +320,8 @@ test("ordinary intake publishes a local conflict, then keeps sent history after 
     { filename: "common.pdf", attribute: "Clearance", value: "17", revision: "R5", common: true,
       quote: "Drawing Clearance 17 mm | Stage P | Revision R5 current | Applies to all facades" },
     { ...drawing("later.pdf", "Other", "300", "R8", "F2"), deferred: true },
+    { filename: "inventory.pdf", attribute: "Width", facade: "F2", revision: "R9", role: "inventory", roleQuote: "Inventory",
+      quote: `Width delivered, ${savedQuote}`, savedQuote, statement: { status: "not_delivered", item: "Width" } },
   ]);
   await finishReading();
   const observed = await assessment();
@@ -337,6 +343,9 @@ test("ordinary intake publishes a local conflict, then keeps sent history after 
   assert.equal(early.coverage.reading.complete, false);
   assert.equal(early.contexts.find(({ kind }) => kind === "common").counts.covered, 1);
   assert.equal(early.contexts.find(({ name }) => name === "F2").counts.needs_review, 2);
+  const f2Width = early.contexts.find(({ name }) => name === "F2").questions.find(({ requirement }) => requirement.positionId === "width");
+  assert.ok(f2Width.machine.citations.length > 0);
+  assert.ok(f2Width.machine.citations.every(({ deliveryStatement }) => deliveryStatement?.status === "delivered"));
   assert.equal(early.contexts.find(({ name }) => name === "F1").counts.confirmed_conflict, 1);
   const newObservations = (await request("GET", early.observations.href)).json().items;
   const titled = newObservations.find(({ basis }) => basis.revisionEvidence);
