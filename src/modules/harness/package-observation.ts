@@ -44,28 +44,30 @@ export function packageCommonGrounded(quote: string) {
 }
 const entireRegister = /(?:\b(?:complete|full|exhaustive)\s+(?:list|schedule|register)\s+of\s+facades?\b|(?:полн\p{L}*|исчерпывающ\p{L}*)\s+(?:перечень|список|ведомость)\s+фасад)/iu;
 const absent = /(?:\b(?:not (?:supplied|provided|delivered|included|sent)|omitted|was not transmitted)\b|не\s+(?:(?:передан|предоставлен|поставлен|направлен|приложен)(?:а|о|ы)?(?!\p{L})|вош[её]л(?!\p{L}))|отсутствует\s+в\s+(?:составе|комплекте))/iu;
-const delivered = /(?:\b(?:supplied|provided|delivered|included|sent|transmitted)\b|(?:передан|предоставлен|поставлен|направлен|приложен)(?:а|о|ы)?(?!\p{L}))/iu;
+const delivered = /(?:\b(?:supplied|provided|delivered|included|sent|transmitted|received)\b|(?:передан|предоставлен|поставлен|направлен|приложен|получен|принят)(?:а|о|ы)?(?!\p{L}))/iu;
+const statementSeparator = /[|;·,]+|\s+(?:and|but|whereas|or|и|но|а|однако|либо|или)\s+/iu;
 
 function directlyNotDelivered(quote: string, item: string) {
   return statementAbout(quote, item, absent);
 }
 
 function directlyDelivered(quote: string, item: string) {
-  return statementAbout(quote, item, delivered, absent);
+  return statementAbout(quote, item, delivered, absent, true);
 }
 
-function statementAbout(quote: string, item: string, expression: RegExp, excluding?: RegExp) {
-  const separator = /[|;·]+/u;
+function statementAbout(quote: string, item: string, expression: RegExp, excluding?: RegExp, allowOmittedSubject = false) {
   const adjacent = /^[\s:—–-]*(?:(?:is|was|бы(?:л|ла|ло|ли))\s+)?[\s:—–-]*$/iu;
-  return quote.split(separator).some((clause) => {
+  const name = item.toLocaleLowerCase('ru');
+  return quote.split(statementSeparator).some((clause) => {
     const predicate = expression.exec(clause);
     if (!predicate || excluding?.test(clause)) return false;
-    const before = clause.slice(0, predicate.index);
-    const after = clause.slice(predicate.index + predicate[0].length);
-    const beforeIndex = before.lastIndexOf(item);
-    const afterIndex = after.indexOf(item);
-    return (beforeIndex !== -1 && hasLiteral(before, item) && adjacent.test(before.slice(beforeIndex + item.length))) ||
-      (afterIndex !== -1 && hasLiteral(after, item) && adjacent.test(after.slice(0, afterIndex)));
+    const before = clause.slice(0, predicate.index).toLocaleLowerCase('ru');
+    const after = clause.slice(predicate.index + predicate[0].length).toLocaleLowerCase('ru');
+    const beforeIndex = before.lastIndexOf(name);
+    const afterIndex = after.indexOf(name);
+    if (allowOmittedSubject && adjacent.test(before) && /^[\s.!?—–-]*$/u.test(after)) return true;
+    return (beforeIndex !== -1 && hasLiteral(before, name) && adjacent.test(before.slice(beforeIndex + name.length))) ||
+      (afterIndex !== -1 && hasLiteral(after, name) && adjacent.test(after.slice(0, afterIndex)));
   });
 }
 const current = /(?:\b(?:current|effective)\b|действующ\p{L}*|актуальн\p{L}*)/iu;
