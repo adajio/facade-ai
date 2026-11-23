@@ -2,6 +2,8 @@ import { createHash } from "node:crypto";
 import { decodeText, FormatHold, unit } from "./model.js";
 import { projectLengthAssignment } from './ifc-units.js';
 import type { CadShape, Locator, Parsed, Row, Unit } from "./model.js";
+import { inventoryLimitation, matchInventory } from "./physical-inventory.js";
+import type { PhysicalInventory } from "./physical-inventory.js";
 
 type Group = { code: number; value: string };
 type Entity = { type: string; groups: Group[] };
@@ -45,11 +47,84 @@ function numeric(entity: Entity, code: number) {
   return Number.isFinite(number) && Math.abs(number) <= 1e9 ? number : undefined;
 }
 
-export function parseDxf(input: Buffer): Parsed {
+export function parseDxf(input: Buffer, checkInventory = false): Parsed {
   if (input.subarray(0, 20).toString().startsWith("AutoCAD Binary DXF")) {
     throw new FormatHold("dxf_binary_unsupported");
   }
-  return parseCadRecords(dxfRecords(decodeText(input)));
+  const records = dxfRecords(decodeText(input));
+  const parsed = parseCadRecords(records);
+  return checkInventory ? { ...parsed, inventory: dxfInventory(records, parsed.units) } : parsed;
+}
+
+const dxfAddressLimits = new Set(["cad_entity_handle_unconfirmed"]);
+
+function dxfInventory(records: Entity[], units: Unit[]): PhysicalInventory {
+  if (units.some(({ limitations }) => limitations.includes("cad_external_reference"))) {
+    return { limitation: "cad_external_reference" };
+  }
+  const limitation = inventoryLimitation(units, dxfAddressLimits);
+  if (limitation) return { limitation };
+  const sections = new Set<string>();
+  const spaces = new Set(["Model"]);
+  const owners = new Map<string, string>();
+  const views: string[] = [];
+  const entities: Entity[] = [];
+  let section: string | undefined;
+  for (const [offset, record] of records.entries()) {
+    if (offset === 0 && record.type === "" && !record.groups.length) continue;
+    if (record.type === "SECTION") {
+      const name = first(record, 2);
+      if (section || !name || sections.has(name)) return { limitation: "dxf_section_inventory_invalid" };
+      section = name;
+      sections.add(name);
+    } else if (record.type === "ENDSEC") {
+      if (!section) return { limitation: "dxf_section_inventory_invalid" };
+      section = undefined;
+    } else if (record.type === "EOF") {
+      if (section || record.groups.length || offset !== records.length - 1) {
+        return { limitation: "dxf_section_inventory_invalid" };
+      }
+    } else if (section === "ENTITIES") entities.push(record);
+    else if (section === "BLOCKS") {
+      if (record.type !== "BLOCK" && record.type !== "ENDBLK") return { limitation: "cad_block_geometry_unmapped" };
+    } else if (section === "OBJECTS" && record.type === "LAYOUT") {
+      const name = first(record, 1);
+      const id = record.groups.filter(({ code }) => code === 330).at(-1)?.value.trim().toUpperCase();
+      if (!name || !id || owners.has(id) || [...owners.values()].includes(name)) {
+        return { limitation: "cad_layout_inventory_unconfirmed" };
+      }
+      spaces.add(name);
+      owners.set(id, name);
+    } else if (section === "TABLES" && record.type === "VIEW") {
+      const name = first(record, 2);
+      if (!name) return { limitation: "cad_named_view_unsupported" };
+      views.push(name);
+    } else if (!section || !["HEADER", "CLASSES", "TABLES", "OBJECTS"].includes(section)) {
+      return { limitation: "dxf_section_inventory_unmapped" };
+    }
+  }
+
+  const key = (...parts: (number | string | undefined)[]) => JSON.stringify(parts);
+  const handles = new Map<string, number>();
+  for (const entity of entities) {
+    const handle = first(entity, 5)?.toUpperCase();
+    if (handle) handles.set(handle, (handles.get(handle) ?? 0) + 1);
+  }
+  const source = entities.map((entity, offset) => {
+    const name = first(entity, 410) || owners.get(first(entity, 330)?.toUpperCase() ?? "")
+      || (first(entity, 67) === "1" ? "Paper" : "Model");
+    spaces.add(name);
+    const handle = first(entity, 5)?.toUpperCase();
+    return handle && /^[0-9A-F]{1,16}$/.test(handle) && handles.get(handle) === 1
+      ? key("handle", name, handle) : key("ordinal", name, offset + 1);
+  });
+  source.push(...[...spaces].map((name) => key("space", name)), ...views.map((name) => key("view", name)));
+  const mapped = units.flatMap(({ locator, rows }) => locator.view ? [key("view", locator.view)] : [
+    key("space", locator.space),
+    ...rows.map(({ locator: row }) => row.space !== locator.space ? ""
+      : row.handle ? key("handle", row.space, row.handle) : key("ordinal", row.space, row.entityOrdinal)),
+  ]);
+  return matchInventory(source, mapped, "dxf_structure_inventory_mismatch");
 }
 
 function parseCadRecords(records: Entity[], issues = new Set<string>()): Parsed {
@@ -137,7 +212,7 @@ function parseCadRecords(records: Entity[], issues = new Set<string>()): Parsed 
     }
     const shape = { handle: handle ?? `ordinal:${entityOrdinal}`, layer, kind: type, x, y };
     const extrusion = numeric(record, 230);
-    if (numeric(record, 30) || numeric(record, 210) || numeric(record, 220)
+    if (numeric(record, 30) || (type === "LINE" && numeric(record, 31)) || numeric(record, 210) || numeric(record, 220)
         || (extrusion !== undefined && extrusion !== 1)) layout.limitations.add("cad_nonplanar_projection");
     if (text) {
       const height = numeric(record, 40) ?? 1;
@@ -332,5 +407,7 @@ export function parseIfc(input: Buffer): Parsed {
     units.push(unit(`entities:${offset + 1}`, `Объекты IFC ${offset + 1}`,
       { firstObject: offset + 1, schema, ...projectUnits }, objects.slice(offset, offset + 100), [...limitations]));
   }
-  return { units };
+  const limitation = ["ifc_multiple_data_sections_partial", "ifc_entity_attributes_truncated"]
+    .find((code) => limitations.has(code)) ?? "ifc_geometry_not_rendered";
+  return { units, inventory: { limitation } };
 }

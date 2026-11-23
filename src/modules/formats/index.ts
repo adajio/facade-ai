@@ -8,13 +8,15 @@ import type { Legacy } from "./conversion.js";
 import { FormatHold, originalOnly, parseText, readInput, readerVersion } from "./model.js";
 import type { Locator, Parsed, Row, Unit } from "./model.js";
 import { cellAddress, parseDocx, parseXlsx } from "./office.js";
+import { stampPhysicalInventory } from "./physical-inventory.js";
 import { parseDwgRecovery, parseDxf, parseIfc } from "./spatial.js";
 
-const formats = ["docx", "xlsx", "txt", "csv", "tsv", "dxf", "ifc", "doc", "xls", "dwg", "rvt", "unknown"] as const;
+const formats = ["docx", "xlsx", "txt", "csv", "tsv", "dxf", "ifc", "doc", "xls", "dwg", "rvt", "image", "unknown"] as const;
 type Format = typeof formats[number];
 const supports = new Set<string>(formats);
 const converterFormats = ["doc", "xls", "dwg"] as const;
-const native = new Map<Format, (input: Buffer) => Parsed | Promise<Parsed>>([
+const rasterExtensions = new Set(["png", "jpg", "jpeg", "webp", "bmp", "gif", "tiff", "tif", "avif", "heic"]);
+const native = new Map<Format, (input: Buffer, checkInventory: boolean) => Parsed | Promise<Parsed>>([
   ["docx", parseDocx], ["xlsx", parseXlsx], ["txt", parseText], ["csv", parseText], ["tsv", parseText],
   ["dxf", parseDxf], ["ifc", parseIfc],
 ]);
@@ -22,6 +24,7 @@ const native = new Map<Format, (input: Buffer) => Parsed | Promise<Parsed>>([
 export function resolveFormat(name: string): Format | "pdf" {
   const extension = /\.([a-z0-9]+)$/i.exec(name)?.[1].toLowerCase();
   if (extension === "pdf") return "pdf";
+  if (extension && rasterExtensions.has(extension)) return "image";
   return extension && supports.has(extension) ? extension as Format : "unknown";
 }
 
@@ -116,23 +119,31 @@ function rawOutput(parsed: Parsed, current: Unit, request: ReadRequest): ReaderO
 
 function adapter(format: Format): ReaderAdapter {
   const legacy = isLegacy(format) ? format : undefined;
-  const profile = format === 'ifc' ? 'formats-1.1.2'
-    : format === "doc" || format === "dwg" || format === "dxf" ? "formats-1.1.1" : readerVersion;
+  const profile = native.has(format) || format === "image" ? "formats-1.1.3"
+    : format === "doc" || format === "dwg" ? "formats-1.1.1" : readerVersion;
   let configured: ReturnType<typeof converterFor> | undefined;
   const resolve = () => legacy ? configured ??= converterFor(legacy).catch((error) => {
     configured = undefined;
     throw error;
   }) : undefined;
+  const version = async () => legacy ? `${profile}:${format}:${(await resolve())?.id ?? "unavailable"}`
+    : `${profile}:${format}`;
 
-  async function parse(path: string): Promise<Parsed> {
+  async function parse(path: string, checkInventory = false): Promise<Parsed> {
     if (format === "rvt") return originalOnly("rvt_original_only", "original_only");
+    if (format === "image") return originalOnly("image_reader_unsupported", "original_only");
     if (format === "unknown") return originalOnly("format_original_only", "original_only");
     const converter = await resolve();
     try {
       if (legacy && !converter) throw new FormatHold(`${legacy}_converter_unavailable`);
       const input = await readInput(path);
       if (!converter) {
-        return await native.get(format)!(input);
+        const parsed = await native.get(format)!(input, checkInventory);
+        return {
+          ...parsed,
+          ...(parsed.inventory && !("limitation" in parsed.inventory)
+            ? { originalSha256: createHash("sha256").update(input).digest("hex") } : {}),
+        };
       }
       const magic = input.subarray(0, 8).toString("hex");
       const valid = legacy === "dwg" ? /^AC10\d{2}$/.test(input.subarray(0, 6).toString("ascii"))
@@ -157,7 +168,8 @@ function adapter(format: Format): ReaderAdapter {
           if (legacy === "xls" && row.details?.formulaAttributes) row.details.cacheSource = "converter";
         }
       }
-      return { ...derived, converter: converter.id, representationSha256: derivative.sha256 };
+      return { ...derived, converter: converter.id, representationSha256: derivative.sha256,
+        inventory: { limitation: `${legacy}_original_inventory_unverified` } };
     } catch (error) {
       if (error instanceof ReaderError || (!(error instanceof FormatHold) && (error as NodeJS.ErrnoException).syscall)) {
         throw error;
@@ -169,14 +181,10 @@ function adapter(format: Format): ReaderAdapter {
 
   return {
     format,
-    async version() {
-      if (!legacy) return `${profile}:${format}`;
-      const converter = await resolve();
-      return `${profile}:${format}:${converter?.id ?? "unavailable"}`;
-    },
+    version,
     async inspect(path) {
-      const parsed = await parse(path);
-      return parsed.units.map(mapUnit);
+      const parsed = await parse(path, true);
+      return stampPhysicalInventory(parsed.units.map(mapUnit), parsed, format, await version());
     },
     async read(path, request, unit) {
       const parsed = await parse(path);

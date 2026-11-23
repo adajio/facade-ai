@@ -1,4 +1,6 @@
 import { open } from "node:fs/promises";
+import { matchInventory } from "./physical-inventory.js";
+import type { PhysicalInventory } from "./physical-inventory.js";
 
 export const readerVersion = "formats-1.1.0";
 export const inputLimit = 16 * 1024 * 1024;
@@ -20,6 +22,7 @@ export type Unit = {
   coverage: Coverage;
   cad?: CadShape[];
   cadView?: { x: number; y: number; width: number; height: number };
+  physicalRows?: number[];
 };
 export type CadShape = {
   handle: string;
@@ -34,7 +37,13 @@ export type CadShape = {
   radius?: number;
   text?: string;
 };
-export type Parsed = { units: Unit[]; converter?: string; representationSha256?: string };
+export type Parsed = {
+  units: Unit[];
+  converter?: string;
+  representationSha256?: string;
+  inventory?: PhysicalInventory;
+  originalSha256?: string;
+};
 
 export class FormatHold extends Error {
   constructor(readonly code: string) { super(code); }
@@ -51,6 +60,7 @@ export function unit(
 
 export function originalOnly(code: string, coverage: "held" | "original_only"): Parsed {
   return {
+    inventory: { limitation: code },
     units: [{
       id: "original", label: "Оригинал", locator: { place: "original" },
       rows: [], limitations: [code], coverage,
@@ -87,13 +97,12 @@ export function decodeText(data: Buffer): string {
   }
 }
 
-export function parseText(data: Buffer): Parsed {
+export function parseText(data: Buffer, checkInventory = false): Parsed {
   const content = decodeText(data);
   const lineCount = content ? (content.match(/\r\n|\r|\n/g)?.length ?? 0) + 1 : 0;
   if (lineCount > 50_000) throw new FormatHold("text_line_limit");
   const lines = lineCount ? content.split(/\r\n|\r|\n/u) : [];
   if (lines.some((line) => line.length > 16_384)) throw new FormatHold("text_line_limit");
-  if (!lines.length) return { units: [unit("lines:1", "Строки", { line: 1 }, [])] };
   const units: Unit[] = [];
   for (let index = 0; index < lines.length; index += 100) {
     const window = lines.slice(index, index + 100);
@@ -103,5 +112,14 @@ export function parseText(data: Buffer): Parsed {
       window.map((text, offset) => ({ text, locator: { line: index + offset + 1 } })),
     ));
   }
-  return { units };
+  if (!lineCount) units.push(unit("lines:1", "Строки", { line: 1 }, []));
+  if (!checkInventory) return { units };
+  // The source count is obtained from the delimiters, independently of window assembly.
+  const source = Array.from({ length: lineCount }, (_, offset) => String(offset + 1));
+  const mapped = units.flatMap(({ locator, rows }) => rows.map(({ locator: row }, offset) =>
+    row.line === Number(locator.firstLine) + offset && Number(row.line) <= Number(locator.lastLine)
+      ? String(row.line) : ""));
+  const inventory = lineCount ? matchInventory(source, mapped, "text_line_inventory_mismatch")
+    : { limitation: "text_no_physical_lines" };
+  return { units, inventory };
 }

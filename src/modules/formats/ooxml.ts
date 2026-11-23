@@ -8,6 +8,7 @@ import { FormatHold } from "./model.js";
 
 export type Element = {
   name: string;
+  namespace: string;
   attributes: Record<string, string>;
   children: Element[];
   value: string;
@@ -28,13 +29,13 @@ function element(tag: SaxesTagNS): Element {
   for (const { local, uri, value } of Object.values(tag.attributes)) {
     if (!uri || namespaces.has(uri)) attributes[local] = value;
   }
-  return { name: namespaces.has(tag.uri) ? tag.local : tag.name, attributes, children: [], value: "" };
+  return { name: namespaces.has(tag.uri) ? tag.local : tag.name, namespace: tag.uri, attributes, children: [], value: "" };
 }
 
 export function xml(buf: Buffer): Element {
   const input = new TextDecoder("utf-8", { fatal: true }).decode(buf);
   const parser = new SaxesParser({ xmlns: true });
-  const document: Element = { name: "", attributes: {}, children: [], value: "" };
+  const document: Element = { name: "", namespace: "", attributes: {}, children: [], value: "" };
   const stack = [document];
   let nodes = 0;
   parser.on("doctype", () => { throw new FormatHold("ooxml_dtd_forbidden"); });
@@ -88,7 +89,7 @@ async function openZip(input: Buffer): Promise<ZipFile> {
   });
 }
 
-export async function unpackXml(input: Buffer, include: (name: string) => boolean) {
+export async function unpackXml(input: Buffer, include: (name: string) => boolean, paths?: Set<string>) {
   const entries = new Map<string, Element>();
   const zip = await openZip(input);
   try {
@@ -98,6 +99,11 @@ export async function unpackXml(input: Buffer, include: (name: string) => boolea
       zip.on("error", reject);
       zip.once("end", resolve);
       zip.on("entry", (entry) => {
+        if (paths?.has(entry.fileName)) {
+          reject(new FormatHold("ooxml_duplicate_part"));
+          return;
+        }
+        paths?.add(entry.fileName);
         if (!include(entry.fileName)) {
           zip.readEntry();
           return;
