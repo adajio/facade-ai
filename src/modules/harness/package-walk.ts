@@ -353,13 +353,21 @@ async function dispatchCatalogFollowup(tx:PoolClient,queue:WorkQueue) {
          OR lower(regexp_replace(requirement->>'applicability','^stage:[[:space:]]*','stage:'))='stage:'||lower(p.project_stage))
          AND (coalesce(jsonb_array_length(requirement->'facadeKinds'),0)=0 OR requirement->'facadeKinds'?scopes.kind)
          AND NOT EXISTS (
-         SELECT 1 FROM harness_package_semantic_checks check_row
-         LEFT JOIN harness_package_followups child ON child.job_id=check_row.job_id
-         WHERE coalesce(child.root_job_id,check_row.job_id)=j.id AND check_row.catalog_version_id=c.id
-           AND check_row.stage=p.project_stage AND check_row.disposition='alternatives_checked'
-           AND check_row.applicability_epoch=coalesce(epoch.epoch,0) AND check_row.scope_epoch=coalesce(scope_epoch.epoch,0)
-           AND check_row.position_id=requirement->>'key' AND check_row.facade_id IS NOT DISTINCT FROM scopes.id
-           AND check_row.subject IS NULL
+           SELECT 1 FROM harness_package_semantic_checks check_row
+           LEFT JOIN harness_package_followups child ON child.job_id=check_row.job_id
+           WHERE coalesce(child.root_job_id,check_row.job_id)=j.id AND check_row.catalog_version_id=c.id
+             AND check_row.stage=p.project_stage AND check_row.disposition='alternatives_checked'
+             AND check_row.applicability_epoch=coalesce(epoch.epoch,0) AND check_row.scope_epoch=coalesce(scope_epoch.epoch,0)
+             AND check_row.position_id=requirement->>'key' AND check_row.facade_id IS NOT DISTINCT FROM scopes.id
+             AND check_row.subject IS NULL
+         )
+         AND NOT EXISTS (
+           SELECT 1 FROM harness_package_followups assigned JOIN gateway_jobs prior ON prior.id=assigned.job_id
+           WHERE assigned.root_job_id=j.id AND assigned.plan_key LIKE 'catalog:%'
+             AND prior.payload#>'{packageWindow,followup,semantic}' @> jsonb_build_object(
+               'catalogVersionId',c.id,'stage',p.project_stage,'epoch',coalesce(epoch.epoch,0)::text,
+               'positions',jsonb_build_array(jsonb_build_object('facadeId',scopes.id,
+                 'positionId',requirement->>'key','scopeEpoch',coalesce(scope_epoch.epoch,0)::text)))
          )
        ORDER BY facade_id,position_id LIMIT 3
        ) next

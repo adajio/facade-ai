@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import { test } from 'node:test';
+import type { CatalogRequirement } from '../access/input.js';
 import { comparePackageFacts, packageCatalogAliases, type PackageFact } from './package-analysis.js';
 import { locatePairQuote } from './pair-evidence.js';
 
@@ -48,4 +49,31 @@ test('verbatim duplicate title text requires the evidence lineId to identify one
   assert.equal(locatePairQuote([first, second], text).length, 2);
   assert.deepEqual(locatePairQuote([first, second], text, 'footer'), [second]);
   assert.deepEqual(locatePairQuote([first, second], text, 'unseen'), []);
+});
+
+test('typed catalogue comparisons require the confirmed type of the addressed facade', () => {
+  const a = measurement('A', 'Gap', '30', 'mm');
+  const b = measurement('B', 'Gap', '40', 'mm');
+  a.designStage = b.designStage = 'RD';
+  a.basis.valueRole = b.basis.valueRole = { kind: 'design', quote: 'Design gap' };
+  b.sourceRole = 'specification';
+  const requirement: CatalogRequirement = {
+    key: 'gap', part: 'Gap', level: 'facade', applicability: 'all', facadeKinds: ['ventilated'],
+    formats: ['pdf'], equivalents: [], aliases: [], sourceRoles: ['drawing', 'specification'],
+    completenessCriterion: 'Addressed design gap', addressee: 'engineer',
+    comparison: { sources: [
+      { sourceRole: 'drawing', valueRole: 'design', priority: 1 },
+      { sourceRole: 'specification', valueRole: 'design', priority: 1 },
+    ] },
+  };
+  const catalog = { versionId: randomUUID(), stage: 'RD', requirements: [requirement] };
+  assert.equal(comparePackageFacts([a, b], undefined, catalog).reviewCandidates.length, 0);
+  const facadeKinds = new Map([[randomUUID(), 'ventilated'], [facade.id, 'curtain wall']]);
+  assert.equal(comparePackageFacts([a, b], undefined, { ...catalog, facadeKinds }).reviewCandidates.length, 0);
+  facadeKinds.set(facade.id, 'ventilated');
+  assert.deepEqual(comparePackageFacts([a, b], undefined, { ...catalog, facadeKinds }).reviewCandidates, [
+    { a: a.id, b: b.id, property: 'Gap', scope: facade, stage: 'RD', catalogVersionId: catalog.versionId },
+  ]);
+  requirement.comparison!.sources[1].priority = 2;
+  assert.equal(comparePackageFacts([a, b], undefined, { ...catalog, facadeKinds }).reviewCandidates.length, 0);
 });

@@ -8,20 +8,21 @@ import { setTimeout as delay } from 'node:timers/promises';
 import { pathToFileURL } from 'node:url';
 import { test } from 'node:test';
 
-const enabled = process.env.FACADE_PACKAGE_INTEGRATION === '1';
+const walkOnly = process.env.FACADE_PACKAGE_INTEGRATION === 'walk';
+const enabled = walkOnly || process.env.FACADE_PACKAGE_INTEGRATION === '1';
 const built = (file) => process.env.FACADE_HARNESS_TEST_DIST
   ? pathToFileURL(join(process.env.FACADE_HARNESS_TEST_DIST, file)).href
   : new URL(`../../../dist/${file}`, import.meta.url).href;
 const sha = (bytes) => createHash('sha256').update(bytes).digest('hex');
 
-function pdf(lines,{size=7,leading=24,top=140}={}) {
+function pdf(lines,{size=7,leading=24,top=140,height=270}={}) {
   const drawing = lines.map((line) => `(${line}) Tj`).join(` 0 -${leading} Td `);
   const stream = `BT /T ${size} Tf 20 ${top} Td ${drawing} ET`;
   const objects = [
     '<< /Type /Catalog /Pages 2 0 R >>',
     '<< /Type /Pages /Kids [4 0 R] /Count 1 >>',
     '<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>',
-    '<< /Type /Page /Parent 2 0 R /MediaBox [0 0 640 270] /Resources << /Font << /T 3 0 R >> >> /Contents 5 0 R >>',
+    `<< /Type /Page /Parent 2 0 R /MediaBox [0 0 640 ${height}] /Resources << /Font << /T 3 0 R >> >> /Contents 5 0 R >>`,
     `<< /Length ${Buffer.byteLength(stream)} >>\nstream\n${stream}\nendstream`,
   ];
   let result = '%PDF-1.4\n';
@@ -168,9 +169,10 @@ test('ordinary intake publishes independent package evidence before questions an
         let output;
         if(assignment.semantic) {
           const checked=replies.filter((reply)=>reply.ok&&Object.keys(reply).length===1).length;
+          const positions=assignment.semantic.positions.filter(({positionId})=>['position-4','position-5'].includes(positionId));
           if(!plan)output=tool('inspect_structure',{});
-          else if(checked<assignment.semantic.positions.length) {
-            const {facadeId,positionId}=assignment.semantic.positions[checked];
+          else if(checked<positions.length) {
+            const {facadeId,positionId}=positions[checked];
             const basisIds=[...new Set(plan.earlierBranchChecks.map(({evidenceId})=>evidenceId))];
             output=tool('record_semantic_check',{
               catalogVersionId:assignment.semantic.catalogVersionId,stage:assignment.semantic.stage,positionId,facadeId,
@@ -229,8 +231,9 @@ test('ordinary intake publishes independent package evidence before questions an
   });
   t.after(async () => {
     driver?.abort();
-    await worker;
-    await new Promise((resolve) => provider.close(resolve));
+    try { await worker; } finally {
+      await new Promise((resolve) => provider.close(resolve));
+    }
     await app.close();
     await external.end();
     delete process.env.FACADE_HARNESS_PACKAGE_EFFECTS;
@@ -277,6 +280,98 @@ test('ordinary intake publishes independent package evidence before questions an
     driver = new AbortController();
     worker = startWorker({ db: app.db, config, logger: { warn: (message) => warnings.push(message) }, signal: driver.signal }, options);
   }
+  await t.test('both branches revisit missed blocks without candidates and preserve their separate lineage',async()=>{
+    delete process.env.FACADE_HARNESS_REPLAY_ONLY;
+    process.env.FACADE_HARNESS_PACKAGE_WALK='1';
+    process.env.FACADE_HARNESS_PACKAGE_EFFECTS = 'enabled';
+    const walked=(await command('POST','/api/projects',{name:'Neutral walkthrough',mode:'intake'})).json();
+    for(const [routeId,purpose] of [['managed-a','primary_a'],['managed-b','primary_b']]){
+      await gateway.grantRoute({projectId:walked.id,routeId,revision:'fixture-v1',purpose,dataClass:'synthetic',allowed:true});
+    }
+    const incoming=(await command('POST',`/api/projects/${walked.id}/receipts`,{source:'upload'})).json();
+    const target=`/api/receipts/${incoming.receiptId}`;
+    const bytes=pdf([...Array.from({length:72},(_,row)=>'Record '+(row+1)),'Material Graphite | project facade ID: K-88'],
+      {size:4,leading:6,top:475,height:500});
+    walkOriginal=sha(bytes);
+    run();
+    try {
+      await upload('walk.pdf',bytes,target);
+      await command('POST',target+'/seal',{});
+      const result=await until(()=>readPackageAnalysis(app.db,walked.id),({facts,coverage})=>facts.length===2&&
+        coverage.structurallyReviewedWindows===1 && coverage.completedWindows===1,'independent followup');
+      assert.deepEqual(result.facts.map(({branch,attribute,observation})=>[branch,attribute,observation.value]).sort(),
+        [['A','Material','Graphite'],['B','Material','Graphite']]);
+      const structure=result.windows[0].structure;
+      assert.equal(structure.blocks.flatMap(({lineIds})=>lineIds??[]).length,73);
+      assert.deepEqual(result.candidates.map(({label})=>label),['K-88']);
+      for(const [branch,purpose] of [['A','primary_a'],['B','primary_b']]){
+        assert.equal(structure.branches[branch].reviewed.length,4);
+        assert.equal(walkthrough.filter((check)=>check.branch===purpose&&check.child).length,3);
+      }
+      const count=await app.db.query(`SELECT count(*)::int AS count FROM harness_package_followups f
+        JOIN gateway_jobs j ON j.id=f.job_id WHERE j.project_id=$1`,[walked.id]);
+      assert.equal(count.rows[0].count,6);
+      await command('GET',`/api/v1/projects/${walked.id}/facade-assessment`,undefined);
+      const catalog=(await command('POST','/api/catalogs',{key:'walk-rd',name:'Walk RD',
+        defaultProfile:{stage:'RD',facadeKinds:['universal'],approvalReference:'synthetic fixture'},
+        requirements:Array.from({length:5},(_,index)=>({key:`position-${index+1}`,part:`Section ${index+1}`,level:'facade',formats:['pdf'],
+          equivalents:[],aliases:[],applicability:'all',sourceRoles:['drawing'],completenessCriterion:'Addressed section',addressee:'customer'})),
+      })).json();
+      // Isolated scheduler fixture for an approved catalogue, before any facade type has been assigned.
+      await app.db.query(`UPDATE projects SET project_stage='RD',confirmed_facade_kinds=ARRAY['universal'],catalog_version_id=$2
+        WHERE id=$1`,[walked.id,catalog.id]);
+      const checked=await until(()=>readPackageAnalysis(app.db,walked.id),({semanticChecks})=>semanticChecks.length===4,'universal catalogue followup');
+      const ids=checked.semanticChecks.map(({jobId})=>jobId);
+      assert.ok(checked.semanticChecks.every(({primaryJobId,branch,disposition,facadeId})=>
+        primaryJobId===result.windows[0].branches[branch].jobId && disposition==='alternatives_checked'&&facadeId===result.candidates[0].id));
+      assert.deepEqual([...new Set(checked.semanticChecks.map(({positionId})=>positionId))].sort(),['position-4','position-5']);
+      const batches=await app.db.query(`SELECT j.payload#>'{packageWindow,followup,semantic,positions}' AS positions
+        FROM harness_package_followups f JOIN gateway_jobs j ON j.id=f.job_id
+        WHERE j.project_id=$1 AND f.plan_key LIKE 'catalog:%' ORDER BY j.created_at`,[walked.id]);
+      assert.equal(batches.rowCount,4);
+      assert.deepEqual(batches.rows.map(({positions})=>positions.map(({positionId})=>positionId).sort()),
+        [['position-1','position-2','position-3'],['position-4','position-5'],['position-1','position-2','position-3'],['position-4','position-5']]);
+      assert.equal((await app.db.query('SELECT count(*)::int AS count FROM facade_type_assignments WHERE project_id=$1',[walked.id])).rows[0].count,0);
+      driver.abort();
+      await worker;
+      await app.db.query("UPDATE projects SET project_stage='P' WHERE id=$1",[walked.id]);
+      await app.db.query("UPDATE projects SET project_stage='RD' WHERE id=$1",[walked.id]);
+      assert.equal((await readPackageAnalysis(app.db,walked.id)).semanticChecks.length,0);
+      run();
+      const updated=await until(()=>readPackageAnalysis(app.db,walked.id),({semanticChecks})=>semanticChecks.length===4,'stage rollback creates a fresh addressed check');
+      assert.ok(updated.semanticChecks.every(({jobId})=>!ids.includes(jobId)));
+      driver.abort();
+      await worker;
+      const fact=updated.facts[0];
+      await command('POST',`/api/projects/${walked.id}/package-facts/${fact.id}/binding`,{
+        state:'identified',candidateIds:[result.candidates[0].id],reason:'Engineer rechecked the printed facade designation.',
+      },{'if-match':'"1"'});
+      assert.equal((await readPackageAnalysis(app.db,walked.id)).semanticChecks.length,0);
+      const currentIds=updated.semanticChecks.map(({jobId})=>jobId);
+      // Simulate a historical assignment whose recorded binding version is stale.
+      const stale=await app.db.query(`INSERT INTO facade_type_assignments(project_id,context_id,version,kind,observation_id,evidence_id,
+        original_version_id,binding_version,basis,author_id,reason)
+        SELECT c.project_id,c.id,1,'universal',f.id,o.evidence_id,o.version_id,1,'{}',u.id,'Synthetic stale type'
+        FROM facade_assessment_contexts c JOIN harness_package_facts f ON f.id=$2
+        JOIN reader_observations o ON o.id=f.id CROSS JOIN users u
+        WHERE c.project_id=$1 AND c.facade_id=$3 AND u.login='package-fixture'`,[walked.id,fact.id,result.candidates[0].id]);
+      assert.equal(stale.rowCount,1);
+      run();
+      const rebound=await until(()=>readPackageAnalysis(app.db,walked.id),({semanticChecks})=>semanticChecks.length===4,
+        'rebind leaves detected facade eligible for a new universal check');
+      assert.ok(rebound.semanticChecks.every(({jobId,facadeId})=>!currentIds.includes(jobId)&&facadeId===result.candidates[0].id));
+      assert.deepEqual(errors,[]);
+      assert.deepEqual(warnings,[]);
+    } finally {
+      driver.abort();
+      await worker;
+      delete process.env.FACADE_HARNESS_PACKAGE_WALK;
+      process.env.FACADE_HARNESS_REPLAY_ONLY='1';
+    }
+  });
+
+  if (walkOnly) return;
+
   const analyze = () => {
     assert.deepEqual(errors, []);
     assert.deepEqual(warnings, []);
@@ -416,75 +511,6 @@ test('ordinary intake publishes independent package evidence before questions an
   assert.equal(journal.rows[0].spend, 0);
   driver.abort();
   await worker;
-
-  await t.test('both branches revisit missed blocks without candidates and preserve their separate lineage',async()=>{
-    delete process.env.FACADE_HARNESS_REPLAY_ONLY;
-    process.env.FACADE_HARNESS_PACKAGE_WALK='1';
-    const walked=(await command('POST','/api/projects',{name:'Neutral walkthrough',mode:'intake'})).json();
-    for(const [routeId,purpose] of [['managed-a','primary_a'],['managed-b','primary_b']]){
-      await gateway.grantRoute({projectId:walked.id,routeId,revision:'fixture-v1',purpose,dataClass:'synthetic',allowed:true});
-    }
-    const incoming=(await command('POST',`/api/projects/${walked.id}/receipts`,{source:'upload'})).json();
-    const target=`/api/receipts/${incoming.receiptId}`;
-    const bytes=pdf([...Array.from({length:72},(_,row)=>'Record '+(row+1)),'Material Graphite | project facade ID: K-88'],
-      {size:3,leading:3.1,top:250});
-    walkOriginal=sha(bytes);
-    run();
-    try {
-      await upload('walk.pdf',bytes,target);
-      await command('POST',target+'/seal',{});
-      const result=await until(()=>readPackageAnalysis(app.db,walked.id),({facts,coverage})=>facts.length===2&&
-        coverage.structurallyReviewedWindows===1,'independent followup');
-      assert.deepEqual(result.facts.map(({branch,attribute,observation})=>[branch,attribute,observation.value]).sort(),
-        [['A','Material','Graphite'],['B','Material','Graphite']]);
-      const structure=result.windows[0].structure;
-      assert.equal(structure.blocks.flatMap(({lineIds})=>lineIds??[]).length,73);
-      assert.deepEqual(result.candidates.map(({label})=>label),['K-88']);
-      for(const [branch,purpose] of [['A','primary_a'],['B','primary_b']]){
-        assert.equal(structure.branches[branch].reviewed.length,4);
-        assert.equal(walkthrough.filter((check)=>check.branch===purpose&&check.child).length,3);
-      }
-      const count=await app.db.query(`SELECT count(*)::int AS count FROM harness_package_followups f
-        JOIN gateway_jobs j ON j.id=f.job_id WHERE j.project_id=$1`,[walked.id]);
-      assert.equal(count.rows[0].count,6);
-      await command('GET',`/api/v1/projects/${walked.id}/facade-assessment`,undefined);
-      const catalog=(await command('POST','/api/catalogs',{key:'walk-rd',name:'Walk RD',
-        defaultProfile:{stage:'RD',facadeKinds:['universal'],approvalReference:'synthetic fixture'},
-        requirements:[{key:'anchor-plan',part:'Anchor plan',level:'facade',formats:['pdf'],equivalents:[],
-          aliases:['Setting-out diagram'],applicability:'all',sourceRoles:['drawing'],completenessCriterion:'Addressed anchor plan',addressee:'customer'}],
-      })).json();
-      // Isolated scheduler fixture for an approved catalogue, before any facade type has been assigned.
-      await app.db.query(`UPDATE projects SET project_stage='RD',confirmed_facade_kinds=ARRAY['universal'],catalog_version_id=$2
-        WHERE id=$1`,[walked.id,catalog.id]);
-      const checked=await until(()=>readPackageAnalysis(app.db,walked.id),({semanticChecks})=>semanticChecks.length===2,'universal catalogue followup');
-      const ids=checked.semanticChecks.map(({jobId})=>jobId);
-      assert.ok(checked.semanticChecks.every(({primaryJobId,branch,disposition,facadeId})=>
-        primaryJobId===result.windows[0].branches[branch].jobId && disposition==='alternatives_checked'&&facadeId===result.candidates[0].id));
-      assert.equal((await app.db.query('SELECT count(*)::int AS count FROM facade_type_assignments WHERE project_id=$1',[walked.id])).rows[0].count,0);
-      driver.abort();
-      await worker;
-      await app.db.query("UPDATE projects SET project_stage='P' WHERE id=$1",[walked.id]);
-      await app.db.query("UPDATE projects SET project_stage='RD' WHERE id=$1",[walked.id]);
-      assert.equal((await readPackageAnalysis(app.db,walked.id)).semanticChecks.length,0);
-      run();
-      const updated=await until(()=>readPackageAnalysis(app.db,walked.id),({semanticChecks})=>semanticChecks.length===2,'stage rollback creates a fresh addressed check');
-      assert.ok(updated.semanticChecks.every(({jobId})=>!ids.includes(jobId)));
-      driver.abort();
-      await worker;
-      const fact=updated.facts[0];
-      await command('POST',`/api/projects/${walked.id}/package-facts/${fact.id}/binding`,{
-        state:'identified',candidateIds:[result.candidates[0].id],reason:'Engineer rechecked the printed facade designation.',
-      },{'if-match':'"1"'});
-      assert.equal((await readPackageAnalysis(app.db,walked.id)).semanticChecks.length,0);
-      assert.deepEqual(errors,[]);
-      assert.deepEqual(warnings,[]);
-    } finally {
-      driver.abort();
-      await worker;
-      delete process.env.FACADE_HARNESS_PACKAGE_WALK;
-      process.env.FACADE_HARNESS_REPLAY_ONLY='1';
-    }
-  });
 
   await t.test('addressed legacy transition preserves paid keys and unknown reserve under fair slot caps', async () => {
     const catalog = (await command('POST', '/api/catalogs', { key: 'legacy', name: 'Legacy',
