@@ -1,6 +1,6 @@
 import type { PoolClient } from "pg";
 import { invalid, unavailable } from "../access/errors.js";
-import type { Finding } from "../assessment/domain.js";
+import { requirementSubjectKey, type Finding } from "../assessment/domain.js";
 import { facadeEvidenceGroups } from "../assessment/facade-rule.js";
 import { getLockedFacadeContext, synchronizeFacadeAssessment } from "../assessment/facade-store.js";
 import type { Observation } from "../pdf/types.js";
@@ -80,15 +80,17 @@ export async function replaceFacadeSources(tx: PoolClient, input: {
         !hasAddressedSubject({ subject: fact.property!, property: fact.property! }, observation, deliveredLines(proof.content.text))))) {
       throw invalid("replacement_subject_unverified", "Новая опора должна содержать адрес и атрибут вопроса.");
     }
-    return { ...ref, address: citation.address, supplementIds, runId: observation.runId, branch: observation.branch, groups };
+    return { ...ref, address: citation.address, supplementIds, runId: observation.runId, branch: observation.branch, groups,
+      valueRole: finding.valueRole, variant: fact.variant ? requirementSubjectKey(fact.variant) : null };
   }
   const replacements: Awaited<ReturnType<typeof verify>>[] = [];
   const replaced: Awaited<ReturnType<typeof verify>>[] = [];
   for (const ref of selected) replacements.push(await verify(ref, true));
   for (const ref of retired) replaced.push(await verify(ref, false));
-  if (replaced.some(({ groups }) => groups.length && !groups.some((group) =>
-    replacements.some((item) => item.groups.includes(group))))) {
-    throw invalid("replacement_requirement_mismatch", "Новые опоры должны относиться к заменяемой части требования.");
+  if (replaced.some(({ groups, valueRole, variant }) => groups.length && !replacements.some((item) =>
+    groups.some((group) => item.groups.includes(group)) && (!valueRole || item.valueRole === valueRole) &&
+    (!variant || item.variant === variant)))) {
+    throw invalid("replacement_requirement_mismatch", "Новые опоры должны подтверждать заменяемую часть, назначение значения и вариант.");
   }
   const receiptIds = [...new Set(replacements.flatMap(({ supplementIds }) => supplementIds))].sort();
   for (const receiptId of receiptIds) {

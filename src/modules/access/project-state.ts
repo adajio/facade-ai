@@ -16,6 +16,7 @@ export interface Project {
   intakeMode: boolean;
   stage: string | null;
   confirmedFacadeKinds: string[];
+  facadeKindsFromAssignments: boolean;
   version: number;
 }
 
@@ -36,7 +37,8 @@ export interface Catalog {
 
 export const projectColumns = [
   'id', 'organization_id AS "organizationId"', 'name', 'catalog_version_id AS "catalogVersionId"',
-  'intake_mode AS "intakeMode"', 'project_stage AS stage', 'confirmed_facade_kinds AS "confirmedFacadeKinds"', 'version',
+  'intake_mode AS "intakeMode"', 'project_stage AS stage', 'confirmed_facade_kinds AS "confirmedFacadeKinds"',
+  'facade_kinds_from_assignments AS "facadeKindsFromAssignments"', 'version',
 ];
 export const catalogColumns = 'id, catalog_key AS key, name, revision, requirements';
 export const catalogProfileColumn = `CASE WHEN default_stage IS NOT NULL THEN jsonb_build_object(
@@ -177,6 +179,8 @@ export async function updateConfirmedFacadeKinds(tx: PoolClient, input: {
   expectedVersion: number;
   facadeKinds: readonly string[];
   actor: AccessActor;
+  advanceVersion?: boolean;
+  assignmentBased?: boolean;
 }): Promise<Project> {
   const { projectId, actor, expectedVersion } = input;
   const facadeKinds = facadeKindSet(input.facadeKinds);
@@ -193,15 +197,17 @@ export async function updateConfirmedFacadeKinds(tx: PoolClient, input: {
       currentVersion: project.version, href: versionHref(projectId),
     });
   }
-  if (JSON.stringify(project.confirmedFacadeKinds) === JSON.stringify(facadeKinds)) return project;
+  const assignmentBased = input.assignmentBased ?? false;
+  if (!input.advanceVersion && assignmentBased === project.facadeKindsFromAssignments &&
+      JSON.stringify(project.confirmedFacadeKinds) === JSON.stringify(facadeKinds)) return project;
   const { rows: [saved] } = await tx.query<Project>(
-    `UPDATE projects SET confirmed_facade_kinds = $2, version = version + 1
-     WHERE id = $1 RETURNING ${projectColumns.join(', ')}`, [project.id, facadeKinds],
+    `UPDATE projects SET confirmed_facade_kinds = $2, facade_kinds_from_assignments = $3, version = version + 1
+     WHERE id = $1 RETURNING ${projectColumns.join(', ')}`, [project.id, facadeKinds, assignmentBased],
   );
   await writeAudit(tx, {
     actorId: actor.userId, organizationId: actor.organizationId, projectId, role: actor.role,
     action: 'project.facade_kinds.confirm', objectId: projectId, version: saved.version, outcome: 'ok',
-    details: { previous: project.confirmedFacadeKinds, facadeKinds },
+    details: { previous: project.confirmedFacadeKinds, facadeKinds, assignmentBased },
   });
   return resolveDefault(tx, saved, scopes, actor);
 }

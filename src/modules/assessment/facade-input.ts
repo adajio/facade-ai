@@ -3,15 +3,17 @@ import { readPackageAnalysis, type PackageFact } from "../harness/package-analys
 import { deliveredLines } from "../questions/attribute-aliases.js";
 import { hasAddressedSubject } from "../questions/subject-evidence.js";
 import { canonicalJson, isInventoryRole } from "./domain.js";
-import type { Evidence, ReaderAddress } from "../pdf/types.js";
+import type { Evidence, ReaderAddress, ReaderLine } from "../pdf/types.js";
 import { exactDeliveryStatement, nonDeliveryFromOriginal, type FacadeFact, type FacadeReadout } from "./facade-model.js";
+import { indexSemanticInput } from "./facade-semantic.js";
 import type { Gate } from "./store.js";
-import { normalizeFormat } from "./store.js";
 
 type AcceptedVersion = { id: string; sha256: string; documentId: string; label: string };
 type Impact = { receiptId: string; questionId: string };
 type ConfirmedStage = { versionId: string; target: ReaderAddress | null; stage: string; evidenceId: string };
 type EvidenceMetadata = Pick<Evidence, "source" | "address" | "representation">;
+const typeAttribute = /^(?:тип фасада|facade (?:kind|type))$/iu;
+const typeClause = /^(?:тип фасада|facade (?:kind|type))\s*[:=–—]\s*([\p{L}\p{N}][\p{L}\p{N} _-]{0,99})\s*$/iu;
 type ReplacementReference = { observationId: string; evidenceId: string; versionId: string; address: Record<string, unknown> };
 export type FacadeReplacement = {
   id: string;
@@ -25,11 +27,11 @@ export type FacadeReplacement = {
 const completeBranch = (state: string) => state === "covered" || state === "reviewed_no_match";
 
 function convertFact(fact: PackageFact, accepted: Map<string, AcceptedVersion>, formats: Map<string, string>,
-  stages: Map<string, ConfirmedStage>, evidence: Map<string, EvidenceMetadata>, originalLines: Map<string, string | undefined>): FacadeFact | null {
+  stages: Map<string, ConfirmedStage>, evidence: Map<string, EvidenceMetadata>, original: ReaderLine[] | undefined): FacadeFact | null {
   const { source, quote, value, unit, evidenceId, receiptId, runId, lineId, address, components, deliveryStatement } = fact.observation;
-  const original = accepted.get(source.versionId);
+  const acceptedOriginal = accepted.get(source.versionId);
   const format = formats.get(fact.windowId);
-  if (!original || original.sha256 !== source.sha256 || original.documentId !== source.documentId || !format) return null;
+  if (!acceptedOriginal || acceptedOriginal.sha256 !== source.sha256 || acceptedOriginal.documentId !== source.documentId || !format) return null;
   const { state, candidates, actorId } = fact.binding;
   const anchored = Boolean(fact.binding.quote || actorId);
   const membership = state === "identified" && anchored && candidates.length ?
@@ -39,7 +41,7 @@ function convertFact(fact: PackageFact, accepted: Map<string, AcceptedVersion>, 
   const attribute = fact.attribute?.trim() || deliveryStatement?.item || null;
   const subjectVerified = attribute && !deliveryStatement && value != null && quote && lineId &&
     hasAddressedSubject({ subject: attribute, property: attribute }, fact.observation,
-      [{ id: lineId, text: quote, box: address.box, locator: address.locator }]);
+      original?.length ? original : [{ id: lineId, text: quote, box: address.box, locator: address.locator }]);
   const literal = attribute?.normalize("NFKC").trim().replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
   const anchoredPresence = literal && !deliveryStatement && value == null && quote &&
     fact.observation.grounding === "text" && !exactDeliveryStatement(quote, attribute!, "not_delivered") &&
@@ -47,8 +49,18 @@ function convertFact(fact: PackageFact, accepted: Map<string, AcceptedVersion>, 
   const evidenceBound = Boolean(quote) && fact.observation.grounding !== "limited" && !fact.observation.limitation &&
     Boolean(fact.basis.role) && Boolean(fact.basis.revision) && Boolean(deliveryStatement || subjectVerified || anchoredPresence);
   const active = evidenceBound && fact.sourceRole !== "unknown" && fact.revisionStatus === "current";
+  function contextAddress(evidenceId: string) {
+    const item = evidence.get(evidenceId);
+    return item?.source.versionId === source.versionId && item.source.sha256 === source.sha256 ? item.address : undefined;
+  }
+  const valueRoleProof = fact.basis.valueRole;
+  const rolePart = fact.basis.parts?.valueRole;
+  const roleAddress = rolePart ? contextAddress(rolePart.evidenceId) : address;
+  const roleQuote = rolePart?.quote ?? quote;
+  const valueRoleBasis = valueRoleProof?.quote && roleAddress && roleQuote?.includes(valueRoleProof.quote)
+    ? { ...valueRoleProof, evidenceId: rolePart?.evidenceId ?? evidenceId, address: { ...roleAddress } } : undefined;
   const literalInventory = active && fact.observation.grounding === "text" && Boolean(quote) && isInventoryRole(fact.sourceRole);
-  const originalLine = originalLines.get(fact.id);
+  const originalLine = original?.find(({ id }) => id === lineId)?.text;
   const absence = literalInventory && !fact.observation.alternatives?.length &&
     deliveryStatement?.status === "not_delivered" && nonDeliveryFromOriginal(quote!, originalLine, deliveryStatement.item);
   const positiveInOriginal = originalLine && deliveryStatement &&
@@ -64,8 +76,12 @@ function convertFact(fact: PackageFact, accepted: Map<string, AcceptedVersion>, 
     (!printedStage ? stages.get(canonicalJson([source.versionId, null])) : undefined);
   const receivedTitle = fact.basis.revisionEvidence;
   const title = receivedTitle && evidence.get(receivedTitle.evidenceId);
+  const revisionPart = fact.basis.parts?.revision;
+  const revisionPartAddress = revisionPart && contextAddress(revisionPart.evidenceId);
   const revisionBasis = title && title.source.versionId === source.versionId && title.source.sha256 === source.sha256 ?
     { evidenceId: receivedTitle!.evidenceId, address: title.address, quote: receivedTitle!.quote } :
+    revisionPart && revisionPartAddress && fact.basis.revision && revisionPart.quote.includes(fact.basis.revision) ?
+      { evidenceId: revisionPart.evidenceId, address: revisionPartAddress, quote: fact.basis.revision } :
     quote && fact.basis.revision && quote.includes(fact.basis.revision) ? { evidenceId, address, quote: fact.basis.revision } : null;
   return {
     membership,
@@ -82,16 +98,18 @@ function convertFact(fact: PackageFact, accepted: Map<string, AcceptedVersion>, 
       sourceRole: fact.sourceRole,
       format,
       representation: evidence.get(evidenceId)?.representation,
+      ...(valueRoleBasis ? { valueRole: valueRoleBasis.kind } : {}),
       comparisonKey: "",
       ...(absence ? { nonDelivery: { kind: "explicit_non_delivery", subjectQuote: deliveryStatement.item, questionId: "", receiptId } } : {}),
       citation: {
         observationId: fact.id, evidenceId, branch: fact.branch, receiptId, documentId: source.documentId,
-        versionId: source.versionId, sha256: source.sha256, address: { ...address }, label: original.label,
+        versionId: source.versionId, sha256: source.sha256, address: { ...address }, label: acceptedOriginal.label,
         quote: quote ?? "", value: value ?? null, unit: unit ?? null, href: fact.evidenceHref,
         ...(components ? { components } : {}),
         ...(deliveryStatement ? { deliveryStatement } : {}),
         ...(deliveryUncertainty ? { deliveryUncertainty } : {}),
         ...(confirmation ? { stageConfirmation: { stage: confirmation.stage, evidenceId: confirmation.evidenceId } } : {}),
+        ...(valueRoleBasis ? { valueRoleBasis } : {}),
         ...(fact.revision && revisionBasis ? { documentRevision: {
           label: fact.revision, ...revisionBasis, address: { ...revisionBasis.address },
         } } : {}),
@@ -100,16 +118,21 @@ function convertFact(fact: PackageFact, accepted: Map<string, AcceptedVersion>, 
   };
 }
 
-export function facadeObservation(fact: PackageFact) {
+function typeInLine(line: string) {
+  const found = new Set(line.split(/[|·;,\n]/u).flatMap((clause) => typeClause.exec(clause.trim())?.[1]?.trim() ?? []));
+  return found.size === 1 ? found.values().next().value! : null;
+}
+
+export function facadeObservation(fact: PackageFact, originalLine?: string) {
   const { observation, id, branch, attribute, sourceRole, designStage, revision, revisionStatus, basis, binding, evidenceHref } = fact;
   const quote = observation.quote ?? null;
-  const typeAttribute = /^(?:тип фасада|facade (?:kind|type))$/iu;
-  const typeClause = /^(?:тип фасада|facade (?:kind|type))\s*[:=–—]\s*([\p{L}\p{N}][\p{L}\p{N} _-]{0,99})\s*$/iu;
   const proposedFacadeKind = attribute && typeAttribute.test(attribute.trim()) && quote && basis.role &&
     binding.state === "identified" && revisionStatus !== "superseded" && observation.grounding === "text"
-    ? quote.split(/[|·;,\n]/u).flatMap((clause) => typeClause.exec(clause.trim())?.[1]?.trim() ?? [])[0] ?? null : null;
+    ? typeInLine(quote) : null;
+  const facadeKindSourceVerified = Boolean(proposedFacadeKind && originalLine && quote && originalLine.includes(quote) &&
+    typeInLine(originalLine) === proposedFacadeKind);
   return { id, branch, attribute, sourceRole, designStage, revision, revisionStatus, basis, binding, evidenceHref,
-    evidenceId: observation.evidenceId, proposedFacadeKind,
+    evidenceId: observation.evidenceId, proposedFacadeKind, facadeKindSourceVerified,
     receiptId: observation.receiptId, documentId: observation.source.documentId, versionId: observation.source.versionId,
     sha256: observation.source.sha256, address: observation.address, quote,
     value: observation.value ?? null, unit: observation.unit ?? null,
@@ -199,14 +222,16 @@ export async function readFacadeInput(tx: PoolClient, projectId: string) {
   const activeFacts = analysis.facts.filter(({ observation, windowId }) =>
     accepted.get(observation.source.versionId)?.sha256 === observation.source.sha256 && formats.has(windowId));
   const evidenceIds = [...new Set(activeFacts.flatMap(({ observation, basis }) =>
-    [observation.evidenceId, ...(basis.revisionEvidence ? [basis.revisionEvidence.evidenceId] : [])]))];
+    [observation.evidenceId, ...(basis.revisionEvidence ? [basis.revisionEvidence.evidenceId] : []),
+      ...Object.values(basis.parts ?? {}).map(({ evidenceId }) => evidenceId)]))];
   const evidenceRows = evidenceIds.length ? (await tx.query<{ id: string; payload: EvidenceMetadata }>(
     `SELECT id,payload FROM reader_evidence WHERE project_id=$1 AND id=ANY($2::uuid[])`, [projectId, evidenceIds],
   )).rows : [];
   const evidenceById = new Map(evidenceRows.map(({ id, payload }) => [id, payload]));
-  const statementIds = activeFacts.filter(({ observation }) => observation.deliveryStatement).map(({ id }) => id);
-  const { rows: statements } = statementIds.length ? await tx.query<{ id: string; lineId: string; content: string }>(
-    `SELECT o.id,o.payload->>'lineId' AS "lineId",issued.content FROM reader_observations o
+  const statementIds = activeFacts.filter(({ attribute, observation }) =>
+    observation.deliveryStatement || observation.components?.length || (attribute && typeAttribute.test(attribute.trim()))).map(({ id }) => id);
+  const { rows: statements } = statementIds.length ? await tx.query<{ id: string; content: string }>(
+    `SELECT o.id,issued.content FROM reader_observations o
        JOIN LATERAL (
          SELECT event#>>'{reply,body,content}' AS content FROM harness_research_events
          WHERE job_id=o.run_id AND event#>>'{reply,evidence,evidenceId}'=o.evidence_id::text
@@ -214,16 +239,15 @@ export async function readFacadeInput(tx: PoolClient, projectId: string) {
        ) issued ON true
      WHERE o.project_id=$1 AND o.id=ANY($2::uuid[]) AND o.payload->>'grounding'='text'`, [projectId, statementIds],
   ) : { rows: [] };
-  const originalLines = new Map(statements.map(({ id, lineId, content }) =>
-    [id, deliveredLines(content).find(({ id }) => id === lineId)?.text]));
-  const facts = activeFacts.flatMap((fact) => convertFact(fact, accepted, formats, stageByAddress, evidenceById, originalLines) ?? []);
-  const branchesWithFindings = new Set(activeFacts.map(({ windowId, branch }) => `${windowId}:${branch}`));
-  const unclassifiedFormats = new Set(windows.filter(({ id }) =>
-    !branchesWithFindings.has(`${id}:A`) || !branchesWithFindings.has(`${id}:B`)).map(({ format }) => normalizeFormat(format)));
+  const originalLines = new Map(statements.map(({ id, content }) => [id, deliveredLines(content)]));
+  const facts = activeFacts.flatMap((fact) => convertFact(fact, accepted, formats, stageByAddress, evidenceById,
+    originalLines.get(fact.id)) ?? []);
   const coveredWindows = windows.filter(({ branches }) => completeBranch(branches.A.status) &&
     completeBranch(branches.B.status) && branches.A.jobId && branches.B.jobId && branches.A.jobId !== branches.B.jobId);
   const mappedVersionIds = [...new Set(windows.map(({ place }) => place.source.versionId))].sort();
   const versionIds = versions.map(({ id }) => id);
+  const mapped = new Set(mappedVersionIds);
+  const semantic = indexSemanticInput(windows, analysis.semanticChecks ?? [], versionIds.filter((id) => !mapped.has(id)));
   const reading = windows.length > 0 && coveredWindows.length === windows.length &&
     canonicalJson(mappedVersionIds) === canonicalJson(versionIds) ?
     { versionIds, basisIds: coveredWindows.flatMap(({ branches }) => [branches.A.jobId!, branches.B.jobId!]).sort() } : null;
@@ -236,7 +260,9 @@ export async function readFacadeInput(tx: PoolClient, projectId: string) {
     pairs: analysis.verifiedPairs,
     reading,
   };
-  return { intake, versionIds, evidence, impacts, replacements, holds, unclassifiedFormats,
-    observations: activeFacts.map(facadeObservation), activeWindows: windows.length,
+  return { intake, versionIds, evidence, impacts, replacements, holds, semantic,
+    observations: activeFacts.map((fact) => facadeObservation(fact,
+      originalLines.get(fact.id)?.find(({ id }) => id === fact.observation.lineId)?.text)), activeWindows: windows.length,
+    structurallyReviewedWindows: windows.filter(({ structure }) => structure?.branches.A.complete && structure.branches.B.complete).length,
     completedWindows: coveredWindows.length };
 }

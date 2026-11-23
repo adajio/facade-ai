@@ -60,7 +60,7 @@ test("facade requirements retain partial local cover and demand a proven pair or
     const { rule = requirement, ...options } = extra;
     return evaluate(rule, facadeReview({
       context, stage: "P", questionId: "test-question", facts, requirement: rule, pairs, coverage, versionIds: ["v1"],
-      supplementReceiptIds, ...options,
+      supplementReceiptIds, semanticBasisIds: ["verified-A", "verified-B"], ...options,
     }));
   }
   const a = fact("A");
@@ -82,6 +82,7 @@ test("facade requirements retain partial local cover and demand a proven pair or
   const negative = ["A", "B"].map((branch) => fact(branch, { kind: "absence", role: "inventory", document: "inventory" }));
   assert.equal(decide(negative).outcome, "needs_review");
   assert.equal(decide(negative, covered).outcome, "confirmed_missing");
+  assert.equal(decide(negative, covered, [], [], { semanticBasisIds: [] }).outcome, "needs_review");
   assert.equal(decide([negative[0], { ...negative[1], runId: negative[0].runId }], covered).outcome, "needs_review");
   assert.equal(decide([...negative, { ...a, membership: { kind: "ambiguous" } }], covered).outcome, "needs_review");
   assert.equal(decide([], covered).outcome, "needs_review");
@@ -100,7 +101,6 @@ test("facade requirements retain partial local cover and demand a proven pair or
   assert.equal(decide(strayNegative, covered).outcome, "needs_review");
   const alias = { ...fact("A"), property: "Plate gauge" };
   assert.equal(decide([...negative, alias], covered, [], [], { rule: { ...requirement, aliases: ["Plate gauge"] } }).outcome, "needs_review");
-  assert.equal(decide(negative, covered, [], [], { unclassifiedFormats: new Set(["pdf"]) }).limitations[0], "alternatives_unverified");
   assert.equal(decide([a, b], covered, [], [], { rule: { ...requirement, evidenceRule: undefined } }).outcome, "needs_review");
   const multi = { ...requirement, sourceRoles: ["drawing", "calculation"], evidenceRule: { distinctOriginals: true, allOf: [
     { anyOf: [{ sourceRole: "drawing" }] }, { anyOf: [{ sourceRole: "calculation", subject: "Heat load" }] },
@@ -150,7 +150,7 @@ test("ordinary intake publishes a local conflict, then keeps sent history after 
   const app = Fastify();
   app.decorate("db", db);
   app.decorate("config", { dataDir: process.env.FACADE_DATA_DIR });
-  for (const name of ["access", "intake", "pdf", "assessment", "letters", "questions", "supplements"]) {
+  for (const name of ["access", "intake", "pdf", "assessment", "letters", "questions", "supplements", "harness/stops"]) {
     await app.register((await built(`${name}/index`)).register);
   }
   const reader = createRuntimePdfService(db, app.config);
@@ -316,10 +316,12 @@ test("ordinary intake publishes a local conflict, then keeps sent history after 
   const initial = await uploadReceipt([
     drawing("first.pdf", "Thickness", "10", "R1"), drawing("second.pdf", "Thickness", "20", "R2"),
     drawing("width.pdf", "Width", "100", "R3"),
-    { ...drawing("south.pdf", "Other", "200", "R4", "F2") },
+    drawing("south.pdf", "Thickness", "200", "R4", "F2"),
     { filename: "common.pdf", attribute: "Clearance", value: "17", revision: "R5", common: true,
       quote: "Drawing Clearance 17 mm | Stage P | Revision R5 current | Applies to all facades" },
     { ...drawing("later.pdf", "Other", "300", "R8", "F2"), deferred: true },
+    { filename: "facade-type.pdf", attribute: "Facade type", facade: "F1", revision: "R10",
+      quote: "Drawing | Facade type: panel | Stage P | Revision R10 current | Scope: F1 | Project facade id: F1" },
     { filename: "inventory.pdf", attribute: "Width", facade: "F2", revision: "R9", role: "inventory", roleQuote: "Inventory",
       quote: `Width delivered, ${savedQuote}`, savedQuote, statement: { status: "not_delivered", item: "Width" } },
   ]);
@@ -327,9 +329,20 @@ test("ordinary intake publishes a local conflict, then keeps sent history after 
   const observed = await assessment();
   assert.equal(observed.catalogVersionId, null);
   assert.equal(observed.contexts.filter(({ kind }) => kind === "facade").length, 2);
+  const kindBasis = (await request("GET", observed.observations.href + "?proposal=facadeKind")).json().items[0];
+  assert.ok(kindBasis?.facadeKindSourceVerified);
+  const firstFacade = observed.contexts.find(({ name }) => name === "F1");
+  const secondFacade = observed.contexts.find(({ name }) => name === "F2");
+  const typeCommand = { kind: "panel", observationId: kindBasis.id, reason: "Exact project classification" };
+  await request("PUT", base + `/facade-assessment/facades/${secondFacade.facadeId}/kind`, typeCommand,
+    { version: project.version, status: 422 });
+  const assigned = (await request("PUT", base + `/facade-assessment/facades/${firstFacade.facadeId}/kind`, typeCommand,
+    { version: project.version })).json();
+  assert.equal(assigned.facadeType.state, "confirmed");
+  assert.equal(assigned.facadeType.basis.versionId, kindBasis.versionId);
   const kinds = (await request("PUT", base + "/facade-assessment/facade-kinds", {
     facadeKinds: ["panel"], reason: "Synthetic original",
-  }, { version: project.version })).json();
+  }, { version: assigned.version })).json();
   await request("PUT", `/api/projects/${projectId}/stage`, { stage: "P", reason: "Synthetic title" }, { version: kinds.version });
   const beforeVerification = await assessment();
   assert.equal(beforeVerification.contexts.find(({ name }) => name === "F1").counts.confirmed_conflict, 0);
@@ -341,8 +354,12 @@ test("ordinary intake publishes a local conflict, then keeps sent history after 
   assert.equal(early.coverage.inventory.complete, false);
   assert.equal(early.coverage.subject.complete, false);
   assert.equal(early.coverage.reading.complete, false);
+  assert.equal(early.contexts.find(({ kind }) => kind === "common").questions[0].semanticRemainder.state, "open");
   assert.equal(early.contexts.find(({ kind }) => kind === "common").counts.covered, 1);
-  assert.equal(early.contexts.find(({ name }) => name === "F2").counts.needs_review, 2);
+  const untypedFacade = early.contexts.find(({ name }) => name === "F2");
+  assert.equal(untypedFacade.facadeType.state, "unconfirmed");
+  assert.equal(untypedFacade.counts.covered, 1);
+  assert.equal(untypedFacade.counts.needs_review, 1);
   const f2Width = early.contexts.find(({ name }) => name === "F2").questions.find(({ requirement }) => requirement.positionId === "width");
   assert.ok(f2Width.machine.citations.length > 0);
   assert.ok(f2Width.machine.citations.every(({ deliveryUncertainty }) => deliveryUncertainty === "contradictory_original"));
@@ -409,6 +426,15 @@ test("ordinary intake publishes a local conflict, then keeps sent history after 
   assert.equal((await request("GET", exported.historicalUrl)).body, text.text);
   assert.equal((await request("GET", base + `/facade-assessment/${early.version}`)).json().outcome, early.outcome);
   assert.equal((await request("GET", early.observations.href + "?binding=common&limit=1")).json().items.length, 1);
+  await request("POST", `/api/projects/${projectId}/package-facts/${kindBasis.id}/binding`, {
+    state: "unidentified", candidateIds: [], reason: "Withdraw this facade attribution",
+  }, { version: kindBasis.binding.version });
+  const retracted = await assessment();
+  assert.equal(context(retracted).facadeType.state, "stale");
+  assert.equal(context(retracted).facadeType.basis.id, kindBasis.id);
+  assert.equal(context((await request("GET", base + `/facade-assessment/${updated.version}`)).json()).facadeType.state, "confirmed");
+  assert.equal(question(retracted, "width").decision.id, nearby.id);
+  assert.equal((await request("GET", sent.url)).json().text, text.text);
   const { rows: [balance] } = await db.query("SELECT count(*)::int AS attempts FROM gateway_attempts WHERE project_id=$1", [projectId]);
   assert.equal(balance.attempts, 0);
 

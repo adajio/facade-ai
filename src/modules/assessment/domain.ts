@@ -1,5 +1,5 @@
 import type { DeliveryStatement, ReaderObservationComponent } from "../pdf/types.js";
-import type { CatalogEvidenceRule } from "../access/input.js";
+import type { CatalogComparisonRule, CatalogEvidenceRule, ValueRole } from "../access/input.js";
 
 export type Outcome =
   | "covered"
@@ -22,6 +22,8 @@ export type Requirement = {
   subject: string;
   aliases?: string[];
   evidenceRule?: CatalogEvidenceRule;
+  facadeKinds?: string[];
+  comparison?: CatalogComparisonRule;
   part: string;
   formats: string[];
   requiredFormats: string[];
@@ -59,6 +61,7 @@ export type Citation = {
   documentRevision?: DocumentRevision;
   verifiedRevision?: string;
   stageConfirmation?: { stage: string; evidenceId: string };
+  valueRoleBasis?: { kind: ValueRole; quote: string; evidenceId: string; address: Record<string, unknown> };
   components?: ReaderObservationComponent[];
 };
 
@@ -77,6 +80,7 @@ export type Finding = {
   format: string;
   comparisonKey: string;
   representation?: "native" | "ocr" | "render";
+  valueRole?: ValueRole;
   nonDelivery?: NonDeliveryStatement;
 };
 
@@ -89,6 +93,7 @@ export type InventoryProof = {
   observationIds?: string[];
   researchInputGeneration?: string;
   materials?: string[];
+  semanticBasisIds?: string[];
 };
 
 export const pairProofVersion = 2;

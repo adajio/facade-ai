@@ -10,6 +10,7 @@ import { object } from "../access/input.js";
 import { lockIntakeProject } from "../intake/gate.js";
 import { recordDecision } from "./commands.js";
 import { facadeAssessmentHref, getLockedFacadeContext, readFacadeObservationPage, readFacadeSnapshot, synchronizeFacadeAssessment } from "./facade-store.js";
+import { recordFacadeType } from "./facade-types.js";
 import { identifier, parseConclusion, parseDecision, shortText, versionNumber } from "./inputs.js";
 import {
   AssessmentError, announceAssessment, assertAvailable, assessmentHref, getLockedGate, getQuestions, invalidInput,
@@ -140,7 +141,8 @@ function registerRoutes(app: FastifyInstance, prefix: string) {
     }, async (tx, actor) => {
       if (evidenceIds.length) {
         const current = await synchronizeFacadeAssessment(tx, projectId);
-        const basis = new Map(current.input.observations.filter(({ proposedFacadeKind }) => proposedFacadeKind)
+        const basis = new Map(current.input.observations.filter(({ proposedFacadeKind, facadeKindSourceVerified, revisionStatus }) =>
+          proposedFacadeKind && facadeKindSourceVerified && revisionStatus === "current")
           .map(({ evidenceId, proposedFacadeKind }) => [evidenceId, proposedFacadeKind!]));
         if (evidenceIds.some((id) => !facadeKinds.includes(basis.get(id) ?? ""))) {
           invalidInput("Опора не подтверждает выбранный тип фасада в текущем комплекте.");
@@ -149,6 +151,46 @@ function registerRoutes(app: FastifyInstance, prefix: string) {
       const body = await updateConfirmedFacadeKinds(tx, { projectId, expectedVersion, facadeKinds, actor });
       await synchronizeFacadeAssessment(tx, projectId);
       return { body, audit: { objectId: projectId, version: body.version, details: { facadeKinds, reason, evidenceIds } } };
+    });
+    if (result.replayed) reply.header("Idempotency-Replayed", "true");
+    return reply.code(result.status).header("ETag", `"${result.body.version}"`).send(result.body);
+  });
+
+  app.put<{ Params: Project & { facadeId: string } }>(`${facadePath}/facades/:facadeId/kind`, async (request, reply) => {
+    const projectId = identifier(request.params.projectId);
+    const facadeId = identifier(request.params.facadeId);
+    const input = object(request.body);
+    if (Object.keys(input).some((key) => !["kind", "observationId", "reason"].includes(key))) invalidInput("Передано неизвестное поле.");
+    const kind = shortText(input.kind, 100);
+    const observationId = identifier(input.observationId);
+    const reason = shortText(input.reason, 2000);
+    let project: Awaited<ReturnType<typeof getProject>>;
+    const result = await executeCommand(db, request, {
+      operation: "assessment.confirm_facade_type",
+      requirement: { action: "project:engineer", projectId },
+      input: { facadeId, kind, observationId, reason },
+      async version(tx) {
+        await lockIntakeProject(tx, projectId);
+        project = await getProject(tx, projectId);
+        return { current: project.version, href: `/api/projects/${projectId}` };
+      },
+    }, async (tx, actor) => {
+      const current = await synchronizeFacadeAssessment(tx, projectId);
+      const facade = current.active.find(({ context }) => context.facadeId === facadeId)?.context;
+      if (!facade) throw new AssessmentError(404, "facade_not_found", "Фасад недоступен в текущей оценке.");
+      await recordFacadeType(tx, { projectId, contextId: facade.id, facadeId, kind, reason, actorId: actor.userId,
+        stage: project.stage, fact: current.input.observations.find(({ id }) => id === observationId) });
+
+      const types = current.active.filter(({ context }) => context.facadeId).map(({ context }) =>
+        context.facadeId === facadeId ? kind : context.facadeType?.state === "confirmed" ? context.facadeType.kind : null);
+      const allConfirmed = !types.includes(null);
+      const facadeKinds = allConfirmed ? types.filter((type): type is string => type !== null) : project.confirmedFacadeKinds;
+      const saved = await updateConfirmedFacadeKinds(tx, { projectId, expectedVersion: project.version, facadeKinds, actor,
+        advanceVersion: true, assignmentBased: allConfirmed || project.facadeKindsFromAssignments });
+      const updated = await synchronizeFacadeAssessment(tx, projectId);
+      const facadeType = updated.active.find(({ context }) => context.facadeId === facadeId)?.context.facadeType;
+      const body = { facadeId, assessmentContextId: facade.id, facadeType, version: saved.version, assessmentVersion: updated.version };
+      return { body, audit: { objectId: facade.id, version: saved.version, details: { facadeId, kind, observationId, reason } } };
     });
     if (result.replayed) reply.header("Idempotency-Replayed", "true");
     return reply.code(result.status).header("ETag", `"${result.body.version}"`).send(result.body);

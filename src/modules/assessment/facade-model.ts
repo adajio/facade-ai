@@ -1,9 +1,11 @@
 import type { CatalogRequirement } from "../access/input.js";
+import { allowsCatalogPair, comparisonSource } from "../access/catalog-comparison.js";
 import {
   canonicalJson, isInventoryRole, matchesRequirementSubject, pairProofVersion, requirementSubjectKey,
   type Finding, type Requirement, type Review, type VerifiedPairEvidence,
 } from "./domain.js";
 import { approvedEvidenceSubjects, facadeEvidenceGroups, proveFacadeRule } from "./facade-rule.js";
+import type { FacadeType } from "./facade-types.js";
 import { catalogRequirement, normalizeFormat } from "./store.js";
 
 export type FacadeCandidate = { id: string; label: string };
@@ -47,6 +49,7 @@ export type FacadeContext = {
   kind: "facade" | "common";
   facadeId: string | null;
   name: string;
+  facadeType?: FacadeType;
 };
 
 const normalize = (value: string) => value.normalize("NFKC").toLowerCase().trim().replace(/\s+/gu, " ");
@@ -78,8 +81,11 @@ export function requirementsFor(rows: CatalogRequirement[], context: FacadeConte
     const rule = normalize(row.applicability);
     const expectedStage = rule.startsWith("stage:") ? rule.slice("stage:".length).trim() : null;
     if (stage && expectedStage && normalize(stage) !== expectedStage) return [];
+    const confirmedKind = context.facadeType?.state === "confirmed" ? context.facadeType.kind : null;
+    if (row.facadeKinds?.length && confirmedKind && !row.facadeKinds.some((kind) => normalize(kind) === normalize(confirmedKind))) return [];
     const unconditional = ["all", "applicable", "*", "все", "для всех", "все фасады"].includes(rule);
-    return [catalogRequirement(row, stage && (unconditional || expectedStage) ? "applicable" : "unknown")];
+    const applies = stage && (unconditional || expectedStage) && (!row.facadeKinds?.length || confirmedKind);
+    return [catalogRequirement(row, applies ? "applicable" : "unknown")];
   });
 }
 
@@ -100,7 +106,7 @@ export function facadeReview(options: {
   versionIds: string[];
   supplementReceiptIds: string[];
   knownSubjectKeys?: ReadonlySet<string>;
-  unclassifiedFormats?: ReadonlySet<string>;
+  semanticBasisIds?: readonly string[];
 }): Review {
   const { questionId, context, stage, requirement, facts, pairs, coverage, versionIds, supplementReceiptIds } = options;
   const sameStage = facts.filter((fact) => !(stage && fact.stage && normalize(stage) !== normalize(fact.stage)));
@@ -114,14 +120,14 @@ export function facadeReview(options: {
   const scoped = relevant.filter((fact) => inFacadeContext(fact, context) &&
     (fact.finding.sourceRole === "unknown" || requirement.sourceRoles.includes(fact.finding.sourceRole) ||
       isInventoryRole(fact.finding.sourceRole) && Boolean(fact.finding.citation.deliveryStatement)));
-  const comparisonKey = (property: string | null, variant: string | null) => canonicalJson([context.id, requirement.positionId,
+  const comparisonKey = (property: string | null, variant: string | null, valueRole: Finding["valueRole"]) => canonicalJson([context.id, requirement.positionId,
     variant && normalize(variant), property && matchesRequirementSubject(requirement, property) ? requirementSubjectKey(requirement.part) :
-      requirementSubjectKey(property ?? "")]);
+      requirementSubjectKey(property ?? ""), ...(valueRole ? [valueRole] : [])]);
   let findings: Finding[] = scoped.map(({ finding, variant, stage: sourceStage, property }) => ({
     ...finding,
     ...(finding.nonDelivery ? { nonDelivery: { ...finding.nonDelivery, questionId } } : {}),
     format: normalizeFormat(finding.format),
-    comparisonKey: comparisonKey(property, variant),
+    comparisonKey: comparisonKey(property, variant, finding.valueRole),
     applicability: finding.applicability === "active" && sourceStage != null && stage != null &&
       normalize(sourceStage) === normalize(stage) ? "active" as const :
       finding.applicability === "superseded" ? "superseded" as const : "unknown" as const,
@@ -145,8 +151,7 @@ export function facadeReview(options: {
       (!fact.property || [fact.property, ...fact.materials ?? []]
         .some((subject) => !options.knownSubjectKeys?.has(requirementSubjectKey(subject))));
   });
-  const alternativesOpen = positiveOrUncertain || plausibleUnknown ||
-    requirement.formats.some((format) => options.unclassifiedFormats?.has(format));
+  const alternativesOpen = positiveOrUncertain || plausibleUnknown;
   const complete = Object.values(coverage).every(({ complete }) => complete);
   const absence = findings.filter(({ kind, applicability, sourceRole, citation, nonDelivery }) =>
     kind === "absence" && applicability === "active" && isInventoryRole(sourceRole) &&
@@ -162,7 +167,7 @@ export function facadeReview(options: {
   const verifiedAbsences = [...negativeByPlace.values()].flatMap((group) => group.some(({ citation: a }) => a.branch === "A" &&
     group.some(({ citation: b }) => b.branch === "B" && byId.get(a.observationId)?.runId !== byId.get(b.observationId)?.runId))
     ? group : []);
-  const inventory = complete && requirement.evidenceRule && !alternativesOpen && verifiedAbsences.length ? {
+  const inventory = complete && options.semanticBasisIds?.length && requirement.evidenceRule && !alternativesOpen && verifiedAbsences.length ? {
     assessmentId: questionId,
     kind: "explicit_non_delivery" as const,
     receiptIds: [...new Set(verifiedAbsences.map(({ citation }) => citation.receiptId))].sort(),
@@ -170,6 +175,7 @@ export function facadeReview(options: {
     materials: [...versionIds].sort(),
     currentCompositionChecked: true,
     alternativesChecked: true,
+    semanticBasisIds: [...options.semanticBasisIds],
   } : undefined;
 
   const activated = new Map<string, Finding>();
@@ -190,16 +196,20 @@ export function facadeReview(options: {
       if (!finding || finding.kind !== "value" || finding.applicability === "superseded" ||
           (finding.applicability !== "active" && !fact.addressedValue) ||
           !requirement.sourceRoles.includes(finding.sourceRole) || !requirement.formats.includes(finding.format)) return;
-      return { ...finding, applicability: "active", comparisonKey: comparisonKey(fact.property, proof.variant),
+      return { ...finding, applicability: "active", comparisonKey: comparisonKey(fact.property, proof.variant, finding.valueRole),
         citation: { ...finding.citation, verifiedRevision: revision } };
     };
     const leftFinding = prepare(left, a, proof.revisionA);
     const rightFinding = prepare(right, b, proof.revisionB);
-    if (!leftFinding || !rightFinding || leftFinding.comparisonKey !== rightFinding.comparisonKey) return [];
+    if (!leftFinding || !rightFinding || leftFinding.comparisonKey !== rightFinding.comparisonKey ||
+        !allowsCatalogPair(requirement.comparison, leftFinding, rightFinding)) return [];
+    const priority = comparisonSource(requirement.comparison, leftFinding)?.priority;
+    if (priority !== undefined && findings.some((finding) => finding.kind === "value" && finding.applicability === "active" &&
+      finding.comparisonKey === leftFinding.comparisonKey && (comparisonSource(requirement.comparison, finding)?.priority ?? -1) > priority)) return [];
     if (requirement.evidenceRule) {
       const leftGroups = facadeEvidenceGroups(requirement, left, leftFinding, true);
       const rightGroups = facadeEvidenceGroups(requirement, right, rightFinding, true);
-      if (!leftGroups.some((group) => rightGroups.includes(group))) return [];
+      if (requirement.comparison ? !leftGroups.length || !rightGroups.length : !leftGroups.some((group) => rightGroups.includes(group))) return [];
     }
     activated.set(a, leftFinding);
     activated.set(b, rightFinding);
@@ -216,7 +226,7 @@ export function facadeReview(options: {
     completenessChecked: localChecked,
     remaining: localChecked ? [] : [!requirement.evidenceRule ? "catalog_evidence_rule_unset" :
       findings.some(({ citation }) => citation.deliveryUncertainty === "contradictory_original") ? "delivery_statement_conflict" :
-      verifiedAbsences.length && alternativesOpen ? "alternatives_unverified" : "required_evidence_incomplete"],
+      verifiedAbsences.length && (alternativesOpen || !options.semanticBasisIds?.length) ? "alternatives_unverified" : "required_evidence_incomplete"],
     ...(inventory ? { inventory } : {}),
     confirmedPairs,
     requireVerifiedPairs: true,

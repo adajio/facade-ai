@@ -211,6 +211,8 @@ export function catalogRequirement(row: CatalogRequirement, applies: Requirement
     subject: row.part,
     ...(row.aliases?.length ? { aliases: row.aliases } : {}),
     ...(row.evidenceRule ? { evidenceRule: row.evidenceRule } : {}),
+    ...(row.facadeKinds ? { facadeKinds: row.facadeKinds } : {}),
+    ...(row.comparison ? { comparison: row.comparison } : {}),
     part: row.part,
     formats: [...new Set([...row.formats, ...row.equivalents].map(normalizeFormat))].sort(),
     requiredFormats: [...new Set(row.formats.map(normalizeFormat))].sort(),
