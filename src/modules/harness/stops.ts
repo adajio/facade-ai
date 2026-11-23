@@ -2,6 +2,7 @@ import type { FastifyInstance } from 'fastify';
 import type { Pool } from 'pg';
 import { AccessError, executeCommand, requireAccess } from '../access/index.js';
 import type { WorkQueue } from '../gateway/queue.js';
+import { packageResumeWaitingSlot } from '../gateway/package-slots.js';
 import { transaction } from '../gateway/types.js';
 import { lockIntakeProject } from '../intake/gate.js';
 import { isReaderId } from '../pdf/service.js';
@@ -20,7 +21,8 @@ export async function resumeResearchStops(db: Pool, queue: Pick<WorkQueue, 'resu
        JOIN gateway_generations g USING(generation_id)
        WHERE s.resume_requested_at IS NOT NULL AND j.state='held' AND j.reason=ANY($1::text[]) AND g.current AND ${latest}
        AND NOT EXISTS (SELECT 1 FROM gateway_attempts a WHERE a.job_id=j.id AND a.state IN ('sending','unknown'))
-       ORDER BY s.resume_requested_at,s.id LIMIT 1 FOR UPDATE OF s SKIP LOCKED`, [reasons]);
+       AND NOT EXISTS (SELECT 1 FROM gateway_outbox e WHERE e.job_id=j.id AND e.lease_epoch=j.lease_epoch AND e.event_type=$2)
+       ORDER BY s.resume_requested_at,s.id LIMIT 1 FOR UPDATE OF s SKIP LOCKED`, [reasons, packageResumeWaitingSlot]);
     return row ? queue.resume(row.job_id, reasons) : false;
   });
 }

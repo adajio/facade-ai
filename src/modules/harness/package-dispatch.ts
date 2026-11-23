@@ -1,6 +1,9 @@
 import { randomUUID } from 'node:crypto';
 import type { Pool, PoolClient } from 'pg';
 import type { WorkQueue } from '../gateway/queue.js';
+import { currentPackagePrimary, currentPackageSource as currentSource, currentPackageWindows as selectedWindows,
+  lockPackagePrimarySlots, packagePrimaryGlobalLimit, packagePrimaryProjectLimit,
+  packageResumeWaitingSlot, runnablePackagePrimary } from '../gateway/package-slots.js';
 import { hash, transaction } from '../gateway/types.js';
 import type { ResearchAdmission } from '../gateway/gateway.js';
 import { lockIntakeProject } from '../intake/gate.js';
@@ -14,8 +17,6 @@ import { packageFollowupKind } from './package-walk.js';
 import { researchKind } from './runner.js';
 
 const branches = ['A', 'B'] as const;
-const projectLimit = 8;
-const globalLimit = 96;
 const mapContract = 'overlapping-windows-v1';
 const readingContract = 'package-primary-v1';
 
@@ -121,18 +122,6 @@ export async function preparePackageMap(
   return true;
 }
 
-const currentSource = `EXISTS (
-  SELECT 1 FROM intake_occurrences o WHERE o.project_id=w.project_id AND o.version_id=w.version_id AND o.state='accepted'
-) AND NOT EXISTS (
-  SELECT 1 FROM intake_document_versions v JOIN intake_occurrences o ON o.project_id=v.project_id
-    AND o.version_id=v.id AND o.state='accepted'
-  WHERE v.project_id=w.project_id AND v.replaces_version_id=w.version_id
-)`;
-const selectedWindows = `harness_package_windows w JOIN harness_package_maps m
-  ON m.version_id=w.version_id AND m.fingerprint=w.map_fingerprint AND m.active`;
-const activeJobs = `harness_package_branches b JOIN ${selectedWindows} ON w.id=b.window_id
-  JOIN gateway_jobs j ON j.id=b.job_id AND j.state<>'done' WHERE b.active AND ${currentSource}`;
-
 async function priorEffect(tx: PoolClient, projectId: string, place: Place, branch: Branch, readerVersion: string, jobId?: string, rootJobId?: string) {
   const { rows: [prior] } = await tx.query<{ job_id: string }>(
     `SELECT a.job_id FROM gateway_jobs j JOIN gateway_attempts a ON a.job_id=j.id
@@ -151,7 +140,7 @@ export async function dispatchPackagePair(db: Pool, queue: WorkQueue, profile: R
   if (!profile.A || !profile.B) return false;
   return transaction(db, async (tx) => {
     // Serialize the slot decision. Reader and sender locks always follow the project lock.
-    await tx.query("SELECT pg_advisory_xact_lock(hashtextextended('facade/package-dispatch',0))");
+    await lockPackagePrimarySlots(tx);
     const { rows: routes } = await tx.query<{ id: string; revision: string }>(
       'SELECT id,revision FROM gateway_routes WHERE enabled AND id=ANY($1::text[])',
       [[profile.A!.routeId, profile.B!.routeId]]);
@@ -176,8 +165,21 @@ export async function dispatchPackagePair(db: Pool, queue: WorkQueue, profile: R
       return true;
     }
     const { rows: [{ count }] } = await tx.query<{ count: number }>(
-      `SELECT count(*)::int AS count FROM ${activeJobs}`);
-    if (count > globalLimit - 2) return false;
+      `SELECT count(*)::int AS count FROM ${runnablePackagePrimary}`);
+    if (count >= packagePrimaryGlobalLimit) return false;
+    const { rows: [waiting] } = await tx.query<{ id: string; project_id: string; reason: string | null }>(
+      `SELECT target.id,target.project_id,target.reason FROM (
+         SELECT j.id,j.project_id,j.reason,j.created_at FROM ${currentPackagePrimary} AND j.state='held'
+         AND EXISTS(SELECT 1 FROM gateway_outbox e WHERE e.job_id=j.id AND e.lease_epoch=j.lease_epoch AND e.event_type=$1)
+         AND NOT EXISTS(SELECT 1 FROM gateway_attempts a WHERE a.job_id=j.id AND a.state IN ('sending','unknown'))
+       ) target WHERE (SELECT count(*) FROM ${runnablePackagePrimary} AND w.project_id=target.project_id)<$2
+       ORDER BY (SELECT last_turn FROM harness_package_projects p WHERE p.project_id=target.project_id),target.created_at,target.id LIMIT 1`,
+      [packageResumeWaitingSlot, packagePrimaryProjectLimit]);
+    if (waiting && await queue.resume(waiting.id, waiting.reason ? [waiting.reason] : undefined, tx)) {
+      await tx.query("UPDATE harness_package_projects SET last_turn=nextval('harness_package_turn') WHERE project_id=$1", [waiting.project_id]);
+      return true;
+    }
+    if (count > packagePrimaryGlobalLimit - 2) return false;
     const { rows: [next] } = await tx.query<{
       projectId: string; generationId: string; windowId: string; place: Place; readerVersion: string; walkDefault: boolean;
     }>(
@@ -194,13 +196,13 @@ export async function dispatchPackagePair(db: Pool, queue: WorkQueue, profile: R
                    AND a.state IN ('reserved','prepared','sending','unknown','paid'))))<2
          ORDER BY w.version_id,w.ordinal LIMIT 1
        ) candidate ON true
-       WHERE (SELECT count(*) FROM ${activeJobs} AND w.project_id=p.project_id)<=$1-2
+       WHERE (SELECT count(*) FROM ${runnablePackagePrimary} AND w.project_id=p.project_id)<=$1-2
          AND (SELECT count(*) FROM gateway_grants g JOIN gateway_routes r ON r.id=g.route_id AND r.revision=g.revision AND r.enabled
               WHERE g.project_id=p.project_id AND g.allowed AND
               ((g.route_id=$2 AND g.data_class=$3 AND g.purpose='primary_a') OR
                (g.route_id=$4 AND g.data_class=$5 AND g.purpose='primary_b')))=2
        ORDER BY p.last_turn,p.project_id LIMIT 1`,
-      [projectLimit, profile.A!.routeId, profile.A!.dataClass, profile.B!.routeId, profile.B!.dataClass]);
+      [packagePrimaryProjectLimit, profile.A!.routeId, profile.A!.dataClass, profile.B!.routeId, profile.B!.dataClass]);
     if (!next) return false;
     await lockIntakeProject(tx, next.projectId);
     // A blocked sibling can be issued later, after a worker's option changes.

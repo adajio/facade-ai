@@ -3,6 +3,8 @@ import {
   encode, GatewayError, hash, positiveInteger, transaction,
   type EnqueueInput, type QueueTarget, type Lease, type Obligation, type PrimaryResult, type Purpose,
 } from './types.js';
+import { currentPackagePrimary, lockPackagePrimarySlots, packagePrimaryGlobalLimit, packagePrimaryProjectLimit,
+  packageResumeWaitingSlot, runnablePackagePrimary } from './package-slots.js';
 
 const MAX_LEASE_MS = 3_600_000;
 
@@ -302,13 +304,34 @@ export class WorkQueue {
     return released.rows;
   }
 
-  async resume(jobId: string, reasons?: readonly string[]): Promise<boolean> {
+  async resume(jobId: string, reasons?: readonly string[], client?: PoolClient): Promise<boolean> {
     return transaction(this.db, async (tx) => {
+      const { rows: [candidate] } = await tx.query<{ packagePrimary: boolean }>(
+        `SELECT scope_id IS NULL AND kind='harness_research' AND purpose IN ('primary_a','primary_b') AS "packagePrimary"
+         FROM gateway_jobs WHERE id=$1`, [jobId]);
+      if (!candidate) return false;
+      if (candidate.packagePrimary) await lockPackagePrimarySlots(tx);
       const generation = await tx.query(
         `SELECT 1 FROM gateway_generations g JOIN gateway_jobs j USING(generation_id)
          WHERE j.id=$1 AND g.current FOR UPDATE OF g`, [jobId],
       );
       if (!generation.rowCount) return false;
+      if (candidate.packagePrimary) {
+        const { rows: [admission] } = await tx.query<{ leaseEpoch: number; slot: boolean; waiting: boolean }>(
+          `SELECT target.lease_epoch AS "leaseEpoch",
+             (SELECT count(*) FROM ${runnablePackagePrimary})<$3 AND
+             (SELECT count(*) FROM ${runnablePackagePrimary} AND w.project_id=target.project_id)<$4 AS slot,
+             EXISTS(SELECT 1 FROM gateway_outbox e WHERE e.job_id=target.id AND e.lease_epoch=target.lease_epoch AND e.event_type=$5) AS waiting
+           FROM (SELECT j.id,j.project_id,j.lease_epoch FROM ${currentPackagePrimary}
+             AND j.id=$1 AND j.state='held' AND ($2::text[] IS NULL OR j.reason=ANY($2))
+             AND NOT EXISTS(SELECT 1 FROM gateway_attempts a WHERE a.job_id=j.id AND a.state IN ('sending','unknown'))
+           ) target`, [jobId, reasons ?? null, packagePrimaryGlobalLimit, packagePrimaryProjectLimit, packageResumeWaitingSlot]);
+        if (!admission) return false;
+        if (!admission.slot) {
+          if (!admission.waiting) await publish(tx, jobId, admission.leaseEpoch, packageResumeWaitingSlot);
+          return false;
+        }
+      }
       const result = await tx.query<{ lease_epoch: number }>(
         `UPDATE gateway_jobs SET state='ready',available_at=clock_timestamp(),reason=NULL,next_action=NULL
          WHERE id=$1 AND state='held' AND ($2::text[] IS NULL OR reason=ANY($2)) AND NOT EXISTS (
@@ -318,7 +341,7 @@ export class WorkQueue {
       if (!result.rows[0]) return false;
       await publish(tx, jobId, result.rows[0].lease_epoch, 'resumed');
       return true;
-    });
+    }, client);
   }
 
   async readOutbox(after: string, limit = 100) {
