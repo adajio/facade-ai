@@ -234,6 +234,8 @@ export function evaluate(
   const scoped = findings.filter((finding) => finding.applicability !== "superseded" &&
     (requirement.sourceRoles.includes(finding.sourceRole) ||
       (finding.kind === "absence" && isInventoryRole(finding.sourceRole)) ||
+      (finding.citation.deliveryUncertainty && isInventoryRole(finding.sourceRole) &&
+        finding.citation.deliveryStatement && matchesRequirementSubject(requirement, finding.citation.deliveryStatement.item)) ||
       deliveryCounterevidence.has(finding)));
   const active = scoped.filter((finding) => finding.applicability === "active");
   const supplied = active.filter((finding) => finding.kind !== "absence" && !deliveryCounterevidence.has(finding));
