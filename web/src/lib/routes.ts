@@ -4,6 +4,7 @@ export const sections = {
   completeness: 'Комплектность',
   facts: 'Сведения',
   fragments: 'Фрагменты',
+  copilot: 'Помощник',
   questions: 'Вопросы',
   letters: 'Письма',
   members: 'Участники',

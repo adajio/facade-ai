@@ -1,7 +1,8 @@
 <script lang="ts" module>
+  import { valueRoles, type ValueRole } from './ComparisonFields.svelte';
   type Representation = 'native' | 'ocr' | 'render';
   type EvidenceOption = {
-    sourceRole: string; mode?: 'value' | 'presence'; formats?: string[]; subject?: string; representations?: Representation[];
+    sourceRole: string; valueRole?: ValueRole; mode?: 'value' | 'presence'; formats?: string[]; subject?: string; representations?: Representation[];
   };
   export type EvidenceRule = { allOf: { anyOf: EvidenceOption[] }[]; distinctOriginals?: boolean };
 
@@ -46,12 +47,20 @@
               </select>
             </label>
             <label>Что проверять
-              <select bind:value={item.mode}>
+              <select bind:value={item.mode} onchange={(event) => { if (event.currentTarget.value === 'presence') item.valueRole = undefined; }}>
                 <option value={undefined}>Значение по умолчанию</option>
                 <option value="value">Значение</option>
                 <option value="presence">Наличие</option>
               </select>
             </label>
+            {#if item.mode !== 'presence'}
+              <label>Роль значения в доказательстве
+                <select bind:value={item.valueRole}>
+                  <option value={undefined}>Любая роль</option>
+                  {#each Object.entries(valueRoles) as [key, label]}<option value={key}>{label}</option>{/each}
+                </select>
+              </label>
+            {/if}
             <label>Форматы варианта через запятую
               <input value={item.formats?.join(', ') ?? ''} placeholder={formats.join(', ')}
                 onchange={(event) => {

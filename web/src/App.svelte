@@ -89,11 +89,12 @@
       let next: Project | undefined;
       if (projectId) {
         const path = '/api/projects/' + id(projectId);
-        if (!entry?.scopeId || route.section !== 'fragments') {
+        const scopedSection = route.section === 'fragments' || route.section === 'copilot';
+        if (!entry?.scopeId || !scopedSection) {
           try {
             next = projectOf(await api.json<ProjectRead>(path, { signal }));
           } catch (error) {
-            if (route.section !== 'fragments' || !denied(error) || entry) throw error;
+            if (!scopedSection || !denied(error) || entry) throw error;
           }
         }
         if (!next) {

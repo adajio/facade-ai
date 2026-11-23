@@ -1,3 +1,4 @@
+import type { SourceAddress } from './copilot';
 import { type Assessment, type Citation } from './workspace';
 
 export const observationLabels = {
@@ -14,7 +15,17 @@ export type FacadeObservation = Pick<Citation, 'branch' | 'versionId' | 'documen
   value: string | null;
   unit: string | null;
   evidenceHref: string;
+  evidenceId?: string;
+  proposedFacadeKind?: string | null;
+  facadeKindSourceVerified?: boolean;
+  revision?: string | null;
+  revisionStatus?: string;
   binding: { state: Binding; reason: string; candidates: { id: string; label: string }[] };
+};
+
+export type FacadeType = {
+  state: 'confirmed' | 'unconfirmed' | 'stale'; kind: string | null;
+  basis: { id: string; evidenceId: string; versionId: string; address: SourceAddress; quote?: string | null; revision: string } | null;
 };
 
 export type Boundary = { complete: boolean; reason: string | null; basisIds: string[] };
@@ -24,6 +35,7 @@ export type FacadeContext = Omit<Assessment, 'scope' | 'catalogVersionId'> & {
   facadeId: string | null;
   name: string;
   counts: Record<string, number>;
+  facadeType?: FacadeType;
   questionHolds: { questionId: string; receiptIds: string[] }[];
 };
 export type FacadeAssessment = {
@@ -33,6 +45,7 @@ export type FacadeAssessment = {
   stage: string | null;
   activeWindows: number;
   completedWindows: number;
+  structurallyReviewedWindows?: number;
   observations: { counts: Record<Binding, number>; href: string };
   coverage: Record<'inventory' | 'map' | 'reading' | 'subject', Boundary>;
   contexts: FacadeContext[];
@@ -57,6 +70,12 @@ export const assessmentReasons: Record<string, string> = {
   inventory_open: 'Опись ещё не зафиксирована',
   inventory_items_excluded: 'Из описи исключены отдельные позиции',
   inventory_import_incomplete: 'Не все операции импорта завершились успешно',
+  material_not_mapped: 'Карта материала ещё не подготовлена',
+  reading_pending: 'Ожидается чтение',
+  structural_remainder_open: 'Остались непрочитанные блоки',
+  semantic_check_missing: 'Содержание ещё не проверено по этому требованию',
+  semantic_independence_unproven: 'Независимость проверок не подтверждена',
+  semantic_remainder_open: 'Есть непроверенные области по требованиям',
   physical_map_unverified: 'Полнота физической карты не подтверждена',
   reading_incomplete: 'Применимый охват A/B ещё не подтверждён',
   facade_boundary_unverified: 'Полный перечень фасадов и общий уровень не подтверждены',

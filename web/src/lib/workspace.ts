@@ -87,6 +87,14 @@ export type AssessmentQuestion = {
   version: number;
   dependencyVersion?: number;
   outcome: string;
+  semanticRemainder?: {
+    state: 'complete' | 'open'; totalWindows: number; verifiedWindows: number; alternativesVerified?: boolean;
+    reasons: string[]; omittedItems: number; items: {
+      windowId: string | null; versionId: string; unitId: string | null;
+      box?: { x: number; y: number; width: number; height: number };
+      pendingBranches?: ('A' | 'B')[]; reason: string; nextAction: string;
+    }[];
+  };
   researchStops?: {
     id?: string; jobId: string; branch: 'A' | 'B'; reason: string; nextAction: string; continuationRequested?: boolean;
     place: { unitId: string; page?: number; source: { documentId: string; versionId: string } };

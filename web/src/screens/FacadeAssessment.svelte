@@ -7,10 +7,11 @@
   import { projectV1, scopedUrl, V1, type AssessmentQuestion, type OpenEvidence, type WorkspaceProps } from '../lib/workspace';
   import EvidenceButtons from '../lib/EvidenceButtons.svelte';
   import Notice from '../lib/Notice.svelte';
+  import FacadeTypeControl from './FacadeTypeControl.svelte';
   import FacadeObservations from './FacadeObservations.svelte';
 
-  let { api, context, open, renew, overview = false, overviewVersion }: {
-    api: Api; context: WorkspaceProps; open: OpenEvidence; renew: () => void; overview?: boolean; overviewVersion?: number;
+  let { api, context, open, renew, refreshProject, overview = false, overviewVersion }: {
+    api: Api; context: WorkspaceProps; open: OpenEvidence; renew: () => void; refreshProject?: () => Promise<void>; overview?: boolean; overviewVersion?: number;
   } = $props();
   const commands = new Commands(() => api);
   let summary = $state<FacadeAssessment>();
@@ -79,6 +80,25 @@
     return scopedUrl(context.project.id, 'receipts', {}, receiptId);
   }
 
+  async function refreshType() {
+    await refreshProject?.();
+    renew();
+  }
+
+  function remainderLink(item: NonNullable<AssessmentQuestion['semanticRemainder']>['items'][number]) {
+    const box = item.box && [item.box.x, item.box.y, item.box.width, item.box.height].join(', ');
+    return scopedUrl(context.project.id, 'copilot', { version: item.versionId, unit: item.unitId, box });
+  }
+
+  function componentLink(citation: AssessmentQuestion['machine']['citations'][number], index: number) {
+    const component = citation.components?.[index];
+    return scopedUrl(context.project.id, 'completeness', {
+      context: contextId, filter: context.filter, revision: historicalVersion, slice: context.params.get('slice'),
+      evidence: citation.observationId ? citation.evidenceId : component?.evidenceId,
+      observation: citation.observationId, component: citation.observationId ? index : undefined,
+    }, active?.id);
+  }
+
   function reason(value: string) {
     return assessmentReasons[value] ?? label(value);
   }
@@ -136,7 +156,10 @@
         {@const boundary = summary.coverage[key as keyof FacadeAssessment['coverage']]}
         <dt>{text}</dt><dd>{boundary.complete ? 'Подтверждено' : reason(boundary.reason ?? 'needs_review')}</dd>
       {/each}
-      <dt>Проверенные окна A/B</dt><dd>{summary.completedWindows} из {summary.activeWindows}</dd>
+      <dt>Завершённые окна A/B</dt><dd>{summary.completedWindows} из {summary.activeWindows}</dd>
+      {#if summary.structurallyReviewedWindows !== undefined}
+        <dt>Структура проверена обеими ветвями</dt><dd>{summary.structurallyReviewedWindows} из {summary.activeWindows}</dd>
+      {/if}
     </dl>
     {#if summary.limitations.length}
       <ul class="plain-list">{#each summary.limitations as limit (limit)}<li>{reason(limit)}</li>{/each}</ul>
@@ -162,7 +185,7 @@
     {#if !summary.contexts.some(({ kind }) => kind === 'facade')}<p class="meta">Фасады пока не выявлены.</p>{/if}
     <div class="table-wrap">
       <table>
-        <thead><tr><th>Контекст</th><th>Проверено</th><th>Нехватка</th><th>Противоречия</th><th>Требуется сверка</th><th>Заключение инженера</th></tr></thead>
+        <thead><tr><th>Контекст</th><th>Тип фасада</th><th>Проверено</th><th>Нехватка</th><th>Противоречия</th><th>Требуется сверка</th><th>Заключение инженера</th></tr></thead>
         <tbody>
           {#each summary.contexts as item (item.assessmentContextId)}
             <tr>
@@ -171,6 +194,12 @@
                 {#if item.facadeId && summary.observations}
                   <br /><a class="meta" href={observationLink('identified', item.facadeId)}>Сведения по фасаду</a>
                 {/if}
+              </td>
+              <td>
+                {#if item.kind === 'facade'}
+                  {item.facadeType?.kind ?? 'Требуется подтверждение'}
+                  {#if item.facadeType?.state === 'stale'}<br /><span class="meta">Опора требует сверки</span>{/if}
+                {:else}—{/if}
               </td>
               <td><a href={url(item, undefined, 'covered')} aria-label={'Проверенные требования · ' + item.name}>{item.counts.covered}</a></td>
               <td><a href={url(item, undefined, 'confirmed_missing')} aria-label={'Подтверждённая нехватка · ' + item.name}>{item.counts.confirmed_missing}</a></td>
@@ -198,6 +227,12 @@
           {#if view.conclusion.authorId}<dt>Автор</dt><dd>{view.conclusion.authorId}</dd>{/if}
         {/if}
       </dl>
+      {#if view.facadeId}
+        {#key view.facadeId}
+          <FacadeTypeControl {api} {context} facade={view} assessmentVersion={summary.version}
+            historical={Boolean(historicalVersion)} {open} refreshProject={refreshType} />
+        {/key}
+      {/if}
       {#if context.canEdit && !historicalVersion && view.questions.length}
         <form onsubmit={(event) => save(event, 'conclusion')}>
           <div class="form-row">
@@ -222,12 +257,16 @@
       <div class="card-header"><h2>Обязательные части</h2></div>
       {#if questions.length}
         <div class="table-wrap"><table>
-          <thead><tr><th>Требование</th><th>Машинный вывод</th><th>Решение инженера</th></tr></thead>
+          <thead><tr><th>Требование</th><th>Машинный вывод</th><th>Проверка содержания</th><th>Решение инженера</th></tr></thead>
           <tbody>
             {#each questions as question (question.id)}
               <tr>
                 <td><a href={url(view, question, context.filter)} aria-current={active?.id === question.id ? 'true' : undefined}>{question.requirement.subject} · {question.requirement.part}</a></td>
                 <td>{label(question.machine.outcome)}</td>
+                <td>{question.semanticRemainder
+                  ? question.semanticRemainder.verifiedWindows + ' из ' + question.semanticRemainder.totalWindows +
+                    (question.semanticRemainder.state === 'open' ? ' · есть остаток' : '')
+                  : 'Данные отсутствуют в этой ревизии'}</td>
                 <td>{label(question.decision?.outcome, 'Ожидает решения')}</td>
               </tr>
             {/each}
@@ -242,7 +281,48 @@
       <section class="card">
         <h2>{active.requirement.subject} · {active.requirement.part}</h2>
         <p>Машинный вывод · {label(active.machine.outcome)}</p>
+        {#if active.requirement.applicability === 'unknown'}
+          <p>Применимость требования требует подтверждения.</p>
+        {/if}
         <EvidenceButtons citations={active.machine.citations} {open} />
+        {#each active.machine.citations as citation}
+          {#if citation.components?.length}
+            <ul class="plain-list">
+              {#each citation.components as component, index}
+                <li><a href={componentLink(citation, index)}>{component.quote}</a></li>
+              {/each}
+            </ul>
+          {/if}
+        {/each}
+        {#if active.semanticRemainder}
+          {@const remainder = active.semanticRemainder}
+          <h3>Проверка содержания</h3>
+          <p>{remainder.verifiedWindows} из {remainder.totalWindows} окон · {remainder.state === 'open' ? 'Есть остаток' : 'Проверка завершена'}</p>
+          {#if remainder.alternativesVerified !== undefined}
+            <p>Альтернативы · {remainder.alternativesVerified ? 'Проверены' : 'Требуют сверки'}</p>
+          {/if}
+          {#if remainder.reasons.length}
+            <ul class="plain-list">{#each remainder.reasons as item}<li>{reason(item)}</li>{/each}</ul>
+          {/if}
+          {#if remainder.items.length}
+            <ul class="plain-list">
+              {#each remainder.items as item}
+                <li>
+                  {#if context.canEdit}
+                    <a href={remainderLink(item)}>{item.unitId ? 'Открыть место ' + item.unitId : 'Открыть версию оригинала'}</a>
+                    ·
+                  {:else if item.unitId}
+                    Место {item.unitId} ·
+                  {/if}
+                  {reason(item.reason)}
+                  {#if item.pendingBranches?.length}<span class="meta"> · ветви {item.pendingBranches.join(' и ')}</span>{/if}
+                  <p>{item.nextAction}</p>
+                </li>
+              {/each}
+            </ul>
+          {/if}
+          {#if remainder.omittedItems}<p>Ещё адресов с остатком · {remainder.omittedItems}</p>{/if}
+        {/if}
         {#if active.machine.limitations?.length}<p class="meta">{active.machine.limitations.map(reason).join(' · ')}</p>{/if}
         {#each view.questionHolds.find(({ questionId }) => questionId === active?.id)?.receiptIds ?? [] as receiptId (receiptId)}
           <p><a href={receiptLink(receiptId)}>Открыть досылку для пересмотра основания</a></p>
