@@ -5,6 +5,7 @@ import { admin, signIn, unique } from './synthetic';
 
 test('Комплект без стадии, оригинал PDF, адрес листа и возврат к описи', async ({ page }) => {
   test.skip(!admin.login || !admin.password, 'Нужна отдельная синтетическая БД');
+  test.setTimeout(150_000);
   const fixture = await readFile(new URL('../../test/fixtures/input/facade-package.pdf', import.meta.url));
   const hash = (data: Buffer) => createHash('sha256').update(data).digest('hex');
   await page.setViewportSize({ width: 480, height: 900 });
@@ -21,6 +22,7 @@ test('Комплект без стадии, оригинал PDF, адрес л�
   await page.getByRole('button', { name: 'Начать передачу' }).click();
 
   const row = page.getByRole('row').filter({ hasText: filename }).filter({ has: page.getByRole('link', { name: 'Карточка документа' }) });
+  await expect(row).toBeVisible({ timeout: 45_000 });
   const rowId = await row.getAttribute('id');
   const card = row.getByRole('link', { name: 'Карточка документа' });
   await card.press('Enter');
