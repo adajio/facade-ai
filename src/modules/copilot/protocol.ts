@@ -1,6 +1,6 @@
 import { z } from 'zod';
 import { decodeCompletion, type FunctionCall } from '../harness/openrouter.js';
-import { copilotReadBatchLimit, type MemorySource } from './contracts.js';
+import type { MemorySource } from './contracts.js';
 
 const text = z.string().trim().min(1).refine((value) => !value.includes('\0'));
 const sourceId = text.max(360);
@@ -66,13 +66,24 @@ export type Action = { [Name in keyof typeof tools]: {
   name: Name; args: z.infer<typeof tools[Name]['args']>;
 } }[keyof typeof tools];
 
-const readTools = new Set<string>(['search_sources', 'open_source']);
+type ReadAction = Extract<Action, { name: 'search_sources' | 'open_source' }>;
+type ToolAction<T extends Action> = { action: T; callId: string };
+
+export type ReadBatch = {
+  calls: ToolAction<ReadAction>[];
+  next: number;
+  foundBefore: number;
+  openedBefore: number;
+};
+
+export function isReadCall(call: ToolAction<Action>): call is ToolAction<ReadAction> {
+  return call.action.name === 'search_sources' || call.action.name === 'open_source';
+}
 
 export function decodeTurn(output: unknown) {
   const result = decodeCompletion(output);
   const calls = result?.message.tool_calls;
-  if (result?.finishReason !== 'tool_calls' || !calls?.length || calls.length > copilotReadBatchLimit) return null;
-  if (calls.length > 1 && calls.some((call) => !readTools.has(call.function.name))) return null;
+  if (result?.finishReason !== 'tool_calls' || !calls?.length) return null;
 
   const actions: { action: Action; callId: string }[] = [];
   const toolCalls: FunctionCall[] = [];
@@ -87,6 +98,7 @@ export function decodeTurn(output: unknown) {
     actions.push({ action: { name, args: args.data } as Action, callId: call.id });
     toolCalls.push({ id: call.id, type: 'function', function: { name, arguments: call.function.arguments } });
   }
+  if (actions.length > 1 && !actions.every(isReadCall)) return null;
   // Replay the entire provider turn with exactly one reply for each tool ID.
   const message: Message = { role: 'assistant', content: null, tool_calls: toolCalls };
   return { actions, message };

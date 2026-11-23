@@ -49,9 +49,9 @@ export type StoredAnswer = {
 };
 
 export const copilotTurnLimit = 24;
-export const copilotReadBatchLimit = 6;
+export const copilotReadsPerSlice = 6;
 export const copilotSearchResultLimit = 6;
 export const copilotOcrLimit = 4;
 
-// Each turn can discover at most one batch of new search results. OCR can add one separately.
-export const copilotJournalLimit = copilotTurnLimit * copilotReadBatchLimit * copilotSearchResultLimit + copilotOcrLimit;
+// The gateway admits at most 1024 input references, including earlier source discoveries.
+export const copilotJournalLimit = 1024;

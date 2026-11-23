@@ -36,6 +36,7 @@
     turn_limit: 'Достигнут предел ходов для этого вопроса.',
     copilot_turn_budget: 'Исчерпан предел модельных ходов для этого вопроса. Достигнутый результат сохранён.',
     copilot_research_budget: 'Исчерпан предел адресов или опор. Следующий запрос на дочитывание сохранён.',
+    copilot_address_budget: 'Исчерпан предел адресов шлюза для этого вопроса. Оставшиеся действия сохранены.',
     copilot_no_progress: 'Последние ходы не добавили новых адресов или опор. Помощник приостановлен.',
     model_response_invalid: 'Модель не вернула проверяемый ответ.',
     research_unavailable: 'Дочитывание по этому адресу сейчас недоступно.',
@@ -219,12 +220,29 @@
           {@render sources(question.citations)}
         {/if}
         {#if question.partialSources?.length}
-          <h4>Места, открытые до остановки</h4>
+          <h4>Открытые места для проверки</h4>
           <ul class="plain-list">
             {#each question.partialSources as source (source.id)}
               <li><a href={projectLink(source.id)}>{source.label} · {renderAddress(source.address)}</a> · {representations[source.representation]}</li>
             {/each}
           </ul>
+        {/if}
+        {#if question.readActions?.length}
+          <h4>Действия группы поиска и чтения</h4>
+          <ol class="plain-list">
+            {#each question.readActions as action}
+              <li>
+                {action.completed ? 'Выполнено' : 'Ожидает'} ·
+                {#if action.operation === 'search_sources'}
+                  Поиск «{action.query}»
+                {:else if action.sourceId}
+                  <a href={projectLink(action.sourceId)}>Открытие источника</a>
+                {:else}
+                  Открытие источника
+                {/if}
+              </li>
+            {/each}
+          </ol>
         {/if}
         {#if question.limitations?.length}
           <h4>Границы ответа</h4>

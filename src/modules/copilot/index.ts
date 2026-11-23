@@ -4,7 +4,7 @@ import { authorize, readSession, touchSession, uuid, type AccessActor, type Sess
 import { invalid, unavailable } from '../access/errors.js';
 import type { CopilotMemory, MemorySource, SourceIdentity, StoredAnswer } from './contracts.js';
 import { createRuntimePdfService } from '../pdf/index.js';
-import { recordedReadAddresses, type Message } from './protocol.js';
+import { recordedReadAddresses, type Message, type ReadBatch } from './protocol.js';
 import { verifyCopilotInputs } from './admission.js';
 import { createCopilotMemory, readCopilotVersions } from './memory.js';
 export { createCopilotMemory, createCopilotResearch } from './memory.js';
@@ -118,35 +118,46 @@ export function registerCopilot(app: FastifyInstance, memory: CopilotMemory) {
 
   async function partialReads(projectId: string, scopeId: string | null, jobId: string, researchSourceId?: string) {
     const { rows: [job] } = await db.query<{
-      cursor: { found: SourceIdentity[]; opened: string[]; messages: Message[] } | null;
+      cursor: { found: SourceIdentity[]; opened: string[]; messages: Message[]; readBatch?: ReadBatch } | null;
     }>(`SELECT j.cursor FROM gateway_jobs j JOIN gateway_generations g USING(generation_id)
        WHERE j.id=$1 AND j.project_id=$2 AND g.current`, [jobId, projectId]);
     if (!job) return null;
     const cursor = job.cursor;
-    if (!cursor || (!cursor.opened.length && !researchSourceId)) return { sources: [] };
+    if (!cursor || (!cursor.opened.length && !researchSourceId && !cursor.readBatch)) return { sources: [] };
     if (!await verifyCopilotInputs(db, {
       projectId, scopeId, jobId, inputRefs: cursor.found.map(({ id }) => id),
     })) return null;
     const opened = new Set(cursor.opened);
     const addresses = recordedReadAddresses(cursor.messages, opened);
     const sources = cursor.found.filter(({ id }) => addresses.has(id) || id === researchSourceId);
-    const current = await readCopilotVersions(db, projectId, [...new Set(sources.map(({ versionId }) => versionId))]);
+    const batch = cursor.readBatch;
+    const inputs = batch ? cursor.found.slice(0, batch.foundBefore) : [];
+    const current = await readCopilotVersions(db, projectId, [...new Set([...sources, ...inputs].map(({ versionId }) => versionId))]);
     const { rowCount } = await db.query(
       `SELECT 1 FROM gateway_jobs j JOIN gateway_generations g USING(generation_id)
        WHERE j.id=$1 AND j.project_id=$2 AND g.current`, [jobId, projectId],
     );
     if (!rowCount) return null;
-    const permitted = sources.flatMap((pin) => {
+    function currentSource(pin: SourceIdentity) {
       const source = current.get(pin.versionId);
       return source?.version === 'current' && source.sha256 === pin.sha256 && source.documentId === pin.documentId
-        ? [{ id: pin.id, label: source.label }] : [];
-    });
+        ? { id: pin.id, label: source.label } : null;
+    }
+    const permitted = sources.map(currentSource).filter((source) => source !== null);
+    // Search terms can include content from the earlier model context.
+    const readActions = batch && inputs.every(currentSource) ? batch.calls.map(({ action }, index) => {
+      const completed = index < batch.next;
+      if (action.name === 'search_sources') return { operation: action.name, completed, query: action.args.query };
+      const source = inputs.find(({ id }) => id === action.args.sourceId);
+      return { operation: action.name, completed, ...(source ? { sourceId: source.id } : {}) };
+    }) : undefined;
     return {
       sources: permitted.flatMap((source) => {
         const address = addresses.get(source.id);
         return address ? [{ ...source, ...address }] : [];
       }),
       researchSourceId: permitted.find(({ id }) => id === researchSourceId)?.id,
+      readActions,
     };
   }
 
@@ -157,11 +168,12 @@ export function registerCopilot(app: FastifyInstance, memory: CopilotMemory) {
       const { rows: [row] } = await db.query<{
         id: string; question: string; state: string; reason: string | null; result: StoredAnswer | null;
         queueReason: string | null; generationCurrent: boolean | null; researchSourceId: string | null;
-        jobId: string | null; scopeId: string | null; asOf: Date | null;
+        jobId: string | null; scopeId: string | null; asOf: Date | null; readBatchPending: boolean | null;
       }>(`SELECT q.id,q.question,q.state,q.reason,q.result,
              CASE WHEN j.state='held' OR (j.state='ready' AND j.available_at>clock_timestamp()) THEN j.reason END AS "queueReason",
              g.current AS "generationCurrent",q.research_source_id AS "researchSourceId",
              j.id AS "jobId",j.scope_id AS "scopeId",
+             (j.cursor#>>'{readBatch,next}')::int < jsonb_array_length(j.cursor#>'{readBatch,calls}') AS "readBatchPending",
              (SELECT e.created_at FROM gateway_outbox e WHERE e.job_id=j.id AND e.event_type='finished'
               ORDER BY e.lease_epoch DESC LIMIT 1) AS "asOf"
            FROM copilot_questions q LEFT JOIN gateway_jobs j ON j.id=q.job_id
@@ -174,13 +186,14 @@ export function registerCopilot(app: FastifyInstance, memory: CopilotMemory) {
       else if (!result && row.queueReason && row.queueReason !== 'addressed_research') { state = 'held'; reason = row.queueReason; }
       const unavailableSources = { id, question, state: 'held', reason: 'sources_unavailable' };
       if (!result) {
-        const partial = state === 'held' && row.generationCurrent && row.jobId
+        const partial = (state === 'held' || row.readBatchPending) && row.generationCurrent && row.jobId
           ? await partialReads(projectId, row.scopeId, row.jobId, row.researchSourceId ?? undefined) : undefined;
         if (partial === null) return unavailableSources;
         const researchSourceId = state === 'held' ? partial?.researchSourceId : row.researchSourceId;
         return { id, question, state, reason,
           ...(researchSourceId ? { researchSourceId } : {}),
           ...(partial?.sources.length ? { partialSources: partial.sources } : {}),
+          ...(partial?.readActions ? { readActions: partial.readActions } : {}),
         };
       }
       if (!row.jobId || !await verifyCopilotInputs(db, {
@@ -197,6 +210,7 @@ export function registerCopilot(app: FastifyInstance, memory: CopilotMemory) {
         id, question, state: historical ? 'historical' : state, reason, asOf: row.asOf,
         claims: result.claims, citations: sources,
         ...(partial?.sources.length ? { partialSources: partial.sources } : {}),
+        ...(partial?.readActions ? { readActions: partial.readActions } : {}),
         limitations: result.limitations,
       };
     }, undefined, true);

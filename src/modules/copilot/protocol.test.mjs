@@ -23,7 +23,7 @@ test('read batches retain completion, size, tool ID and argument checks', () => 
   assert.equal(decodeTurn(completion([open, call('ocr', 'research_source', { sourceId: 'open', reason: 'fixture' })])), null);
   assert.equal(decodeTurn(completion([open, open])), null);
   assert.equal(decodeTurn(completion([open, call('bad', 'open_source', { sourceId: 1 })])), null);
-  assert.equal(decodeTurn(completion(Array.from({ length: 7 }, (_, id) => call('item-' + id)))), null);
+  assert.equal(decodeTurn(completion(Array.from({ length: 13 }, (_, id) => call('item-' + id)))), null);
   assert.equal(decodeTurn(completion([open], 'length')), null);
   assert.equal(decodeTurn(completion([])), null);
 });

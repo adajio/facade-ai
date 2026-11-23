@@ -191,6 +191,7 @@ test('engineer question reopens originals through the gateway and restricted sea
   assert.equal((await get(publishedPath, limited)).source.quote, 'Permitted synthetic quote');
 
   const sent = [];
+  const readBatchQueries = Array.from({ length: 10 }, (_, index) => 'JOURNAL-ITEM-' + (index + 10));
   const route = { routeId: 'fixture-copilot', model: 'managed/copilot', dataClass: 'synthetic', maxTokens: 850 };
   const policy = { id: route.routeId, revision: 'fixture-v1', transport: 'managed', enabled: true,
     maxRequestBytes: 1_000_000, ceilingUsdNanos: 1, timeoutMs: 4000 };
@@ -209,6 +210,16 @@ test('engineer question reopens originals through the gateway and restricted sea
           output,
           receipt: { state: 'paid', costUsdNanos: 0, providerId: 'fixture-' + attempt.id, evidenceRef: 'fixture:' + attempt.id },
         });
+        if (question === 'READ_BATCH_REPLAY') {
+          const turn = sent.filter((item) => item.request.messages[1].content === question).length;
+          if (turn <= 6) {
+            const group = 'ABC'[Math.floor((turn - 1) / 2)];
+            if (turn % 2) return paid(responseTool(attempt, 'search_sources', { query: 'JOURNAL-GROUP-' + group }));
+            return paid(responseTools(attempt, toolReplies.at(-1).sources.map(({ sourceId }) => ['open_source', { sourceId }])));
+          }
+          assert.equal(turn, 7);
+          return paid(responseTools(attempt, readBatchQueries.map((query) => ['search_sources', { query }])));
+        }
         if (question === 'READ_JOURNAL') {
           const turn = sent.filter((item) => item.request.messages[1].content === question).length;
           const last = toolReplies.at(-1);
@@ -546,6 +557,70 @@ test('engineer question reopens originals through the gateway and restricted sea
   assert.equal(sent.filter(({ attempt }) => attempt.jobId === readsJob).length, 21);
   assert.equal((await db.query('SELECT count(*)::int AS value FROM gateway_attempts WHERE job_id=$1', [readsJob])).rows[0].value, 21);
 
+  const batchId = (await ask('READ_BATCH_REPLAY')).json().id;
+  const batchPath = base + '/questions/' + batchId;
+  assert.equal(await next({ route }), true);
+  const { rows: [{ job_id: batchJob }] } = await db.query('SELECT job_id FROM copilot_questions WHERE id=$1', [batchId]);
+  const executed = [];
+  const batchMemory = {
+    ...memory,
+    async search(...args) {
+      if (readBatchQueries.includes(args[2])) executed.push(args[2]);
+      return memory.search(...args);
+    },
+  };
+  const stopBatch = new Proxy(gateway, { get(target, property) {
+    if (property === 'checkpoint') return async (lease, cursor, tx) => {
+      if (cursor.readBatch?.next === 4) throw new Error('fixture stops before committing fourth search');
+      return target.checkpoint(lease, cursor, tx);
+    };
+    const member = target[property];
+    return typeof member === 'function' ? member.bind(target) : member;
+  }});
+  await assert.rejects(next({ route, gateway: stopBatch, memory: batchMemory }), /fixture stops before committing fourth search/);
+  const readProgress = async () => (await db.query('SELECT cursor FROM gateway_jobs WHERE id=$1', [batchJob])).rows[0].cursor;
+  const interrupted = await readProgress();
+  assert.equal(interrupted.turn, 7);
+  assert.equal(interrupted.readBatch.next, 3);
+  assert.deepEqual(executed, readBatchQueries.slice(0, 4));
+  await db.query("UPDATE gateway_jobs SET lease_until=clock_timestamp()-interval '1 second' WHERE id=$1 AND state='leased'", [batchJob]);
+  assert.equal(await next({ workerId: id() }), true);
+  const paused = await get(batchPath);
+  assert.equal(paused.state, 'held');
+  assert.equal(paused.reason, 'model_unavailable');
+  assert.deepEqual(paused.readActions, readBatchQueries.map((query, index) => (
+    { operation: 'search_sources', completed: index < 3, query }
+  )));
+  assert.equal(paused.partialSources.length, 12);
+  assert.equal(paused.claims, undefined);
+  assert.equal((await inject(batchPath, limited)).statusCode, 404);
+  assert.equal(await next({ route, workerId: id() }), true); // Resume the same routed job.
+  assert.equal(await next({ route, workerId: id(), memory: batchMemory }), true);
+  assert.equal((await readProgress()).readBatch.next, 9);
+  assert.deepEqual(executed, [...readBatchQueries.slice(0, 4), ...readBatchQueries.slice(3, 9)]);
+  const heldAfterReads = new Proxy(gateway, { get(target, property) {
+    if (property === 'call') return ({ request, effectKey }) => {
+      assert.equal(effectKey, 'copilot/turn/7');
+      const turn = request.messages.find(({ tool_calls }) => tool_calls?.length === 10);
+      assert.deepEqual(request.messages.slice(request.messages.indexOf(turn) + 1).map(({ tool_call_id }) => tool_call_id),
+        turn.tool_calls.map(({ id }) => id));
+      return Promise.resolve({ status: 'held', code: 'budget_exhausted', nextAction: 'Inspect budget' });
+    };
+    const member = target[property];
+    return typeof member === 'function' ? member.bind(target) : member;
+  }});
+  assert.equal(await next({ route, workerId: id(), gateway: heldAfterReads, memory: batchMemory }), true);
+  const completeBatch = await get(batchPath);
+  assert.equal(completeBatch.reason, 'budget_exhausted');
+  assert.equal(completeBatch.partialSources.length, 12);
+  assert.equal(completeBatch.claims, undefined);
+  assert.deepEqual(completeBatch.readActions, paused.readActions.map((action) => ({ ...action, completed: true })));
+  assert.deepEqual(executed, [...readBatchQueries.slice(0, 4), ...readBatchQueries.slice(3)]);
+  assert.equal(sent.filter(({ attempt }) => attempt.jobId === batchJob).length, 7);
+  assert.equal((await db.query('SELECT count(*)::int AS value FROM gateway_attempts WHERE job_id=$1', [batchJob])).rows[0].value, 7);
+  assert.equal(await next({ route }), false);
+  console.info('Copilot fixture: ten read tools, durable prefix, bounded continuation and paid receipt replay checked');
+
   const partialId = (await ask('PARTIAL_JOURNAL')).json().id;
   const partialPath = base + '/questions/' + partialId;
   assert.equal(await next({ route }), true);
@@ -567,6 +642,7 @@ test('engineer question reopens originals through the gateway and restricted sea
   assert.equal((await get(base + '/sources?id=' + partialAnswer.partialSources[0].id)).source.text, journalLines[0]);
   await accept('read-journal-new.txt', Buffer.from('Later journal edition'), 'text/plain', { replaces: journalOriginal });
   assert.equal((await get(partialPath)).partialSources, undefined);
+  assert.equal((await get(batchPath)).readActions, undefined);
   console.info('Copilot fixture: ninth read, older citation, replay, partial addresses and superseded partial suppression checked');
 
   const unknownKey = id();

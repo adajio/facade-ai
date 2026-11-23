@@ -6,11 +6,11 @@ import { GatewayError, type Gateway, type LeasedJob } from '../gateway/index.js'
 import { hash } from '../gateway/types.js';
 import type { ResearchAdmission } from '../gateway/gateway.js';
 import {
-  copilotJournalLimit, copilotOcrLimit, copilotSearchResultLimit, copilotTurnLimit,
+  copilotJournalLimit, copilotOcrLimit, copilotReadsPerSlice, copilotSearchResultLimit, copilotTurnLimit,
   type CopilotMemory, type MemorySource, type SourceIdentity, type StoredAnswer,
 } from './contracts.js';
 import { copilotKind, verifyCopilotInputs } from './admission.js';
-import { decodeTurn, messagesFor, requestFor, recentTranscript, type Message } from './protocol.js';
+import { decodeTurn, isReadCall, messagesFor, requestFor, recentTranscript, type Message, type ReadBatch } from './protocol.js';
 
 export { copilotKind } from './admission.js';
 const leaseMs = 30_000;
@@ -44,6 +44,7 @@ type Progress = {
   found: SourceIdentity[];
   opened: string[];
   limitations: string[];
+  readBatch?: ReadBatch;
   research?: { sourceId: string; reason: string; callId: string; finished: boolean; addressKey?: string };
   attemptedAddresses?: string[];
   stagnantTurns?: number;
@@ -254,6 +255,52 @@ async function run(work: LeasedJob, runtime: CopilotRuntime, signal: AbortSignal
     });
   }
 
+  async function readSource({ action, callId }: ReadBatch['calls'][number], availableSources: Set<string>) {
+    if (action.name === 'search_sources') {
+      const found = await withOwner(db, question, (session) => memory.search(session, work.projectId, action.args.query));
+      if (!found) return 'access_changed';
+      const selected = [...found.sources.slice(0, copilotSearchResultLimit - 2), ...found.windows.slice(0, 2)];
+      const newIds = new Set(selected.map(({ id }) => id));
+      for (const { id } of progress.found) newIds.delete(id);
+      if (progress.found.length + newIds.size > copilotJournalLimit) return 'copilot_address_budget';
+      for (const source of selected) include(progress, source);
+      searchLimits(progress, found.limitations);
+      reply(progress, callId, { sources: selected.filter(({ window }) => !window).map(metadata),
+        unresolvedWindows: selected.filter(({ window }) => window).map(metadata), limitations: found.limitations });
+    } else {
+      const key = action.args.sourceId;
+      const original = availableSources.has(key) ? await authorizedSource(key) : null;
+      if (original) {
+        if (original.source.text && !progress.opened.includes(key)) progress.opened.push(key);
+        reply(progress, callId, { source: opened(original.source) });
+      } else {
+        reply(progress, callId, { code: 'source_unavailable' });
+      }
+    }
+  }
+
+  async function continueReads(batch: ReadBatch) {
+    if (!await currentOwner(db, question)) { await suspend('access_changed'); return false; }
+    if (!await verifyCopilotInputs(db, {
+      projectId: work.projectId, scopeId: work.scopeId, jobId: lease.jobId, inputRefs: progress.found.map(({ id }) => id),
+    })) { await suspend('sources_unavailable'); return false; }
+    const available = new Set(progress.found.slice(0, batch.foundBefore).map(({ id }) => id));
+    const end = Math.min(batch.next + copilotReadsPerSlice, batch.calls.length);
+    while (!active.aborted && batch.next < end) {
+      const held = await readSource(batch.calls[batch.next], available);
+      if (held) { await suspend(held); return false; }
+      batch.next++;
+      if (batch.next === batch.calls.length) {
+        advance(progress, progress.found.length > batch.foundBefore || progress.opened.length > batch.openedBefore);
+      }
+      if (!await save()) return false;
+    }
+    if (active.aborted) return false;
+    if (batch.next === batch.calls.length) return true;
+    await suspend('copilot_read_quantum', new Date());
+    return false;
+  }
+
   try {
     const research = progress.research;
     const attempted = progress.attemptedAddresses ??= [];
@@ -291,6 +338,8 @@ async function run(work: LeasedJob, runtime: CopilotRuntime, signal: AbortSignal
       research.finished = true;
       if (!await save(research.sourceId)) return;
     }
+    if (progress.readBatch && progress.readBatch.next < progress.readBatch.calls.length &&
+        !await continueReads(progress.readBatch)) return;
     const leaseEndsAt = Math.min(progress.turn + turnsPerLease, copilotTurnLimit);
     while (!active.aborted && progress.turn < leaseEndsAt) {
       if ((progress.stagnantTurns ?? 0) >= maxStagnantTurns) { await suspend('copilot_no_progress'); return; }
@@ -315,35 +364,24 @@ async function run(work: LeasedJob, runtime: CopilotRuntime, signal: AbortSignal
       const { actions, message } = decoded;
       progress.turn += 1;
       progress.messages.push(message);
+      const searchCount = actions.filter(({ action }) => action.name === 'search_sources').length;
+      if (actions.every(isReadCall) && (actions.length > copilotReadsPerSlice ||
+          progress.found.length + searchCount * copilotSearchResultLimit > copilotJournalLimit)) {
+        const batch = { calls: actions, next: 0, foundBefore: progress.found.length, openedBefore: progress.opened.length };
+        progress.readBatch = batch;
+        if (!await save() || !await continueReads(batch)) return;
+        continue;
+      }
       const before = progress.found.length + progress.opened.length;
       let lastResearchSource: string | undefined;
       const availableSources = new Set(progress.found.map(({ id }) => id));
       for (const { action, callId } of actions) {
         if (active.aborted) return;
         switch (action.name) {
-          case 'search_sources': {
-            const found = await withOwner(db, question, (session) => memory.search(session, work.projectId, action.args.query));
-            if (!found) { await suspend('access_changed'); return; }
-            const selected: MemorySource[] = [];
-            for (const source of [...found.sources.slice(0, copilotSearchResultLimit - 2), ...found.windows.slice(0, 2)]) {
-              include(progress, source);
-              selected.push(source);
-            }
-            searchLimits(progress, found.limitations);
-            // Search descriptions contain metadata only. Open the original before using a claim.
-            reply(progress, callId, { sources: selected.filter(({ window }) => !window).map(metadata),
-              unresolvedWindows: selected.filter(({ window }) => window).map(metadata), limitations: found.limitations });
-            break;
-          }
+          case 'search_sources':
           case 'open_source': {
-            const key = action.args.sourceId;
-            const original = availableSources.has(key) ? await authorizedSource(key) : null;
-            if (original) {
-              if (original.source.text && !progress.opened.includes(key)) progress.opened.push(key);
-              reply(progress, callId, { source: opened(original.source) });
-            } else {
-              reply(progress, callId, { code: 'source_unavailable' });
-            }
+            const held = await readSource({ action, callId }, availableSources);
+            if (held) { await suspend(held); return; }
             break;
           }
           case 'research_source': {

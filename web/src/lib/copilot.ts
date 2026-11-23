@@ -25,6 +25,9 @@ export type CopilotQuestion = {
   id: string; question: string; state: 'pending' | 'queued' | 'research_queued' | 'answered' | 'limited' | 'held' | 'historical';
   reason?: string; asOf?: string; claims?: { text: string; sources: string[] }[]; researchSourceId?: string; citations?: OriginalSource[]; limitations?: string[];
   partialSources?: Pick<OriginalSource, 'id' | 'label' | 'address' | 'representation'>[];
+  readActions?: ({ completed: boolean } & (
+    { operation: 'search_sources'; query: string } | { operation: 'open_source'; sourceId?: string }
+  ))[];
 };
 
 export const sourceVersions = {
