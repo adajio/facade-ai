@@ -8,18 +8,26 @@
     type Capabilities, type Inventory, type ManifestItem, type NewInput, type Occurrence, type Receipt, type Upload, type UploadProgress,
   } from '../lib/intake';
   import { projectApi, scopedUrl, type OpenEvidence, type Page, type Projection, type WorkspaceProps } from '../lib/workspace';
+  import { workReceiptFilters, workSliceApi, type WorkReceiptFilter } from '../lib/work-slice';
   import Notice from '../lib/Notice.svelte';
   import Document from './Document.svelte';
   import IntakeHolds from './IntakeHolds.svelte';
 
-  type ReceiptList = { receipts: Receipt[]; nextCursor?: number | null };
+  type ReceiptList = { receipts: Receipt[]; nextCursor?: number | string | null };
+  type ReceiptSelection = 'present' | 'filtered' | 'missing';
+  type WorkReceiptList = ReceiptList & { total: number; workSliceId: string; filter: WorkReceiptFilter; selection?: ReceiptSelection };
   type Link = { id: string; receiptId: string; letterId: string; sentId: string; itemId?: string };
   type ImportEntry = { id: string; relativePath?: string; path?: string; status?: string; reason?: string; restriction?: string };
 
   let { api, context, projection, renew, open }: { api: Api; context: WorkspaceProps; projection?: Projection; renew: () => void; open: OpenEvidence } = $props();
   const commands = new Commands(() => api);
+  const receiptFilters = Object.entries(workReceiptFilters) as [WorkReceiptFilter, string][];
   let list = $state<Receipt[]>([]);
-  let nextCursor = $state<number | null>(null);
+  let nextCursor = $state<ReceiptList['nextCursor']>(null);
+  let resolvedWorkSlice = $state('');
+  let totalReceipts = $state<number>();
+  let selection = $state<ReceiptSelection>();
+  let sliceRefreshed = $state(false);
   let inventory = $state<Inventory>();
   let technicalEntries = $state<ImportEntry[]>([]);
   let entriesCursor = $state<string | null>(null);
@@ -80,11 +88,13 @@
       continuation = '';
     }
   });
-  let priorUpload = false;
+  let priorUpload: string | null;
   $effect(() => {
-    const show = context.params.get('upload') === '1';
-    if (show && !priorUpload) startNew();
-    priorUpload = show;
+    const upload = context.params.get('upload');
+    if (upload !== priorUpload) {
+      priorUpload = upload;
+      if (upload === '1' || upload === 'link') startNew(upload === 'link' ? 'link' : 'file');
+    }
   });
   $effect(() => {
     const project = context.project.id;
@@ -111,7 +121,21 @@
   let uploadSignal: AbortController | undefined;
   let batch = new Map<File, string>();
   let finished = new Set<File>();
-  let mode = $derived(context.filter === 'uploading' || context.filter === 'open' ? 'uploading' : undefined);
+  let projectId = $derived(context.project.id);
+  let filter = $derived<WorkReceiptFilter>(
+    context.filter === 'processing' ? 'processing' : context.filter === 'open' || context.filter === 'uploading' ? 'open' : 'all',
+  );
+  let workScope = $derived(context.project.intakeMode && !context.project.scopeId ? undefined : context.scopeId);
+  let requestedWorkSlice = $derived(context.params.get('workSlice') ?? '');
+  let usesWorkSlice = $derived(Boolean(requestedWorkSlice) || filter === 'processing');
+  let receiptSelection = $derived(usesWorkSlice ? context.objectId : undefined);
+  let listRefresh = $derived(usesWorkSlice ? 0 : context.refreshKey);
+  let listContext = $derived(JSON.stringify([
+    context.project.id, context.scopeId, filter, requestedWorkSlice, receiptSelection, context.params.get('slice'),
+  ]));
+  let previousListContext = '';
+  let retainedWorkSlice = '';
+  let listRequest: AbortController | undefined;
   let linkedLetter = $derived(context.params.get('letter') ?? '');
   let linkedSent = $derived(context.params.get('sent') ?? '');
   let linkedItem = $derived(context.params.get('item') ?? '');
@@ -127,17 +151,57 @@
   });
 
   $effect(() => {
-    const project = context.project.id;
-    const state = mode;
-    void context.refreshKey;
+    const project = projectId;
+    const selectedFilter = filter;
+    const scope = workScope;
+    const pinned = requestedWorkSlice;
+    const sliced = usesWorkSlice;
+    const receipt = receiptSelection;
+    const location = listContext;
+    void listRefresh;
     const stop = new AbortController();
+    listRequest = stop;
     loading = true;
+    paging = false;
     error = '';
-    api.json<ReceiptList>(query(projectApi(project) + '/receipts', { state }), { signal: stop.signal }).then((page) => {
-      list = page.receipts;
-      nextCursor = page.nextCursor ?? null;
-    }).catch((problem) => { if (!stop.signal.aborted) error = describe(problem); })
-      .finally(() => { if (!stop.signal.aborted) loading = false; });
+    nextCursor = null;
+    let slice = pinned;
+    if (previousListContext !== location) {
+      list = [];
+      retainedWorkSlice = pinned;
+      resolvedWorkSlice = '';
+      totalReceipts = undefined;
+      selection = undefined;
+      sliceRefreshed = false;
+    } else {
+      slice = retainedWorkSlice;
+    }
+    previousListContext = location;
+
+    async function openList() {
+      if (!sliced) {
+        const page = await readLegacyReceipts(project, selectedFilter, stop.signal);
+        applyPage(page, false, stop.signal, location);
+        return;
+      }
+      let refreshed = false;
+      const current = slice || await currentWorkSlice(project, scope, stop.signal);
+      let page: WorkReceiptList;
+      try {
+        page = await readWorkReceipts(project, current, selectedFilter, stop.signal, { receiptId: receipt });
+      } catch (problem) {
+        if (!needsCurrentSlice(problem)) throw problem;
+        page = await readCurrentReceipts(project, scope, selectedFilter, stop.signal, receipt);
+        refreshed = true;
+      }
+      if (applyPage(page, false, stop.signal, location) && refreshed) sliceRefreshed = true;
+    }
+
+    void openList().catch((problem) => {
+      if (!stop.signal.aborted) error = describe(problem);
+    }).finally(() => {
+      if (!stop.signal.aborted) loading = false;
+    });
     return () => stop.abort();
   });
 
@@ -183,7 +247,8 @@
 
   function url(receipt?: string, params: Record<string, unknown> = {}) {
     return scopedUrl(context.project.id, 'receipts', {
-      scope: context.scopeId, filter: context.filter, slice: context.params.get('slice'), ...params,
+      scope: context.scopeId, filter: context.filter, slice: context.params.get('slice'),
+      workSlice: resolvedWorkSlice || requestedWorkSlice, ...params,
     }, receipt);
   }
 
@@ -194,20 +259,88 @@
     navigationLink?.click();
   }
 
+  function needsCurrentSlice(problem: unknown) {
+    return problem instanceof ApiError && problem.status === 409 && problem.code === 'snapshot_required';
+  }
+
+  function readLegacyReceipts(project: string, selectedFilter: WorkReceiptFilter, signal: AbortSignal, cursor?: string | number) {
+    const state = selectedFilter === 'open' ? 'uploading' : undefined;
+    return api.json<ReceiptList>(query(projectApi(project) + '/receipts', { state, cursor }), { signal });
+  }
+
+  async function currentWorkSlice(project: string, scopeId: string | undefined, signal: AbortSignal) {
+    const path = query(workSliceApi(project), { scopeId });
+    const current = await api.json<{ workSliceId: string }>(path, { signal });
+    return current.workSliceId;
+  }
+
+  async function readWorkReceipts(
+    project: string, slice: string, selectedFilter: WorkReceiptFilter, signal: AbortSignal,
+    after: { cursor?: string | number; receiptId?: string } = {},
+  ) {
+    const path = query(workSliceApi(project, slice) + '/receipts', { filter: selectedFilter, ...after });
+    const page = await api.json<WorkReceiptList>(path, { signal });
+    if (page.workSliceId !== slice || page.filter !== selectedFilter) {
+      throw new ApiError(502, 'work_slice_mismatch', 'Сервер вернул список другого среза или фильтра.');
+    }
+    return page;
+  }
+
+  async function readCurrentReceipts(
+    project: string, scopeId: string | undefined, selectedFilter: WorkReceiptFilter, signal: AbortSignal, receiptId?: string,
+  ) {
+    return readWorkReceipts(project, await currentWorkSlice(project, scopeId, signal), selectedFilter, signal, { receiptId });
+  }
+
+  function applyPage(page: ReceiptList | WorkReceiptList, append: boolean, signal: AbortSignal, location: string) {
+    if (signal.aborted || listContext !== location) return false;
+    if ('workSliceId' in page) {
+      retainedWorkSlice = page.workSliceId;
+      resolvedWorkSlice = page.workSliceId;
+      totalReceipts = page.total;
+      if (!append) selection = page.selection;
+    }
+    if (append) {
+      const prior = new Set(list.map(item => item.receiptId));
+      list = [...list, ...page.receipts.filter(item => !prior.has(item.receiptId))];
+    } else {
+      list = page.receipts;
+    }
+    nextCursor = page.nextCursor ?? null;
+    return true;
+  }
+
   async function loadMore() {
-    if (paging || nextCursor == null) return;
-    const observed = context.refreshKey;
+    const signal = listRequest?.signal;
+    const cursor = nextCursor;
+    if (!signal || signal.aborted || paging || cursor == null) return;
+    const location = listContext;
+    const project = context.project.id;
+    const selectedFilter = filter;
+    const scope = workScope;
+    const slice = resolvedWorkSlice;
+    const receipt = receiptSelection;
     paging = true;
+    error = '';
     try {
-      const page = await api.json<ReceiptList>(query(projectApi(context.project.id) + '/receipts', { state: mode, cursor: nextCursor }));
-      if (observed !== context.refreshKey) return;
-      const prior = new Set(list.map((item) => item.receiptId));
-      list = [...list, ...page.receipts.filter((item) => !prior.has(item.receiptId))];
-      nextCursor = page.nextCursor ?? null;
+      const page = slice
+        ? await readWorkReceipts(project, slice, selectedFilter, signal, { cursor })
+        : await readLegacyReceipts(project, selectedFilter, signal, cursor);
+      applyPage(page, true, signal, location);
     } catch (problem) {
-      error = describe(problem);
+      if (signal.aborted || location !== listContext) return;
+      if (!slice || !needsCurrentSlice(problem)) {
+        error = describe(problem);
+        return;
+      }
+      try {
+        const fresh = await readCurrentReceipts(project, scope, selectedFilter, signal, receipt);
+        if (applyPage(fresh, false, signal, location)) sliceRefreshed = true;
+      } catch (refreshError) {
+        if (!signal.aborted && location === listContext) error = describe(refreshError);
+      }
     } finally {
-      paging = false;
+      if (!signal.aborted && location === listContext) paging = false;
     }
   }
 
@@ -251,7 +384,7 @@
     batch = new Map();
   }
 
-  function startNew() {
+  function startNew(method: 'file' | 'link' = 'file') {
     form = true;
     active = '';
     existing = '';
@@ -260,7 +393,7 @@
     draft = undefined;
     linkUrl = '';
     declareScope = false;
-    channel = 'file';
+    channel = method;
     files = [];
     batch = new Map();
     finished = new Set();
@@ -493,11 +626,22 @@
 
 <a href={openInventoryLink} bind:this={navigationLink} hidden>К описи</a>
 <div class="actions receipt-actions">
-  {#if context.canEdit}<button type="button" class="primary" disabled={pending} onclick={startNew}>Загрузить комплект</button>{/if}
+  {#if context.canEdit}<button type="button" class="primary" disabled={pending} onclick={() => startNew()}>Загрузить комплект</button>{/if}
   {#if continuation && continuation !== activeReceipt}
     <a class="button" href={url(continuation)}>Открыть сохранённое поступление</a>
   {/if}
-  <a class="button" href={scopedUrl(context.project.id, 'receipts', { scope: context.scopeId, filter: mode ? undefined : 'uploading' })}>{mode ? 'Все поступления' : 'Незавершённые'}</a>
+  {#if usesWorkSlice}
+    <nav class="actions" aria-label="Фильтры поступлений">
+      {#each receiptFilters as [candidate, title] (candidate)}
+        <a class="button" aria-current={filter === candidate ? 'page' : undefined}
+          href={url(context.objectId, { filter: candidate, row: activeRow })}>{title}</a>
+      {/each}
+    </nav>
+  {:else}
+    <a class="button" href={url(undefined, { filter: filter === 'open' ? '' : 'open' })}>
+      {filter === 'open' ? 'Все поступления' : 'Открытые описи'}
+    </a>
+  {/if}
 </div>
 
 {#if context.canEdit && (form || (linkedLetter && linkedSent))}
@@ -559,11 +703,25 @@
 <Notice kind="error" message={operationError} />
 <Notice kind="success" message={success} />
 <Notice kind="error" message={error} />
+{#if sliceRefreshed}
+  <p class="notice" role="status">Срез устарел. Список перечитан с актуального среза.
+    <a href={url(context.objectId, { ...Object.fromEntries(context.params), workSlice: resolvedWorkSlice, filter })}>Ссылка на актуальный срез</a>
+  </p>
+{/if}
+
+{#if selection === 'filtered'}
+  <Notice message="Выбранное поступление не входит в этот фильтр." />
+{:else if selection === 'missing'}
+  <Notice message="Выбранное поступление отсутствует в этом срезе." />
+{/if}
 
 {#if loading && !list.length}<p role="status">Открываем список поступлений…</p>{/if}
 {#if list.length || (!loading && !error)}
   <section class="card table-card">
-    <div class="card-header"><h2>{mode ? 'Незавершённые поступления' : 'Реестр поступлений'}</h2></div>
+    <div class="card-header">
+      <h2>{filter === 'processing' ? 'Поступления в обработке' : filter === 'open' ? 'Открытые описи' : 'Реестр поступлений'}</h2>
+      {#if totalReceipts !== undefined}<span class="meta">Всего · {count(totalReceipts)}</span>{/if}
+    </div>
     {#if list.length}
       <div class="table-wrap">
         <table><thead><tr><th>Поступление</th><th>Канал</th><th>Опись</th><th>Принято</th></tr></thead>
