@@ -67,6 +67,11 @@ export function exactDeliveryStatement(quote: string, item: string, status: "del
   return quote.split(/[|·;,\n]|(?<=[.!?])\s+/u).some((clause) => pattern.test(normalize(clause)));
 }
 
+export function nonDeliveryFromOriginal(quote: string, originalLine: string | undefined, item: string): boolean {
+  return Boolean(originalLine?.includes(quote) && exactDeliveryStatement(quote, item, "not_delivered") &&
+    exactDeliveryStatement(originalLine, item, "not_delivered") && !exactDeliveryStatement(originalLine, item, "delivered"));
+}
+
 export function requirementsFor(rows: CatalogRequirement[], context: FacadeContext, stage: string | null) {
   return rows.flatMap((row) => {
     if (row.level !== context.kind) return [];

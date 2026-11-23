@@ -28,7 +28,7 @@ function pdf(line) {
 }
 
 test("facade requirements retain partial local cover and demand a proven pair or explicit non-delivery", async () => {
-  const { exactDeliveryStatement, facadeReview, requirementsFor } = await built("assessment/facade-model");
+  const { exactDeliveryStatement, facadeReview, nonDeliveryFromOriginal, requirementsFor } = await built("assessment/facade-model");
   const { evaluate, pairProofVersion } = await built("assessment/domain");
   const context = { id: "f1", facadeId: "f1", kind: "facade", name: "F1" };
   const [requirement] = requirementsFor([{
@@ -89,6 +89,10 @@ test("facade requirements retain partial local cover and demand a proven pair or
   assert.equal(exactDeliveryStatement(misleading, "Теплотехнический расчёт", "not_delivered"), false);
   assert.equal(exactDeliveryStatement(misleading, "Теплотехнический расчёт", "delivered"), true);
   assert.equal(exactDeliveryStatement(misleading, "Паспорт", "not_delivered"), true);
+  const absenceQuote = "Паспорт не передан";
+  assert.equal(nonDeliveryFromOriginal(absenceQuote, misleading, "Паспорт"), true);
+  assert.equal(nonDeliveryFromOriginal(absenceQuote, "Паспорт передан, Паспорт не передан", "Паспорт"), false);
+  assert.equal(nonDeliveryFromOriginal(absenceQuote, undefined, "Паспорт"), false);
   assert.equal(exactDeliveryStatement("Thickness was delivered, Width not provided.", "Thickness", "not_delivered"), false);
   const strayNegative = negative.map((fact) => ({ ...fact, finding: { ...fact.finding, citation: {
     ...fact.finding.citation, quote: "Thickness was delivered, Width not provided.",

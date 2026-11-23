@@ -1,9 +1,10 @@
 import type { PoolClient } from "pg";
 import { readPackageAnalysis, type PackageFact } from "../harness/package-analysis.js";
+import { deliveredLines } from "../questions/attribute-aliases.js";
 import { hasAddressedSubject } from "../questions/subject-evidence.js";
 import { canonicalJson, isInventoryRole } from "./domain.js";
 import type { Evidence, ReaderAddress } from "../pdf/types.js";
-import { exactDeliveryStatement, type FacadeFact, type FacadeReadout } from "./facade-model.js";
+import { exactDeliveryStatement, nonDeliveryFromOriginal, type FacadeFact, type FacadeReadout } from "./facade-model.js";
 import type { Gate } from "./store.js";
 import { normalizeFormat } from "./store.js";
 
@@ -24,7 +25,7 @@ export type FacadeReplacement = {
 const completeBranch = (state: string) => state === "covered" || state === "reviewed_no_match";
 
 function convertFact(fact: PackageFact, accepted: Map<string, AcceptedVersion>, formats: Map<string, string>,
-  stages: Map<string, ConfirmedStage>, evidence: Map<string, EvidenceMetadata>): FacadeFact | null {
+  stages: Map<string, ConfirmedStage>, evidence: Map<string, EvidenceMetadata>, originalLines: Map<string, string | undefined>): FacadeFact | null {
   const { source, quote, value, unit, evidenceId, receiptId, runId, lineId, address, components, deliveryStatement } = fact.observation;
   const original = accepted.get(source.versionId);
   const format = formats.get(fact.windowId);
@@ -47,9 +48,10 @@ function convertFact(fact: PackageFact, accepted: Map<string, AcceptedVersion>, 
     Boolean(fact.basis.role) && Boolean(fact.basis.revision) && Boolean(deliveryStatement || subjectVerified || anchoredPresence);
   const active = evidenceBound && fact.sourceRole !== "unknown" && fact.revisionStatus === "current";
   const literalInventory = active && fact.observation.grounding === "text" && Boolean(quote) && isInventoryRole(fact.sourceRole);
-  const delivered = literalInventory && attribute ? exactDeliveryStatement(quote!, attribute, "delivered") : false;
+  const originalLine = originalLines.get(fact.id);
+  const delivered = literalInventory && attribute && originalLine ? exactDeliveryStatement(originalLine, attribute, "delivered") : false;
   const absence = literalInventory && !delivered && !fact.observation.alternatives?.length &&
-    deliveryStatement?.status === "not_delivered" && exactDeliveryStatement(quote!, deliveryStatement.item, "not_delivered");
+    deliveryStatement?.status === "not_delivered" && nonDeliveryFromOriginal(quote!, originalLine, deliveryStatement.item);
   const statement = delivered ? { status: "delivered" as const, item: attribute! } : deliveryStatement;
   const printedStage = fact.basis.stage ? fact.designStage : null;
   const confirmation = stages.get(canonicalJson([source.versionId, address])) ??
@@ -195,7 +197,19 @@ export async function readFacadeInput(tx: PoolClient, projectId: string) {
     `SELECT id,payload FROM reader_evidence WHERE project_id=$1 AND id=ANY($2::uuid[])`, [projectId, evidenceIds],
   )).rows : [];
   const evidenceById = new Map(evidenceRows.map(({ id, payload }) => [id, payload]));
-  const facts = activeFacts.flatMap((fact) => convertFact(fact, accepted, formats, stageByAddress, evidenceById) ?? []);
+  const statementIds = activeFacts.filter(({ observation }) => observation.deliveryStatement).map(({ id }) => id);
+  const { rows: statements } = statementIds.length ? await tx.query<{ id: string; lineId: string; content: string }>(
+    `SELECT o.id,o.payload->>'lineId' AS "lineId",issued.content FROM reader_observations o
+       JOIN LATERAL (
+         SELECT event#>>'{reply,body,content}' AS content FROM harness_research_events
+         WHERE job_id=o.run_id AND event#>>'{reply,evidence,evidenceId}'=o.evidence_id::text
+         ORDER BY sequence LIMIT 1
+       ) issued ON true
+     WHERE o.project_id=$1 AND o.id=ANY($2::uuid[]) AND o.payload->>'grounding'='text'`, [projectId, statementIds],
+  ) : { rows: [] };
+  const originalLines = new Map(statements.map(({ id, lineId, content }) =>
+    [id, deliveredLines(content).find(({ id }) => id === lineId)?.text]));
+  const facts = activeFacts.flatMap((fact) => convertFact(fact, accepted, formats, stageByAddress, evidenceById, originalLines) ?? []);
   const branchesWithFindings = new Set(activeFacts.map(({ windowId, branch }) => `${windowId}:${branch}`));
   const unclassifiedFormats = new Set(windows.filter(({ id }) =>
     !branchesWithFindings.has(`${id}:A`) || !branchesWithFindings.has(`${id}:B`)).map(({ format }) => normalizeFormat(format)));
