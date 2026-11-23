@@ -5,10 +5,12 @@ import { accessConfig, authorize, checkCsrf, checkOrigin, readCookie, readSessio
 import type { AccessActor, AccessRequirement } from '../access/auth.js';
 import { executeCommand, lockOrganization, lockSession, transaction } from '../access/commands.js';
 import { AccessError, sendAccessError, unavailable } from '../access/errors.js';
+import { facadeAssessmentHref, getLockedFacadeContext } from '../assessment/facade-store.js';
+import { lockIntakeProject } from '../intake/gate.js';
 import { contentTypes, hashText, renderDocument, renderText } from './content.js';
 import type { Ground, LetterItem, Selection } from './content.js';
 import {
-  LetterError, expectedVersion, identifier, parseConfirm, parseCreate, parseExport, parsePage, parsePatch,
+  LetterError, assessmentTarget, expectedVersion, identifier, parseConfirm, parseCreate, parseExport, parsePage, parsePatch,
   parseResponse, parseSent,
 } from './inputs.js';
 import {
@@ -19,7 +21,8 @@ import type { Letter, Revision } from './store.js';
 import { approveWording, wordingIsCurrent } from './wording.js';
 
 type ProjectRequirement = Extract<AccessRequirement, { projectId: string }>;
-type LetterResources = { projectId: string; scopeId: string; recipient?: string; selections?: Selection[] };
+type LetterTarget = { scopeId?: string | null; assessmentContextId?: string | null };
+type LetterResources = LetterTarget & { projectId: string; recipient?: string; selections?: Selection[] };
 
 export interface LetterDependencies {
   lockScopes: (tx: PoolClient, projectId: string, scopeIds: readonly string[]) => Promise<unknown>;
@@ -41,7 +44,8 @@ function noEligible(): never {
 
 function stale(letter: Letter): never {
   throw new LetterError(412, 'letter_basis_stale', 'Проверьте изменившиеся основания письма.', {
-    href: `/api/projects/${letter.projectId}/assessments/current?scopeId=${letter.scopeId}`,
+    href: letter.assessmentContextId ? facadeAssessmentHref(letter.projectId) :
+      `/api/projects/${letter.projectId}/assessments/current?scopeId=${letter.scopeId}`,
   });
 }
 
@@ -107,15 +111,25 @@ export function registerLetterRoutes(app: FastifyInstance, deps: LetterDependenc
     });
   }
 
-  async function checkHolds(tx: PoolClient, letter: Pick<Letter, 'projectId' | 'scopeId'>) {
-    const holds = await deps.getHolds(tx, letter.projectId, letter.scopeId);
+  async function lockTarget(tx: PoolClient, projectId: string, target: LetterTarget) {
+    if (target.scopeId) await deps.lockScopes(tx, projectId, [target.scopeId]);
+    else await lockIntakeProject(tx, projectId);
+  }
+
+  async function targetHolds(tx: PoolClient, projectId: string, target: LetterTarget) {
+    return target.assessmentContextId ? (await getLockedFacadeContext(tx, projectId, target.assessmentContextId)).gate.holds :
+      deps.getHolds(tx, projectId, target.scopeId!);
+  }
+
+  async function checkHolds(tx: PoolClient, letter: LetterResources) {
+    const holds = await targetHolds(tx, letter.projectId, letter);
     if (holds.length) scopeError(holds);
   }
 
   async function selectedGrounds(tx: PoolClient, args: LetterResources & { selections: Selection[] }) {
     if (!args.selections.length) return [];
     const grounds = await deps.getGrounds(tx, args);
-    return orderGrounds(grounds.filter((ground) => ground.scopeId === args.scopeId), args.selections);
+    return orderGrounds(grounds.filter((ground) => ground.scopeId === (args.assessmentContextId ?? args.scopeId)), args.selections);
   }
 
   async function assertCurrent(tx: PoolClient, letter: Letter, revision: Revision) {
@@ -141,8 +155,12 @@ export function registerLetterRoutes(app: FastifyInstance, deps: LetterDependenc
   const letterPath = `${prefix}/letters/:letterId`;
   const projectsPath = `${prefix}/projects/:projectId/letters`;
   const pathTo = (letter: Letter) => `/api/letters/${letter.id}`;
-  const readRequirement = ({ projectId, scopeId }: Letter): ProjectRequirement => ({ action: 'project:read', projectId, scopeId });
-  const editRequirement = ({ projectId, scopeId }: Letter): ProjectRequirement => ({ action: 'project:engineer', projectId, scopeId });
+  const readRequirement = ({ projectId, scopeId }: Letter): ProjectRequirement => ({
+    action: 'project:read', projectId, scopeId: scopeId ?? undefined,
+  });
+  const editRequirement = ({ projectId, scopeId }: Letter): ProjectRequirement => ({
+    action: 'project:engineer', projectId, scopeId: scopeId ?? undefined,
+  });
 
   async function requestLetter(request: FastifyRequest) {
     // Authenticate before resolving the object. Unknown and inaccessible IDs share 404.
@@ -160,7 +178,7 @@ export function registerLetterRoutes(app: FastifyInstance, deps: LetterDependenc
 
   function versionOf(letter: Letter) {
     return async (tx: PoolClient) => {
-      await deps.lockScopes(tx, letter.projectId, [letter.scopeId]);
+      await lockTarget(tx, letter.projectId, letter);
       const head = await getRevision(tx, letter.id);
       return { current: head.version, href: pathTo(letter), details: { revisionId: head.id, status: head.status } };
     };
@@ -168,25 +186,27 @@ export function registerLetterRoutes(app: FastifyInstance, deps: LetterDependenc
 
   app.get(`${projectsPath}/eligible`, async (request) => {
     const projectId = identifier((request.params as { projectId: string }).projectId, 'projectId');
-    const query = request.query as { scopeId?: string; recipient?: string };
-    const scopeId = identifier(query.scopeId, 'scopeId');
+    const query = request.query as Record<string, unknown>;
+    const target = assessmentTarget(query);
     if (query.recipient !== undefined && (typeof query.recipient !== 'string' || query.recipient.length > 300)) {
       throw new LetterError(422, 'invalid_letter_input', 'Недопустимый адресат.');
     }
-    return read(request, { action: 'project:read', projectId, scopeId }, async (tx) => {
-      const holds = await deps.getHolds(tx, projectId, scopeId);
-      const items = holds.length ? [] : await deps.getGrounds(tx, { projectId, scopeId, recipient: query.recipient?.trim() });
+    const recipient = typeof query.recipient === 'string' ? query.recipient.trim() : undefined;
+    return read(request, { action: 'project:read', projectId, scopeId: target.scopeId }, async (tx) => {
+      const holds = await targetHolds(tx, projectId, target);
+      const items = holds.length ? [] : await deps.getGrounds(tx, { projectId, ...target, recipient });
       return { items, holds };
     }, true);
   });
 
   app.get(projectsPath, async (request) => {
     const projectId = identifier((request.params as { projectId: string }).projectId, 'projectId');
-    const { scopeId: rawScope, ...query } = request.query as Record<string, unknown>;
-    const scopeId = rawScope === undefined ? undefined : identifier(rawScope, 'scopeId');
+    const { scopeId, assessmentContextId, ...query } = request.query as Record<string, unknown>;
+    const target: LetterTarget = scopeId === undefined && assessmentContextId === undefined ? {} :
+      assessmentTarget({ scopeId, assessmentContextId });
     const { cursor, limit } = parsePage(query);
-    return read(request, { action: 'project:read', projectId, scopeId }, (tx, actor) =>
-      listLetters(tx, projectId, scopeId ?? null, cursor, limit, isEngineer(actor)));
+    return read(request, { action: 'project:read', projectId, scopeId: target.scopeId ?? undefined }, (tx, actor) =>
+      listLetters(tx, projectId, target, cursor, limit, isEngineer(actor)));
   });
 
   app.post(projectsPath, async (request, reply) => {
@@ -196,14 +216,14 @@ export function registerLetterRoutes(app: FastifyInstance, deps: LetterDependenc
       operation: 'letter.create', requirement: { action: 'project:engineer', projectId, scopeId: input.scopeId }, input,
     }, async (tx, actor) => {
       if (!input.items.length) noEligible();
-      await deps.lockScopes(tx, projectId, [input.scopeId]);
-      await checkHolds(tx, { projectId, scopeId: input.scopeId });
+      await lockTarget(tx, projectId, input);
+      await checkHolds(tx, { projectId, ...input });
       const grounds = await selectedGrounds(tx, { ...input, projectId, selections: input.items });
       if (!grounds.length) noEligible();
       if (grounds.length !== input.items.length) {
         throw new LetterError(422, 'ineligible_letter_selection', 'Часть выбранных пунктов не допущена к письму.');
       }
-      const letter = await addLetter(tx, projectId, input.scopeId, actor.userId);
+      const letter = await addLetter(tx, projectId, input, actor.userId);
       const revision = await putRevision(tx, letter.id, 1, actor.userId, {
         status: 'confirmed', recipient: input.recipient, layout: 'formal',
         items: grounds.map((ground) => ({ ...ground, id: randomUUID(), editedWording: null })),
@@ -355,7 +375,7 @@ export function registerLetterRoutes(app: FastifyInstance, deps: LetterDependenc
     const result = await executeCommand(app.db, request, {
       operation: 'letter.sent', requirement: editRequirement(letter), input: { letterId: letter.id, ...input },
     }, async (tx, actor) => {
-      await deps.lockScopes(tx, letter.projectId, [letter.scopeId]);
+      await lockTarget(tx, letter.projectId, letter);
       const revision = await getRevision(tx, letter.id, input.revisionId);
       if (revision.status !== 'confirmed') unconfirmed();
       const byId = new Map(revision.items.map((item) => [item.id, item]));
@@ -385,7 +405,7 @@ export function registerLetterRoutes(app: FastifyInstance, deps: LetterDependenc
     const result = await executeCommand(app.db, request, {
       operation: 'letter.response', requirement: editRequirement(letter), input: { letterId: letter.id, ...input },
     }, async (tx, actor) => {
-      await deps.lockScopes(tx, letter.projectId, [letter.scopeId]);
+      await lockTarget(tx, letter.projectId, letter);
       const sent = await getSent(tx, letter.id, input.sentId);
       if (!sent.items.some((item) => item.id === input.itemId)) {
         throw new LetterError(422, 'unknown_letter_item', 'Ответ относится к пункту отправленного снимка.');

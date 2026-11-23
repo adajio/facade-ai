@@ -29,7 +29,7 @@ function addressLabel(citation: Citation) {
 
 function clientSource(citation: Citation) {
   const name = externalLine(citation.label ?? '');
-  const revision = externalLine(citation.documentRevision?.label ?? '');
+  const revision = externalLine(citation.documentRevision?.label ?? citation.verifiedRevision ?? '');
   const label = [
     name ? `«${name}»` : 'Документ из описи',
     ...(revision ? [`ред. ${revision}`] : []),
@@ -104,7 +104,8 @@ export async function getGrounds(
 ): Promise<Ground[]> {
   try {
     const result = await selectConfirmedGrounds(tx, {
-      projectId: args.projectId, scopeId: args.scopeId, recipient: args.recipient, items: args.selections, readDocumentRevision,
+      projectId: args.projectId, scopeId: args.scopeId ?? undefined, assessmentContextId: args.assessmentContextId ?? undefined,
+      recipient: args.recipient, items: args.selections, readDocumentRevision,
     });
     return result.items.map(renderGround);
   } catch (error) {

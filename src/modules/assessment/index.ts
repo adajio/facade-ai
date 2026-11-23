@@ -1,14 +1,18 @@
 import { randomUUID } from "node:crypto";
-import type { FastifyInstance, FastifyRequest } from "fastify";
+import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import type { PoolClient } from "pg";
 import { executeCommand, requireAccess } from "../access/index.js";
 import { transaction } from "../access/commands.js";
 import { AccessError, sendAccessError } from "../access/errors.js";
-import { accessConfig, authorize, checkCsrf, checkOrigin, readCookie, readSession } from "../access/auth.js";
+import { accessConfig, authorize, checkCsrf, checkOrigin, readCookie, readSession, touchSession } from "../access/auth.js";
+import { facadeKindSet, getProject, updateConfirmedFacadeKinds } from "../access/project-state.js";
+import { object } from "../access/input.js";
+import { lockIntakeProject } from "../intake/gate.js";
 import { recordDecision } from "./commands.js";
-import { identifier, parseConclusion, parseDecision, versionNumber } from "./inputs.js";
+import { facadeAssessmentHref, getLockedFacadeContext, readFacadeObservationPage, readFacadeSnapshot, synchronizeFacadeAssessment } from "./facade-store.js";
+import { identifier, parseConclusion, parseDecision, shortText, versionNumber } from "./inputs.js";
 import {
-  AssessmentError, announceAssessment, assertAvailable, assessmentHref, getLockedGate, getQuestions,
+  AssessmentError, announceAssessment, assertAvailable, assessmentHref, getLockedGate, getQuestions, invalidInput,
   getRevision, makeChange, snapshot, synchronize, writeRevision, type Conclusion, type Gate,
 } from "./store.js";
 
@@ -64,6 +68,92 @@ export async function register(app: FastifyInstance): Promise<void> {
 
 function registerRoutes(app: FastifyInstance, prefix: string) {
   const db = app.db;
+  const facadePath = `${prefix}/projects/:projectId/facade-assessment`;
+  type FacadeParams = Project & { version?: string };
+  async function readFacade(request: FastifyRequest<{ Params: FacadeParams }>, reply: FastifyReply) {
+      const projectId = identifier(request.params.projectId);
+      const version = request.params.version === undefined ? undefined : versionNumber(request.params.version);
+      const result = await transaction(db, async (tx) => {
+        const session = await readSession(tx, request);
+        await authorize(tx, session, { action: "project:read", projectId });
+        const current = version === undefined ? await synchronizeFacadeAssessment(tx, projectId) :
+          await readFacadeSnapshot(tx, projectId, version);
+        if (!current) throw new AssessmentError(404, "assessment_not_found", "Версия оценки недоступна.");
+        await touchSession(tx, session);
+        const { observations, contexts, ...payload } = current.payload;
+        return {
+          ...payload, version: current.version, historical: version !== undefined,
+          contexts: version === undefined ? contexts : contexts.map((context) => ({ ...context, historical: true })),
+          observations: { counts: observations.counts, proposalCounts: observations.proposalCounts,
+            href: `${facadeAssessmentHref(projectId)}/${current.version}/observations` },
+        };
+      });
+      return reply.header("ETag", `"${result.version}"`).send(result);
+  }
+  app.get<{ Params: FacadeParams }>(facadePath, readFacade);
+  app.get<{ Params: FacadeParams }>(`${facadePath}/:version`, readFacade);
+  app.get<{
+    Params: Project & { version: string };
+    Querystring: { binding?: string; facadeId?: string; after?: string; limit?: string; proposal?: string };
+  }>(`${facadePath}/:version/observations`, async (request, reply) => {
+    const projectId = identifier(request.params.projectId);
+    const version = versionNumber(request.params.version);
+    const { binding, facadeId, after, limit, proposal } = request.query;
+    if (binding !== undefined && binding !== "identified" && binding !== "common" &&
+        binding !== "unclear" && binding !== "unidentified") invalidInput("Неизвестный тип привязки.");
+    if (proposal !== undefined && proposal !== "stage" && proposal !== "facadeKind") {
+      invalidInput("Неизвестный вид предложения.");
+    }
+    const result = await transaction(db, async (tx) => {
+      const session = await readSession(tx, request);
+      await authorize(tx, session, { action: "project:read", projectId });
+      const items = await readFacadeObservationPage(tx, projectId, version, {
+        binding, proposal, facadeId: facadeId === undefined ? undefined : identifier(facadeId),
+        after: after === undefined ? undefined : identifier(after),
+        limit: limit === undefined ? 50 : Math.min(versionNumber(limit), 100),
+      });
+      await touchSession(tx, session);
+      return items;
+    });
+    return reply.header("ETag", `"${version}"`).send(result);
+  },
+  );
+
+  app.put<{ Params: Project }>(`${facadePath}/facade-kinds`, async (request, reply) => {
+    const projectId = identifier(request.params.projectId);
+    const input = object(request.body);
+    const facadeKinds = facadeKindSet(input.facadeKinds);
+    const reason = shortText(input.reason, 2000);
+    const ids = input.evidenceIds ?? [];
+    if (!Array.isArray(ids) || ids.length > 100) invalidInput("Укажите до 100 адресных опор.");
+    const evidenceIds = [...new Set(ids.map(identifier))].sort();
+    let expectedVersion: number;
+    const result = await executeCommand(db, request, {
+      operation: "assessment.confirm_facade_kinds",
+      requirement: { action: "project:engineer", projectId },
+      input: { facadeKinds, reason, evidenceIds },
+      async version(tx) {
+        await lockIntakeProject(tx, projectId);
+        expectedVersion = (await getProject(tx, projectId)).version;
+        return { current: expectedVersion, href: `/api/projects/${projectId}` };
+      },
+    }, async (tx, actor) => {
+      if (evidenceIds.length) {
+        const current = await synchronizeFacadeAssessment(tx, projectId);
+        const basis = new Map(current.input.observations.filter(({ proposedFacadeKind }) => proposedFacadeKind)
+          .map(({ evidenceId, proposedFacadeKind }) => [evidenceId, proposedFacadeKind!]));
+        if (evidenceIds.some((id) => !facadeKinds.includes(basis.get(id) ?? ""))) {
+          invalidInput("Опора не подтверждает выбранный тип фасада в текущем комплекте.");
+        }
+      }
+      const body = await updateConfirmedFacadeKinds(tx, { projectId, expectedVersion, facadeKinds, actor });
+      await synchronizeFacadeAssessment(tx, projectId);
+      return { body, audit: { objectId: projectId, version: body.version, details: { facadeKinds, reason, evidenceIds } } };
+    });
+    if (result.replayed) reply.header("Idempotency-Replayed", "true");
+    return reply.code(result.status).header("ETag", `"${result.body.version}"`).send(result.body);
+  });
+
   app.get<{ Params: Project; Querystring: ScopeQuery }>(
     `${prefix}/projects/:projectId/assessments/current`,
     async (request, reply) => {
@@ -114,32 +204,39 @@ function registerRoutes(app: FastifyInstance, prefix: string) {
     async (request, reply) => {
       const questionId = identifier(request.params.questionId);
       await requireAccess(db, request, { action: "session" });
-      const { rows: [location] } = await db.query<{ project_id: string; scope_id: string }>(
-        `SELECT s.project_id, s.scope_id FROM assessment_questions AS q
+      const { rows: [location] } = await db.query<{ project_id: string; scope_id: string; assessment_context_id: string | null }>(
+        `SELECT s.project_id, s.scope_id, s.assessment_context_id FROM assessment_questions AS q
          JOIN assessment_series AS s USING (scope_id) WHERE q.id = $1`, [questionId],
       );
       if (!location) throw new AssessmentError(404, "not_found", "Ресурс недоступен.");
-      const { project_id: projectId, scope_id: scopeId } = location;
-      const requirement = { action: "project:engineer", projectId, scopeId } as const;
+      const { project_id: projectId, scope_id: scopeId, assessment_context_id: assessmentContextId } = location;
+      const requirement = { action: "project:engineer", projectId, scopeId: assessmentContextId ? undefined : scopeId } as const;
       await requireAccess(db, request, requirement);
       const input = parseDecision(request.body);
       let context: Parameters<typeof recordDecision>[1] | undefined;
       const result = await executeCommand(db, request, {
         operation: "assessment.decide", requirement, input: { questionId, ...input },
         async version(tx) {
-          const gate = await getLockedGate(tx, projectId, scopeId);
+          const facade = assessmentContextId ? await getLockedFacadeContext(tx, projectId, assessmentContextId) : null;
+          const gate = facade?.gate ?? await getLockedGate(tx, projectId, scopeId);
           assertAvailable(gate);
-          const revision = await synchronize(tx, projectId, scopeId, gate);
-          const question = (await getQuestions(tx, scopeId, revision.version)).find((item) => item.id === questionId);
-          const href = assessmentHref(projectId, scopeId);
+          const revision = facade?.revision ?? await synchronize(tx, projectId, scopeId, gate);
+          const question = (facade?.questions ?? await getQuestions(tx, scopeId, revision.version)).find((item) => item.id === questionId);
+          const href = facade ? facadeAssessmentHref(projectId) : assessmentHref(projectId, scopeId);
           if (!question || !question.active) {
             throw new AssessmentError(412, "question_obsolete", "Обязательство изменилось.", { href });
           }
-          context = { projectId, scopeId, revision, gate, question };
+          if (question.review?.supplementReceiptIds?.length) {
+            throw new AssessmentError(409, "question_held", "Ожидается проверка досылки по вопросу.", {
+              receiptIds: question.review.supplementReceiptIds, href,
+            });
+          }
+          context = { projectId, scopeId, assessmentContextId: assessmentContextId ?? undefined, revision, gate, question };
           return { current: question.version, href };
         },
       }, async (tx, actor) => {
         const body = await recordDecision(tx, context!, actor.userId, input);
+        if (assessmentContextId) await synchronizeFacadeAssessment(tx, projectId);
         return { status: 201, body, audit: { objectId: questionId, version: body.version } };
       });
       if (result.replayed) reply.header("Idempotency-Replayed", "true");
@@ -151,18 +248,23 @@ function registerRoutes(app: FastifyInstance, prefix: string) {
     `${prefix}/projects/:projectId/conclusions`,
     async (request, reply) => {
       const projectId = identifier(request.params.projectId);
-      const { scopeId, startWork, reason } = parseConclusion(request.body);
+      const { scopeId, assessmentContextId, startWork, reason } = parseConclusion(request.body);
       let revision: Awaited<ReturnType<typeof synchronize>>;
       let gate: Gate;
       const result = await executeCommand(db, request, {
         operation: "assessment.conclude",
         requirement: { action: "project:engineer", projectId, scopeId },
-        input: { scopeId, startWork, reason },
+        input: { scopeId, assessmentContextId, startWork, reason },
         async version(tx) {
-          gate = await getLockedGate(tx, projectId, scopeId);
+          const facade = assessmentContextId ? await getLockedFacadeContext(tx, projectId, assessmentContextId) : null;
+          gate = facade?.gate ?? await getLockedGate(tx, projectId, scopeId!);
           assertAvailable(gate);
-          revision = await synchronize(tx, projectId, scopeId, gate);
-          return { current: revision.version, href: assessmentHref(projectId, scopeId) };
+          if (facade?.questions.some(({ active, review }) => active && review?.supplementReceiptIds?.length)) {
+            throw new AssessmentError(409, "context_held", "Ожидается проверка досылки по контексту.",
+              { href: facadeAssessmentHref(projectId) });
+          }
+          revision = facade?.revision ?? await synchronize(tx, projectId, scopeId!, gate);
+          return { current: revision.version, href: facade ? facadeAssessmentHref(projectId) : assessmentHref(projectId, scopeId!) };
         },
       }, async (tx, actor) => {
         const current = await snapshot(tx, revision, gate);
@@ -174,8 +276,9 @@ function registerRoutes(app: FastifyInstance, prefix: string) {
         };
         const next = await writeRevision(tx, revision, revision.version + 1, gate,
           makeChange("engineer_conclusion", []), conclusion);
-        await announceAssessment(tx, projectId, next);
-        const body = { id: conclusion.id, scopeId, version: next.version, basedOnVersion: revision.version };
+        if (assessmentContextId) await synchronizeFacadeAssessment(tx, projectId);
+        else await announceAssessment(tx, projectId, next);
+        const body = { id: conclusion.id, scopeId, assessmentContextId, version: next.version, basedOnVersion: revision.version };
         return { status: 201, body, audit: { objectId: conclusion.id, version: body.version } };
       });
       if (result.replayed) reply.header("Idempotency-Replayed", "true");

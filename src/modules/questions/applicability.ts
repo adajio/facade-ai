@@ -5,6 +5,7 @@ import { requireAccess, uuid } from "../access/auth.js";
 import { executeCommand } from "../access/commands.js";
 import { AccessError, invalid, unavailable } from "../access/errors.js";
 import { canonicalJson, type Finding, type Review } from "../assessment/domain.js";
+import { facadeAssessmentHref } from "../assessment/facade-store.js";
 import { assessmentHref, getLockedGate, getQuestions, synchronize, normalizeFormat } from "../assessment/store.js";
 import { applyAssessmentUpdate } from "../assessment/updates.js";
 import { createIntakeStorage } from "../intake/blob.js";
@@ -14,12 +15,13 @@ import { publishProjectEvent } from "../supplements/events.js";
 import { deliveredLines, readAttributeAliases } from "./attribute-aliases.js";
 import { normalize } from "./domain.js";
 import type { ObservationPublication, QuestionSearchPorts } from "./domain.js";
-import { createRuntimeInquiryPorts } from "./reader.js";
+import { createReaderSupportOpener, createRuntimeInquiryPorts } from "./reader.js";
+import { getReplacementQuestion, replaceFacadeSources } from "./facade-replacement.js";
 import { refreshAssessmentInquiries } from "./store.js";
 import { hasAddressedSubject, isAttributeAlias } from "./subject-evidence.js";
 
 type Reference = { observationId: string; evidenceId: string; versionId: string };
-type ScopedQuestion = { projectId: string; scopeId: string };
+type ScopedQuestion = { projectId: string; scopeId: string; assessmentContextId: string | null };
 type ProofRow = { source: ObservationPublication; observation: Observation };
 type OpenProof = ProofRow & { representation: Awaited<ReturnType<QuestionSearchPorts["openSupport"]>> & object };
 
@@ -47,8 +49,8 @@ function references(value: unknown): Reference[] {
 
 async function locate(db: Pool | PoolClient, id: string): Promise<ScopedQuestion> {
   const { rows: [row] } = await db.query<ScopedQuestion>(
-    `SELECT s.project_id AS "projectId",s.id AS "scopeId"
-     FROM assessment_questions q JOIN project_scopes s ON s.id=q.scope_id WHERE q.id=$1`, [id],
+    `SELECT s.project_id AS "projectId",s.scope_id AS "scopeId",s.assessment_context_id AS "assessmentContextId"
+     FROM assessment_questions q JOIN assessment_series s ON s.scope_id=q.scope_id WHERE q.id=$1`, [id],
   );
   if (!row) throw unavailable();
   return row;
@@ -149,10 +151,10 @@ export async function registerApplicability(app: FastifyInstance) {
   let runtime: ReturnType<typeof createRuntimePdfService> | undefined;
   let storage: ReturnType<typeof createIntakeStorage> | undefined;
   app.addHook("onClose", async () => { storage?.objects.close(); });
-  const ports = (tx: PoolClient) => {
+  const resources = () => {
     storage ??= createIntakeStorage(app.config.dataDir);
     runtime ??= createRuntimePdfService(app.db, app.config, { storage });
-    return createRuntimeInquiryPorts(app.db, runtime, storage.objects, undefined, tx);
+    return { runtime, objects: storage.objects };
   };
 
   for (const prefix of ["/api", "/api/v1"]) {
@@ -160,7 +162,17 @@ export async function registerApplicability(app: FastifyInstance) {
     app.get<{ Params: { id: string } }>(`${path}/applicability`, async (request, reply) => {
       const id = uuid(request.params.id);
       const ref = await locate(app.db, id);
-      await requireAccess(app.db, request, { ...ref, action: "project:read" });
+      await requireAccess(app.db, request, {
+        projectId: ref.projectId, scopeId: ref.assessmentContextId ? undefined : ref.scopeId, action: "project:read",
+      });
+      if (ref.assessmentContextId) {
+        const { rows } = await app.db.query(
+          `SELECT id,catalog_version_id AS "catalogVersionId", author_id AS "authorId",reason,replaced,replacements,
+            receipt_ids AS "receiptIds",created_at AS "createdAt"
+           FROM facade_source_replacements WHERE question_id=$1 ORDER BY created_at DESC,id LIMIT 100`, [id],
+        );
+        return reply.header("Cache-Control", "no-store").send({ aliases: [], replacements: rows });
+      }
       const [aliases, replacements] = await Promise.all([
         app.db.query(
           `SELECT catalog_version_id AS "catalogVersionId",scope_version AS "scopeVersion",alias,
@@ -185,6 +197,28 @@ export async function registerApplicability(app: FastifyInstance) {
         const reason = text(body.reason, 2000);
         const selected = references(alias === undefined ? body.replacements : body.proof);
         const retired = alias === undefined ? references(body.replaced) : [];
+        if (ref.assessmentContextId) {
+          if (alias !== undefined) throw unavailable();
+          const { projectId, assessmentContextId } = ref;
+          let state: Awaited<ReturnType<typeof getReplacementQuestion>>;
+          const result = await executeCommand(app.db, request, {
+            operation: "inquiry.source-replacements", requirement: { projectId, action: "project:engineer" },
+            input: { id, reason, selected, retired },
+            async version(tx) {
+              state = await getReplacementQuestion(tx, projectId, assessmentContextId, id);
+              return { current: state.question.version, href: facadeAssessmentHref(projectId) };
+            },
+          }, async (tx, actor) => {
+            const { runtime, objects } = resources();
+            const body = await replaceFacadeSources(tx, {
+              id: randomUUID(), state, projectId, selected, retired, reason, actorId: actor.userId,
+              open: createReaderSupportOpener(app.db, runtime, objects, tx),
+            });
+            return { status: 201, body, audit: { objectId: id, version: body.version, details: { selected, retired } } };
+          });
+          if (result.replayed) reply.header("Idempotency-Replayed", "true");
+          return reply.header("Cache-Control", "no-store").header("ETag", `"${result.body.version}"`).code(result.status).send(result.body);
+        }
         let state: Current;
         const result = await executeCommand(app.db, request, {
           operation: `inquiry.${operation}`, requirement: { ...ref, action: "project:engineer" },
@@ -195,7 +229,9 @@ export async function registerApplicability(app: FastifyInstance) {
           },
         }, async (tx, actor) => {
           const review = currentReview(state);
-          const opened = await openProofs(tx, state, ref, selected, ports(tx));
+          const { runtime, objects } = resources();
+          const ports = createRuntimeInquiryPorts(app.db, runtime, objects, undefined, tx);
+          const opened = await openProofs(tx, state, ref, selected, ports);
           requireIndependent(opened);
           const verified = addressedFindings(review, opened, alias === undefined);
           const eventId = randomUUID();
@@ -221,7 +257,7 @@ export async function registerApplicability(app: FastifyInstance) {
             if (opened.some((proof) => !bound(proof, asTarget(state, aliases)))) {
               throw invalid("replacement_subject_unverified", "Применимость новых опор к вопросу не установлена.");
             }
-            const old = await openProofs(tx, state, ref, retired, ports(tx));
+            const old = await openProofs(tx, state, ref, retired, ports);
             addressedFindings(review, old, true);
             const replacingVersions = new Set(selected.map(({ versionId }) => versionId));
             if (old.some(({ source }) => replacingVersions.has(source.versionId))) {

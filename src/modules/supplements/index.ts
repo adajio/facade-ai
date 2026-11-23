@@ -3,6 +3,7 @@ import type { Pool, PoolClient } from 'pg';
 import { executeCommand } from '../access/index.js';
 import { authorize, readSession, touchSession } from '../access/auth.js';
 import { AccessError, sendAccessError } from '../access/errors.js';
+import { synchronizeFacadeAssessment } from '../assessment/facade-store.js';
 import { resolveIntakeHold } from '../intake/index.js';
 import { SupplementError } from './errors.js';
 import { inProjectionSnapshot, readProjectEvents } from './events.js';
@@ -89,6 +90,11 @@ export async function register(app: FastifyInstance): Promise<void> {
         operation: 'supplement.link', requirement: { action: 'project:engineer', projectId }, input: target,
       }, async (tx, actor) => {
         const { link, created } = await linkReceipt(tx, projectId, target, actor.userId);
+        if (created) {
+          const letter = await tx.query(
+            'SELECT 1 FROM letters WHERE project_id=$1 AND id=$2 AND assessment_context_id IS NOT NULL', [projectId, target.letterId]);
+          if (letter.rowCount) await synchronizeFacadeAssessment(tx, projectId);
+        }
         return { body: link, status: created ? 201 : 200, audit: { objectId: link.id, details: target } };
       });
       return sendCommand(reply, result);

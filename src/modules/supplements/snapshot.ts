@@ -34,5 +34,10 @@ export async function readProjectSnapshot(tx: PoolClient, projectId: string, sco
     });
   }
   const holds = [...new Map(states.flatMap((scope) => scope.holds).map((cause) => [cause.id, cause])).values()];
-  return { ...projection, projectId, scopes: states, holds };
+  const result = { ...projection, projectId, scopes: states, holds };
+  if (scopeId) return result;
+  const { rows: [facade] } = await tx.query<{ version: number }>(
+    'SELECT version FROM facade_assessment_snapshots WHERE project_id=$1 ORDER BY version DESC LIMIT 1', [projectId],
+  );
+  return { ...result, facadeAssessmentVersion: facade?.version ?? null };
 }

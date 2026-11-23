@@ -7,7 +7,7 @@ export type DocumentRevisionReader = (
 ) => Promise<DocumentRevision | undefined>;
 
 const maxHeaderEvidenceBytes = 8 * 1024 * 1024;
-const explicitRevision = /(?:^|[.·;]\s*)(?:редакция|ред\.?|revision)\s*[:№]?\s*([\p{L}\d][\p{L}\d_-]{0,23})(?=$|[\s.·;,])/iu;
+const explicitRevision = /(?:^|[.·;|]\s*)(?:(?:current|effective|действующая|актуальная)\s+)?(?:редакция|ред\.?|revision|rev\.?)\s*[:№]?\s*([\p{L}\d][\p{L}\d_-]{0,23})(?=$|[\s.·;,|])/iu;
 const revisionCode = /^(?:\p{L}{0,4}\d[\p{L}\d_-]{0,22}|[A-ZА-ЯЁ])$/u;
 
 function headerRevision(format: string, stage: string, line: ReaderLine): string | undefined {
@@ -49,18 +49,18 @@ export function createDocumentRevisionReader(
        FROM reader_evidence e
        JOIN reader_maps m ON m.project_id = e.project_id
          AND m.version_id = e.version_id AND m.reader_version = e.reader_version
-       WHERE e.project_id = $1 AND e.version_id = $2 AND m.original_sha256 = $3 AND m.document_id = $4 AND e.branch = $6
+       WHERE e.project_id = $1 AND e.version_id = $2 AND m.original_sha256 = $3 AND m.document_id = $4
          AND e.payload#>>'{source,sha256}' = $3
          AND e.payload->>'representation' = 'native' AND e.payload->>'mediaType' = 'application/json'
          AND (e.payload->>'size')::bigint BETWEEN 1 AND 1048576
          AND (
-           e.id = $7::uuid OR
+           e.id = $6::uuid OR
            (m.format = 'pdf' AND e.payload#>>'{address,locator,page}' = $5 AND e.payload#>>'{address,box}' IS NULL)
            OR (m.format IN ('doc', 'docx') AND e.payload#>>'{address,locator,firstParagraph}' = '1')
            OR (m.format = 'txt' AND e.payload#>>'{address,locator,firstLine}' = '1')
          )
        ORDER BY e.payload->>'sha256', e.created_at, e.id`,
-      [projectId, citation.versionId, citation.sha256, citation.documentId, page == null ? null : String(page), citation.branch,
+      [projectId, citation.versionId, citation.sha256, citation.documentId, page == null ? null : String(page),
         component?.evidenceId ?? null],
     );
     // Conversion metadata can give identical headers different artifact hashes across reads.
@@ -79,7 +79,8 @@ export function createDocumentRevisionReader(
       const { lines } = JSON.parse(bytes.toString("utf8")) as { lines: ReaderLine[] };
       for (const line of lines) {
         const label = headerRevision(evidence.format, stage, line);
-        if (label && !revisions.has(label)) {
+        if (label && (!citation.verifiedRevision || label.toLowerCase() === citation.verifiedRevision.toLowerCase()) &&
+            !revisions.has(label)) {
           revisions.set(label, {
             label, quote: line.text, address: headerAddress(evidence, line), evidenceId: evidence.id,
           });

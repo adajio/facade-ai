@@ -1,4 +1,5 @@
 import type { PoolClient } from 'pg';
+import { lockIntakeProject } from '../intake/gate.js';
 import { getSentItems } from '../letters/index.js';
 import { SupplementError } from './errors.js';
 import { readProjectionPosition } from './events.js';
@@ -21,6 +22,7 @@ const linkFields = `id, receipt_id AS "receiptId", letter_id AS "letterId",
 
 export async function linkReceipt(tx: PoolClient, projectId: string, target: ReceiptLinkTarget, actorId: string) {
   const { receiptId, letterId, sentId, itemId } = target;
+  await lockIntakeProject(tx, projectId);
   const { rowCount } = await tx.query('SELECT 1 FROM intake_receipts WHERE project_id = $1 AND id = $2', [projectId, receiptId]);
   if (!rowCount) throw new SupplementError(404, 'not_found', 'Поступление недоступно.');
   const sentItems = await getSentItems(tx, projectId, letterId, sentId);

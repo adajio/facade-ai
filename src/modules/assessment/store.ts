@@ -36,7 +36,7 @@ export type Conclusion = {
 export type Revision = {
   scope_id: string;
   version: number;
-  catalog_version_id: string;
+  catalog_version_id: string | null;
   source_token: string;
   scope: Scope;
   limitations: string[];
@@ -204,6 +204,25 @@ export function normalizeFormat(format: string): string {
   return normalized === "application/pdf" ? "pdf" : normalized;
 }
 
+export function catalogRequirement(row: CatalogRequirement, applies: Requirement["applicability"]): Requirement {
+  return {
+    positionId: row.key,
+    partId: row.key,
+    subject: row.part,
+    ...(row.aliases?.length ? { aliases: row.aliases } : {}),
+    ...(row.evidenceRule ? { evidenceRule: row.evidenceRule } : {}),
+    part: row.part,
+    formats: [...new Set([...row.formats, ...row.equivalents].map(normalizeFormat))].sort(),
+    requiredFormats: [...new Set(row.formats.map(normalizeFormat))].sort(),
+    equivalentFormats: [...new Set(row.equivalents.map(normalizeFormat))].sort(),
+    sourceRoles: [...new Set(row.sourceRoles.map((role) => role.trim().toLowerCase()))].sort(),
+    completeness: row.completenessCriterion,
+    recipient: row.addressee || null,
+    requestedAction: `Предоставить ${row.part}`,
+    applicability: applies,
+  };
+}
+
 function catalogRequirements(source: ScopeSource): { requirements: Requirement[]; limitations: string[] } {
   if (!source.requirements.length) return { requirements: [], limitations: ["catalog_empty"] };
   const requirements: Requirement[] = [];
@@ -214,20 +233,7 @@ function catalogRequirements(source: ScopeSource): { requirements: Requirement[]
     }
     const applies = applicability(row.applicability, source);
     if (applies === "elsewhere") continue;
-    requirements.push({
-      positionId: row.key,
-      partId: row.key,
-      subject: row.part,
-      part: row.part,
-      formats: [...new Set([...row.formats, ...row.equivalents].map(normalizeFormat))].sort(),
-      requiredFormats: [...new Set(row.formats.map(normalizeFormat))].sort(),
-      equivalentFormats: [...new Set(row.equivalents.map(normalizeFormat))].sort(),
-      sourceRoles: [...new Set(row.sourceRoles.map((role) => role.trim().toLowerCase()))].sort(),
-      completeness: row.completenessCriterion,
-      recipient: row.addressee || null,
-      requestedAction: `Предоставить ${row.part}`,
-      applicability: applies,
-    });
+    requirements.push(catalogRequirement(row, applies));
   }
   const duplicates = new Set(requirements.map(key)).size !== requirements.length;
   if (duplicates) return { requirements: [], limitations: ["catalog_rule_duplicate"] };

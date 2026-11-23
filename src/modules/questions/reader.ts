@@ -6,7 +6,7 @@ import type { createRuntimePdfService } from "../pdf/index.js";
 import { ReaderError } from "../pdf/types.js";
 import type { Observation } from "../pdf/types.js";
 import { escapeRegex, matchReason, normalize } from "./domain.js";
-import type { ObservationPublication, QuestionSearchPorts } from "./domain.js";
+import type { ObservationPublication, OpenSupport, QuestionSearchPorts } from "./domain.js";
 import { onObservationPublished } from "./store.js";
 import { hasVerifiedMeaning } from "./semantic-review.js";
 import { deliveredLines, readAttributeAliases } from "./attribute-aliases.js";
@@ -79,13 +79,16 @@ function hasName(line: string, name: string): boolean {
   return new RegExp(`(?:^|[^\\p{L}\\p{N}])${token}(?=$|[^\\p{L}\\p{N}])`, "u").test(normalize(line));
 }
 
-export function createRuntimeInquiryPorts(
+type ReaderSupport = Pick<ObservationPublication, "projectId" | "observationId" | "receiptId" | "evidenceId" |
+  "originalId" | "documentId" | "versionId" | "sha256" | "quote" | "measurement" | "components" | "address"> & {
+  scopeId: string | null;
+};
+
+export function createReaderSupportOpener(
   db: Pool, reader: Reader, objects: IntakeStorage["objects"],
-  checkMeaning?: QuestionSearchPorts["checkMeaning"],
   tx?: PoolClient,
-): QuestionSearchPorts {
-  return {
-    async openSupport(source, signal) {
+): (source: ReaderSupport, signal: AbortSignal) => Promise<OpenSupport | null> {
+  return async (source, signal) => {
       const pin = tx
         ? (await tx.query<{ payload: Observation }>(
           "SELECT payload FROM reader_observations WHERE project_id=$1 AND id=$2",
@@ -145,7 +148,16 @@ export function createRuntimeInquiryPorts(
           (error as { $metadata?: { httpStatusCode?: number } })?.$metadata?.httpStatusCode === 404) return null;
         throw error;
       }
-    },
+  };
+}
+
+export function createRuntimeInquiryPorts(
+  db: Pool, reader: Reader, objects: IntakeStorage["objects"],
+  checkMeaning?: QuestionSearchPorts["checkMeaning"],
+  tx?: PoolClient,
+): QuestionSearchPorts {
+  return {
+    openSupport: createReaderSupportOpener(db, reader, objects, tx),
     async checkMeaning(question, candidate, support, signal, context) {
       if (candidate.components?.length) {
         if (support.content.kind !== "text" || !candidate.measurement || candidate.components.some((part) => !part.binding)) return "unclear";

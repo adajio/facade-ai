@@ -1,4 +1,5 @@
 import type { DeliveryStatement, ReaderObservationComponent } from "../pdf/types.js";
+import type { CatalogEvidenceRule } from "../access/input.js";
 
 export type Outcome =
   | "covered"
@@ -13,10 +14,14 @@ export type Scope = {
   stage: string;
 };
 
+export type EvidenceOption = CatalogEvidenceRule["allOf"][number]["anyOf"][number];
+
 export type Requirement = {
   positionId: string;
   partId: string;
   subject: string;
+  aliases?: string[];
+  evidenceRule?: CatalogEvidenceRule;
   part: string;
   formats: string[];
   requiredFormats: string[];
@@ -51,6 +56,8 @@ export type Citation = {
   href: string;
   deliveryStatement?: DeliveryStatement;
   documentRevision?: DocumentRevision;
+  verifiedRevision?: string;
+  stageConfirmation?: { stage: string; evidenceId: string };
   components?: ReaderObservationComponent[];
 };
 
@@ -68,6 +75,7 @@ export type Finding = {
   sourceRole: string;
   format: string;
   comparisonKey: string;
+  representation?: "native" | "ocr" | "render";
   nonDelivery?: NonDeliveryStatement;
 };
 
@@ -98,6 +106,9 @@ export type Review = {
   completenessChecked: boolean;
   inventory?: InventoryProof;
   confirmedPairs?: { a: string; b: string; proofVersion?: number }[];
+  requireVerifiedPairs?: boolean;
+  supplementReceiptIds?: string[];
+  packageCoverageIds?: string[];
 };
 
 export type Machine = {
@@ -154,7 +165,7 @@ function numericValue(value: string, unit: string | null): Value | null {
   };
 }
 
-function compare(a: Citation, b: Citation): "equal" | "different" | "unknown" {
+export function compareCitationValues(a: Citation, b: Citation): "equal" | "different" | "unknown" {
   if (a.value === null || b.value === null) return "unknown";
   const left = numericValue(a.value, a.unit);
   const right = numericValue(b.value, b.unit);
@@ -178,7 +189,7 @@ function distinctConflictSources(citations: readonly Citation[]): Citation[] {
   for (const citation of citations) {
     const key = canonicalJson([citation.documentId, citation.versionId, citation.sha256]);
     const measurements = byVersion.get(key) ?? [];
-    if (measurements.some((other) => compare(other, citation) === "equal")) continue;
+    if (measurements.some((other) => compareCitationValues(other, citation) === "equal")) continue;
     measurements.push(citation);
     byVersion.set(key, measurements);
     distinct.push(citation);
@@ -193,9 +204,13 @@ export function canonicalJson(value: unknown): string {
   return `{${Object.keys(object).sort().map((key) => `${JSON.stringify(key)}:${canonicalJson(object[key])}`).join(",")}}`;
 }
 
+export function requirementSubjectKey(value: string): string {
+  return value.normalize("NFKC").toLocaleLowerCase("ru").replace(/\s+/g, " ").trim();
+}
+
 export function matchesRequirementSubject(requirement: Requirement, item: string): boolean {
-  const normalize = (value: string) => value.normalize("NFKC").toLocaleLowerCase("ru").replace(/\s+/g, " ").trim();
-  return [requirement.subject, requirement.part].some((name) => normalize(item) === normalize(name));
+  const key = requirementSubjectKey(item);
+  return [requirement.subject, requirement.part, ...requirement.aliases ?? []].some((name) => key === requirementSubjectKey(name));
 }
 
 export function isInventoryRole(sourceRole: string): boolean {
@@ -243,7 +258,7 @@ export function evaluate(
       const right = byId.get(b);
       if (!left || !right || left.citation.branch !== "A" || right.citation.branch !== "B" ||
           left.citation.versionId === right.citation.versionId || left.citation.sha256 === right.citation.sha256 ||
-          left.comparisonKey !== right.comparisonKey || compare(left.citation, right.citation) !== "different") return [];
+          left.comparisonKey !== right.comparisonKey || compareCitationValues(left.citation, right.citation) !== "different") return [];
       return [left.citation, right.citation];
     });
     if (supported.length) return { ...base, outcome: "confirmed_conflict",
@@ -259,6 +274,15 @@ export function evaluate(
     return { ...base, limitations };
   }
 
+  if (review.packageCoverageIds?.length) {
+    const ids = new Set(review.packageCoverageIds);
+    const citations = received.filter(({ citation }) => ids.has(citation.observationId)).map(({ citation }) => citation);
+    if (new Set(citations.map(({ observationId }) => observationId)).size === ids.size) {
+      return { ...base, outcome: "covered", readability: "readable", citations };
+    }
+    return { ...base, limitations: ["required_evidence_incomplete"] };
+  }
+
   let conflict: [Citation, Citation] | null = null;
   let crossBranchConflict: [Citation, Citation] | null = null;
   const variants = new Set(values.map((item) => item.comparisonKey));
@@ -268,11 +292,11 @@ export function evaluate(
     for (const { citation } of values) {
       const place = canonicalJson([citation.sha256, citation.address]);
       const seen = places.get(place);
-      if (seen && compare(seen, citation) !== "equal") {
+      if (seen && compareCitationValues(seen, citation) !== "equal") {
         return { ...base, limitations: ["readers_disagree_at_same_place"] };
       }
       places.set(place, citation);
-      const relation = compare(first.citation, citation);
+      const relation = compareCitationValues(first.citation, citation);
       if (relation === "unknown") return { ...base, limitations: ["comparison_unresolved"] };
       if (relation === "different") {
         conflict ??= [first.citation, citation];
@@ -286,17 +310,19 @@ export function evaluate(
   if (conflict && !crossBranchConflict) {
     const [anchor, alternate] = conflict;
     const opposite = values.find(({ citation }) => citation.branch !== anchor.branch)?.citation;
-    if (opposite && compare(alternate, opposite) === "different") {
+    if (opposite && compareCitationValues(alternate, opposite) === "different") {
       crossBranchConflict = [alternate, opposite];
     }
   }
   const pair = crossBranchConflict ?? (manual ? conflict : null);
   if (pair) {
+    if (review.requireVerifiedPairs) return { ...base, limitations: ["pair_verification_required"] };
     // A pair establishes the conflict. Include other active sources of the same compared assertion.
     const citations = distinctConflictSources([...pair, ...values.map(({ citation }) => citation)]);
     return { ...base, outcome: "confirmed_conflict", citations };
   }
   if (values.length) {
+    if (review.packageCoverageIds) return { ...base, limitations: ["required_evidence_incomplete"] };
     if (variants.size !== 1 || conflict || (!manual && !independent(values))) {
       return { ...base, limitations: ["comparison_unresolved"] };
     }

@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import type { PoolClient } from "pg";
 import type { DocumentRevisionReader } from "./document-revision.js";
+import { facadeAssessmentHref, getLockedFacadeContext } from "./facade-store.js";
 import {
   effectiveOutcome, evaluate, type Decision, type Exclusion, type Machine, type Outcome,
 } from "./domain.js";
@@ -19,7 +20,10 @@ type Decide = {
   startWorkCritical?: boolean;
 };
 
-type DecideContext = { projectId: string; scopeId: string; revision: Revision; gate: Gate; question: Question };
+type DecideContext = {
+  projectId: string; scopeId: string; assessmentContextId?: string;
+  revision: Revision; gate: Gate; question: Question;
+};
 
 function chooseBasis(question: Question, input: Decide): Machine {
   if (input.action !== "correct") return question.machine;
@@ -46,6 +50,7 @@ export async function recordDecision(
   tx: PoolClient, context: DecideContext, authorId: string, input: Decide,
 ) {
   const { question, gate, projectId, scopeId, revision } = context;
+  if (!revision.catalog_version_id) invalidInput("Нет рабочего каталога.");
   const confirmingConflict = (input.action === "confirm" || input.action === "correct") &&
     question.machine.outcome === "confirmed_conflict" && question.review !== null;
   const machine = confirmingConflict ? evaluate(question.requirement, question.review) : question.machine;
@@ -86,15 +91,17 @@ export async function recordDecision(
     decision,
     previous_decision_id: question.decision?.id ?? question.previous_decision_id,
   });
-  await announceAssessment(tx, projectId, next);
-  return { id: decision.id, questionId: question.id, version, scopeId, assessmentVersion: next.version, outcome };
+  if (!context.assessmentContextId) await announceAssessment(tx, projectId, next);
+  const subject = context.assessmentContextId ? { assessmentContextId: context.assessmentContextId } : { scopeId };
+  return { id: decision.id, questionId: question.id, version, ...subject, assessmentVersion: next.version, outcome };
 }
 
 export type GroundSelection = { questionId: string; questionVersion: number; decisionId: string };
 
 export type GroundsOptions = {
   projectId: string;
-  scopeId: string;
+  scopeId?: string;
+  assessmentContextId?: string;
   recipient?: string;
   items?: readonly GroundSelection[];
   readDocumentRevision?: DocumentRevisionReader;
@@ -107,6 +114,7 @@ export type Ground = {
   kind: "confirmed_missing" | "confirmed_conflict";
   scope: Revision["scope"];
   scopeId: string;
+  assessmentContextId?: string;
   subject: string;
   part: string;
   recipient: string;
@@ -118,18 +126,23 @@ export type Ground = {
 };
 
 export async function selectConfirmedGrounds(tx: PoolClient, options: GroundsOptions) {
-  const { projectId, scopeId, recipient, items, readDocumentRevision } = options;
-  const gate = await getLockedGate(tx, projectId, scopeId);
-  const revision = await synchronize(tx, projectId, scopeId, gate);
+  const { projectId, assessmentContextId, recipient, items, readDocumentRevision } = options;
+  const scopeId = assessmentContextId ?? options.scopeId!;
+  const facade = assessmentContextId ? await getLockedFacadeContext(tx, projectId, assessmentContextId) : null;
+  const gate = facade?.gate ?? await getLockedGate(tx, projectId, scopeId);
+  const revision = facade?.revision ?? await synchronize(tx, projectId, scopeId, gate);
   if (items !== undefined || recipient !== undefined) assertAvailable(gate);
-  const questions = (await getQuestions(tx, scopeId, revision.version)).filter((question) => question.active);
+  const questions = (facade?.questions ?? await getQuestions(tx, scopeId, revision.version)).filter((question) => question.active);
   const byId = new Map(questions.map((question) => [question.id, question]));
+  const href = facade ? facadeAssessmentHref(projectId) : assessmentHref(projectId, scopeId);
   const selected = items?.map((selection) => {
     const question = byId.get(selection.questionId);
+    if (question?.review?.supplementReceiptIds?.length) {
+      throw new AssessmentError(409, "question_held", "Ожидается проверка досылки по вопросу.",
+        { receiptIds: question.review.supplementReceiptIds, href });
+    }
     if (!question || question.version !== selection.questionVersion || question.decision?.id !== selection.decisionId) {
-      throw new AssessmentError(412, "letter_basis_stale", "Основание письма изменилось.", {
-        href: assessmentHref(projectId, scopeId),
-      });
+      throw new AssessmentError(412, "letter_basis_stale", "Основание письма изменилось.", { href });
     }
     return question;
   }) ?? questions;
@@ -139,7 +152,7 @@ export async function selectConfirmedGrounds(tx: PoolClient, options: GroundsOpt
       !revision.limitations.includes("catalog_rule_invalid")) {
     for (const question of selected) {
       const { decision, requirement } = question;
-      if (!decision?.requestExternal || !requirement.recipient ||
+      if (question.review?.supplementReceiptIds?.length || !decision?.requestExternal || !requirement.recipient ||
           (recipient !== undefined && recipient !== requirement.recipient)) continue;
       const kind = effectiveOutcome(question.machine, decision, now);
       if (kind !== "confirmed_missing" && kind !== "confirmed_conflict") continue;
@@ -156,6 +169,7 @@ export async function selectConfirmedGrounds(tx: PoolClient, options: GroundsOpt
         kind,
         scope: revision.scope,
         scopeId,
+        ...(assessmentContextId ? { assessmentContextId } : {}),
         subject: requirement.subject,
         part: requirement.part,
         recipient: requirement.recipient,

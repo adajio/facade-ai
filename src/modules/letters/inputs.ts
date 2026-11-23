@@ -89,10 +89,18 @@ function time(value: unknown, field: string): string {
   return time.toISOString();
 }
 
+export function assessmentTarget(input: Record<string, unknown>) {
+  if ((input.scopeId === undefined) === (input.assessmentContextId === undefined)) {
+    invalid('Укажите область или контекст оценки.');
+  }
+  return input.scopeId !== undefined ? { scopeId: identifier(input.scopeId, 'scopeId') } :
+    { assessmentContextId: identifier(input.assessmentContextId, 'assessmentContextId') };
+}
+
 export function parseCreate(value: unknown) {
-  const input = fields(value, ['scopeId', 'recipient', 'items']);
+  const input = fields(value, ['scopeId', 'assessmentContextId', 'recipient', 'items']);
   return {
-    scopeId: identifier(input.scopeId, 'scopeId'),
+    ...assessmentTarget(input),
     recipient: recipient(input.recipient),
     items: select(input.items),
   };

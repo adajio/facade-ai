@@ -94,9 +94,13 @@ export function parseDecision(value: unknown) {
 }
 
 export function parseConclusion(value: unknown) {
-  const input = fields(value, ["scopeId", "startWork", "reason"]);
+  const input = fields(value, ["scopeId", "assessmentContextId", "startWork", "reason"]);
+  if ((input.scopeId === undefined) === (input.assessmentContextId === undefined)) {
+    invalidInput("Укажите область или контекст оценки.");
+  }
   return {
-    scopeId: identifier(input.scopeId),
+    scopeId: input.scopeId === undefined ? undefined : identifier(input.scopeId),
+    assessmentContextId: input.assessmentContextId === undefined ? undefined : identifier(input.assessmentContextId),
     startWork: choice(input.startWork, ["can_start", "cannot_start", "can_start_with_limitations"] as const),
     reason: shortText(input.reason, 2000),
   };

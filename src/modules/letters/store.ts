@@ -8,7 +8,8 @@ type Db = Pool | PoolClient;
 export interface Letter {
   id: string;
   projectId: string;
-  scopeId: string;
+  scopeId?: string | null;
+  assessmentContextId?: string | null;
   number: number;
   createdAt: Date;
 }
@@ -28,7 +29,8 @@ export interface Revision extends RevisionBody {
   createdAt: Date;
 }
 
-const letterColumns = 'l.id, l.project_id AS "projectId", l.scope_id AS "scopeId", l.number, l.created_at AS "createdAt"';
+const letterColumns = `l.id, l.project_id AS "projectId", l.scope_id AS "scopeId",
+  l.assessment_context_id AS "assessmentContextId", l.number, l.created_at AS "createdAt"`;
 const revisionColumns = 'id, version, status, recipient, layout, items, text, text_sha256 AS "textSha256", created_at AS "createdAt"';
 const sentColumns = 'id, revision_id AS "revisionId", recipient, items, text, text_sha256 AS "textSha256", sent_at AS "sentAt", registered_at AS "registeredAt", registered_by AS "registeredBy"';
 
@@ -45,32 +47,35 @@ export async function getLetter(db: Db, id: string) {
   return letter ?? notFound();
 }
 
-export async function listLetters(db: Db, projectId: string, scopeId: string | null, cursor: string | null, limit: number, engineer: boolean) {
+export async function listLetters(db: Db, projectId: string, target: Pick<Letter, 'scopeId' | 'assessmentContextId'>,
+  cursor: string | null, limit: number, engineer: boolean) {
   const { rows } = await db.query<ReturnType<typeof summary>>(`
     SELECT ${letterColumns}, r.version, r.id AS "revisionId", r.status, r.recipient
     FROM letters l
     JOIN LATERAL (SELECT id, version, status, recipient FROM letter_revisions
       WHERE letter_id = l.id AND ($5 OR status = 'confirmed') ORDER BY version DESC LIMIT 1) r ON TRUE
     WHERE l.project_id = $1 AND ($2::uuid IS NULL OR l.scope_id = $2)
+      AND ($6::uuid IS NULL OR l.assessment_context_id = $6)
       AND ($3::uuid IS NULL OR l.number < (SELECT number FROM letters
-        WHERE id = $3 AND project_id = $1 AND ($2::uuid IS NULL OR scope_id = $2)))
+        WHERE id = $3 AND project_id = $1 AND ($2::uuid IS NULL OR scope_id = $2)
+          AND ($6::uuid IS NULL OR assessment_context_id = $6)))
     ORDER BY l.number DESC LIMIT $4
-  `, [projectId, scopeId, cursor, limit + 1, engineer]);
+  `, [projectId, target.scopeId ?? null, cursor, limit + 1, engineer, target.assessmentContextId ?? null]);
   const items = rows.slice(0, limit);
   return { items, nextCursor: rows.length > limit ? items.at(-1)?.id : null };
 }
 
-export async function addLetter(tx: PoolClient, projectId: string, scopeId: string, userId: string) {
+export async function addLetter(tx: PoolClient, projectId: string, target: Pick<Letter, 'scopeId' | 'assessmentContextId'>, userId: string) {
   const { rows: [letter] } = await tx.query<Letter>(`
     WITH counter AS (
       INSERT INTO letter_counters (project_id, last_number) VALUES ($1, 1)
       ON CONFLICT (project_id) DO UPDATE SET last_number = letter_counters.last_number + 1
       RETURNING last_number
     )
-    INSERT INTO letters AS l (project_id, scope_id, number, created_by)
-    SELECT $1, $2, last_number, $3 FROM counter
+    INSERT INTO letters AS l (project_id, scope_id, number, created_by, assessment_context_id)
+    SELECT $1, $2, last_number, $3, $4 FROM counter
     RETURNING ${letterColumns}
-  `, [projectId, scopeId, userId]);
+  `, [projectId, target.scopeId ?? null, userId, target.assessmentContextId ?? null]);
   return letter;
 }
 
