@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import { decodeCompletion } from '../harness/openrouter.js';
+import { decodeCompletion, type FunctionCall } from '../harness/openrouter.js';
 
 const text = z.string().trim().min(1).refine((value) => !value.includes('\0'));
 const sourceId = text.max(360);
@@ -41,6 +41,14 @@ export function messagesFor(question: string): Message[] {
   }, { role: 'user', content: question }];
 }
 
+export function recentTranscript(messages: Message[], history: number) {
+  // Keep complete assistant turns and their tool replies.
+  let start = messages.length - history;
+  if (start <= 2) return messages;
+  while (messages[start]?.role === 'tool') start++;
+  return [...messages.slice(0, 2), ...messages.slice(start)];
+}
+
 export function requestFor(route: { model: string; maxTokens: number; toolChoice?: 'auto' | 'required' }, messages: Message[], researchAvailable: boolean) {
   return {
     model: route.model, messages,
@@ -57,19 +65,29 @@ export type Action = { [Name in keyof typeof tools]: {
   name: Name; args: z.infer<typeof tools[Name]['args']>;
 } }[keyof typeof tools];
 
-export function decodeAction(output: unknown) {
+const maxReadBatch = 6;
+const readTools = new Set<string>(['search_sources', 'open_source']);
+
+export function decodeTurn(output: unknown) {
   const result = decodeCompletion(output);
-  if (!result || result.finishReason !== 'tool_calls' || result.message.tool_calls?.length !== 1) return null;
-  const [call] = result.message.tool_calls;
-  if (!/^[\w:.-]+$/.test(call.id)) return null;
-  const name = call.function.name as keyof typeof tools;
-  if (!Object.hasOwn(tools, name)) return null;
-  let raw: unknown;
-  try { raw = JSON.parse(call.function.arguments); } catch { return null; }
-  const args = tools[name].args.safeParse(raw);
-  if (!args.success) return null;
-  // Only forward the selected tool. Free-form assistant text and reasoning are unnecessary.
-  const message: Message = { role: 'assistant', content: null,
-    tool_calls: [{ id: call.id, type: 'function', function: { name, arguments: call.function.arguments } }] };
-  return { action: { name, args: args.data } as Action, message, call };
+  const calls = result?.message.tool_calls;
+  if (result?.finishReason !== 'tool_calls' || !calls?.length || calls.length > maxReadBatch) return null;
+  if (calls.length > 1 && calls.some((call) => !readTools.has(call.function.name))) return null;
+
+  const actions: { action: Action; callId: string }[] = [];
+  const toolCalls: FunctionCall[] = [];
+  for (const call of calls) {
+    if (!/^[\w:.-]+$/.test(call.id)) return null;
+    const name = call.function.name as keyof typeof tools;
+    if (!Object.hasOwn(tools, name)) return null;
+    let raw: unknown;
+    try { raw = JSON.parse(call.function.arguments); } catch { return null; }
+    const args = tools[name].args.safeParse(raw);
+    if (!args.success) return null;
+    actions.push({ action: { name, args: args.data } as Action, callId: call.id });
+    toolCalls.push({ id: call.id, type: 'function', function: { name, arguments: call.function.arguments } });
+  }
+  // Replay the entire provider turn with exactly one reply for each tool ID.
+  const message: Message = { role: 'assistant', content: null, tool_calls: toolCalls };
+  return { actions, message };
 }
