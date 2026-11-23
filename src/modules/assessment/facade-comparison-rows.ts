@@ -14,7 +14,15 @@ export type RowCitation = {
 export type IssuedComparisonEvidence = { evidenceId: string; runId: string; content: string | null };
 type Witness = { fact: PackageFact; evidence: Evidence; line: ReaderLine; key: string; citation: RowCitation };
 export type CanonicalRow = {
-  blockId: string; artifactSha256: string; lineId: string; text: string; address: ReaderAddress;
+  blockId: string; artifactSha256: string; lineId: string; text: string; address: ReaderAddress; completePage?: boolean;
+};
+type DrawingCitation = Omit<RowCitation, "observationId">;
+type DrawingView = {
+  title: DrawingCitation;
+  scope: DrawingCitation;
+  variant: { value: string; mark: string; citation: DrawingCitation };
+  revision: { value: string; citation: DrawingCitation };
+  stage?: string;
 };
 export type ComparisonRow = {
   key: string;
@@ -25,6 +33,7 @@ export type ComparisonRow = {
   value: RowCitation;
   context: RowCitation;
   canonical?: Pick<CanonicalRow, "blockId" | "artifactSha256" | "lineId">;
+  drawingView?: DrawingView;
   composed: boolean;
 };
 
@@ -55,26 +64,30 @@ const rowKey = (block: string, line: string) => canonicalJson([block, line]);
 
 export async function readCanonicalComparisonRows(tx: PoolClient, projectId: string, facts: PackageFact[],
   evidence: ReadonlyMap<string, Evidence>): Promise<CanonicalRow[]> {
-  const targets = new Map();
+  const targets = new Map<string, {
+    block_id: string; unit_id: string; version_id: string;
+    document_id: string; original_sha256: string; reader_version: string;
+  }>();
   for (const { observation: o } of facts) {
     const stored = evidence.get(o.evidenceId);
     if (stored?.format !== "pdf" || stored.representation !== "native" || o.grounding !== "text" ||
         !o.lineId || !o.value || o.limitation) continue;
     const { unitId } = o.address;
     const block = blockId(o.source, o.readerVersion, unitId);
-    targets.set(rowKey(block, o.lineId), { block_id: block, line_id: o.lineId, unit_id: unitId,
-      version_id: o.source.versionId, document_id: o.source.documentId, original_sha256: o.source.sha256, reader_version: o.readerVersion });
+    targets.set(block, { block_id: block, unit_id: unitId, version_id: o.source.versionId,
+      document_id: o.source.documentId, original_sha256: o.source.sha256, reader_version: o.readerVersion });
   }
   if (!targets.size) return [];
   const { rows } = await tx.query<CanonicalRow>(
-    `SELECT b.id AS "blockId", b.artifact_sha256 AS "artifactSha256", l.line_id AS "lineId", l.literal AS text, l.address
-       FROM jsonb_to_recordset($2::jsonb) AS t(block_id text, line_id text, unit_id text, version_id uuid,
+    `SELECT b.id AS "blockId", b.artifact_sha256 AS "artifactSha256", l.line_id AS "lineId", l.literal AS text, l.address,
+            true AS "completePage"
+       FROM jsonb_to_recordset($2::jsonb) AS t(block_id text, unit_id text, version_id uuid,
          document_id uuid, original_sha256 text, reader_version text)
        JOIN project_memory_blocks b ON b.id=t.block_id AND b.project_id=$1 AND b.version_id=t.version_id
          AND b.unit_id=t.unit_id AND b.contract=$3
        JOIN project_memory_versions v ON v.project_id=b.project_id AND v.version_id=b.version_id AND v.contract=b.contract
        JOIN reader_maps r ON r.project_id=b.project_id AND r.version_id=b.version_id AND r.reader_version=v.reader_version
-       JOIN project_memory_lines l ON l.block_id=b.id AND l.line_id=t.line_id
+       JOIN project_memory_lines l ON l.block_id=b.id
        WHERE v.reader_version=t.reader_version AND r.document_id=t.document_id
          AND r.original_sha256=t.original_sha256 AND r.format='pdf'
          AND b.ordinal<v.next_ordinal AND r.units->b.ordinal->>'id'=t.unit_id
@@ -179,10 +192,92 @@ function contextRole(witness: Witness, profile: PackageAnalysis["facadeProfiles"
   return { role, scopeKey };
 }
 
+const documentRoleField = /^(?:document role|роль документа)$/iu;
+const stageField = /^(?:stage|стадия)$/iu;
+const markField = /^(?:mark|марка)$/iu;
+const variantField = /^(?:variant|execution|исполнение|вариант)$/iu;
+const titleField = /^(?:view|view title|drawing title|вид|название вида|название листа)$/iu;
+const titleText = /^\p{L}[\p{L}\p{N} ._,/()—–-]{0,119}$/u;
+const printedCode = /^(?:\p{L}{1,3}|(?=[\p{L}\p{N}_.-]*\d)[\p{L}\p{N}_.-]{1,24})$/u;
+const printedCurrent = /^(?:current|effective|действующая|актуальная)$/iu;
+const drawingAnnotation = /^(?:(?:scale|масштаб)\s*:?\s*\d+\s*:\s*\d+|(?:dimensions in|размеры в)\s+(?:mm|cm|m|мм|см|м|millimet(?:er|re)s)|(?:detail reference|ссылка на узел)\s*:\s*(?:view|вид)\s+\d+(?:\s*\/\s*[\p{L}][\p{L}\p{N} ._-]{0,39})?)$/iu;
+
+function drawingIdentity(text: string, header: boolean) {
+  const row = fields(text);
+  if (header && (row.length !== 3 || clauses(text).length !== 3)) return;
+  const qualifiers = [facadeField, buildingField, axesField].map((pattern) => row.filter(({ name }) => pattern.test(name)));
+  if (qualifiers.some((matches) => matches.length !== 1 || !matches[0].value)) return;
+  return canonicalJson(qualifiers.map(([{ value }]) => requirementSubjectKey(value)));
+}
+
+function drawingLineKind(text: string) {
+  if (drawingAnnotation.test(text)) return "annotation";
+  const row = fields(text);
+  if (row.some(({ name }) => documentRoleField.test(name) || revisionField.test(name) || stageField.test(name))) return "header";
+  if (row.some(({ name }) => facadeField.test(name) || buildingField.test(name) || axesField.test(name))) return "scope";
+  if (row.some(({ name }) => markField.test(name) || variantField.test(name))) return "item";
+  if (titleText.test(text) || row.length === 1 && clauses(text).length === 1 &&
+      titleField.test(row[0].name) && titleText.test(row[0].value)) return "title";
+  return "unknown";
+}
+
+// Require a complete single-view sheet, one marked execution and a measured row repeating the view's facade identity.
+function localDrawingView(row: CanonicalRow, page: CanonicalRow[], witness: Witness, issued: ReaderLine[],
+  group: Witness[]): DrawingView | undefined {
+  if (page.some((line) =>
+      line.artifactSha256 !== row.artifactSha256 || !line.address.box || !validBox(line.address.box) ||
+      line.address.unitId !== row.address.unitId || canonicalJson(line.address.locator) !== canonicalJson(row.address.locator)) ||
+      new Set(page.map(({ lineId }) => lineId)).size !== page.length) return;
+  const { title: titles = [], header: headers = [], scope: scopes = [], item: items = [], unknown = [] } =
+    Object.groupBy(page.filter((line) => line !== row), ({ text }) => drawingLineKind(text));
+  if (unknown.length || [titles, headers, scopes, items].some((lines) => lines.length !== 1)) return;
+  const [[title], [header], [scope], [item]] = [titles, headers, scopes, items];
+  const before = (a: CanonicalRow, b: CanonicalRow) => a.address.box!.y + a.address.box!.height < b.address.box!.y;
+  if (!before(title, scope) || !before(header, scope) || !before(scope, item) || !before(item, row) ||
+      !(before(title, header) || before(header, title)) ||
+      [title, header, scope, item].some((line) => Math.abs(line.address.box!.x - row.address.box!.x) > 1)) return;
+  const identity = drawingIdentity(scope.text, true);
+  if (!identity || identity !== drawingIdentity(row.text, false) || fields(row.text).length !== 4 || clauses(row.text).length !== 5) return;
+  const headerClauses = clauses(header.text);
+  const headerFields = fields(header.text);
+  const itemFields = fields(item.text);
+  const matching = (xs: typeof headerFields, pattern: RegExp) => xs.filter(({ name }) => pattern.test(name));
+  const [documentRole, duplicateRole] = matching(headerFields, documentRoleField);
+  const [revision, duplicateRevision] = matching(headerFields, revisionField);
+  const [stage, duplicateStage] = matching(headerFields, stageField);
+  const [mark] = matching(itemFields, markField);
+  const [variant] = matching(itemFields, variantField);
+  if (headerClauses.filter((clause) => printedCurrent.test(clause)).length !== 1 ||
+      headerClauses.length !== headerFields.length + 1 || headerFields.length !== (stage ? 3 : 2) ||
+      !documentRole || duplicateRole || roleNames.get(documentRole.value.toLowerCase()) !== "drawing" ||
+      !revision || duplicateRevision || !printedCode.test(revision.value) ||
+      duplicateStage || stage && !printedCode.test(stage.value) ||
+      clauses(item.text).length !== 2 || !mark || !printedCode.test(mark.value) || !variant || !printedCode.test(variant.value) ||
+      group.some(({ fact }) => fact.variant && requirementSubjectKey(fact.variant) !== requirementSubjectKey(variant.value) ||
+        fact.revision && requirementSubjectKey(fact.revision) !== requirementSubjectKey(revision.value) ||
+        stage && fact.designStage && requirementSubjectKey(fact.designStage) !== requirementSubjectKey(stage.value))) return;
+  const cite = (line: CanonicalRow): DrawingCitation | undefined => {
+    const [issuedLine, duplicate] = issued.filter(({ id }) => id === line.lineId);
+    if (!issuedLine || duplicate || issuedLine.text !== line.text ||
+        canonicalJson(issuedLine.box) !== canonicalJson(line.address.box) ||
+        witness.evidence.address.box && !contains(witness.evidence.address.box, line.address.box!)) return;
+    const { evidenceId, runId, href } = witness.citation;
+    return { evidenceId, runId, href, lineId: line.lineId, address: line.address, quote: line.text };
+  };
+  const titleCitation = cite(title);
+  const scopeCitation = cite(scope);
+  const revisionCitation = cite(header);
+  const variantCitation = cite(item);
+  if (!titleCitation || !scopeCitation || !revisionCitation || !variantCitation) return;
+  return { title: titleCitation, scope: scopeCitation, variant: { value: variant.value, mark: mark.value, citation: variantCitation },
+    revision: { value: revision.value, citation: revisionCitation }, ...(stage ? { stage: stage.value } : {}) };
+}
+
 /** Compose only candidate-review inputs. Each witness is checked against its own run's issued native bytes. */
 export function comparisonRows(facts: PackageFact[], formats: ReadonlyMap<string, string>, evidence: ReadonlyMap<string, Evidence>,
   issued: IssuedComparisonEvidence[], profiles: PackageAnalysis["facadeProfiles"], native: CanonicalRow[]): Map<string, ComparisonRow> {
   const canonicalByRow = Map.groupBy(native, (row) => rowKey(row.blockId, row.lineId));
+  const canonicalPages = Map.groupBy(native.filter(({ completePage }) => completePage), ({ blockId }) => blockId);
   const issuedByEvidence = new Map(issued.map((event) => [event.evidenceId, event]));
   const parsed = new Map<string, ReaderLine[]>();
   const witnesses = facts.toSorted((a, b) => a.id.localeCompare(b.id)).flatMap((fact) => {
@@ -237,8 +332,11 @@ export function comparisonRows(facts: PackageFact[], formats: ReadonlyMap<string
       const physicalPlace = anchor.evidence.format === "pdf" ?
         ["pdf", ...locatorKey(address.locator, pageKeys), line.id] :
         ["xlsx", address.locator?.sheetId, address.locator?.cell];
+      const drawingView = role === "drawing" && canonical?.completePage ?
+        localDrawingView(canonical, canonicalPages.get(canonical.blockId) ?? [], witness, parsed.get(witness.evidence.id) ?? [], group) : undefined;
       result.set(fact.id, { key: canonicalJson([source, physicalPlace]), property, role, scopeKey, binding: witness.fact.binding,
         value: { ...anchor.citation, quote: measured }, context: witness.citation,
+        ...(drawingView ? { drawingView } : {}),
         ...(canonical && anchor.evidence.format === "pdf" ? { canonical: {
           blockId: canonical.blockId, artifactSha256: canonical.artifactSha256, lineId: canonical.lineId,
         } } : {}),

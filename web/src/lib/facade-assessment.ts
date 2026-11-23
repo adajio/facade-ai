@@ -51,7 +51,9 @@ export type FacadeAssessment = {
     id: string; property: string; facadeId: string | null; reasons: string[];
     sources: { citation: Citation; binding: FacadeObservation['binding']; variant: string | null;
       stage: string | null; revision: string | null; revisionStatus: string; sourceRole: string;
-      row?: { value: Citation & { lineId: string; address: SourceAddress }; context: Citation & { lineId: string } };
+      row?: { value: Citation & { lineId: string; address: SourceAddress }; context: Citation & { lineId: string };
+        drawingView?: { title: Citation; scope: Citation; variant: { value: string; mark: string; citation: Citation };
+          revision: { value: string; citation: Citation }; stage?: string } };
       clarification?: { branch: 'A' | 'B'; state: 'route_required' | 'ready' | 'leased' | 'held' | 'done' }[] }[];
   }[] };
   unresolvedMentions?: { items: MentionSource[]; limited: boolean };
@@ -114,6 +116,7 @@ export const assessmentReasons: Record<string, string> = {
   variant_unproven: 'Установите исполнение изделия в каждой опоре',
   variants_differ: 'В опорах указаны разные исполнения изделия',
   revisions_unproven: 'Сверьте действующие редакции обоих оригиналов',
+  revision_applicability_unproven: 'Установите, где каждая редакция действует для области сверки',
   project_stage_unconfirmed: 'Владелец проекта должен подтвердить стадию',
   source_stage_unproven: 'Подтвердите стадию материала по адресу опоры',
   source_stages_differ: 'Стадия одного из материалов отличается от стадии проекта',

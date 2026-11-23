@@ -24,7 +24,7 @@ function fixture() {
   const native = [];
   function add({ id, format = "pdf", branch = "A", runId = id, lineId = "1.0.5.0", quote, text = quote, value, unit = "mm",
     lineBox, frame, locator, binding: mark, building = "West", attribute = null, role = "unknown", revision = null,
-    revisionStatus = "unknown", limitation, sourceSuffix = "", readerVersion = "fixture-v1" }) {
+    revisionStatus = "unknown", limitation, sourceSuffix = "", readerVersion = "fixture-v1", variant = null, stage = null }) {
     const source = { projectId: "p", versionId: format + "-v1" + sourceSuffix, documentId: format + "-doc",
       sha256: createHash("sha256").update(format + sourceSuffix).digest("hex") };
     const receiptId = "receipt";
@@ -41,9 +41,9 @@ function fixture() {
     const identityQuote = mark ? `Facade: ${mark}` : null;
     const binding = { state: mark ? "identified" : "unidentified", candidates: mark ? [{ id: mark, label: mark }] : [],
       quote: identityQuote, actorId: null };
-    const basis = { ...(role === "drawing" ? { role: "Drawing" } : {}) };
-    const fact = { id, windowId: source.versionId, branch, observation, evidenceHref, attribute, sourceRole: role, designStage: null,
-      variant: null, revision, revisionStatus, basis, binding, materials: [] };
+    const basis = { ...(role === "drawing" ? { role: "Drawing" } : {}), ...(stage ? { stage: `Stage: ${stage}` } : {}) };
+    const fact = { id, windowId: source.versionId, branch, observation, evidenceHref, attribute, sourceRole: role, designStage: stage,
+      variant, revision, revisionStatus, basis, binding, materials: [] };
     if (mark) {
       const profile = profiles.get(mark) ?? { facadeId: mark, identity: "independent", mentions: [] };
       profile.mentions.push({ factId: id, label: mark, branch, evidenceId, lineId, versionId: source.versionId, readerVersion,
@@ -185,3 +185,97 @@ test("native row composition refuses unrelated, contradictory or unverified frag
     assert.deepEqual(f.view().items, []);
   });
 });
+
+test("the composed card cites the sole local mark and printed sheet revision without qualifying the pair", () => {
+  const f = drawingView();
+  const [item] = f.view().items;
+  const [source] = item.sources;
+  const proof = source.row.drawingView;
+  assert.equal(proof.variant.value, "V7");
+  assert.equal(proof.variant.mark, "LK-29");
+  assert.equal(proof.variant.citation.lineId, "1.0.3.0");
+  assert.equal(proof.revision.value, "M3");
+  assert.equal(proof.stage, "RD");
+  assert.equal(proof.revision.citation.lineId, "1.0.1.0");
+  assert.equal(proof.scope.quote, "Facade: K-29 | Building: West | Axes: C-E");
+  assert.equal(proof.title.quote, "Elevation and detail / west sector");
+  assert.equal(proof.variant.citation.evidenceId, "e-drawing-context");
+  assert.equal(source.variant, null);
+  assert.equal(source.revision, null);
+  assert.equal(source.stage, null);
+  assert.ok(item.reasons.includes("comparability_unproven"));
+  assert.ok(!item.reasons.includes("variant_unproven"));
+  assert.ok(!item.reasons.includes("revisions_unproven"));
+  assert.ok(!item.reasons.includes("source_stage_unproven"));
+  assert.ok(item.reasons.includes("project_stage_unconfirmed"));
+});
+
+test("drawing metadata follows semantic fields despite a different title, field order and annotations", () => {
+  const title = "View: Bracket arrangement, west wing";
+  const f = drawingView({ title, header: "Revision: U4 | Stage: P | current | Document role: drawing",
+    identity: "Axes: C-E | Facade: K-29 | Building: West", item: "Variant: N3 | Mark: BR-29",
+    extra: ["Scale: 1:20", "Dimensions in mm"] });
+  const [{ sources: [{ row: { drawingView: proof } }] }] = f.view().items;
+  assert.equal(proof.title.quote, title);
+  assert.equal(proof.variant.value, "N3");
+  assert.equal(proof.variant.mark, "BR-29");
+  assert.equal(proof.revision.value, "U4");
+  assert.equal(proof.stage, "P");
+});
+
+test("different printed variants and revisions remain gaps in the candidate card", () => {
+  const f = drawingView({ sheetVariant: "V8", sheetRevision: "M4" });
+  const [{ reasons }] = f.view().items;
+  assert.ok(reasons.includes("variants_differ"));
+  assert.ok(reasons.includes("revision_applicability_unproven"));
+});
+
+test("local drawing metadata is held when the view, scope, revision, or evidence is ambiguous", async (t) => {
+  const cases = [
+    ["unbounded page", { completePage: false }],
+    ["other view", { extra: "Elevation / east sector" }],
+    ["other facade", { identity: "Facade: K-82 | Building: West | Axes: C-E" }],
+    ["other mark", { extra: "Mark: LK-82" }],
+    ["other variant", { item: "Mark: LK-29 | Variant: V7 | Variant: V8" }],
+    ["explicit local override", { extra: "Override: use variant V8 for bracket reach" }],
+    ["other revision", { header: "Document role: drawing | Stage: RD | Revision: M3 | Revision: M4 | current" }],
+    ["superseded revision", { header: "Document role: drawing | Stage: RD | Revision: M3 | superseded" }],
+    ["missing scope identity", { identity: "Facade: K-29 | Building: West" }],
+    ["metadata outside the issued native bytes", { omitIssued: "1.0.3.0" }],
+  ];
+  for (const [name, options] of cases) await t.test(name, () => {
+    const f = drawingView(options);
+    const [item] = f.view().items;
+    assert.ok(item);
+    assert.equal(item.sources[0].row.drawingView, undefined);
+  });
+});
+
+function drawingView({ completePage = true, extra, omitIssued,
+  title = "Elevation and detail / west sector",
+  header = "Document role: drawing | Stage: RD | Revision: M3 | current",
+  identity = "Facade: K-29 | Building: West | Axes: C-E", item = "Mark: LK-29 | Variant: V7",
+  sheetVariant = "V7", sheetRevision = "M3" } = {}) {
+  const f = fixture();
+  const metadata = [title, header, identity, item].map((text, index) => ({
+    text, id: `1.0.${index}.0`, box: box(0, 45, 4 + index * 20),
+  }));
+  f.context({ lineBox: box(0, 85, 90), frame: { ...box(0, 85, 0), height: 120 } });
+  f.value({ lineBox: box(65, 40, 90), frame: { ...box(65, 50, 0), height: 120 } });
+  f.canonical({ completePage, address: { ...page, box: box(0, 105, 90) } });
+  for (const row of metadata) f.canonical({ completePage, lineId: row.id, text: row.text, address: { ...page, box: row.box } });
+  for (const [index, text] of (extra ? [extra].flat() : []).entries()) {
+    f.canonical({ completePage, lineId: `1.0.${6 + index}.0`, text, address: { ...page, box: box(0, 70, 110 + index * 20) } });
+  }
+  const body = JSON.parse(f.issued[0].content);
+  body.lines.unshift(...metadata.filter(({ id }) => id !== omitIssued));
+  const content = f.issued[0].content = JSON.stringify(body);
+  const issued = f.evidence.get("e-drawing-context");
+  issued.sha256 = createHash("sha256").update(content).digest("hex");
+  issued.size = Buffer.byteLength(content);
+  f.cell("matched", "F3", "B", mark, "West", [3, 6], {
+    quote: `Schedule | Facade: ${mark} | Building: West | Axes: C-E | Stage: RD | Variant: ${sheetVariant} | Revision: ${sheetRevision} current | ${property}: 26 mm`,
+    variant: sheetVariant, revision: sheetRevision, stage: "RD",
+  });
+  return f;
+}

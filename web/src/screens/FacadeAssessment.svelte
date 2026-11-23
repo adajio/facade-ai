@@ -210,7 +210,7 @@
                 {#if source.variant} · исполнение {source.variant}{/if}
                 {#if source.revision} · редакция {source.revision}{/if}
                 {#if source.stage} · стадия {source.stage}{/if}
-                {#if source.revisionStatus !== 'current'} · действующая редакция требует сверки{/if}
+                {#if source.revisionStatus !== 'current' && !source.row?.drawingView} · действующая редакция требует сверки{/if}
                 {#each source.clarification ?? [] as read (read.branch)}
                   {#if read.state === 'route_required'}
                     <div>Ветвь {read.branch}. Для адресного дочитывания требуется доступ к закреплённому маршруту.</div>
@@ -235,6 +235,22 @@
                     <EvidenceButtons citations={[{ ...source.row.context, branch: source.citation.branch,
                       documentId: source.citation.documentId, versionId: source.citation.versionId,
                       sha256: source.citation.sha256, sourceLabel: 'Контекст строки' }]} {open} />
+                  {/if}
+                  {#if source.row.drawingView}
+                    {@const view = source.row.drawingView}
+                    <p>Исполнение {view.variant.value} указано для марки {view.variant.mark} в этом виде.</p>
+                    <blockquote>{view.title.quote}<br />{view.scope.quote}<br />{view.variant.citation.quote}</blockquote>
+                    <p>
+                      Редакция {view.revision.value} отмечена как действующая в заголовке этого листа.
+                      {#if view.stage}В заголовке указана стадия {view.stage}.{/if}
+                    </p>
+                    <blockquote>{view.revision.citation.quote}</blockquote>
+                    <EvidenceButtons citations={[
+                      { ...view.title, sourceLabel: 'Название вида' }, { ...view.scope, sourceLabel: 'Область вида' },
+                      { ...view.variant.citation, sourceLabel: 'Марка и исполнение' },
+                      { ...view.revision.citation, sourceLabel: 'Редакция листа' },
+                    ].map((citation) => ({ ...citation, branch: source.citation.branch, documentId: source.citation.documentId,
+                      versionId: source.citation.versionId, sha256: source.citation.sha256 }))} {open} />
                   {/if}
                 {:else if source.citation.quote}
                   <blockquote>{source.citation.quote}</blockquote>

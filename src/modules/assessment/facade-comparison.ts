@@ -6,13 +6,14 @@ import type { ComparisonRead, FacadeObservation } from "./facade-input.js";
 import { requirementsFor, type FacadeContext, type FacadeFact, type FacadeReadout } from "./facade-model.js";
 
 export type ComparisonGap = "comparability_unproven" | "facade_link_unproven" | "facades_differ" | "variant_unproven" | "variants_differ" | "revisions_unproven" |
+  "revision_applicability_unproven" |
   "project_stage_unconfirmed" | "source_stage_unproven" | "source_stages_differ" | "source_role_unproven" |
   "value_role_unproven" | "comparison_rule_unproven" | "units_not_comparable" | "pair_verification_required";
 
 type ComparisonSource = { citation: Citation; binding: FacadeObservation["binding"]; variant: string | null;
   stage: string | null; revision: string | null; revisionStatus: FacadeObservation["revisionStatus"];
   sourceRole: string; valueRole?: FacadeFact["finding"]["valueRole"]; clarification?: ComparisonRead[];
-  row?: Pick<ComparisonRow, "value" | "context" | "canonical"> };
+  row?: Pick<ComparisonRow, "value" | "context" | "canonical" | "drawingView"> };
 type ComparisonItem = { id: string; property: string; facadeId: string | null; reasons: ComparisonGap[];
   sources: [ComparisonSource, ComparisonSource] };
 export type ComparisonReview = { items: ComparisonItem[]; limited: boolean };
@@ -149,12 +150,21 @@ export function comparisonReview(facts: FacadeFact[], observations: FacadeObserv
       const reasons: ComparisonGap[] = [];
       if (!common && facadeId === null) reasons.push(a.membership.kind === "facades" && a.membership.facadeIds.length === 1 &&
         b.membership.kind === "facades" && b.membership.facadeIds.length === 1 ? "facades_differ" : "facade_link_unproven");
-      if (!a.variant || !b.variant) reasons.push("variant_unproven");
-      else if (subjectKey(a.variant) !== subjectKey(b.variant)) reasons.push("variants_differ");
-      if ([oa, ob].some(({ revision, revisionStatus }) => !revision || revisionStatus !== "current")) reasons.push("revisions_unproven");
+      const viewA = left.row?.drawingView;
+      const viewB = right.row?.drawingView;
+      const variantA = viewA?.variant.value ?? a.variant;
+      const variantB = viewB?.variant.value ?? b.variant;
+      if (!variantA || !variantB) reasons.push("variant_unproven");
+      else if (subjectKey(variantA) !== subjectKey(variantB)) reasons.push("variants_differ");
+      const revisionA = viewA?.revision.value ?? (oa.revisionStatus === "current" ? oa.revision : null);
+      const revisionB = viewB?.revision.value ?? (ob.revisionStatus === "current" ? ob.revision : null);
+      if (!revisionA || !revisionB) reasons.push("revisions_unproven");
+      else if ((viewA || viewB) && subjectKey(revisionA) !== subjectKey(revisionB)) reasons.push("revision_applicability_unproven");
+      const stageA = a.stage ?? viewA?.stage;
+      const stageB = b.stage ?? viewB?.stage;
       if (!stage) reasons.push("project_stage_unconfirmed");
-      if (!a.stage || !b.stage) reasons.push("source_stage_unproven");
-      else if (stage && [a.stage, b.stage].some((value) => subjectKey(value) !== subjectKey(stage))) reasons.push("source_stages_differ");
+      if (!stageA || !stageB) reasons.push("source_stage_unproven");
+      else if (stage && [stageA, stageB].some((value) => subjectKey(value) !== subjectKey(stage))) reasons.push("source_stages_differ");
       if ([a, b].some(({ finding }) => finding.sourceRole === "unknown")) reasons.push("source_role_unproven");
       else if (requirements && catalog) {
         const allowed = requirements.some((requirement) =>
@@ -177,7 +187,8 @@ export function comparisonReview(facts: FacadeFact[], observations: FacadeObserv
         revision: observation.revision, revisionStatus: observation.revisionStatus, sourceRole: fact.finding.sourceRole,
         ...(fact.finding.valueRole ? { valueRole: fact.finding.valueRole } : {}),
         ...(reads.has(observation.id) ? { clarification: reads.get(observation.id) } : {}),
-        ...(row ? { row: { value: row.value, context: row.context, ...(row.canonical ? { canonical: row.canonical } : {}) } } : {}),
+        ...(row ? { row: { value: row.value, context: row.context, ...(row.canonical ? { canonical: row.canonical } : {}),
+          ...(row.drawingView ? { drawingView: row.drawingView } : {}) } } : {}),
       });
       if (rowPair) {
         rowPairs.add(rowPair);
