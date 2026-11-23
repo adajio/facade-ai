@@ -7,6 +7,7 @@ import { getCatalog, getProject, matchesDefaultProfile } from '../access/project
 import { deliveredLines } from '../questions/attribute-aliases.js';
 import { ReaderRefusal, jobSchema, type BlockCheck, type PackageBlock, type PackageSemanticCheck, type Place, type ReaderContext } from './contracts.js';
 import type { ReaderService } from './reader.js';
+import { memoryVersion } from '../project-memory/contracts.js';
 
 export const packageFollowupKind = 'harness_package_followup';
 
@@ -21,14 +22,17 @@ const activeFacts = `harness_package_facts fact
   LEFT JOIN harness_package_followups child ON child.job_id=fact.job_id
   JOIN harness_package_branches primary_branch ON primary_branch.job_id=coalesce(child.root_job_id,fact.job_id) AND primary_branch.active
   JOIN ${activeWindows} ON w.id=fact.window_id
-  JOIN LATERAL (SELECT version,state,candidates FROM harness_package_bindings b
+  JOIN LATERAL (SELECT version,state,candidates,actor_id FROM harness_package_bindings b
     WHERE b.fact_id=fact.id ORDER BY version DESC LIMIT 1) binding ON true`;
 
 export function currentFacadeScopes(project: string, stage: string) {
   return `SELECT detected.id,detected.label,confirmed.kind FROM (
     SELECT DISTINCT (candidate->>'id')::uuid AS id,candidate->>'label' AS label
-    FROM ${activeFacts} CROSS JOIN LATERAL jsonb_array_elements(binding.candidates) candidate
-    WHERE fact.project_id=${project} AND ${activeSource}
+    FROM ${activeFacts} LEFT JOIN harness_facade_discovery d ON d.fact_id=fact.id
+    CROSS JOIN LATERAL jsonb_array_elements(binding.candidates) candidate
+    WHERE fact.project_id=${project} AND ${activeSource} AND (binding.actor_id IS NOT NULL OR d.resolved)
+      AND (binding.actor_id IS NOT NULL OR NOT EXISTS(SELECT 1 FROM harness_stale_facade_profiles stale
+        WHERE stale.project_id=fact.project_id AND stale.facade_id::text=candidate->>'id'))
   ) detected
   LEFT JOIN facade_assessment_contexts ctx ON ctx.project_id=${project} AND ctx.facade_id=detected.id AND ctx.kind='facade'
   LEFT JOIN LATERAL (
@@ -292,7 +296,7 @@ export async function dispatchPackageFollowup(db: Pool,queue: WorkQueue) {
            WHERE x.project_id=w.project_id AND x.state IN ('ready','leased'))
          AND 4>(SELECT count(*) FROM harness_package_followups f JOIN gateway_jobs x ON x.id=f.job_id WHERE x.state IN ('ready','leased'))
        ORDER BY j.created_at,j.project_id,b.branch LIMIT 1`);
-    if (!row) return dispatchCatalogFollowup(tx,queue);
+    if (!row) return await dispatchFacadeFollowup(tx,queue) || dispatchCatalogFollowup(tx,queue);
     return putFollowup(tx,queue,row,`blocks:${row.round}`);
   });
 }
@@ -300,7 +304,8 @@ export async function dispatchPackageFollowup(db: Pool,queue: WorkQueue) {
 type FollowupTarget={rootId:string;windowId:string;projectId:string;generationId:string;payload:unknown;blocks:string[]};
 type SemanticPlan={catalogVersionId:string;stage:string;epoch:string;positions:{facadeId:string|null;positionId:string;scopeEpoch:string}[]};
 
-async function putFollowup(tx:PoolClient,queue:WorkQueue,row:FollowupTarget,planKey:string,semantic?:SemanticPlan) {
+async function putFollowup(tx:PoolClient,queue:WorkQueue,row:FollowupTarget,planKey:string,semantic?:SemanticPlan,
+  discovery?:{label:string}) {
   await lockIntakeProject(tx,row.projectId);
   const root=jobSchema.parse(row.payload);
   if (root.mode!=='primary'||!root.packageWindow||!root.settings) return false;
@@ -315,12 +320,61 @@ async function putFollowup(tx:PoolClient,queue:WorkQueue,row:FollowupTarget,plan
   const jobId=await queue.enqueue({...ref,kind:packageFollowupKind,key,priority:-100,
     purpose:root.branch==='A'?'primary_a':'primary_b',subjectId:root.place.source.versionId,obligationId:key,
     payload:{...root,settings:{...root.settings,maxTurns:Math.min(root.settings.maxTurns,8)},
-      packageWindow:{...root.packageWindow,followup:{rootJobId:row.rootId,blocks:row.blocks,...(semantic?{semantic}:{})}}},
+      packageWindow:{...root.packageWindow,followup:{rootJobId:row.rootId,blocks:row.blocks,
+        ...(semantic?{semantic}:{}),...(discovery?{discovery}:{})}}},
   },tx);
   await tx.query(`INSERT INTO harness_package_followups(root_job_id,job_id,window_id,branch,blocks,plan_key)
     VALUES($1,$2,$3,$4,$5,$6)`,[row.rootId,jobId,row.windowId,root.branch,JSON.stringify(row.blocks),planKey]);
   await publishProjectEvent(tx,row.projectId,{ type:'package-analysis.changed',payload:{} });
   return true;
+}
+
+async function dispatchFacadeFollowup(tx:PoolClient,queue:WorkQueue) {
+  const {rows}=await tx.query<FollowupTarget&{label:string;key:string}>(`WITH demand AS (
+      SELECT DISTINCT fact.project_id,w.version_id,translate(lower(trim(mark->>'label')),'‐‑‒–—','-----') AS key,mark->>'label' AS label,
+        mark->>'branch' AS branch,mark->>'kind' AS mention_kind
+      FROM ${activeFacts} JOIN harness_facade_discovery d ON d.fact_id=fact.id
+      CROSS JOIN LATERAL jsonb_array_elements(d.mentions) mark
+      WHERE ${activeSource} AND binding.state IN ('unclear','identified')
+        AND mark->>'kind' IN ('designation','reference','context','registry')
+    )
+    SELECT j.id AS "rootId",w.id AS "windowId",w.project_id AS "projectId",j.generation_id AS "generationId",
+      j.payload,demand.label,'facade:'||md5(demand.key) AS key,ARRAY(SELECT item->>'id' FROM jsonb_array_elements(s.blocks) item) AS blocks
+    FROM ${activeWindows}
+    JOIN harness_package_structures s ON s.window_id=w.id AND jsonb_array_length(s.blocks)>0
+    JOIN harness_package_branches b ON b.window_id=w.id AND b.active
+    JOIN gateway_jobs j ON j.id=b.job_id AND j.state='done'
+    JOIN gateway_generations g ON g.generation_id=j.generation_id AND g.current
+    JOIN demand ON demand.project_id=w.project_id AND (demand.branch=b.branch OR demand.mention_kind IN ('context','registry'))
+      AND (demand.version_id=w.version_id OR demand.mention_kind='reference')
+    JOIN project_memory_versions v ON v.version_id=w.version_id AND v.project_id=w.project_id AND v.contract=$1 AND v.reader_version=m.reader_version
+    JOIN project_memory_blocks mb ON mb.project_id=v.project_id AND mb.version_id=v.version_id AND mb.contract=v.contract
+      AND mb.unit_id=w.place->>'unitId' AND mb.ordinal<v.next_ordinal AND mb.artifact_sha256 IS NOT NULL AND NOT ('native'=ANY(mb.remaining))
+    WHERE ${activeSource} AND j.payload#>>'{packageWindow,walkProtocol}'='1'
+      AND EXISTS (SELECT 1 FROM project_memory_lines l
+        CROSS JOIN LATERAL regexp_split_to_table(l.folded,'[|;·]') field
+        WHERE l.block_id=mb.id AND (
+          translate(trim(substring(trim(field) FROM '^(?:project facade (?:identifier|id)|идентификатор фасада проекта|код фасада проекта)\\s*[:№=]\\s*(.+)$')),'‐‑‒–—','-----')=demand.key
+          OR demand.mention_kind<>'reference' AND (
+            translate(trim(substring(trim(field) FROM '^(?:facade(?: mark| designation| id)?|фасад|марка фасада|обозначение фасада)\\s*[:№=]\\s*(.+)$')),'‐‑‒–—','-----')=demand.key
+            OR substring(translate(trim(field),'‐‑‒–—','-----') FROM '^(?:facade|фасад)\\s+([[:alnum:]_.\\/-]+)\\s+(?:в|по|in|at|axes|grid|корпус|building|block)')=demand.key)
+          AND l.folded~'(facade (type|kind)|тип фасада|building|корпус|axes|grid|оси|осях|осям)'))
+      AND NOT EXISTS(SELECT 1 FROM harness_package_facts f LEFT JOIN harness_package_followups step ON step.job_id=f.job_id
+        JOIN harness_facade_discovery proof ON proof.fact_id=f.id CROSS JOIN LATERAL jsonb_array_elements(proof.mentions) item
+        WHERE coalesce(step.root_job_id,f.job_id)=j.id AND f.revision_status<>'superseded'
+          AND item->>'kind' IN ('registry','context') AND translate(lower(trim(item->>'label')),'‐‑‒–—','-----')=demand.key
+          AND lower(trim(coalesce((SELECT o.payload->>'quote' FROM reader_observations o WHERE o.id=f.id),'')))
+            ~'(facade (type|kind)|тип фасада)\\s*[:№=]')
+      AND NOT EXISTS(SELECT 1 FROM harness_package_followups f WHERE f.root_job_id=j.id AND f.plan_key='facade:'||md5(demand.key))
+      AND NOT EXISTS(SELECT 1 FROM gateway_attempts a WHERE a.job_id=j.id AND a.state IN ('reserved','prepared','sending','unknown'))
+      AND NOT EXISTS(SELECT 1 FROM harness_package_followups f JOIN gateway_jobs x ON x.id=f.job_id
+        WHERE x.project_id=w.project_id AND x.state IN ('ready','leased'))
+      AND 4>(SELECT count(*) FROM harness_package_followups f JOIN gateway_jobs x ON x.id=f.job_id WHERE x.state IN ('ready','leased'))
+    ORDER BY j.created_at,j.project_id,b.branch,demand.key LIMIT 8`,[memoryVersion]);
+  for(const row of rows) {
+    if(await putFollowup(tx,queue,row,row.key,undefined,{label:row.label}))return true;
+  }
+  return false;
 }
 
 async function dispatchCatalogFollowup(tx:PoolClient,queue:WorkQueue) {

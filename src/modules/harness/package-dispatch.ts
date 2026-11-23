@@ -262,7 +262,9 @@ export async function authorizedPackageWindow(
             j.payload#>>'{packageWindow,followup,semantic,epoch}'
           AND NOT EXISTS(SELECT 1 FROM jsonb_array_elements(j.payload#>'{packageWindow,followup,semantic,positions}') item
             WHERE coalesce((SELECT epoch FROM harness_semantic_scope_epochs se WHERE se.project_id=catalog.id AND
-              se.scope_key=coalesce(item->>'facadeId','common')),0)::text<>item->>'scopeEpoch'))) AND o.sha256=w.place#>>'{source,sha256}' AND ${currentSource}`,
+              se.scope_key=coalesce(item->>'facadeId','common')),0)::text<>item->>'scopeEpoch'
+              OR EXISTS (SELECT 1 FROM harness_stale_facade_profiles stale WHERE stale.project_id=catalog.id AND
+                stale.facade_id::text=item->>'facadeId')))) AND o.sha256=w.place#>>'{source,sha256}' AND ${currentSource}`,
     [work.windowId, work.projectId, work.place, work.readerVersion, work.id, work.generationId, work.branch]);
   return Boolean(result.rowCount);
 }

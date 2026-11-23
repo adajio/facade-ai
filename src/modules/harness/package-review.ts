@@ -103,6 +103,8 @@ export async function authorizedPackageReview(db: Pool | PoolClient, projectId: 
        AND $4::uuid=CASE $5::jsonb->>'mode' WHEN 'lead' THEN p.lead_job_id
          ELSE CASE $5::jsonb->>'branch' WHEN 'A' THEN p.a_job_id ELSE p.b_job_id END END
        AND p.assignment->'dispute'=$5::jsonb->'dispute'
+       AND NOT EXISTS (SELECT 1 FROM harness_stale_facade_profiles stale WHERE stale.project_id=p.project_id
+         AND stale.facade_id::text=p.assignment#>>'{packageReview,scopeId}')
        AND NOT EXISTS (
          SELECT 1 FROM harness_package_bindings x WHERE
          (x.fact_id=p.a_fact_id AND x.version>p.a_binding_version) OR (x.fact_id=p.b_fact_id AND x.version>p.b_binding_version)

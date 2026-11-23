@@ -7,6 +7,7 @@ import type { Observation } from '../pdf/types.js';
 import type { VerifiedPairEvidence } from '../assessment/domain.js';
 import { printedPairVariant } from './pair-evidence.js';
 import { currentFacadeScopes } from './package-walk.js';
+import { buildFacadeProfiles, type FacadeMention, type FacadeProfile } from './facade-discovery.js';
 
 export const packageRoles = ['drawing', 'detail', 'schedule', 'specification', 'calculation', 'inventory',
   'correspondence', 'model', 'other', 'unknown'] as const;
@@ -79,6 +80,8 @@ export interface PackageAnalysis {
   facts: PackageFact[];
   semanticChecks: PackageSemanticCheck[];
   candidates: PackageBinding['candidates'];
+  facadeProfiles: FacadeProfile[];
+  facadeMentions: FacadeMention[];
   windows: PackageWindow[];
   comparisons: PackageComparison[];
   reviewCandidates: { a: string; b: string; property: string; scope: { id: string; label: string };catalogVersionId?:string;stage?:string }[];
@@ -107,7 +110,9 @@ interface PackageCoverageProof {
   basisIds: string[];
 }
 
-type FactRow = Omit<PackageFact, 'variant' | 'evidenceHref'> & { register: { quote: string; commonChecked: boolean } | null };
+type FactRow = Omit<PackageFact, 'variant' | 'evidenceHref'> & {
+  register: { quote: string; commonChecked: boolean } | null; mentions: FacadeMention[] | null;
+};
 type WindowRow = Omit<PackageWindow, 'branches'> & {
   branch: Branch | null;
   walk: boolean;
@@ -308,15 +313,22 @@ export async function readPackageAnalysis(db: Pool | PoolClient, projectId: stri
   const { rows } = await db.query<FactRow>(
     `WITH accepted AS (${accepted})
      SELECT f.id,o.branch,f.window_id AS "windowId",o.payload AS observation,f.attribute,f.source_role AS "sourceRole",
-       f.design_stage AS "designStage",f.revision,f.revision_status AS "revisionStatus",f.basis,f.materials,f.subject_register AS register,
-       jsonb_build_object('state',b.state,'quote',b.quote,'reason',b.reason,'candidates',b.candidates,'version',b.version,'actorId',b.actor_id) AS binding
+       f.design_stage AS "designStage",f.revision,f.revision_status AS "revisionStatus",f.basis,f.materials,f.subject_register AS register,d.mentions,
+       jsonb_build_object('state',CASE WHEN b.state IN ('identified','unclear') AND (stale.yes OR b.actor_id IS NULL AND NOT coalesce(d.resolved,false))
+         THEN 'unclear' ELSE b.state END,'quote',b.quote,'reason',CASE WHEN stale.yes THEN 'Зависимая опора заменена.' ELSE b.reason END,
+         'candidates',CASE WHEN NOT stale.yes AND (b.actor_id IS NOT NULL OR d.resolved) THEN b.candidates ELSE '[]'::jsonb END,
+         'version',b.version,'actorId',b.actor_id) AS binding
      FROM harness_package_facts f JOIN reader_observations o ON o.id=f.id
      JOIN accepted a ON a.version_id=o.version_id
      LEFT JOIN harness_package_followups followup ON followup.job_id=f.job_id
      JOIN harness_package_branches active ON active.job_id=coalesce(followup.root_job_id,f.job_id) AND active.active
      JOIN harness_package_windows w ON w.id=f.window_id
      JOIN harness_package_maps m ON m.version_id=w.version_id AND m.fingerprint=w.map_fingerprint AND m.active
+     LEFT JOIN harness_facade_discovery d ON d.fact_id=f.id
      JOIN LATERAL (SELECT * FROM harness_package_bindings h WHERE h.fact_id=f.id ORDER BY version DESC LIMIT 1) b ON true
+     CROSS JOIN LATERAL (SELECT EXISTS(SELECT 1 FROM harness_stale_facade_profiles stale
+       CROSS JOIN LATERAL jsonb_array_elements(b.candidates) candidate
+       WHERE b.actor_id IS NULL AND stale.project_id=f.project_id AND stale.facade_id::text=candidate->>'id') AS yes) stale
      WHERE f.project_id=$1 ORDER BY o.created_at,f.id`, args);
   const { rows: [inventory] } = await db.query<{ closed: boolean }>(
     `SELECT EXISTS(SELECT 1 FROM intake_receipts WHERE project_id=$1) AND NOT EXISTS (
@@ -387,20 +399,24 @@ export async function readPackageAnalysis(db: Pool | PoolClient, projectId: stri
      LEFT JOIN harness_package_followups f ON f.job_id=s.job_id
      JOIN harness_package_branches b ON b.job_id=coalesce(f.root_job_id,s.job_id) AND b.active
      WHERE s.window_id=ANY($1::uuid[]) AND p.id=$2 AND s.applicability_epoch=coalesce(epoch.epoch,0)
-       AND s.scope_epoch=coalesce(scope_epoch.epoch,0) AND NOT EXISTS (
+       AND s.scope_epoch=coalesce(scope_epoch.epoch,0)
+       AND NOT EXISTS(SELECT 1 FROM harness_stale_facade_profiles stale WHERE stale.project_id=p.id AND stale.facade_id=s.facade_id)
+       AND NOT EXISTS (
        SELECT 1 FROM unnest(s.basis_ids) item(id)
        JOIN LATERAL (SELECT state,candidates FROM harness_package_bindings x WHERE x.fact_id=item.id ORDER BY version DESC LIMIT 1) current ON true
        WHERE (s.facade_id IS NULL AND current.state<>'common') OR (s.facade_id IS NOT NULL AND
          (current.state<>'identified' OR NOT EXISTS(SELECT 1 FROM jsonb_array_elements(current.candidates) c WHERE c->>'id'=s.facade_id::text)))
      ) ORDER BY s.window_id,s.branch,s.position_id`,[walkIds,projectId]):{rows:[]};
 
-  const facts = rows.map(({ register, ...fact }) => ({
+  const facts = rows.map(({ register, mentions, ...fact }) => ({
     ...fact, evidenceHref: `/api/v1/evidence/${fact.observation.evidenceId}`,
     variant: (fact.observation.grounding === 'text' && fact.observation.quote ?
       printedPairVariant(fact.observation.quote) : null) ?? fact.observation.components?.find(({ role }) => role === 'variant')?.literal ?? null,
   }));
   const candidates = [...new Map(facts.flatMap(({ binding }) => binding.candidates)
     .map((candidate) => [candidate.id, candidate])).values()];
+  const facadeMentions=rows.flatMap(({mentions})=>mentions??[]);
+  const facadeProfiles=buildFacadeProfiles(facts,facadeMentions,candidates);
   const completedWindows = windows.filter(({ branches,structure }) => (['A','B'] as const).every((key)=>{
     const {status,reason}=branches[key];
     return status==='covered'||status==='reviewed_no_match'||
@@ -479,7 +495,7 @@ export async function readPackageAnalysis(db: Pool | PoolClient, projectId: stri
       } },
     };
   });
-  return { facts: published, semanticChecks, candidates, windows, ...comparison, verifiedPairs, coverage: {
+  return { facts: published, semanticChecks, candidates, facadeProfiles, facadeMentions, windows, ...comparison, verifiedPairs, coverage: {
     inventory: inventory.closed ? 'closed' : 'open', acceptedVersions: versionIds.length, mappedVersions,
     refusedVersions: versions.rows.filter(({ refusal }) => refusal !== null).length,
     pendingVersions: versionIds.length - mappedVersions, completedWindows, structurallyReviewedWindows,

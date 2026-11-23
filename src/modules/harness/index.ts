@@ -27,6 +27,7 @@ import { reviewPairAdmission } from './review-pair.js';
 import { connectReader } from './reader.js';
 import { executeResearch, researchKind, resumeInterruptedResearch } from './runner.js';
 import { resumeResearchStops } from './stops.js';
+import { reconcileNextFacadeDiscovery } from './facade-discovery.js';
 
 export { register } from './stops.js';
 export { readPackageAnalysis, type PackageAnalysis } from './package-analysis.js';
@@ -207,6 +208,7 @@ export async function startWorker(context: WorkerContext, test?: ManagedTestOpti
       ...(packageEnabled?[
         ()=>preparePackageMap(db,gateway,service,packageProjects),
         ()=>scanPackageStructure(db,service),
+        ()=>reconcileNextFacadeDiscovery(db),
       ]:[]),
     ];
     let nextLocal=0;

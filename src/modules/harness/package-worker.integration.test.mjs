@@ -312,7 +312,7 @@ test('ordinary intake publishes independent package evidence before questions an
       process.env.FACADE_HARNESS_PACKAGE_EFFECTS='enabled';
       delete process.env.FACADE_HARNESS_REPLAY_ONLY;
       run();
-      const result=await until(()=>readPackageAnalysis(app.db,walked.id),({facts,coverage})=>facts.length===2&&
+      const result=await until(()=>readPackageAnalysis(app.db,walked.id),({facts,coverage,candidates})=>facts.length===2&&candidates.length===1&&
         coverage.structurallyReviewedWindows===1 && coverage.completedWindows===1,'independent followup');
       assert.deepEqual(Object.values(result.windows[0].branches).map(({jobId})=>jobId).sort(),roots);
       assert.deepEqual(result.facts.map(({branch,attribute,observation})=>[branch,attribute,observation.value]).sort(),
@@ -361,7 +361,7 @@ test('ordinary intake publishes independent package evidence before questions an
       const fact=updated.facts[0];
       await command('POST',`/api/projects/${walked.id}/package-facts/${fact.id}/binding`,{
         state:'identified',candidateIds:[result.candidates[0].id],reason:'Engineer rechecked the printed facade designation.',
-      },{'if-match':'"1"'});
+      },{'if-match':`"${fact.binding.version}"`});
       assert.equal((await readPackageAnalysis(app.db,walked.id)).semanticChecks.length,0);
       const currentIds=updated.semanticChecks.map(({jobId})=>jobId);
       // Simulate a historical assignment whose recorded binding version is stale.
@@ -460,7 +460,7 @@ test('ordinary intake publishes independent package evidence before questions an
   run();
   await upload('second.pdf', pdf([opposingDrawing, opposingTitle]));
   await command('POST', receiptUrl + '/seal', {});
-  const complete = await until(analyze, ({ coverage }) => coverage.completedWindows === 2, 'completed package');
+  const complete = await until(analyze, ({ coverage }) => coverage.completedWindows === 2 && coverage.subjectProof, 'completed package');
   assert.equal(complete.coverage.physicalProof.versionIds.length, 2);
   assert.equal(complete.coverage.subjectProof.facadeIds.length, 2);
   assert.deepEqual(complete.candidates.map(({ label }) => label).sort(), ['K-47', 'M-18']);
