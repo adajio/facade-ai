@@ -195,6 +195,21 @@ function adapter(format: Format): ReaderAdapter {
       }
       return rawOutput(parsed, current, request);
     },
+    async *readNativeUnits(path, units) {
+      const parsed = await parse(path);
+      const byId = new Map(parsed.units.map((current) => [current.id, current]));
+      for (const { id } of units) {
+        try {
+          const current = byId.get(id);
+          if (!current) throw new ReaderError(parsed.units[0]?.limitations[0] ?? "format_unit_unavailable",
+            "Не удалось повторно открыть закреплённую единицу reader", 424);
+          yield rawOutput(parsed, current, { address: { unitId: id }, representation: "native" });
+        } catch (error) {
+          if (!(error instanceof ReaderError)) throw error;
+          yield error;
+        }
+      }
+    },
   };
 }
 

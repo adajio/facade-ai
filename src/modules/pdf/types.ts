@@ -57,6 +57,8 @@ export interface ReaderLine {
   text: string;
   box?: Box;
   locator?: Record<string, string | number>;
+  details?: Record<string, unknown>;
+  drawingBounds?: Box;
 }
 
 export interface ImageTransform {
@@ -86,7 +88,24 @@ export interface ReaderAdapter {
   version(): Promise<string>;
   inspect(path: string): Promise<ReaderUnit[]>;
   read(path: string, request: ReadRequest, unit: ReaderUnit, containedWords?: boolean): Promise<ReaderOutput>;
+  readNativeUnits?(path: string, units: readonly ReaderUnit[]): AsyncIterable<ReaderOutput | ReaderError>;
 }
+
+export interface NativePresentation {
+  address: ReaderAddress;
+  lines: ReaderLine[];
+  limitations: string[];
+}
+
+export interface NativeArtifact { sha256: string; size: number }
+
+export type NativeBlock = {
+  ordinal: number;
+  unit: ReaderUnit;
+  presentation?: NativePresentation;
+  artifact?: NativeArtifact;
+  limitation?: string;
+};
 
 /** Private, immutable, content-addressed storage. A put must verify or atomically create the object. */
 export interface ArtifactStore {

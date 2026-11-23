@@ -8,6 +8,7 @@ import type { Pool, PoolClient } from 'pg';
 import { groundComponents } from './components.js';
 import {
   type ArtifactStore, type Box, type DocumentKey, type Evidence, type Observation, type ReaderComponentInput,
+  type NativeArtifact, type NativeBlock, type NativePresentation, type ReaderOutput,
   type Original, type PageMap, type PinInput, type ReaderAdapter, type ReaderAddress, type ReaderLine,
   type ReadRequest, type ReadScope, type ResolveOriginal, type SourceRef, contains, ReaderError, validBox,
 } from './types.js';
@@ -241,6 +242,15 @@ export async function readArtifact(
   return bytes;
 }
 
+function nativePresentation(bytes: Buffer, unitId?: string): NativePresentation {
+  const value: NativePresentation = JSON.parse(bytes.toString('utf8'));
+  if (!value.address?.unitId || (unitId !== undefined && value.address.unitId !== unitId)
+    || value.address.box || !Array.isArray(value.lines) || !Array.isArray(value.limitations)) {
+    throw new ReaderError('reader_native_presentation_invalid', 'Полное нативное окно не подтверждено', 422);
+  }
+  return value;
+}
+
 export function createReaderService(db: Pool, deps: ReaderDependencies, adapters: readonly ReaderAdapter[]) {
   const registry = new Map(adapters.map((adapter) => [adapter.format, adapter]));
   if (registry.size !== adapters.length) throw new Error('Duplicate reader adapter format');
@@ -335,6 +345,56 @@ export function createReaderService(db: Pool, deps: ReaderDependencies, adapters
     const stored = await lookupMap(source, version);
     if (!stored) mismatch();
     return stored;
+  }
+
+  async function materializeNative(sourceRef: SourceRef, readerVersion: string, start: number, count: number,
+    publish: (block: NativeBlock) => Promise<void>): Promise<void> {
+    const source = checkedSource(sourceRef);
+    const { original, adapter, version } = await describe(source);
+    if (readerVersion !== version) {
+      throw new ReaderError('reader_profile_changed', 'Требуется исходный профиль reader', 409);
+    }
+    const map = await lookupMap(source, version);
+    if (!map || !Number.isSafeInteger(start) || start < 0 || start >= map.units.length
+      || !Number.isSafeInteger(count) || count < 1 || count > 16) {
+      throw new ReaderError('reader_address_invalid', 'Пакет нативных окон отсутствует в карте', 422);
+    }
+    const selected = map.units.slice(start, start + count);
+    await withOriginal(original, deps, async (path) => {
+      async function* readUnits(): AsyncIterable<ReaderOutput | ReaderError> {
+        for (const unit of selected) {
+          try {
+            yield await adapter.read(path, { address: { unitId: unit.id }, representation: 'native' }, unit);
+          } catch (error) {
+            if (!(error instanceof ReaderError)) throw error;
+            yield error;
+          }
+        }
+      }
+      const results = adapter.readNativeUnits?.(path, selected) ?? readUnits();
+      let ordinal = start;
+      for await (const output of results) {
+        const unit = selected[ordinal - start];
+        if (!unit) throw new Error('Adapter returned extra native units');
+        if (output instanceof ReaderError || output.mediaType !== 'application/json') {
+          const failure = output instanceof ReaderError ? output
+            : new ReaderError('reader_native_presentation_invalid', 'Окно не имеет нативного представления', 422);
+          if (![415, 422, 424].includes(failure.statusCode)) throw failure;
+          await publish({ ordinal, unit, limitation: failure.code });
+        } else {
+          const presentation = nativePresentation(output.bytes, unit.id);
+          const artifact = await saveArtifact(deps.artifacts, source.projectId, output.bytes);
+          await publish({ ordinal, unit, presentation, artifact });
+        }
+        ordinal++;
+      }
+      if (ordinal !== start + selected.length) throw new Error('Adapter omitted native units');
+    });
+  }
+
+  async function readMaterializedNative(projectId: string, artifact: NativeArtifact) {
+    const bytes = await readArtifact(deps.artifacts, projectId, artifact.sha256, artifact.size);
+    return nativePresentation(bytes);
   }
 
   async function open(sourceRef: SourceRef, readScope: ReadScope, input: ReadRequest) {
@@ -532,7 +592,7 @@ export function createReaderService(db: Pool, deps: ReaderDependencies, adapters
       );
       if (rows[0]) return mapFromRow(rows[0]);
     },
-    open, pin, findEvidence, content, readPdfFragment,
+    open, pin, findEvidence, content, readPdfFragment, materializeNative, readMaterializedNative,
     async findObservation(projectId: string, id: string): Promise<Observation | undefined> {
       const { rows } = await db.query<{ payload: Observation }>(
         'SELECT payload FROM reader_observations WHERE project_id = $1 AND id = $2', [projectId, id],
