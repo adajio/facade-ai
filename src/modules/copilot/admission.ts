@@ -1,12 +1,11 @@
 import type { Pool, PoolClient } from 'pg';
 import type { ModelAuthorization } from '../gateway/types.js';
-import type { SourceIdentity } from './contracts.js';
+import { copilotJournalLimit, type SourceIdentity } from './contracts.js';
 
 const uuid = /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/;
 const digest = /^[0-9a-f]{64}$/;
 
 export const copilotKind = 'copilot_question';
-export const maxCopilotInputRefs = 20;
 export const copilotOcrOperation = 'copilot/addressed/ocr';
 
 async function pinnedRefs(tx: Pool | PoolClient, context: Pick<ModelAuthorization, 'projectId' | 'scopeId' | 'jobId' | 'inputRefs'>) {
@@ -19,7 +18,7 @@ async function pinnedRefs(tx: Pool | PoolClient, context: Pick<ModelAuthorizatio
   );
   if (!job) return null;
   const sources = job.sources ?? [];
-  if (!Array.isArray(sources) || sources.length > maxCopilotInputRefs || sources.length !== context.inputRefs.length) return null;
+  if (!Array.isArray(sources) || sources.length > copilotJournalLimit || sources.length !== context.inputRefs.length) return null;
   if (!sources.every((source, offset) => source && source.id === context.inputRefs[offset] &&
     uuid.test(source.versionId) && uuid.test(source.documentId) && digest.test(source.sha256) &&
     (source.proof?.kind === 'memory' && digest.test(source.proof.blockId) ||

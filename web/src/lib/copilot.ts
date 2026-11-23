@@ -24,6 +24,7 @@ export type SearchResult = { limitations: string[] } & (
 export type CopilotQuestion = {
   id: string; question: string; state: 'pending' | 'queued' | 'research_queued' | 'answered' | 'limited' | 'held' | 'historical';
   reason?: string; asOf?: string; claims?: { text: string; sources: string[] }[]; researchSourceId?: string; citations?: OriginalSource[]; limitations?: string[];
+  partialSources?: Pick<OriginalSource, 'id' | 'label' | 'address' | 'representation'>[];
 };
 
 export const sourceVersions = {

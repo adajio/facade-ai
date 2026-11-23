@@ -47,3 +47,11 @@ export type StoredAnswer = {
   cited: string[];
   limitations: string[];
 };
+
+export const copilotTurnLimit = 24;
+export const copilotReadBatchLimit = 6;
+export const copilotSearchResultLimit = 6;
+export const copilotOcrLimit = 4;
+
+// Each turn can discover at most one batch of new search results. OCR can add one separately.
+export const copilotJournalLimit = copilotTurnLimit * copilotReadBatchLimit * copilotSearchResultLimit + copilotOcrLimit;
