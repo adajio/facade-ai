@@ -74,6 +74,11 @@ test('typed catalogue comparisons require the confirmed type of the addressed fa
   assert.deepEqual(comparePackageFacts([a, b], undefined, { ...catalog, facadeKinds }).reviewCandidates, [
     { a: a.id, b: b.id, property: 'Gap', scope: facade, stage: 'RD', catalogVersionId: catalog.versionId },
   ]);
+  const other: CatalogRequirement = { ...requirement, key: 'other-gap', facadeKinds: ['curtain wall'], comparison: undefined };
+  const twoKinds = { ...catalog, facadeKinds, requirements: [requirement, other] };
+  assert.equal(comparePackageFacts([a, b], undefined, twoKinds).reviewCandidates.length, 1);
+  other.facadeKinds = ['ventilated'];
+  assert.equal(comparePackageFacts([a, b], undefined, twoKinds).reviewCandidates.length, 0);
   requirement.comparison!.sources[1].priority = 2;
   assert.equal(comparePackageFacts([a, b], undefined, { ...catalog, facadeKinds }).reviewCandidates.length, 0);
 });

@@ -178,14 +178,15 @@ function pairCandidate(a: PackageFact, b: PackageFact, scope: { id: string; labe
     a.revisionStatus === 'superseded' || b.revisionStatus === 'superseded' ||
     (a.variant && b.variant && a.variant !== b.variant) ||
     (a.designStage && b.designStage && a.designStage !== b.designStage)) return;
+  const facadeKind=catalog?.facadeKinds?.get(scope.id);
   const rules=catalog?.requirements.filter((rule)=>normalizeAttribute(rule.part)===normalizeAttribute(property)&&
-    (!rule.level||rule.level===(scope.id==='common'?'common':'facade')))??[];
+    (!rule.level||rule.level===(scope.id==='common'?'common':'facade'))&&
+    (!rule.facadeKinds?.length||Boolean(facadeKind&&rule.facadeKinds.includes(facadeKind))))??[];
   const rule=rules.length===1?rules[0]:undefined;
   const crossRole=a.sourceRole!==b.sourceRole;
   const roles=[a,b].map(({sourceRole,basis})=>({sourceRole,valueRole:basis.valueRole?.kind}));
   if(!allowsCatalogPair(rule?.comparison,roles[0],roles[1]))return;
   if(crossRole&&(!rule?.comparison||!catalog?.stage||
-    (rule.facadeKinds?.length&&!rule.facadeKinds.includes(catalog.facadeKinds?.get(scope.id)??''))||
     ![a,b].every(({designStage})=>designStage&&normalizeAttribute(designStage)===normalizeAttribute(catalog.stage!))))return;
   return { a: a.id, b: b.id, scope,...(rule?.comparison&&catalog?.stage?{catalogVersionId:catalog.versionId,stage:catalog.stage}:{}) };
 }
