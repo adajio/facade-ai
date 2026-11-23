@@ -6,6 +6,7 @@ import type { Observation } from '../pdf/types.js';
 import { type ObservationInput, type ReaderContext } from './contracts.js';
 import { packageRoles, type PackageBinding, type PackageSourceRole } from './package-analysis.js';
 import { hasPrintedRevision } from './pair-evidence.js';
+import { adjacentFacadeTypeHeader } from './facade-type-evidence.js';
 
 const literal = z.string().trim().min(1).max(500).refine((value) => !value.includes('\0'));
 const label = z.string().trim().min(1).max(160).refine((value) => !value.includes('\0'));
@@ -30,7 +31,8 @@ export const packageDetails = z.strictObject({
     commonQuote: literal.optional() }).optional(),
 });
 
-export type PackageDetails = z.infer<typeof packageDetails>;
+export const profileScanDetails=packageDetails.extend({facadeHeaderLineId:literal.optional()});
+export type PackageDetails = z.infer<typeof profileScanDetails>;
 
 const referenceFields = ['attribute', 'role', 'stage', 'revision', 'binding', 'valueRole'] as const;
 type ReferenceField = typeof referenceFields[number];
@@ -166,10 +168,11 @@ export async function publishPackageObservation(
   const references=details.references??{};
   const fields=referenceFields;
   const supportIds=[...new Set([observation.evidenceId,...(observation.components??[]).map(({evidenceId})=>evidenceId)])];
-  const {rows:issued}=grounding==='text'&&(details.role||details.binding||Object.keys(references).length)
-    ? await tx.query<{ id:string;content:string|null }>(
+  const {rows:issued}=grounding==='text'&&(details.role||details.binding||details.facadeHeaderLineId||Object.keys(references).length)
+    ? await tx.query<{ id:string;content:string|null;readKind?:string;box?:Observation['address']['box'] }>(
       `SELECT DISTINCT ON(event#>>'{reply,evidence,evidenceId}') event#>>'{reply,evidence,evidenceId}' AS id,
-        event#>>'{reply,body,content}' AS content FROM harness_research_events
+        event#>>'{reply,body,content}' AS content,event#>>'{reply,readKind}' AS "readKind",
+        event#>'{reply,evidence,place,box}' AS box FROM harness_research_events
         WHERE job_id=$1 AND event#>>'{reply,evidence,evidenceId}'=ANY($2::text[])
         ORDER BY event#>>'{reply,evidence,evidenceId}',sequence`,[task.jobId,supportIds]):{rows:[]};
   function fullLine(evidenceId:string,lineId:string|undefined) {
@@ -177,8 +180,17 @@ export async function publishPackageObservation(
   }
   const anchor={evidenceId:observation.evidenceId,lineId:observation.lineId,quote:observation.quote,
     address:observation.address};
+  const discovery=task.job.packageWindow.followup?.discovery;
+  const opened=issued.find(({id})=>id===observation.evidenceId);
+  const headerLine=discovery&&'kind' in discovery&&discovery.kind==='profile_scan'&&details.facadeHeaderLineId&&anchor.lineId&&anchor.quote&&
+    opened?.readKind==='extract'&&!opened.box&&details.binding?.state==='identified'&&details.binding.labels.length===1
+    ? adjacentFacadeTypeHeader(deliveredLines(opened.content),anchor.lineId,details.facadeHeaderLineId,anchor.quote) : undefined;
+  const header=headerLine&&!inactive.test(headerLine.text)?{...anchor,lineId:headerLine.id,quote:headerLine.text,
+    address:{unitId:observation.address.unitId,locator:headerLine.locator,box:headerLine.box}}:undefined;
+  const headerFields=new Set<ReferenceField>(['role','stage','revision','binding']);
   const citations=Object.fromEntries(fields.map((field)=>{
     const reference=references[field];
+    if(details.facadeHeaderLineId&&headerFields.has(field))return [field,header];
     if(reference===undefined)return [field,anchor];
     const part=observation.components?.[reference];
     return [field,part?.binding&&part.source.versionId===observation.source.versionId&&
@@ -226,8 +238,8 @@ export async function publishPackageObservation(
   const qualified={attribute:attributeGrounded,role:confirmedRole,stage,revision,binding:scopedBinding,valueRole};
   const parts=Object.fromEntries(fields.flatMap((name)=>{
     const part=citations[name];
-    return qualified[name]&&references[name]!==undefined&&part?.lineId&&part.quote?
-      [[name,{lineId:part.lineId,evidenceId:part.evidenceId,quote:part.quote}]]:[];
+    return qualified[name]&&(references[name]!==undefined||header&&headerFields.has(name))&&part?.lineId&&part.quote?
+      [[name,{lineId:part.lineId,evidenceId:part.evidenceId,quote:part.quote,...(part===header?{address:header.address}:{})}]]:[];
   }));
   const basis = { role: confirmedRole?.quote, stage: stage?.quote, revision: revision?.quote,
     valueRole,...(Object.keys(parts).length?{parts}:{}) };
@@ -268,7 +280,9 @@ export async function publishPackageObservation(
     const supported = field === 'attribute' ? attributeGrounded : Boolean(proposedQuote && ref?.quote?.includes(proposedQuote));
     const code = componentIndex !== undefined && !ref ? 'reference_invalid' : supported ? 'field_not_grounded'
       : componentIndex === undefined ? 'reference_required' : 'quote_not_supported';
-    const nextAction = code === 'field_not_grounded' ? fieldGuidance[field]
+    const nextAction = details.facadeHeaderLineId&&headerFields.has(field)&&!header
+      ? 'Откройте нативный текст целого окна. Укажите строку действующего заголовка непосредственно перед строкой типа того же фасада.'
+      : code === 'field_not_grounded' ? fieldGuidance[field]
       : code === 'quote_not_supported' ? 'Используйте точную цитату из указанного компонента.'
       : `Откройте нужную строку и укажите индекс адресного компонента в package.references.${field} при save_compound_observation. В повторном сохранении сохраните подтверждённые поля. ${fieldGuidance[field]}`;
     reject(field, code, nextAction);

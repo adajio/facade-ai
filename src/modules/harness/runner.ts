@@ -56,12 +56,13 @@ function primaryResult(task: ScheduledResearchTask, outcome: ResearchOutcome): P
 
 // Older workers parked an in-flight sibling as manual route reconciliation.
 export async function resumeInterruptedResearch(
-  db: Pool, queue: Pick<WorkQueue, 'resume'>, signal: AbortSignal,
+  db: Pool, queue: Pick<WorkQueue, 'resume'>, signal: AbortSignal, allowProfileScans=false,
 ): Promise<void> {
   const { rows } = await db.query<{ id: string; reason: string }>(
     `SELECT j.id,j.reason FROM gateway_jobs j JOIN gateway_generations g USING(generation_id)
      LEFT JOIN harness_route_bindings b ON b.job_id=j.id
-     WHERE g.current AND j.kind=$1 AND j.state='held'
+     WHERE g.current AND (j.kind=$1 OR $2::boolean AND j.payload#>>'{packageWindow,followup,discovery,kind}'='profile_scan')
+       AND j.state='held'
        AND (j.reason IN ('analysis_replay_only','journal_unavailable','research_profile_unavailable','research_route_not_approved',
                          'research_gateway_unconfigured','synthetic_input_not_approved')
          OR (j.reason='route_reconciliation' AND j.next_action='operator_reconcile_route'))
@@ -70,7 +71,7 @@ export async function resumeInterruptedResearch(
            AND a.route_id=coalesce(j.payload#>>'{settings,routeId}',b.settings->>'routeId') AND a.state='unknown'
            AND (NOT a.route_isolated OR a.job_id=j.id OR a.receipt->>'providerId' IS NOT NULL)
        )
-     ORDER BY j.created_at,j.id`, [researchKind]);
+     ORDER BY j.created_at,j.id`, [researchKind,allowProfileScans]);
   for (const { id, reason } of rows) {
     if (signal.aborted) return;
     await queue.resume(id, [reason]);

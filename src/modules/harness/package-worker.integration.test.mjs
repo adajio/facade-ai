@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { managedProfile, managedWorkerOptions, verifyManagedLauncherTargets } from '../../../test/fixtures/managed-worker-support.mjs';
 import { createHash, randomUUID } from 'node:crypto';
-import { readFile } from 'node:fs/promises';
+import { readFile, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:http';
 import { join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
@@ -10,7 +10,8 @@ import { test } from 'node:test';
 
 const walkOnly = process.env.FACADE_PACKAGE_INTEGRATION === 'walk';
 const legacyOnly = process.env.FACADE_PACKAGE_INTEGRATION === 'legacy';
-const enabled = walkOnly || legacyOnly || process.env.FACADE_PACKAGE_INTEGRATION === '1';
+const discoveryOnly = process.env.FACADE_PACKAGE_INTEGRATION === 'discovery';
+const enabled = walkOnly || legacyOnly || discoveryOnly || process.env.FACADE_PACKAGE_INTEGRATION === '1';
 const built = (file) => process.env.FACADE_HARNESS_TEST_DIST
   ? pathToFileURL(join(process.env.FACADE_HARNESS_TEST_DIST, file)).href
   : new URL(`../../../dist/${file}`, import.meta.url).href;
@@ -117,6 +118,8 @@ test('ordinary intake publishes independent package evidence before questions an
   let driver;
   let walkOriginal;
   const walkthrough=[];
+  const discoveryFixtures=new Map();
+  const discoveryOpens=[];
   const provider = createServer(async (req, res) => {
     try {
       const { attempt, request } = await new Response(req).json();
@@ -126,6 +129,51 @@ test('ordinary intake publishes independent package evidence before questions an
       const replies = request.messages.filter(({ role }) => role === 'tool').map(({ content }) => JSON.parse(content));
       const wrong = replies.find(({ ok }) => ok === false);
       if (wrong) throw new Error(JSON.stringify(wrong));
+      const fixture=discoveryFixtures.get(assignment.place?.source.sha256);
+      if(fixture) {
+        const review=assignment.discovery?.kind==='profile_scan';
+        assert.equal(assignment.question,undefined);
+        if(fixture.unknown&&attempt.purpose==='primary_b') {
+          assert.equal(review,false,'unknown root must stay fenced');
+          res.setHeader('content-type','application/json');
+          res.end(JSON.stringify({receipt:{state:'unknown',code:'synthetic_unsettled_root'}}));
+          return;
+        }
+        if(review) {
+          assert.equal(assignment.discovery.label,undefined);
+          assert.ok(assignment.blocks.some((block)=>block.startsWith('native:')));
+          if(!replies.length)discoveryOpens.push([fixture.mark,attempt.purpose]);
+        }
+        const plan=replies.find(({blocks})=>blocks);
+        const survey=replies.find(({evidence,transform})=>evidence&&transform);
+        const native=replies.find(({content})=>content&&JSON.parse(content).lines);
+        const recorded=replies.find(({reviewed})=>reviewed);
+        const saved=replies.filter(({observationId})=>observationId);
+        let output;
+        if(!plan)output=tool('inspect_structure',{});
+        else if(!survey)output=tool('survey',{});
+        else if(!native)output=tool('extract',{});
+        else if(review&&fixture.unknown)output=tool('finish_reading',{status:'no_match',explanation:'The register heading has no actual entry.'});
+        else if(!review&&!recorded)output=tool('record_blocks',{checks:plan.blocks.map(({id,kind})=>({
+          blockId:id,evidenceId:(kind==='native'?native:survey).evidence.evidenceId,status:'reviewed',reason:'Opened the assigned block.',
+        }))});
+        else if(!saved.length||review&&fixture.type&&saved.length<3) {
+          const lines=JSON.parse(native.content).lines;
+          const rejectedTypes=['Facade type: not applicable','Facade type: historic screen'];
+          const hasProfileEvidence=review||fixture.prequalified;
+          const anchorQuote=hasProfileEvidence ? rejectedTypes[saved.length-1]??fixture.type??fixture.heading : 'Record of attachment';
+          const line=lines.find(({text})=>text===anchorQuote);
+          const heading=saved.length?lines[lines.indexOf(line)-1]:lines.find(({text})=>text===fixture.heading);
+          const fields=hasProfileEvidence?{...observation(heading).package,
+            ...(saved.length===1?{binding:{state:'identified',labels:['SE-177'],quote:heading.text,reason:'Unverified service label'}}:{}),
+            ...(fixture.type?{facadeHeaderLineId:heading.id}:{}),stage:{value:'RD',quote:'Stage: RD'}}:undefined;
+          output=tool('save_observation',{evidenceId:native.evidence.evidenceId,lineId:line.id,quote:line.text,
+            ...(fields?{package:fields}:{})});
+        }else output=tool('finish_reading',{status:'covered',explanation:'The observed source has been saved.'});
+        res.setHeader('content-type','application/json');
+        res.end(JSON.stringify({receipt:{state:'paid',costUsdNanos:0,providerId:attempt.id,evidenceRef:'synthetic:discovery'},output}));
+        return;
+      }
       if (assignment.mode === 'lead' || assignment.mode === 'verify') {
         const texts = replies.filter(({ content }) => content && JSON.parse(content).lines);
         const { a, b } = assignment.dispute;
@@ -282,6 +330,100 @@ test('ordinary intake publishes independent package evidence before questions an
     driver = new AbortController();
     worker = startWorker({ db: app.db, config, logger: { warn: (message) => warnings.push(message) }, signal: driver.signal }, options);
   }
+  await t.test('ordinary upload finds unseeded facades and an adjacent type without promoting incidental labels',
+    {skip:legacyOnly||walkOnly},async()=>{
+      delete process.env.FACADE_HARNESS_PACKAGE_WALK;
+      delete process.env.FACADE_HARNESS_REPLAY_ONLY;
+      process.env.FACADE_HARNESS_PACKAGE_EFFECTS='enabled';
+      const fresh=(await command('POST','/api/projects',{name:'No seed from first reading',mode:'intake'})).json();
+      for(const [routeId,purpose] of [['managed-a','primary_a'],['managed-b','primary_b']]) {
+        await gateway.grantRoute({projectId:fresh.id,routeId,revision:'fixture-v1',purpose,dataClass:'synthetic',allowed:true});
+      }
+      const incoming=(await command('POST',`/api/projects/${fresh.id}/receipts`,{source:'upload'})).json();
+      const target=`/api/receipts/${incoming.receiptId}`;
+      const fixtures=[
+        {mark:'PX-621',heading:'Schedule | Stage: RD | current revision P71 | project facade ID: PX-621'},
+        {mark:'ZR-908',heading:'Drawing | Stage: RD | current revision C62 | project facade ID: ZR-908',type:'Facade type: glazed cassette'},
+      ];
+      const suffix=['Record of attachment','Access label: SE-177','Facade type: not applicable',
+        'Drawing | superseded revision H63 | project facade ID: XA-311','Facade type: historic screen'];
+      async function uploadFixture(name,fixture,receipt) {
+        const saved=process.env.FACADE_DISCOVERY_FIXTURES;
+        const lines=[fixture.heading,...(fixture.type?[fixture.type]:[]),...(fixture.prequalified||fixture.unknown?['Record of attachment']:suffix)];
+        const bytes=saved?await readFile(join(saved,name)):pdf(lines,{top:225});
+        const capture=process.env.FACADE_DISCOVERY_CAPTURE;
+        if(capture)await writeFile(join(capture,name),bytes,{flag:'wx'});
+        discoveryFixtures.set(sha(bytes),fixture);
+        return upload(name,bytes,receipt);
+      }
+      for(const [index,fixture] of fixtures.entries()) {
+        await uploadFixture(`no-seed-${index}.pdf`,fixture,target);
+      }
+      await command('POST',target+'/seal',{});
+      run();
+      try {
+        await until(async()=>({ready:(await app.db.query(`SELECT count(*)=4 AND bool_and(j.state='done') AS ready
+          FROM gateway_jobs j WHERE j.project_id=$1 AND j.kind='harness_research'
+          AND 2=(SELECT count(*) FROM project_memory_versions v WHERE v.project_id=$1 AND v.total=v.next_ordinal)`,[fresh.id])).rows[0].ready}),
+          ({ready})=>ready,'primary roots and indexed memory');
+        const rootMarks=await app.db.query(`SELECT count(*)::int AS count FROM harness_facade_discovery d
+          JOIN harness_package_facts f ON f.id=d.fact_id JOIN gateway_jobs j ON j.id=f.job_id
+          WHERE j.project_id=$1 AND j.kind='harness_research' AND jsonb_array_length(d.mentions)>0`,[fresh.id]);
+        assert.equal(rootMarks.rows[0].count,0);
+        for(let tick=0;!discoveryOpens.length&&tick<20;tick++)await delay(500);
+        assert.ok(discoveryOpens.length,'indexed possible facade evidence must schedule a discovery with zero root mentions');
+        const analyzed=await until(()=>readPackageAnalysis(app.db,fresh.id),({facadeProfiles,facts})=>facadeProfiles.length===2&&
+          facadeProfiles.every(({identity})=>identity==='independent')&&
+          facadeProfiles.some(({attributes})=>attributes.facadeKind?.[0].evidence.length===2)&&
+          facts.filter(({observation})=>['Facade type: not applicable','Facade type: historic screen'].includes(observation.quote)).length===4,
+          'independent discovery evidence');
+        assert.deepEqual(analyzed.facadeProfiles.map(({label,attributes})=>[label,attributes.facadeKind?.map(({value})=>value)??[]]).sort(),
+          [['PX-621',[]],['ZR-908',['glazed cassette']]]);
+        const assessment=(await command('GET',`/api/v1/projects/${fresh.id}/facade-assessment`,undefined)).json();
+        const proposals=(await command('GET',`${assessment.observations.href}?proposal=facadeKind`,undefined)).json().items;
+        assert.deepEqual(proposals.map(({proposedFacadeKind,facadeKindSourceVerified})=>[proposedFacadeKind,facadeKindSourceVerified]),
+          [['glazed cassette',true],['glazed cassette',true]]);
+        await until(async()=>({ready:(await app.db.query(`SELECT count(*)=4 AND bool_and(j.state='done') AS ready
+          FROM gateway_jobs j JOIN harness_package_followups f ON f.job_id=j.id WHERE j.project_id=$1 AND f.plan_key='facade-profile-scan:1'`,
+          [fresh.id])).rows[0].ready}),({ready})=>ready,'bounded facade followups finish');
+        assert.deepEqual(discoveryOpens.map((pair)=>pair.join('/')).sort(),[
+          'PX-621/primary_a','PX-621/primary_b','ZR-908/primary_a','ZR-908/primary_b',
+        ]);
+        const surveyed={mark:'HM-525',prequalified:true,
+          heading:'Drawing | Stage: RD | current revision E52 | project facade ID: HM-525 | Facade type: ribbed panel'};
+        const confirmedReceipt=(await command('POST',`/api/projects/${fresh.id}/receipts`,{source:'upload'})).json();
+        const confirmedTarget=`/api/receipts/${confirmedReceipt.receiptId}`;
+        const confirmed=await uploadFixture('qualified-in-primary.pdf',surveyed,confirmedTarget);
+        await command('POST',confirmedTarget+'/seal',{});
+        await until(async()=>({ready:(await app.db.query(`SELECT count(*)=2 AND bool_and(j.state='done') AS ready
+          FROM gateway_jobs j WHERE j.project_id=$1 AND j.subject_id=$2 AND j.kind='harness_research'
+          AND EXISTS(SELECT 1 FROM project_memory_versions WHERE project_id=$1 AND version_id::text=$2 AND next_ordinal=total)`,
+          [fresh.id,confirmed.versionId])).rows[0].ready}),({ready})=>ready,'primary type scope and memory are ready');
+        await until(()=>readPackageAnalysis(app.db,fresh.id),({facadeProfiles})=>facadeProfiles.some(({label,attributes})=>
+          label===surveyed.mark&&attributes.facadeKind?.[0]?.evidence.length===2),'primary type is qualified in both branches');
+        await delay(1300);
+        assert.equal((await app.db.query(`SELECT count(*)::int AS count FROM harness_package_followups f JOIN gateway_jobs j ON j.id=f.job_id
+          WHERE j.project_id=$1 AND j.subject_id=$2 AND f.plan_key='facade-profile-scan:1'`,[fresh.id,confirmed.versionId])).rows[0].count,0);
+        const fencedReceipt=(await command('POST',`/api/projects/${fresh.id}/receipts`,{source:'upload'})).json();
+        const fencedTarget=`/api/receipts/${fencedReceipt.receiptId}`;
+        const empty=await uploadFixture('empty-register.pdf',{mark:'empty-register',heading:'Facade register | No entries',unknown:true},fencedTarget);
+        await command('POST',fencedTarget+'/seal',{});
+        await until(async()=>({ready:(await app.db.query(`SELECT count(*)=1 AND bool_and(j.state='done' AND j.purpose='primary_a'
+          AND j.result->>'kind'='reviewed_no_match') AS ready FROM gateway_jobs j
+          JOIN harness_package_followups f ON f.job_id=j.id WHERE j.project_id=$1 AND j.subject_id=$2 AND f.plan_key='facade-profile-scan:1'`,
+          [fresh.id,empty.versionId])).rows[0].ready}),({ready})=>ready,'independent A finishes while B remains fenced');
+        const fenced=(await app.db.query(`SELECT a.state FROM gateway_jobs j JOIN gateway_attempts a ON a.job_id=j.id
+          WHERE j.project_id=$1 AND j.subject_id=$2 AND j.purpose='primary_b'`,[fresh.id,empty.versionId])).rows;
+        assert.deepEqual(fenced,[{state:'unknown'}]);
+        assert.deepEqual(discoveryOpens.at(-1),['empty-register','primary_a']);
+        assert.deepEqual(errors,[]);
+      } finally {
+        driver.abort();
+        await worker;
+        delete process.env.FACADE_HARNESS_PACKAGE_EFFECTS;
+      }
+    });
+  if(discoveryOnly)return;
   await t.test('new intake defaults to addressed A/B and pinned work continues after opt-out',{skip:legacyOnly},async()=>{
     delete process.env.FACADE_HARNESS_PACKAGE_WALK;
     delete process.env.FACADE_HARNESS_PACKAGE_EFFECTS;

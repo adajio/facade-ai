@@ -38,7 +38,7 @@ export interface PackageFact {
     revisionEvidence?: { evidenceId: string; quote: string; lineId?: string; href: string };
     valueRole?: {kind:'design'|'as_built'|'limit';quote:string};
     parts?: Partial<Record<'attribute'|'role'|'stage'|'revision'|'binding'|'valueRole',
-      {evidenceId:string;lineId:string;quote:string}>> };
+      {evidenceId:string;lineId:string;quote:string;address?:Observation['address']}>> };
   binding: PackageBinding;
   materials: { id: string; label: string; quote: string }[];
 }

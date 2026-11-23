@@ -183,6 +183,8 @@ export async function startWorker(context: WorkerContext, test?: ManagedTestOpti
 
   try {
     const { gateway, admit, hasTransport, mode, copilotRoute } = modelGateway(context, external, profile, packageEnabled, packageProjects, test);
+    const allowProfileScans=packageEnabled&&hasTransport&&process.env.FACADE_HARNESS_PACKAGE_EFFECTS==='enabled'&&
+      process.env.FACADE_HARNESS_REPLAY_ONLY!=='1';
     if (test) {
       if (test.transport.kind !== 'managed' || !/^[a-f0-9]{64}$/.test(test.toolSha256) ||
         Object.values(profile).some((slot) => slot && (slot.dataClass !== 'synthetic' || !slot.model.startsWith('managed/')))) {
@@ -237,11 +239,11 @@ export async function startWorker(context: WorkerContext, test?: ManagedTestOpti
       lanes.push(poll('research recovery', async () => {
         if ((await external.journal.balance()).frozen) return false;
         await gateway.syncRouteIsolations();
-        await resumeInterruptedResearch(db, gateway, signal);
+        await resumeInterruptedResearch(db, gateway, signal, allowProfileScans);
         return true;
       }, true));
     }
-    if(packageEnabled) lanes.push(poll('package followup scheduler',()=>dispatchPackageFollowup(db,gateway)));
+    if(packageEnabled) lanes.push(poll('package followup scheduler',()=>dispatchPackageFollowup(db,gateway,allowProfileScans)));
     const workKinds=[...Array.from({length:hasTransport?3:1},()=>researchKind),...(packageEnabled?[packageFollowupKind]:[])];
     for (const kind of workKinds) {
       const workerId = randomUUID();

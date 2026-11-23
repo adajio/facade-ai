@@ -5,7 +5,7 @@ import { lockIntakeProject } from '../intake/gate.js';
 import { publishProjectEvent } from '../supplements/events.js';
 import { getCatalog, getProject, matchesDefaultProfile } from '../access/project-state.js';
 import { deliveredLines } from '../questions/attribute-aliases.js';
-import { ReaderRefusal, jobSchema, type BlockCheck, type PackageBlock, type PackageSemanticCheck, type Place, type ReaderContext } from './contracts.js';
+import { ReaderRefusal, jobSchema, type BlockCheck, type PackageBlock, type PackageDiscovery, type PackageSemanticCheck, type Place, type ReaderContext } from './contracts.js';
 import type { ReaderService } from './reader.js';
 import { memoryVersion } from '../project-memory/contracts.js';
 
@@ -255,9 +255,10 @@ export async function saveSemanticCheck(tx: PoolClient, context: ReaderContext,
   await publishProjectEvent(tx,task.projectId,{ type:'package-analysis.changed',payload:{} });
 }
 
-export async function dispatchPackageFollowup(db: Pool,queue: WorkQueue) {
+export async function dispatchPackageFollowup(db: Pool,queue: WorkQueue,allowProfileScans=true) {
   return transaction(db,async (tx)=>{
     await tx.query("SELECT pg_advisory_xact_lock(hashtextextended('facade/package-followup',0))");
+    if(allowProfileScans&&await dispatchUnseededFacadeScan(tx,queue))return true;
     const {rows:[row]}=await tx.query<{ rootId:string;windowId:string;projectId:string;generationId:string;payload:unknown;blocks:string[];round:number }>(
       `SELECT j.id AS "rootId",w.id AS "windowId",w.project_id AS "projectId",j.generation_id AS "generationId",j.payload,missing.ids AS blocks,coalesce(history.round,0)+1 AS round
        FROM ${activeWindows}
@@ -305,7 +306,7 @@ type FollowupTarget={rootId:string;windowId:string;projectId:string;generationId
 type SemanticPlan={catalogVersionId:string;stage:string;epoch:string;positions:{facadeId:string|null;positionId:string;scopeEpoch:string}[]};
 
 async function putFollowup(tx:PoolClient,queue:WorkQueue,row:FollowupTarget,planKey:string,semantic?:SemanticPlan,
-  discovery?:{label:string}) {
+  discovery?:PackageDiscovery) {
   await lockIntakeProject(tx,row.projectId);
   const root=jobSchema.parse(row.payload);
   if (root.mode!=='primary'||!root.packageWindow||!root.settings) return false;
@@ -327,6 +328,81 @@ async function putFollowup(tx:PoolClient,queue:WorkQueue,row:FollowupTarget,plan
     VALUES($1,$2,$3,$4,$5,$6)`,[row.rootId,jobId,row.windowId,root.branch,JSON.stringify(row.blocks),planKey]);
   await publishProjectEvent(tx,row.projectId,{ type:'package-analysis.changed',payload:{} });
   return true;
+}
+
+// These patterns select places to review. They never supply a label or a type to the reader.
+const profileTypeHint=String.raw`(^|[|;·]\s*)(facade (kind|type)|тип фасада)\s*[:=№–—]\s*(?!not\y|no\y|none\y|n/a\y|unknown\y|unspecified\y|не\y|нет\y|отсутств|неприменим)\S`;
+const profileHeadingHint=String.raw`^\s*(?:(?:project facade (?:identifier|id|reference|ref)|идентификатор фасада проекта|код фасада проекта|ссылка на (?:код|идентификатор) фасада проекта|facade (?:mark|designation|id)|марка фасада|обозначение фасада|фасад)\s*[:№=]\s*\S|(?:facade (?:schedule|register|list)|list of facades|(?:ведомость|реестр|перечень) фасадов)\y|(?:facade|фасад)\s+\S+\s+(?:in|at|в|по)\s)`;
+const profileDocumentHeader=String.raw`^\s*(?:drawing|schedule|elevation|specification|detail|inventory|черт[её]ж|ведомость|спецификация|опись)\s*[|;·].*(project facade (?:identifier|id|reference|ref)|идентификатор фасада проекта|код фасада проекта|(?:facade|фасад)\s*[:№=])`;
+const profileInactive=String.raw`(?:\y(?:superseded|withdrawn|obsolete|draft|not[ -]+current)\y|\y(?:отмен[её]н|архивн|замен[её]н|черновик|недействующ|неактуальн|не\s+действующ))`;
+const compass=String.raw`(?:north(?:east|west)?|south(?:east|west)?|east|west)(?:ern)?|(?:северо-восточн|северо-западн|юго-восточн|юго-западн|северн|южн|восточн|западн)(?:ый|ого|ому|ым|ом)`;
+const profileCompassHint=String.raw`^\s*(?:(?:${compass})\s+(?:facade|фасад[аеу]?)|(?:facade|фасад)\s+(?:${compass}))\y`;
+const profileScanPlan='facade-profile-scan:1';
+
+async function dispatchUnseededFacadeScan(tx:PoolClient,queue:WorkQueue) {
+  const {rows}=await tx.query<FollowupTarget>(`SELECT j.id AS "rootId",w.id AS "windowId",w.project_id AS "projectId",
+      j.generation_id AS "generationId",j.payload,targets.blocks
+    FROM ${activeWindows}
+    JOIN projects project ON project.id=w.project_id
+    JOIN harness_package_structures s ON s.window_id=w.id
+    JOIN harness_package_branches b ON b.window_id=w.id AND b.active
+    JOIN gateway_jobs j ON j.id=b.job_id AND (j.state='done' OR j.state='held' AND j.reason='turn_limit_final')
+    JOIN gateway_generations g ON g.generation_id=j.generation_id AND g.current
+    JOIN project_memory_versions v ON v.version_id=w.version_id AND v.project_id=w.project_id AND v.contract=$1 AND v.reader_version=m.reader_version
+    JOIN project_memory_blocks mb ON mb.project_id=v.project_id AND mb.version_id=v.version_id AND mb.contract=v.contract AND mb.unit_id=w.place->>'unitId'
+      AND mb.ordinal<v.next_ordinal AND mb.artifact_sha256 IS NOT NULL AND NOT ('native'=ANY(mb.remaining))
+    JOIN LATERAL (
+      SELECT array_agg(id ORDER BY ordinal) AS blocks FROM (
+        SELECT p.id,p.ordinal,max(CASE WHEN cue.is_type THEN 1 ELSE 0 END) AS priority
+        FROM project_memory_lines l
+        CROSS JOIN LATERAL (SELECT l.folded~$2 AS is_type) cue
+        JOIN LATERAL (SELECT block->>'id' AS id,ordinal,jsonb_array_elements_text(block->'lineIds') AS line_id
+          FROM jsonb_array_elements(s.blocks) WITH ORDINALITY p(block,ordinal)) p ON p.line_id=l.line_id
+        WHERE l.block_id=mb.id AND (cue.is_type OR l.folded~$3 OR l.folded~$4 OR l.folded~$6) AND l.folded!~$5
+          AND NOT (cue.is_type AND EXISTS (SELECT 1 FROM project_memory_lines preceding
+            WHERE preceding.block_id=l.block_id AND preceding.ordinal=l.ordinal-1 AND preceding.folded~$5
+              AND (preceding.folded~$3 OR preceding.folded~$4 OR preceding.folded~$6)))
+          AND NOT EXISTS (SELECT 1 FROM harness_package_facts f
+            JOIN reader_observations o ON o.id=f.id
+            JOIN harness_facade_discovery d ON d.fact_id=f.id AND d.resolved
+            LEFT JOIN harness_package_followups child ON child.job_id=f.job_id
+            JOIN LATERAL (SELECT state,candidates,actor_id FROM harness_package_bindings x WHERE x.fact_id=f.id ORDER BY version DESC LIMIT 1) binding ON true
+            WHERE f.project_id=w.project_id AND f.window_id=w.id AND coalesce(child.root_job_id,f.job_id)=j.id
+              AND binding.state='identified' AND f.revision_status<>'superseded'
+              AND (binding.actor_id IS NOT NULL OR NOT EXISTS (
+                SELECT 1 FROM harness_stale_facade_profiles stale CROSS JOIN LATERAL jsonb_array_elements(binding.candidates) item
+                WHERE stale.project_id=w.project_id AND stale.facade_id::text=item->>'id'))
+              AND (
+                cue.is_type AND f.revision_status='current' AND f.revision IS NOT NULL AND f.source_role<>'unknown' AND f.basis?'role'
+                  AND (project.project_stage IS NULL OR f.design_stage IS NULL OR lower(f.design_stage)=lower(project.project_stage))
+                  AND jsonb_array_length(binding.candidates)=1 AND lower(coalesce(o.payload->>'quote',''))~$2
+                  AND (o.payload->>'lineId'=l.line_id OR o.payload->>'quote'=l.literal)
+                OR NOT cue.is_type AND EXISTS(SELECT 1 FROM jsonb_array_elements(d.mentions) mark
+                  WHERE mark->>'kind' IN ('registry','context','reference') AND
+                    (mark->>'lineId'=l.line_id OR mark->>'quote'=l.literal OR mark->>'contextQuote'=l.literal))
+              ))
+        GROUP BY p.ordinal,p.id ORDER BY priority DESC,p.ordinal LIMIT 3
+      ) selected
+    ) targets ON targets.blocks IS NOT NULL
+    WHERE ${activeSource} AND m.refusal IS NULL AND j.payload#>>'{packageWindow,walkProtocol}'='1'
+      AND EXISTS(SELECT 1 FROM gateway_grants grant_row JOIN gateway_routes route
+        ON route.id=grant_row.route_id AND route.revision=grant_row.revision AND route.enabled
+        WHERE grant_row.project_id=w.project_id AND grant_row.allowed AND grant_row.purpose=j.purpose
+          AND route.id=j.payload#>>'{settings,routeId}' AND route.revision=j.payload#>>'{packageWindow,routeRevision}'
+          AND grant_row.data_class=j.payload#>>'{settings,dataClass}')
+      AND NOT EXISTS(SELECT 1 FROM harness_package_facts f LEFT JOIN harness_facade_discovery d ON d.fact_id=f.id
+        WHERE f.project_id=w.project_id AND f.window_id=w.id AND f.job_id=j.id AND NOT coalesce(d.resolved,false))
+      AND NOT EXISTS(SELECT 1 FROM harness_package_followups f WHERE f.root_job_id=j.id AND f.plan_key=$7)
+      AND NOT EXISTS(SELECT 1 FROM gateway_attempts a WHERE a.state IN ('reserved','prepared','sending','unknown')
+        AND (a.job_id=j.id OR EXISTS(SELECT 1 FROM harness_package_followups child WHERE child.root_job_id=j.id AND child.job_id=a.job_id)))
+      AND NOT EXISTS(SELECT 1 FROM harness_package_followups f JOIN gateway_jobs x ON x.id=f.job_id
+        WHERE x.project_id=w.project_id AND x.state IN ('ready','leased'))
+      AND 4>(SELECT count(*) FROM harness_package_followups f JOIN gateway_jobs x ON x.id=f.job_id WHERE x.state IN ('ready','leased'))
+    ORDER BY j.created_at,j.project_id,b.branch LIMIT 8`,[memoryVersion,profileTypeHint,profileHeadingHint,profileDocumentHeader,profileInactive,profileCompassHint,profileScanPlan]);
+  for(const row of rows) {
+    if(await putFollowup(tx,queue,row,profileScanPlan,undefined,{kind:'profile_scan'}))return true;
+  }
+  return false;
 }
 
 async function dispatchFacadeFollowup(tx:PoolClient,queue:WorkQueue) {

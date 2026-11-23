@@ -58,6 +58,8 @@ export const settingsSchema = z.strictObject({
 
 const packageReviewSchema = z.strictObject({ scopeId: text, scopeLabel: text,
   readerVersions: z.strictObject({ A: text, B: text }), routeRevision: text, catalogVersionId:id.optional(), stage:text.optional() });
+const packageDiscovery = z.union([z.strictObject({ label: text }), z.strictObject({ kind: z.literal('profile_scan') })]);
+export type PackageDiscovery = z.infer<typeof packageDiscovery>;
 export const jobSchema = z.discriminatedUnion('mode', [
   z.strictObject({
     mode: z.literal('primary'),
@@ -69,7 +71,7 @@ export const jobSchema = z.discriminatedUnion('mode', [
     packageWindow: z.strictObject({ id, readerVersion: text, routeRevision: text,
       walkProtocol: z.literal(1).optional(), followup: z.strictObject({ rootJobId: id,
         blocks: z.array(z.string().min(1).max(60)).min(1).max(4096),
-        discovery: z.strictObject({ label: text }).optional(),
+        discovery: packageDiscovery.optional(),
         semantic:z.strictObject({catalogVersionId:id,stage:text,epoch:z.string().regex(/^\d+$/),
           positions:z.array(z.strictObject({facadeId:id.nullable(),positionId:text,scopeEpoch:z.string().regex(/^\d+$/)})).max(4096)}).optional(),
       }).optional(),

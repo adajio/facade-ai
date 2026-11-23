@@ -3,8 +3,20 @@ import { randomUUID } from 'node:crypto';
 import { test } from 'node:test';
 import type { Observation, ReaderLine } from '../pdf/types.js';
 import { collectFacadeMentions, resolveFacadeMentions } from './facade-discovery.js';
+import { adjacentFacadeTypeHeader, affirmedFacadeKind } from './facade-type-evidence.js';
 
 const projectId=randomUUID();
+
+test('a type needs an affirmative literal and a uniquely addressed adjacent header',()=>{
+  const head={id:'heading',text:'Drawing | Project facade ID: CW-751',box:{x:10,y:20,width:100,height:10}};
+  const type={id:'kind',text:'Facade type: closed cassette',box:{x:10,y:35,width:95,height:10}};
+  assert.equal(adjacentFacadeTypeHeader([head,type],type.id,head.id,type.text),head);
+  assert.equal(adjacentFacadeTypeHeader([head,{...type,id:'separator'},type],type.id,head.id,type.text),undefined);
+  assert.equal(adjacentFacadeTypeHeader([head,{...type,box:{...type.box,x:120}}],type.id,head.id,type.text),undefined);
+  assert.equal(adjacentFacadeTypeHeader([head,{...type,text:'Facade type: not applicable'}],type.id,head.id,'Facade type: not applicable'),undefined);
+  assert.equal(affirmedFacadeKind('Facade type: closed cassette | Facade type: unknown'),undefined);
+  assert.equal(affirmedFacadeKind('Тип фасада: остекление не подтвержден'),undefined);
+});
 function opened(quote:string, branch:'A'|'B'='A', versionId=randomUUID()) {
   const lineId='selected';
   const evidenceId=randomUUID();

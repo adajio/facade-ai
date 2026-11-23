@@ -6,6 +6,7 @@ import type { Observation, ReaderAddress, ReaderLine } from '../pdf/types.js';
 import { deliveredLines } from '../questions/attribute-aliases.js';
 import { publishProjectEvent } from '../supplements/events.js';
 import type { PackageBinding, PackageFact } from './package-analysis.js';
+import { affirmedFacadeKind } from './facade-type-evidence.js';
 
 export type FacadeEvidence = {
   factId: string; branch: 'A' | 'B'; evidenceId: string; versionId: string; readerVersion: string;
@@ -30,7 +31,6 @@ export type FacadeProfile = {
 
 const clauses = /[|;·\r\n]/u;
 const facadeHeading = /^(?:facade(?:\s+(?:mark|designation|id))?|фасад|(?:марка|обозначение|код) фасада)\s*[:№=]?$/iu;
-const facadeType = /^(?:facade (?:type|kind)|тип фасада)\s*[:№=]\s*(.+)$/iu;
 const registered = /^(?:project facade (?:identifier|id)|идентификатор фасада проекта|код фасада проекта)\s*[:№=]\s*(.+)$/iu;
 const referred = /^(?:project facade (?:reference|ref)|ссылка на (?:код|идентификатор) фасада проекта)\s*[:№=]\s*(.+)$/iu;
 const designation = /^(?:facade(?:\s+(?:mark|designation|id))?|фасад|(?:марка|обозначение|код) фасада)\s*[:№=]\s*(.+)$/iu;
@@ -255,11 +255,11 @@ async function recordDiscovery(tx: PoolClient, row: DiscoveryRow) {
   const quote=original.quote??observation.quote;
   let mentions: FacadeMention[]=[];
   if (quote) {
-    const evidenceId=component?.evidenceId??observation.evidenceId;
-    const lineId=component?.lineId??observation.lineId;
+    const evidenceId=part?.evidenceId??observation.evidenceId;
+    const lineId=part?.lineId??observation.lineId;
     const reference: FacadeEvidence={factId:row.id,branch:observation.branch,
       evidenceId,versionId:observation.source.versionId,readerVersion:observation.readerVersion,
-      address:component?.address??observation.address,lineId,quote};
+      address:part?.address??component?.address??observation.address,lineId,quote};
     const addressed=observation.components?.filter((item)=>item.binding && item.readerVersion===reference.readerVersion &&
       item.source.versionId===reference.versionId && item.address.unitId===reference.address.unitId)??[];
     const evidenceIds=[...new Set([evidenceId,...addressed.map((item)=>item.evidenceId)])];
@@ -285,9 +285,10 @@ async function reconcileBindings(tx:PoolClient,projectId:string) {
   const { rows }=await tx.query<{
     id:string; version:number; state:PackageBinding['state']; candidates:PackageBinding['candidates']; quote:string|null;
     actor:string|null; mentions:FacadeMention[]; basis:PackageFact['basis']; revisionStatus:PackageFact['revisionStatus']; resolved:boolean;
-    versionId:string; mapFingerprint:string;
+    versionId:string; mapFingerprint:string; anchorQuote:string|null;
   }>(`SELECT f.id,binding.version,binding.state,binding.candidates,binding.quote,binding.actor_id AS actor,d.mentions,
-       f.basis,f.revision_status AS "revisionStatus",d.resolved,o.version_id AS "versionId",w.map_fingerprint AS "mapFingerprint"
+       f.basis,f.revision_status AS "revisionStatus",d.resolved,o.version_id AS "versionId",w.map_fingerprint AS "mapFingerprint",
+       o.payload->>'quote' AS "anchorQuote"
     FROM ${activeDiscoveryFacts} JOIN harness_facade_discovery d ON d.fact_id=f.id
     JOIN LATERAL(SELECT * FROM harness_package_bindings x WHERE x.fact_id=f.id ORDER BY version DESC LIMIT 1) binding ON true
     WHERE f.project_id=$1 AND ${currentPackageSource} ORDER BY o.created_at,f.id`,[projectId]);
@@ -324,7 +325,7 @@ async function reconcileBindings(tx:PoolClient,projectId:string) {
       for(const mention of row.mentions) {
         if(resolved.get(mention)?.id!==id)continue;
         const authority=identityKey(mention);
-        const kind=row.revisionStatus==='current'&&row.basis.stage ? uniqueField(mention.quote,facadeType) : undefined;
+        const kind=row.revisionStatus==='current'&&row.basis.role&&row.anchorQuote ? affirmedFacadeKind(row.anchorQuote) : undefined;
         if(!authority&&!kind)continue;
         const collected=proof.get(id)??{versions:new Set<string>(),claims:new Set<string>()};
         collected.versions.add(row.versionId);
@@ -402,13 +403,13 @@ export function buildFacadeProfiles(facts: PackageFact[], mentions: FacadeMentio
       const ref=(field:keyof NonNullable<typeof basis.parts>,quote?:string)=>{
         const part=basis.parts?.[field];
         const component=part&&o.components?.find((c)=>c.evidenceId===part.evidenceId&&c.lineId===part.lineId);
-        return component&&part?{...anchor,...part,address:component.address}: {...anchor,quote:quote??anchor.quote};
+        return part&&(part.address||component)?{...anchor,...part,address:part.address??component!.address}: {...anchor,quote:quote??anchor.quote};
       };
       if(basis.stage)attach('stage',fact.designStage,ref('stage',basis.stage));
       if(basis.revision)attach('revision',fact.revision,ref('revision',basis.revision),fact.revisionStatus);
       if(basis.role&&fact.sourceRole!=='unknown') {
         attach('documentRole',fact.sourceRole,ref('role',basis.role));
-        if(fact.revisionStatus==='current')attach('facadeKind',uniqueField(o.quote,facadeType),anchor);
+        if(fact.revisionStatus==='current')attach('facadeKind',affirmedFacadeKind(o.quote),anchor);
       }
       if(basis.valueRole)attach('valueRole',basis.valueRole.kind,ref('valueRole',basis.valueRole.quote));
       const variant=o.components?.find(({role,binding,source})=>role==='variant'&&binding?.kind==='variant_field'&&source.versionId===o.source.versionId);
