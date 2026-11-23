@@ -1,4 +1,4 @@
-import type { PoolClient } from 'pg';
+import type { SessionAccount } from '../access/auth.js';
 
 export type SourceAddress = {
   unitId: string;
@@ -14,17 +14,36 @@ export type MemorySource = {
   label: string;
   address: SourceAddress;
   text: string;
+  context?: { id: string; address: SourceAddress; text: string }[];
+  window?: true;
+  readerVersion?: string;
   version: 'current' | 'historical' | 'unknown';
   representation: 'native' | 'ocr' | 'render';
   limitations: string[];
+  proof: { kind: 'memory'; blockId: string } | { kind: 'evidence'; evidenceId: string };
 };
+
+export type PublishedSource = { id: string; page: number; quote: string };
 
 export type MemorySearch = {
   sources: MemorySource[];
+  windows: MemorySource[];
   limitations: string[];
 };
 
 export type CopilotMemory = {
-  search(tx: PoolClient, projectId: string, query: string): Promise<MemorySearch>;
-  open(tx: PoolClient, projectId: string, id: string): Promise<MemorySource | null>;
+  search(session: SessionAccount, projectId: string, query: string): Promise<MemorySearch>;
+  open(session: SessionAccount, projectId: string, id: string): Promise<MemorySource | null>;
+  searchPublications(session: SessionAccount, projectId: string, scopeId: string, query: string):
+    Promise<{ sources: PublishedSource[]; limitations: string[] }>;
+  openPublication(session: SessionAccount, projectId: string, scopeId: string, id: string): Promise<PublishedSource | null>;
+};
+
+export type SourceIdentity = Pick<MemorySource, 'id' | 'sha256' | 'documentId' | 'versionId' | 'proof'>;
+
+export type StoredAnswer = {
+  claims: { text: string; sources: string[] }[];
+  exposed: SourceIdentity[];
+  cited: string[];
+  limitations: string[];
 };

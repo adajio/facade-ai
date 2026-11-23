@@ -1,3 +1,4 @@
+import { verifyCopilotInputs } from '../copilot/admission.js';
 import { BUDGET_USD_NANOS, GatewayError, hash, positiveInteger, type ModelTransport, type RoutePolicy, type RouterDiagnostic } from './types.js';
 
 type SyntheticScope = {
@@ -462,6 +463,13 @@ export function openRouterTransport(approval: Step15Approval): ModelTransport {
       if (profile.mode === 'strict-zdr') return true;
       const scope = syntheticScope(profile, context.projectId, context.scopeId);
       if (context.dataClass !== 'synthetic' || !scope) return false;
+      if (record(context.payload)?.mode === 'copilot') {
+        if (isAlibabaQwen4Max(profile)) {
+          const block = retentionBlock(scope);
+          if (block) return block;
+        }
+        return verifyCopilotInputs(tx, context, scope.originalSha256s);
+      }
       const sources = assignedSources(context.payload);
       if (!sources.length || sources.some(source => source.projectId !== context.projectId
         || typeof source.versionId !== 'string' || !uuid.test(source.versionId)
