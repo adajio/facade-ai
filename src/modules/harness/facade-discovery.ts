@@ -8,6 +8,8 @@ import { publishProjectEvent } from '../supplements/events.js';
 import type { PackageBinding, PackageFact } from './package-analysis.js';
 import { affirmedFacadeKind } from './facade-type-evidence.js';
 
+export const facadeDiscoveryVersion=2;
+
 export type FacadeEvidence = {
   factId: string; branch: 'A' | 'B'; evidenceId: string; versionId: string; readerVersion: string;
   address: ReaderAddress; lineId?: string; quote: string;
@@ -18,6 +20,7 @@ export type FacadeMention = FacadeEvidence & {
   partialContext?: { building?: string; axes?: string; conflicting?: true };
   contextQuote?: string;
   lookupToken?: string;
+  relation?: { sourceLabel?: string; targetLabels: string[] };
   qualifier?: { evidenceId: string; lineId: string; quote: string; address: ReaderAddress };
 };
 
@@ -33,6 +36,8 @@ const clauses = /[|;·\r\n]/u;
 const facadeHeading = /^(?:facade(?:\s+(?:mark|designation|id))?|фасад|(?:марка|обозначение|код) фасада)\s*[:№=]?$/iu;
 const registered = /^(?:project facade (?:identifier|id)|идентификатор фасада проекта|код фасада проекта)\s*[:№=]\s*(.+)$/iu;
 const referred = /^(?:project facade (?:reference|ref)|ссылка на (?:код|идентификатор) фасада проекта)\s*[:№=]\s*(.+)$/iu;
+const viewName = /^(?:view(?: name)?|detail view|вид|наименование вида)\s*[:№=]\s*(.+)$/iu;
+const viewReference = /(?:^|\s)(refers to|reference to|does not refer to|not referring to|не относится к|не ссылается на|относится к|ссылается на)(?=\s|[:№=]|$)\s*[:№=]?\s*(.*)$/iu;
 const designation = /^(?:facade(?:\s+(?:mark|designation|id))?|фасад|(?:марка|обозначение|код) фасада)\s*[:№=]\s*(.+)$/iu;
 const inlineDesignation = /^(?:facade|фасад)\s+([\p{L}\p{N}_.\/‐‑‒–—-]+)(?=\s+(?:в\s+|по\s+|in\s+|at\s+|axes\s+|grid\s+|корпус|building|block))/iu;
 const buildingField = /^(?:building|block|корпус|здани[ея]|секция)\s*[:№=]\s*(.+)$/iu;
@@ -124,6 +129,35 @@ function addressedContext(line: string, mark: string) {
   return {context,contextQuote,partialContext:{building,axes,...(conflicting?{conflicting:true as const}:{})}};
 }
 
+function referencedFacade(line: string) {
+  const statements=line.split(clauses).flatMap((clause)=>{
+    const text=clause.trim();
+    const match=viewReference.exec(text);
+    return match?[{prefix:text.slice(0,match.index).trim(),predicate:match[1],literal:match[2]}]:[];
+  });
+  if(!statements.length)return;
+  const {prefix}=statements[0];
+  const sourceLabel=prefix?(uniqueField(prefix,viewName)??uniqueField(prefix,designation)??prefix):
+    uniqueField(line,viewName)??uniqueField(line,designation);
+  const labels=new Map<string,string>();
+  let ambiguous=false;
+  for (const {predicate,literal} of statements) {
+    if(/^(?:does not|not |не )/iu.test(predicate))ambiguous=true;
+    const targets=literal.replace(/^(?:the\s+)?(?:project\s+)?(?:facade(?: (?:identifier|id))?|фасаду?)\s*[:№=]?\s+/iu,'').split(
+      /\s*(?:,|&|\s+(?:and|or|и|или|либо)\s+)\s*/iu);
+    for(const value of targets) {
+      const target=normalize(value.replace(/\s+(?:in\s+axes|at\s+grid|в\s+осях|по\s+осям)\b.*$/iu,'').replace(/[.。]$/u,''));
+      if(!/^[\p{L}\p{N}][\p{L}\p{N}_.\/ ‐‑‒–—-]{0,159}$/u.test(target))ambiguous=true;
+      else labels.set(foldedLabel(target),target);
+    }
+  }
+  const targetLabels=[...labels.values()];
+  const context=addressedContext(line,sourceLabel?foldedLabel(sourceLabel):'');
+  const unique=!ambiguous&&targetLabels.length===1&&fields(line,buildingField).size<=1&&fields(line,axesField).size<=1;
+  return {label:unique?targetLabels[0]:sourceLabel||targetLabels[0]||line,
+    kind:unique?'reference' as const:'unresolved' as const,relation:{...(sourceLabel?{sourceLabel}:{}),targetLabels},...context};
+}
+
 export function collectFacadeMentions(observation: Observation, initial: Pick<PackageBinding,'quote'|'candidates'>,
   reference: FacadeEvidence, lines: ReaderLine[], evidenceByLine: ReadonlyMap<string,string> = new Map()): FacadeMention[] {
   const { quote, lineId } = reference;
@@ -132,6 +166,8 @@ export function collectFacadeMentions(observation: Observation, initial: Pick<Pa
   if (!line || observation.grounding !== 'text') {
     return [...possible].map((label) => ({ ...reference, label, kind: 'unresolved' }));
   }
+  const relation=referencedFacade(line.text);
+  if(relation)return [{...reference,quote:line.text,...relation}];
   const projectMarks = fields(quote, registered);
   const referenceMarks = fields(quote, referred);
   const localMarks = localFacadeFields(quote);
@@ -187,8 +223,10 @@ export function resolveFacadeMentions(projectId: string, mentions: FacadeMention
       const partial=item.partialContext??item.context;
       const compatible=!(item.partialContext?.conflicting || partial?.building&&buildings.size&&!buildings.has(foldedLabel(partial.building)) ||
         partial?.axes&&axes.size&&!axes.has(foldedLabel(partial.axes)));
+      const hasReferenceTarget=sameBranch.some((entry)=>!item.relation||entry.versionId===item.versionId||
+        contextKey!==undefined&&contextKey===registryContext&&entry.context!==undefined);
       if (registerId && (item.kind==='registry' || item.kind==='context' && contextKey===registryContext
-        || item.kind==='reference' && sameBranch.length>0 && compatible
+        || item.kind==='reference' && hasReferenceTarget && compatible
         || item.kind==='designation' && sameLine && compatible)) {
         resolved.set(item,{id:registerId,label:registry!.label});
       } else if ((item.kind==='context'||item.kind==='registry') && contextKey) {
@@ -198,6 +236,18 @@ export function resolveFacadeMentions(projectId: string, mentions: FacadeMention
           && foldedLabel(other.context.axes)===foldedLabel(context.axes))!.label;
         resolved.set(item,{id:facadeId(projectId,JSON.stringify(['building-axes',context.building,context.axes]),label),label});
       }
+    }
+    // A source-local contextual identity may also have been established from its printed building and axes.
+    if(!registries.length)for(const item of group) {
+      if(item.kind!=='reference'||!item.relation||!item.context||item.partialContext?.conflicting)continue;
+      const context=item.context;
+      const targets=new Map(group.flatMap((source)=>{
+        const canonical=resolved.get(source);
+        return canonical&&source.kind==='context'&&source.versionId===item.versionId&&source.branch===item.branch&&source.context&&
+          foldedLabel(source.context.building)===foldedLabel(context.building)&&foldedLabel(source.context.axes)===foldedLabel(context.axes)
+          ? [[canonical.id,canonical] as const]:[];
+      }));
+      if(targets.size===1)resolved.set(item,targets.values().next().value!);
     }
   }
   // A new identifier may add proof to an existing contextual identity. Retain the issued ID
@@ -235,8 +285,8 @@ export async function reconcileNextFacadeDiscovery(db: Pool) {
         jsonb_build_object('quote',first.quote,'candidates',first.candidates) AS original
       FROM ${activeDiscoveryFacts} JOIN harness_package_bindings first ON first.fact_id=f.id AND first.version=1
       LEFT JOIN harness_facade_discovery discovery ON discovery.fact_id=f.id
-      WHERE f.project_id=$1 AND discovery.fact_id IS NULL AND ${currentPackageSource}
-      ORDER BY f.id LIMIT 32`, [projectId]);
+      WHERE f.project_id=$1 AND coalesce(discovery.discovery_version,0)<$2 AND ${currentPackageSource}
+      ORDER BY f.id LIMIT 32`, [projectId,facadeDiscoveryVersion]);
     for (const row of due) await recordDiscovery(tx,row);
     if (due.length===32) {
       await tx.query('UPDATE harness_facade_discovery_dirty SET changed_at=clock_timestamp() WHERE project_id=$1',[projectId]);
@@ -277,19 +327,22 @@ async function recordDiscovery(tx: PoolClient, row: DiscoveryRow) {
     }
     mentions=collectFacadeMentions(observation,original,reference,[...lines.values()],evidenceByLine);
   }
-  await tx.query('INSERT INTO harness_facade_discovery(fact_id,mentions) VALUES($1,$2) ON CONFLICT DO NOTHING',
-    [row.id,JSON.stringify(mentions)]);
+  await tx.query(`INSERT INTO harness_facade_discovery(fact_id,mentions,discovery_version) VALUES($1,$2,$3) ON CONFLICT(fact_id)
+    DO UPDATE SET prior_mentions=coalesce(harness_facade_discovery.prior_mentions,'[]'::jsonb)||jsonb_build_array(
+        jsonb_build_object('version',harness_facade_discovery.discovery_version,'mentions',harness_facade_discovery.mentions)),
+      mentions=EXCLUDED.mentions,discovery_version=EXCLUDED.discovery_version,resolved=false
+    WHERE harness_facade_discovery.discovery_version<EXCLUDED.discovery_version`,[row.id,JSON.stringify(mentions),facadeDiscoveryVersion]);
 }
 
 async function reconcileBindings(tx:PoolClient,projectId:string) {
   const { rows }=await tx.query<{
     id:string; version:number; state:PackageBinding['state']; candidates:PackageBinding['candidates']; quote:string|null;
     actor:string|null; mentions:FacadeMention[]; basis:PackageFact['basis']; revisionStatus:PackageFact['revisionStatus']; resolved:boolean;
-    versionId:string; mapFingerprint:string; anchorQuote:string|null;
+    versionId:string; mapFingerprint:string; anchorQuote:string|null; reinterpreted:boolean;
   }>(`SELECT f.id,binding.version,binding.state,binding.candidates,binding.quote,binding.actor_id AS actor,d.mentions,
        f.basis,f.revision_status AS "revisionStatus",d.resolved,o.version_id AS "versionId",w.map_fingerprint AS "mapFingerprint",
-       o.payload->>'quote' AS "anchorQuote"
-    FROM ${activeDiscoveryFacts} JOIN harness_facade_discovery d ON d.fact_id=f.id
+       o.payload->>'quote' AS "anchorQuote",d.prior_mentions IS NOT NULL AND NOT d.resolved AS reinterpreted
+    FROM ${activeDiscoveryFacts} JOIN harness_facade_discovery d ON d.fact_id=f.id AND d.discovery_version=${facadeDiscoveryVersion}
     JOIN LATERAL(SELECT * FROM harness_package_bindings x WHERE x.fact_id=f.id ORDER BY version DESC LIMIT 1) binding ON true
     WHERE f.project_id=$1 AND ${currentPackageSource} ORDER BY o.created_at,f.id`,[projectId]);
   const eligible=rows.filter(({actor,state,revisionStatus})=>!actor&&state!=='common'&&revisionStatus!=='superseded');
@@ -313,6 +366,7 @@ async function reconcileBindings(tx:PoolClient,projectId:string) {
     byIdentity.set(key,candidate);
   }
   const proof=new Map<string,{versions:Set<string>;claims:Set<string>}>();
+  const changed=new Set<string>();
   for (const row of rows) {
     if (row.actor || row.state==='common') continue;
     const candidates=[...new Map(row.mentions.flatMap((mention)=> {
@@ -336,6 +390,7 @@ async function reconcileBindings(tx:PoolClient,projectId:string) {
       }
     }
     if (state===row.state && JSON.stringify(candidates)===JSON.stringify(row.candidates)) continue;
+    if(row.reinterpreted)for(const {id} of [...row.candidates,...candidates])changed.add(id);
     await tx.query(`INSERT INTO harness_package_bindings(fact_id,version,state,candidates,quote,reason)
       VALUES($1,$2,$3,$4,$5,$6)`,[row.id,row.version+1,state,JSON.stringify(candidates),row.quote,
       state==='identified'?'Обозначение связано с адресным проектным идентификатором или контекстом корпуса и осей.'
@@ -344,30 +399,29 @@ async function reconcileBindings(tx:PoolClient,projectId:string) {
   const stored=await tx.query<{facade_id:string;fingerprint:string}>(
     'SELECT facade_id,fingerprint FROM harness_facade_profile_proofs WHERE project_id=$1',[projectId]);
   const previous=new Map(stored.rows.map(({facade_id,fingerprint})=>[facade_id,fingerprint]));
-  const changed:string[]=[];
   for(const [id,items] of proof) {
     const fingerprint=hash([...items.claims].sort());
     if(previous.get(id)!==fingerprint) {
       await tx.query(`INSERT INTO harness_facade_profile_proofs(project_id,facade_id,fingerprint,version_ids) VALUES($1,$2,$3,$4)
         ON CONFLICT(project_id,facade_id) DO UPDATE SET fingerprint=EXCLUDED.fingerprint,version_ids=EXCLUDED.version_ids`,
         [projectId,id,fingerprint,[...items.versions]]);
-      changed.push(id);
+      changed.add(id);
     }
     previous.delete(id);
   }
   if(previous.size) {
-    changed.push(...previous.keys());
+    for(const id of previous.keys())changed.add(id);
     await tx.query('DELETE FROM harness_facade_profile_proofs WHERE project_id=$1 AND facade_id=ANY($2)',[projectId,[...previous.keys()]]);
   }
-  if(changed.length) {
+  if(changed.size) {
     await tx.query(`INSERT INTO harness_semantic_scope_epochs(project_id,scope_key,epoch)
       SELECT $1,id,1 FROM unnest($2::text[]) id ON CONFLICT(project_id,scope_key)
-      DO UPDATE SET epoch=harness_semantic_scope_epochs.epoch+1`,[projectId,changed]);
+      DO UPDATE SET epoch=harness_semantic_scope_epochs.epoch+1`,[projectId,[...changed]]);
     await publishProjectEvent(tx,projectId,{type:'package-analysis.changed',payload:{}});
   }
   const completed=await tx.query(`UPDATE harness_facade_discovery SET resolved=true WHERE NOT resolved AND fact_id=ANY($1::uuid[])`,
     [rows.map(({id})=>id)]);
-  if(completed.rowCount&&!changed.length)await publishProjectEvent(tx,projectId,{type:'package-analysis.changed',payload:{}});
+  if(completed.rowCount&&!changed.size)await publishProjectEvent(tx,projectId,{type:'package-analysis.changed',payload:{}});
 }
 
 export function buildFacadeProfiles(facts: PackageFact[], mentions: FacadeMention[], candidates: PackageBinding['candidates']): FacadeProfile[] {

@@ -9,6 +9,7 @@ import { ReaderRefusal, jobSchema, type BlockCheck, type PackageBlock, type Pack
 import type { ReaderService } from './reader.js';
 import { memoryVersion } from '../project-memory/contracts.js';
 import { currentProfileHintLines,profileHintPatterns } from './facade-profile-hints.js';
+import { facadeDiscoveryVersion } from './facade-discovery.js';
 
 export const packageFollowupKind = 'harness_package_followup';
 
@@ -29,7 +30,7 @@ const activeFacts = `harness_package_facts fact
 export function currentFacadeScopes(project: string, stage: string) {
   return `SELECT detected.id,detected.label,confirmed.kind FROM (
     SELECT DISTINCT (candidate->>'id')::uuid AS id,candidate->>'label' AS label
-    FROM ${activeFacts} LEFT JOIN harness_facade_discovery d ON d.fact_id=fact.id
+    FROM ${activeFacts} LEFT JOIN harness_facade_discovery d ON d.fact_id=fact.id AND d.discovery_version=${facadeDiscoveryVersion}
     CROSS JOIN LATERAL jsonb_array_elements(binding.candidates) candidate
     WHERE fact.project_id=${project} AND ${activeSource} AND (binding.actor_id IS NOT NULL OR d.resolved)
       AND (binding.actor_id IS NOT NULL OR NOT EXISTS(SELECT 1 FROM harness_stale_facade_profiles stale
@@ -371,7 +372,7 @@ async function dispatchUnseededFacadeScan(tx:PoolClient,queue:WorkQueue) {
               AND (preceding.folded~$3 OR preceding.folded~$4 OR preceding.folded~$6)))
           AND NOT EXISTS (SELECT 1 FROM harness_package_facts f
             JOIN reader_observations o ON o.id=f.id
-            JOIN harness_facade_discovery d ON d.fact_id=f.id AND d.resolved
+            JOIN harness_facade_discovery d ON d.fact_id=f.id AND d.resolved AND d.discovery_version=${facadeDiscoveryVersion}
             LEFT JOIN harness_package_followups child ON child.job_id=f.job_id
             JOIN LATERAL (SELECT state,candidates,actor_id FROM harness_package_bindings x WHERE x.fact_id=f.id ORDER BY version DESC LIMIT 1) binding ON true
             WHERE f.project_id=w.project_id AND f.window_id=w.id AND coalesce(child.root_job_id,f.job_id)=j.id
@@ -399,7 +400,8 @@ async function dispatchUnseededFacadeScan(tx:PoolClient,queue:WorkQueue) {
           AND route.id=j.payload#>>'{settings,routeId}' AND route.revision=j.payload#>>'{packageWindow,routeRevision}'
           AND grant_row.data_class=j.payload#>>'{settings,dataClass}')
       AND NOT EXISTS(SELECT 1 FROM harness_package_facts f LEFT JOIN harness_facade_discovery d ON d.fact_id=f.id
-        WHERE f.project_id=w.project_id AND f.window_id=w.id AND f.job_id=j.id AND NOT coalesce(d.resolved,false))
+        WHERE f.project_id=w.project_id AND f.window_id=w.id AND f.job_id=j.id
+          AND NOT coalesce(d.resolved AND d.discovery_version=${facadeDiscoveryVersion},false))
       AND (history.job_id IS NULL OR (history.state='done' AND history.result->>'kind' IN ('covered','reviewed_no_match')
           OR history.state='held' AND history.reason='turn_limit_final') AND EXISTS (
           SELECT 1 FROM harness_package_block_checks c WHERE c.job_id=history.job_id AND c.reviewed AND history.blocks?c.block_id))
@@ -420,7 +422,7 @@ async function dispatchFacadeFollowup(tx:PoolClient,queue:WorkQueue) {
       SELECT DISTINCT fact.project_id,w.version_id,coalesce(mark->>'lookupToken',translate(lower(trim(mark->>'label')),'‐‑‒–—','-----')) AS key,
         mark->>'lookupToken' AS direction,mark->>'label' AS label,
         mark->>'branch' AS branch,mark->>'kind' AS mention_kind
-      FROM ${activeFacts} JOIN harness_facade_discovery d ON d.fact_id=fact.id
+      FROM ${activeFacts} JOIN harness_facade_discovery d ON d.fact_id=fact.id AND d.discovery_version=${facadeDiscoveryVersion}
       CROSS JOIN LATERAL jsonb_array_elements(d.mentions) mark
       WHERE ${activeSource} AND binding.state IN ('unclear','identified')
         AND mark->>'kind' IN ('designation','reference','context','registry')
@@ -450,14 +452,16 @@ async function dispatchFacadeFollowup(tx:PoolClient,queue:WorkQueue) {
               AND field~('(^|[^[:alpha:]])'||demand.direction||'(ern|ый|ого|ому|ым|ом)?($|[^[:alpha:]])'))
           AND l.folded~'(facade (type|kind)|тип фасада|building|корпус|axes|grid|оси|осях|осям)'))
       AND NOT EXISTS(SELECT 1 FROM harness_package_facts f LEFT JOIN harness_package_followups step ON step.job_id=f.job_id
-        JOIN harness_facade_discovery proof ON proof.fact_id=f.id CROSS JOIN LATERAL jsonb_array_elements(proof.mentions) item
+        JOIN harness_facade_discovery proof ON proof.fact_id=f.id AND proof.discovery_version=${facadeDiscoveryVersion}
+        CROSS JOIN LATERAL jsonb_array_elements(proof.mentions) item
         WHERE coalesce(step.root_job_id,f.job_id)=j.id AND f.revision_status<>'superseded'
           AND item->>'kind' IN ('registry','context') AND coalesce(item->>'lookupToken',translate(lower(trim(item->>'label')),'‐‑‒–—','-----'))=demand.key
           AND lower(trim(coalesce((SELECT o.payload->>'quote' FROM reader_observations o WHERE o.id=f.id),'')))
             ~'(facade (type|kind)|тип фасада)\\s*[:№=]')
       AND NOT EXISTS(SELECT 1 FROM harness_package_followups f WHERE f.root_job_id=j.id AND f.plan_key='facade:'||md5(demand.key))
       AND NOT EXISTS(SELECT 1 FROM harness_package_facts f LEFT JOIN harness_facade_discovery proof ON proof.fact_id=f.id
-        WHERE f.project_id=w.project_id AND f.window_id=w.id AND f.job_id=j.id AND NOT coalesce(proof.resolved,false))
+        WHERE f.project_id=w.project_id AND f.window_id=w.id AND f.job_id=j.id
+          AND NOT coalesce(proof.resolved AND proof.discovery_version=${facadeDiscoveryVersion},false))
       AND NOT EXISTS(SELECT 1 FROM gateway_attempts a WHERE a.job_id=j.id AND a.state IN ('reserved','prepared','sending','unknown'))
       AND NOT EXISTS(SELECT 1 FROM harness_package_followups f JOIN gateway_jobs x ON x.id=f.job_id
         WHERE x.project_id=w.project_id AND x.state IN ('ready','leased'))

@@ -17,7 +17,7 @@ test('a type needs an affirmative literal and a uniquely addressed adjacent head
   assert.equal(affirmedFacadeKind('Facade type: closed cassette | Facade type: unknown'),undefined);
   assert.equal(affirmedFacadeKind('Тип фасада: остекление не подтвержден'),undefined);
 });
-function opened(quote:string, branch:'A'|'B'='A', versionId=randomUUID()) {
+function opened(quote:string, branch:'A'|'B'='A', versionId:string=randomUUID()) {
   const lineId='selected';
   const evidenceId=randomUUID();
   const address={unitId:'unit'};
@@ -121,4 +121,37 @@ test('descriptive cladding is not an identity and directional headings survive i
   assert.ok(linked.get(direct)?.id);
   assert.equal(linked.get(direct)?.id,linked.get(reversed)?.id);
   assert.equal(linked.has(proposed[0]),false);
+});
+
+test('an addressed view refers to the registered facade without opening its own identity',()=>{
+  const registry=mark('Project facade ID: CK-751 | Building: Pavilion | Axes: 8-9');
+  const quote='Facade: Detail-90';
+  const {obs,ref}=opened(quote,'A',registry.versionId);
+  const relation=(target:string,axes='8-9')=>collectFacadeMentions(obs,{quote,candidates:[{id:randomUUID(),label:'Detail-90'}]},ref,[{
+    id:ref.lineId,text:`${quote} | Refers to ${target} | Building: Pavilion | Axes: ${axes}`,
+  }]);
+  const [linked]=relation('CK-751');
+  assert.equal(linked.label,'CK-751');
+  assert.deepEqual(linked.relation,{sourceLabel:'Detail-90',targetLabels:['CK-751']});
+  assert.equal(relation('CK-751').length,1);
+  const scopes=resolveFacadeMentions(projectId,[registry,linked]);
+  assert.equal(scopes.get(linked)?.id,scopes.get(registry)?.id);
+  assert.equal(resolveFacadeMentions(projectId,[linked]).size,0);
+  const [conflict]=relation('CK-751','2-3');
+  const [double]=relation('CK-751 and CG-873');
+  const wrongDocument={...linked,versionId:randomUUID(),context:undefined,partialContext:undefined};
+  const [denied]=collectFacadeMentions(obs,{quote,candidates:[{id:randomUUID(),label:'Detail-90'}]},ref,[{
+    id:ref.lineId,text:`${quote} | не относится к CK-751 | Building: Pavilion | Axes: 8-9`,
+  }]);
+  assert.equal(denied.kind,'unresolved');
+  assert.equal(double.kind,'unresolved');
+  assert.deepEqual(double.relation?.targetLabels,['CK-751','CG-873']);
+  const uncertain=resolveFacadeMentions(projectId,[registry,conflict,double,wrongDocument]);
+  assert.equal(uncertain.has(conflict),false);
+  assert.equal(uncertain.has(double),false);
+  assert.equal(uncertain.has(wrongDocument),false);
+  const contextual={...mark('Facade: CK-751 | Building: Pavilion | Axes: 8-9'),versionId:registry.versionId};
+  const byContext=resolveFacadeMentions(projectId,[contextual,linked]);
+  assert.ok(byContext.get(contextual));
+  assert.equal(byContext.get(linked)?.id,byContext.get(contextual)?.id);
 });

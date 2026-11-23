@@ -7,7 +7,7 @@ import type { Observation } from '../pdf/types.js';
 import type { VerifiedPairEvidence } from '../assessment/domain.js';
 import { printedPairVariant } from './pair-evidence.js';
 import { currentFacadeScopes } from './package-walk.js';
-import { buildFacadeProfiles, type FacadeMention, type FacadeProfile } from './facade-discovery.js';
+import { buildFacadeProfiles, facadeDiscoveryVersion, type FacadeMention, type FacadeProfile } from './facade-discovery.js';
 
 export const packageRoles = ['drawing', 'detail', 'schedule', 'specification', 'calculation', 'inventory',
   'correspondence', 'model', 'other', 'unknown'] as const;
@@ -325,7 +325,7 @@ export async function readPackageAnalysis(db: Pool | PoolClient, projectId: stri
      JOIN harness_package_branches active ON active.job_id=coalesce(followup.root_job_id,f.job_id) AND active.active
      JOIN harness_package_windows w ON w.id=f.window_id
      JOIN harness_package_maps m ON m.version_id=w.version_id AND m.fingerprint=w.map_fingerprint AND m.active
-     LEFT JOIN harness_facade_discovery d ON d.fact_id=f.id
+     LEFT JOIN harness_facade_discovery d ON d.fact_id=f.id AND d.discovery_version=${facadeDiscoveryVersion}
      JOIN LATERAL (SELECT * FROM harness_package_bindings h WHERE h.fact_id=f.id ORDER BY version DESC LIMIT 1) b ON true
      CROSS JOIN LATERAL (SELECT EXISTS(SELECT 1 FROM harness_stale_facade_profiles stale
        CROSS JOIN LATERAL jsonb_array_elements(b.candidates) candidate

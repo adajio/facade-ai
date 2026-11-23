@@ -6,11 +6,12 @@ import { pathToFileURL } from 'node:url';
 import pg from 'pg';
 
 const enabled=process.env.FACADE_DISCOVERY_INTEGRATION==='1';
+const viewUpgrade=process.env.FACADE_VIEW_UPGRADE;
 const built=(path)=>process.env.FACADE_HARNESS_TEST_DIST
   ?pathToFileURL(join(process.env.FACADE_HARNESS_TEST_DIST,path)).href:new URL(`../../../dist/${path}`,import.meta.url).href;
 const sha=(text)=>createHash('sha256').update(text).digest('hex');
 
-test('addressed PDF and XLSX facts share a stable facade; the branch worker consumes memory and preserves history', {skip:!enabled}, async(t)=>{
+test('addressed PDF and XLSX facts share a stable facade; the branch worker consumes memory and preserves history', {skip:!enabled||viewUpgrade==='verify'}, async(t)=>{
   const url=process.env.DATABASE_URL;
   const database=new URL(url).pathname.slice(1);
   assert.match(database,/^test_facade_identity_[a-z0-9_]+$/u);
@@ -113,6 +114,10 @@ test('addressed PDF and XLSX facts share a stable facade; the branch worker cons
   await publish(leased.get(pdf.version_id+'B'),pdf,text('11','Project facade ID'),'11');
   await publish(leased.get(xlsx.version_id+'A'),xlsx,text('19'),'19');
   const tableFact=await publish(leased.get(xlsx.version_id+'B'),xlsx,text('19'),'19');
+  const representative=`Specification | Facade: Detail-73 | Refers to ${mark} | Building: Forge | Axes: 6-8 | Stage: RD | Revision: Q-9 current`;
+  const viewFact=await publish(leased.get(pdf.version_id+'A'),pdf,representative,'11',{
+    package:{binding:{state:'identified',labels:['Detail-73'],quote:representative,reason:'Candidate from the view name.'}},
+  });
   await publish(leased.get(pdf.version_id+'A'),pdf,'Схема восточного фасада','11');
   await publish(leased.get(pdf.version_id+'B'),pdf,'Схема восточного фасада','11');
   const referenceText=text('19','Project facade ref','Physical schedule');
@@ -126,9 +131,19 @@ test('addressed PDF and XLSX facts share a stable facade; the branch worker cons
   await settle();
   const state=()=>readPackageAnalysis(db,projectId);
   const first=await state();
+  if(viewUpgrade==='seed') {
+    assert.deepEqual(first.candidates.map(({label})=>label).sort(),['Detail-73',mark]);
+    const {binding}=first.facts.find(({id})=>id===tableFact.id);
+    await db.query(`INSERT INTO harness_package_bindings(fact_id,version,state,candidates,reason,actor_id)
+      VALUES($1,$2,'identified',$3,'Manual decision on a different original',$4)`,
+    [tableFact.id,binding.version+1,JSON.stringify(binding.candidates),owner.actor]);
+    return;
+  }
   assert.deepEqual(first.candidates.map(({label})=>label),[mark]);
   const facadeId=first.candidates[0].id;
   assert.equal(first.facadeProfiles[0].identity,'independent');
+  assert.equal(first.facts.find(({id})=>id===viewFact.id).binding.candidates[0]?.id,facadeId);
+  assert.deepEqual(first.facadeMentions.find(({factId})=>factId===viewFact.id).relation,{sourceLabel:'Detail-73',targetLabels:[mark]});
   assert.ok(first.reviewCandidates.some(({a,b,scope})=>a===pdfFact.id&&b===tableFact.id&&scope.id===facadeId));
   assert.ok(references.every(({id})=>first.facts.find((f)=>f.id===id).binding.candidates[0]?.id===facadeId));
   assert.equal(first.facts.find(({id})=>id===alias.id).binding.state,'unclear');
@@ -207,4 +222,32 @@ test('addressed PDF and XLSX facts share a stable facade; the branch worker cons
   assert.equal((await db.query('SELECT actor_id FROM harness_package_bindings WHERE fact_id=$1 AND version=$2',
     [pdfFact.id,lastReplaced+1])).rows[0].actor_id,owner.actor);
   assert.equal((await db.query('SELECT count(*)::int AS n FROM harness_package_bindings WHERE fact_id=$1',[tableFact.id])).rows[0].n,last+1);
+});
+
+test('migration reinterprets a stored view reference while preserving prior and manual bindings', {skip:!enabled||viewUpgrade!=='verify'}, async(t)=>{
+  const connectionString=process.env.DATABASE_URL;
+  assert.match(new URL(connectionString).pathname,/^\/test_facade_identity_view_upgrade$/u);
+  const db=new pg.Pool({connectionString});
+  t.after(()=>db.end());
+  const {readPackageAnalysis}=await import(built('src/modules/harness/package-analysis.js'));
+  const {reconcileNextFacadeDiscovery}=await import(built('src/modules/harness/facade-discovery.js'));
+  const {rows:[{id:projectId}]}=await db.query("SELECT id FROM projects WHERE name='Addressed'");
+  const before=await readPackageAnalysis(db,projectId);
+  const manual=before.facts.find(({binding})=>binding.actorId);
+  assert.ok(manual);
+  assert.deepEqual(before.candidates.map(({label})=>label),['VB-27']);
+  while(await reconcileNextFacadeDiscovery(db)){}
+  const after=await readPackageAnalysis(db,projectId);
+  assert.deepEqual(after.candidates,before.candidates);
+  assert.deepEqual(after.facts.find(({id})=>id===manual.id).binding,manual.binding);
+  const addressed=after.facadeMentions.find(({relation})=>relation?.sourceLabel==='Detail-73');
+  assert.ok(addressed);
+  assert.equal(after.facts.find(({id})=>id===addressed.factId).binding.candidates[0].id,before.candidates[0].id);
+  const {rows:[history]}=await db.query(`SELECT d.prior_mentions AS mentions,
+    EXISTS(SELECT 1 FROM harness_package_bindings b CROSS JOIN LATERAL jsonb_array_elements(b.candidates) c
+      WHERE b.fact_id=d.fact_id AND c->>'label'='Detail-73') AS retained
+    FROM harness_facade_discovery d WHERE d.fact_id=$1 AND d.resolved AND d.discovery_version=2`,[addressed.factId]);
+  assert.ok(history.retained);
+  assert.equal(history.mentions[0].version,1);
+  assert.deepEqual(history.mentions[0].mentions.map(({label})=>label),['Detail-73']);
 });
