@@ -147,6 +147,11 @@ export async function startWorker(context: WorkerContext, test?: ManagedTestOpti
   const profile = test?.profile ?? loadResearchProfile();
   const packageMode = process.env.FACADE_HARNESS_PACKAGE_PRIMARY;
   const packageEnabled = packageMode !== 'legacy';
+  const walkOverride = process.env.FACADE_HARNESS_PACKAGE_WALK;
+  if (walkOverride !== undefined && walkOverride !== '0' && walkOverride !== '1') {
+    throw new Error('Invalid FACADE_HARNESS_PACKAGE_WALK');
+  }
+  const newWalkJobs = walkOverride === undefined ? undefined : walkOverride === '1';
   const packageProjects = [...new Set((process.env.FACADE_HARNESS_PACKAGE_PROJECTS ?? '').split(',')
     .map((value) => value.trim()).filter(Boolean))];
   if (packageProjects.some((id) => !isReaderId(id))) throw new Error('Invalid FACADE_HARNESS_PACKAGE_PROJECTS');
@@ -196,12 +201,13 @@ export async function startWorker(context: WorkerContext, test?: ManagedTestOpti
     const publish = publication(db, gateway, profile);
     const reader = connectReader(db, service, publish.observation);
     const inquiry = createRuntimeInquiryPorts(db, service, storage.objects);
-    const walk=packageEnabled&&process.env.FACADE_HARNESS_PACKAGE_WALK==='1';
     const localReads=[
       ()=>dispatchNext(db,gateway,service.map,profile,publish.onSeal,packageProjects),
       ()=>indexNextProjectMemory(db,base,signal),
-      ...(packageEnabled?[()=>preparePackageMap(db,gateway,service,packageProjects)]:[]),
-      ...(walk?[()=>scanPackageStructure(db,service)]:[]),
+      ...(packageEnabled?[
+        ()=>preparePackageMap(db,gateway,service,packageProjects),
+        ()=>scanPackageStructure(db,service),
+      ]:[]),
     ];
     let nextLocal=0;
     const copilot={db,gateway,workerId:randomUUID(),route:copilotRoute??null,
@@ -221,7 +227,7 @@ export async function startWorker(context: WorkerContext, test?: ManagedTestOpti
       startImports({ ...context, signal }, { storage }),
     );
     if (packageEnabled) lanes.push(
-      poll('package primary scheduler', () => dispatchPackagePair(db, gateway, profile,walk)),
+      poll('package primary scheduler', () => dispatchPackagePair(db, gateway, profile, newWalkJobs)),
       poll('package review scheduler', () => schedulePackageReview(db, gateway, profile)),
     );
     if (hasTransport && external) {
@@ -233,8 +239,8 @@ export async function startWorker(context: WorkerContext, test?: ManagedTestOpti
         return true;
       }, true));
     }
-    if(walk) lanes.push(poll('package followup scheduler',()=>dispatchPackageFollowup(db,gateway)));
-    const workKinds=[...Array.from({length:hasTransport?3:1},()=>researchKind),...(walk?[packageFollowupKind]:[])];
+    if(packageEnabled) lanes.push(poll('package followup scheduler',()=>dispatchPackageFollowup(db,gateway)));
+    const workKinds=[...Array.from({length:hasTransport?3:1},()=>researchKind),...(packageEnabled?[packageFollowupKind]:[])];
     for (const kind of workKinds) {
       const workerId = randomUUID();
       lanes.push(poll(kind, async () => {

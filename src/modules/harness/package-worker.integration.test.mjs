@@ -236,6 +236,7 @@ test('ordinary intake publishes independent package evidence before questions an
     const stopped = await Promise.allSettled([worker, new Promise((resolve) => provider.close(resolve))]);
     const closed = await Promise.allSettled([app.close(), external.end()]);
     delete process.env.FACADE_HARNESS_PACKAGE_EFFECTS;
+    delete process.env.FACADE_HARNESS_PACKAGE_WALK;
     delete process.env.FACADE_HARNESS_REPLAY_ONLY;
     const failure = [...stopped, ...closed].find(({ status }) => status === 'rejected');
     if (failure) throw failure.reason;
@@ -281,10 +282,10 @@ test('ordinary intake publishes independent package evidence before questions an
     driver = new AbortController();
     worker = startWorker({ db: app.db, config, logger: { warn: (message) => warnings.push(message) }, signal: driver.signal }, options);
   }
-  await t.test('both branches revisit missed blocks without candidates and preserve their separate lineage',{skip:legacyOnly},async()=>{
-    delete process.env.FACADE_HARNESS_REPLAY_ONLY;
-    process.env.FACADE_HARNESS_PACKAGE_WALK='1';
-    process.env.FACADE_HARNESS_PACKAGE_EFFECTS = 'enabled';
+  await t.test('new intake defaults to addressed A/B and pinned work continues after opt-out',{skip:legacyOnly},async()=>{
+    delete process.env.FACADE_HARNESS_PACKAGE_WALK;
+    delete process.env.FACADE_HARNESS_PACKAGE_EFFECTS;
+    process.env.FACADE_HARNESS_REPLAY_ONLY='1';
     const walked=(await command('POST','/api/projects',{name:'Neutral walkthrough',mode:'intake'})).json();
     for(const [routeId,purpose] of [['managed-a','primary_a'],['managed-b','primary_b']]){
       await gateway.grantRoute({projectId:walked.id,routeId,revision:'fixture-v1',purpose,dataClass:'synthetic',allowed:true});
@@ -298,8 +299,22 @@ test('ordinary intake publishes independent package evidence before questions an
     try {
       await upload('walk.pdf',bytes,target);
       await command('POST',target+'/seal',{});
+      const passive=await until(()=>readPackageAnalysis(app.db,walked.id),({windows})=>windows.some(({branches})=>
+        branches.A.status==='held'&&branches.B.status==='held'),'default addressed jobs on the passive worker');
+      const roots=Object.values(passive.windows[0].branches).map(({jobId})=>jobId).sort();
+      const { rows: protocols }=await app.db.query(`SELECT payload#>>'{packageWindow,walkProtocol}' AS protocol
+        FROM gateway_jobs WHERE id=ANY($1::uuid[])`,[roots]);
+      assert.deepEqual(protocols.map(({protocol})=>protocol),['1','1']);
+      assert.equal(calls.length,0);
+      driver.abort();
+      await worker;
+      process.env.FACADE_HARNESS_PACKAGE_WALK='0';
+      process.env.FACADE_HARNESS_PACKAGE_EFFECTS='enabled';
+      delete process.env.FACADE_HARNESS_REPLAY_ONLY;
+      run();
       const result=await until(()=>readPackageAnalysis(app.db,walked.id),({facts,coverage})=>facts.length===2&&
         coverage.structurallyReviewedWindows===1 && coverage.completedWindows===1,'independent followup');
+      assert.deepEqual(Object.values(result.windows[0].branches).map(({jobId})=>jobId).sort(),roots);
       assert.deepEqual(result.facts.map(({branch,attribute,observation})=>[branch,attribute,observation.value]).sort(),
         [['A','Material','Graphite'],['B','Material','Graphite']]);
       const structure=result.windows[0].structure;
@@ -378,13 +393,18 @@ test('ordinary intake publishes independent package evidence before questions an
     assert.deepEqual(warnings, []);
     return readPackageAnalysis(app.db, project.id);
   };
+  process.env.FACADE_HARNESS_PACKAGE_WALK = '0';
   process.env.FACADE_HARNESS_REPLAY_ONLY = '1';
+  const beforePassive = calls.length;
   run();
   const first = await upload('first.pdf', pdf([primaryDrawing, register, notDelivered, common]));
   const passive = await until(analyze, ({ windows }) => windows.some(({ branches }) => branches.A.status === 'held'), 'passive hold');
-  assert.equal(calls.length, 0);
+  assert.equal(calls.length, beforePassive);
   assert.equal(passive.facts.length, 0);
   assert.equal(passive.coverage.completedWindows, 0);
+  const legacyJob=passive.windows.find(({branches})=>branches.A.status==='held').branches.A.jobId;
+  assert.equal((await app.db.query(`SELECT payload#>>'{packageWindow,walkProtocol}' AS protocol FROM gateway_jobs WHERE id=$1`,
+    [legacyJob])).rows[0].protocol,null);
 
   driver.abort();
   await worker;
@@ -528,6 +548,8 @@ test('ordinary intake publishes independent package evidence before questions an
     const existing = await newProject('Existing package', true);
     const other = await newProject('Untouched historical package', true);
     const small = await newProject('Competing intake package');
+    // Simulate an intake project that predated migration 20 with a newly uploaded original.
+    await app.db.query('UPDATE projects SET package_walk_default=false WHERE id=$1',[small.id]);
     for (const project of [existing, small]) {
       for (const [routeId, purpose] of [['managed-a','primary_a'], ['managed-b','primary_b']]) {
         await gateway.grantRoute({ projectId: project.id, routeId, revision: 'fixture-v1', purpose, dataClass: 'synthetic', allowed: true });
@@ -595,6 +617,12 @@ test('ordinary intake publishes independent package evidence before questions an
     assert.equal(large.windows.flatMap(({ branches }) => Object.values(branches)).filter(({ jobId }) => jobId).length, 8);
     assert.equal(competing.windows.length, 3);
     assert.ok(competing.windows.every(({ branches }) => branches.A.jobId && branches.B.jobId));
+    const unchangedJobs=[existing.id,small.id];
+    const { rows: [contracts] }=await app.db.query(`SELECT count(*)::int AS total,
+      count(*) FILTER (WHERE j.payload#>>'{packageWindow,walkProtocol}'='1')::int AS walk
+      FROM harness_package_branches b JOIN gateway_jobs j ON j.id=b.job_id
+      WHERE b.active AND j.project_id=ANY($1::uuid[])`,[unchangedJobs]);
+    assert.deepEqual(contracts,{total:14,walk:0});
     assert.equal((await readPackageAnalysis(app.db, other.id)).windows.length, 0);
     assert.deepEqual((await app.db.query(`SELECT id,effect_key,state,ceiling_usd_nanos FROM gateway_attempts
       WHERE project_id=$1 ORDER BY state`, [existing.id])).rows, before);

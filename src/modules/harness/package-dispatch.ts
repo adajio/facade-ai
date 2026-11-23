@@ -147,7 +147,7 @@ async function priorEffect(tx: PoolClient, projectId: string, place: Place, bran
   return prior?.job_id ?? null;
 }
 
-export async function dispatchPackagePair(db: Pool, queue: WorkQueue, profile: ResearchProfile, walk = false) {
+export async function dispatchPackagePair(db: Pool, queue: WorkQueue, profile: ResearchProfile, walkOverride?: boolean) {
   if (!profile.A || !profile.B) return false;
   return transaction(db, async (tx) => {
     // Serialize the slot decision. Reader and sender locks always follow the project lock.
@@ -179,10 +179,12 @@ export async function dispatchPackagePair(db: Pool, queue: WorkQueue, profile: R
       `SELECT count(*)::int AS count FROM ${activeJobs}`);
     if (count > globalLimit - 2) return false;
     const { rows: [next] } = await tx.query<{
-      projectId: string; generationId: string; windowId: string; place: Place; readerVersion: string;
+      projectId: string; generationId: string; windowId: string; place: Place; readerVersion: string; walkDefault: boolean;
     }>(
-      `SELECT p.project_id AS "projectId",p.generation_id AS "generationId",candidate.*
+      `SELECT p.project_id AS "projectId",p.generation_id AS "generationId",candidate.*,
+        (project.intake_mode AND project.package_walk_default) AS "walkDefault"
        FROM harness_package_projects p
+       JOIN projects project ON project.id=p.project_id
        JOIN LATERAL (
          SELECT w.id AS "windowId",w.place,m.reader_version AS "readerVersion"
          FROM ${selectedWindows}
@@ -201,6 +203,13 @@ export async function dispatchPackagePair(db: Pool, queue: WorkQueue, profile: R
       [projectLimit, profile.A!.routeId, profile.A!.dataClass, profile.B!.routeId, profile.B!.dataClass]);
     if (!next) return false;
     await lockIntakeProject(tx, next.projectId);
+    // A blocked sibling can be issued later, after a worker's option changes.
+    const { rows: [{ walkPinned }] } = await tx.query<{ walkPinned: boolean | null }>(
+      `SELECT bool_and(coalesce(j.payload#>>'{packageWindow,walkProtocol}'='1',false)) AS "walkPinned"
+       FROM harness_package_branches b JOIN gateway_jobs j ON j.id=b.job_id
+       WHERE b.window_id=$1 AND b.profile_hash=ANY($2::text[])`,
+      [next.windowId, pinned.map(({ profileHash }) => profileHash)]);
+    const walk = walkPinned ?? walkOverride ?? next.walkDefault;
     const ref = { projectId: next.projectId, scopeId: null, generationId: next.generationId };
     for (const { branch, revision, profileHash: branchHash, settings } of pinned) {
       const { rows: [previous] } = await tx.query<{ job_id: string | null }>(
