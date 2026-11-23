@@ -1,6 +1,6 @@
 import pg, { type Pool } from 'pg';
 import type { FastifyInstance } from 'fastify';
-import { Gateway, type ReviewAdmission } from './gateway.js';
+import { Gateway, type ReviewAdmission, type ResearchAdmission } from './gateway.js';
 import { PostgresIntentJournal } from './journal.js';
 import { openRouterTransport, type Step15Approval } from './openrouter.js';
 import { GatewayError, type ModelTransport } from './types.js';
@@ -12,20 +12,25 @@ export { estimateOpenRouterRequest, matchesKimiEndpoint, type OpenRouterCostBoun
 export { type LeasedJob } from './queue.js';
 export * from './types.js';
 
+export interface ResearchGatewayPolicy {
+  researchAdmission?: ResearchAdmission;
+  replayOnly?: boolean;
+}
+
 type ManagedTransport = ModelTransport & { kind: 'managed' };
 
 export function createGateway(
-  db: Pool, options?: { journal?: PostgresIntentJournal; transport?: ManagedTransport; reviewAdmission?: ReviewAdmission },
+  db: Pool, options?: ResearchGatewayPolicy & { journal?: PostgresIntentJournal; transport?: ManagedTransport; reviewAdmission?: ReviewAdmission },
 ): Gateway {
   if (options?.transport && options.transport.kind !== 'managed') throw new GatewayError('managed_transport_required');
-  return new Gateway(db, options?.journal, options?.transport, options?.reviewAdmission);
+  return new Gateway(db, options?.journal, options?.transport, options?.reviewAdmission, options?.researchAdmission, options?.replayOnly);
 }
 
 export function createStep15Gateway(
-  db: Pool, journal: PostgresIntentJournal, approval: Step15Approval, reviewAdmission?: ReviewAdmission,
+  db: Pool, journal: PostgresIntentJournal, approval: Step15Approval, reviewAdmission?: ReviewAdmission, policy?: ResearchGatewayPolicy,
 ): Gateway {
   if (process.env.FACADE_GATEWAY_LIVE_MODE !== 'step-15') throw new GatewayError('step15_approval_required');
-  return new Gateway(db, journal, openRouterTransport(approval), reviewAdmission);
+  return new Gateway(db, journal, openRouterTransport(approval), reviewAdmission, policy?.researchAdmission, policy?.replayOnly);
 }
 
 export function journalFromEnv(env: NodeJS.ProcessEnv = process.env): { journal: PostgresIntentJournal; close: () => Promise<void> } | null {

@@ -1,12 +1,12 @@
 import type { Pool, PoolClient } from 'pg';
 import {
   encode, GatewayError, hash, positiveInteger, transaction,
-  type EnqueueInput, type GenerationRef, type Lease, type Obligation, type PrimaryResult, type Purpose,
+  type EnqueueInput, type QueueTarget, type Lease, type Obligation, type PrimaryResult, type Purpose,
 } from './types.js';
 
 const MAX_LEASE_MS = 3_600_000;
 
-export type LeasedJob = GenerationRef & {
+export type LeasedJob = QueueTarget & {
   lease: Lease;
   kind: string;
   purpose: Purpose;
@@ -20,7 +20,7 @@ export type LeasedJob = GenerationRef & {
 type JobRow = {
   id: string;
   project_id: string;
-  scope_id: string;
+  scope_id: string | null;
   generation_id: string;
   job_key: string;
   kind: string;
@@ -52,10 +52,10 @@ async function publish(tx: PoolClient, jobId: string, epoch: number, kind: strin
   );
 }
 
-async function lockGeneration(tx: PoolClient, ref: GenerationRef): Promise<{ sealed: boolean }> {
+async function lockGeneration(tx: PoolClient, ref: QueueTarget): Promise<{ sealed: boolean }> {
   const result = await tx.query<{ sealed: boolean }>(
     `SELECT sealed FROM gateway_generations
-     WHERE project_id=$1 AND scope_id=$2 AND generation_id=$3 AND current FOR UPDATE`,
+     WHERE project_id=$1 AND scope_id IS NOT DISTINCT FROM $2::uuid AND generation_id=$3 AND current FOR UPDATE`,
     [ref.projectId, ref.scopeId, ref.generationId],
   );
   if (!result.rows[0]) throw new GatewayError('stale_generation');
@@ -87,31 +87,31 @@ async function putObligation(
 export class WorkQueue {
   constructor(protected readonly db: Pool) {}
 
-  async openGeneration(ref: GenerationRef, client?: PoolClient): Promise<void> {
+  async openGeneration(ref: QueueTarget, client?: PoolClient): Promise<void> {
     await transaction(this.db, async (tx) => {
       const { projectId, scopeId, generationId } = ref;
       await tx.query('SELECT pg_advisory_xact_lock(hashtextextended($1, 8))', [projectId + '/' + scopeId]);
       const previous = await tx.query<{ current: boolean }>(
-        'SELECT current FROM gateway_generations WHERE project_id=$1 AND scope_id=$2 AND generation_id=$3',
+        'SELECT current FROM gateway_generations WHERE project_id=$1 AND scope_id IS NOT DISTINCT FROM $2::uuid AND generation_id=$3',
         [projectId, scopeId, generationId],
       );
       if (previous.rows[0]?.current) return;
       if (previous.rowCount) throw new GatewayError('stale_generation');
-      await tx.query('UPDATE gateway_generations SET current=false WHERE project_id=$1 AND scope_id=$2 AND current',
+      await tx.query('UPDATE gateway_generations SET current=false WHERE project_id=$1 AND scope_id IS NOT DISTINCT FROM $2::uuid AND current',
         [projectId, scopeId]);
       await tx.query('INSERT INTO gateway_generations(project_id,scope_id,generation_id) VALUES($1,$2,$3)',
         [projectId, scopeId, generationId]);
     }, client);
   }
 
-  async declarePrimary(ref: GenerationRef, obligation: Obligation, client?: PoolClient): Promise<void> {
+  async declarePrimary(ref: QueueTarget, obligation: Obligation, client?: PoolClient): Promise<void> {
     await transaction(this.db, async (tx) => {
       const generation = await lockGeneration(tx, ref);
       await putObligation(tx, ref.generationId, obligation, generation.sealed);
     }, client);
   }
 
-  async sealGeneration(ref: GenerationRef, manifest: readonly Obligation[], client?: PoolClient): Promise<void> {
+  async sealGeneration(ref: QueueTarget, manifest: readonly Obligation[], client?: PoolClient): Promise<void> {
     const ids = new Set(manifest.map(item => item.id));
     if (ids.size !== manifest.length) throw new GatewayError('manifest_mismatch');
     await transaction(this.db, async (tx) => {

@@ -1,6 +1,7 @@
 import type { PoolClient } from 'pg';
 import type { LeasedJob } from '../gateway/queue.js';
 import { canonicalJson, type Finding } from '../assessment/domain.js';
+import { authorizedPackageReview } from './package-review.js';
 import { jobSchema, type Citation } from './contracts.js';
 
 function matches(citation: Citation, { citation: saved }: Finding): boolean {
@@ -18,6 +19,8 @@ export async function reviewPairAdmission(tx: PoolClient, work: LeasedJob) {
   if (!parsed.success || parsed.data.mode === 'primary') return 'stale';
   const job = parsed.data;
   const { dispute } = job;
+  if (work.scopeId === null) return await authorizedPackageReview(tx, work.projectId, work.generationId, job, work.lease.jobId)
+    ? 'early' : 'stale';
   const key = job.mode === 'lead' ? `lead:${dispute.id}` : `verify:${dispute.id}:${job.branch}`;
   if (key !== work.key || work.subjectId !== dispute.question.id
     || [dispute.a, dispute.b].some(({ place }) => place.source.projectId !== work.projectId)) return 'stale';

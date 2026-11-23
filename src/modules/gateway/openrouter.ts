@@ -2,7 +2,7 @@ import { BUDGET_USD_NANOS, GatewayError, hash, positiveInteger, type ModelTransp
 
 type SyntheticScope = {
   projectId: string;
-  scopeId: string;
+  scopeId: string | null;
   approvalRef: string;
   originalSha256s: readonly string[];
   retentionApproval?: {
@@ -212,7 +212,7 @@ function approvedProfile(profile: OpenRouterProfile): boolean {
   if (profile.mode !== 'synthetic-research' || (!kimi && !qwen)
     || (qwen && !/^alibaba(?:\/|$)/.test(profile.provider))
     || !Array.isArray(profile.syntheticScopes) || !profile.syntheticScopes.length) return false;
-  return profile.syntheticScopes.every(scope => uuid.test(scope.projectId) && uuid.test(scope.scopeId)
+  return profile.syntheticScopes.every(scope => uuid.test(scope.projectId) && (scope.scopeId === null || uuid.test(scope.scopeId))
     && typeof scope.approvalRef === 'string' && Boolean(scope.approvalRef.trim())
     && Array.isArray(scope.originalSha256s) && scope.originalSha256s.length > 0
     && scope.originalSha256s.every((digest: unknown) => typeof digest === 'string' && sha256.test(digest)));
@@ -235,7 +235,7 @@ export function matchesKimiEndpoint(model: string, provider: string, mode: OpenR
     || (mode === 'synthetic-research' && isDecartKimiK31Pro(model, provider)));
 }
 
-function syntheticScope(profile: OpenRouterProfile, projectId: string, scopeId: string): SyntheticScope | undefined {
+function syntheticScope(profile: OpenRouterProfile, projectId: string, scopeId: string | null): SyntheticScope | undefined {
   return profile.syntheticScopes?.find(item => item.projectId === projectId && item.scopeId === scopeId);
 }
 

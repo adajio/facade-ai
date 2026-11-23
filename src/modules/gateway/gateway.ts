@@ -35,6 +35,11 @@ const actions: Record<string, string> = {
   route_parameters_unsupported: 'use_supported_parameters_for_pinned_endpoint',
   route_zdr_unavailable: 'verify_zdr_for_pinned_endpoint',
   route_endpoint_unverified: 'verify_exact_regional_endpoint',
+  analysis_replay_only: 'approve_remaining_model_work',
+  analysis_legacy_replay_only: 'resume_saved_legacy_effect',
+  analysis_prior_effect: 'reconcile_original_window_effect',
+  analysis_target_changed: 'restore_pinned_reader_and_route',
+  analysis_input_denied: 'verify_package_input_authorization',
   route_receipt_mismatch: 'operator_verify_provider_endpoint',
 };
 
@@ -49,8 +54,11 @@ type Gate = {
   requestHash: string;
   quote: RequestQuote | null;
   earlyReview: boolean;
+  dispatchBlock?: string;
 };
 export type ReviewAdmission = (tx: PoolClient, work: LeasedJob) => Promise<'early' | 'standard' | 'stale'>;
+export type ResearchAdmission = (tx: PoolClient, work: LeasedJob, route: RoutePolicy, input: CallInput) =>
+  Promise<{ deny?: string; dispatchBlock?: string }>;
 const active = "('reserved','prepared','sending','unknown')";
 
 function knownCost(value: unknown): value is number {
@@ -95,7 +103,8 @@ export class Gateway extends WorkQueue {
   private pendingRecovery?: Promise<unknown>;
 
   constructor(db: Pool, private readonly journal?: PostgresIntentJournal, private readonly transport?: ModelTransport,
-    private readonly reviewAdmission?: ReviewAdmission) {
+    private readonly reviewAdmission?: ReviewAdmission, private readonly researchAdmission?: ResearchAdmission,
+    private readonly replayOnly = false) {
     super(db);
   }
 
@@ -140,11 +149,12 @@ export class Gateway extends WorkQueue {
   }
 
   private async gate(tx: PoolClient, input: CallInput, wire: string): Promise<Gate | string> {
-    if (this.reviewAdmission) {
+    if (this.reviewAdmission || this.researchAdmission) {
       // Reader publication and source replacement lock the intake project before the generation.
       await tx.query(
         `SELECT pg_advisory_xact_lock(hashtextextended('intake/project/' || project_id::text, 0))
-         FROM gateway_jobs WHERE id=$1 AND purpose='review'`, [input.lease.jobId],
+         FROM gateway_jobs WHERE id=$1 AND (purpose='review' OR ($2 AND kind='harness_research'))`,
+        [input.lease.jobId, Boolean(this.researchAdmission)],
       );
     }
     const work = await this.lockLease(tx, input.lease);
@@ -175,6 +185,8 @@ export class Gateway extends WorkQueue {
     });
     if (typeof authorization === 'string') return authorization;
     if (authorization === false) return 'route_data_unapproved';
+    const research = await this.researchAdmission?.(tx, work, route, input);
+    if (research?.deny) return research.deny;
     const review = work.purpose === 'review' ? await this.reviewAdmission?.(tx, work) : undefined;
     if (review === 'stale') return 'review_pair_stale';
     if (work.purpose === 'review' && review !== 'early') {
@@ -189,6 +201,7 @@ export class Gateway extends WorkQueue {
     }
     return {
       work: { ...work, purpose: work.purpose }, route, quote, earlyReview: review === 'early',
+      dispatchBlock: this.replayOnly ? 'analysis_replay_only' : research?.dispatchBlock,
       effect: hash([work.projectId, work.scopeId, work.generationId, work.key, input.effectKey]),
       requestHash: hash([route.id, route.revision, input.dataClass, input.inputRefs, wire, ...(quote ? [quote] : [])]),
     };
@@ -312,7 +325,7 @@ export class Gateway extends WorkQueue {
     const journal = this.journal;
     const transport = this.transport;
     if (!journal || !transport) return held('journal_unavailable');
-    if (transport.kind === 'openrouter' && !this.recovered) {
+    if ((transport.kind === 'openrouter' || this.researchAdmission) && !this.recovered) {
       try {
         this.pendingRecovery ??= this.recover().finally(() => { this.pendingRecovery = undefined; });
         await this.pendingRecovery;
@@ -342,6 +355,7 @@ export class Gateway extends WorkQueue {
           return this.terminal(input, previous, true);
         }
       }
+      if (first.dispatchBlock) return held(first.dispatchBlock, attemptId);
       if ((input.retryRejectedAttemptId && !previous)
         || (previous?.state === 'prepared' && previous.attempt.previousRejectedId !== (input.retryRejectedAttemptId ?? null))) {
         return held('effect_conflict', attemptId);
@@ -350,6 +364,7 @@ export class Gateway extends WorkQueue {
       const reserved = await transaction(this.db, async tx => {
         const current = await this.gate(tx, input, wire);
         if (typeof current === 'string') return current;
+        if (current.dispatchBlock) return current.dispatchBlock;
         if (current.requestHash !== first.requestHash) return 'effect_conflict';
         if (previous?.state === 'prepared') return previous.attempt;
         return this.findOrReserve(tx, current, input, journal);
@@ -377,6 +392,7 @@ export class Gateway extends WorkQueue {
             || (current.quote?.ceilingUsdNanos ?? current.route.ceilingUsdNanos) !== reserved.ceilingUsdNanos) {
             return typeof current === 'string' ? current : 'effect_conflict';
           }
+          if (current.dispatchBlock) return current.dispatchBlock;
           const claimStartedAt = performance.now();
           const permission = await journal.claim(reserved.id, current.route, current.earlyReview);
           if (permission !== 'claimed') return permission;
@@ -398,7 +414,8 @@ export class Gateway extends WorkQueue {
         if (['route_denied','route_data_unapproved','synthetic_retention_not_approved','route_training_policy_unverified',
           'route_parameters_unsupported','route_zdr_unavailable','route_endpoint_unverified','invalid_request',
           'route_bound_unavailable','primary_barrier','review_pair_stale','effect_conflict','route_busy','route_rate_limited',
-          'route_reconciliation','budget_frozen','budget_exhausted'].includes(denied)) {
+          'route_reconciliation','budget_frozen','budget_exhausted','analysis_replay_only','analysis_prior_effect',
+          'analysis_target_changed','analysis_input_denied','analysis_legacy_replay_only'].includes(denied)) {
           // Cancellation is conditional in the journal because a concurrent caller may already own the attempt.
           await this.mirror(await journal.cancelPrepared(reserved.id), journal);
         }
@@ -434,10 +451,10 @@ export class Gateway extends WorkQueue {
         await this.mirror(entry, journal);
         const unsettled = entry.state === 'sending' || entry.state === 'unknown';
         const paid = entry.receipt?.state === 'paid' ? entry.receipt : null;
-        const missing = this.transport?.lookup && paid && paid.routeVerified !== false
+        const missing = !this.replayOnly && this.transport?.lookup && paid && paid.routeVerified !== false
           && !await this.response(this.db, entry.attempt.id, paid);
         if (unsettled || missing) {
-          const outcome = await this.transport?.lookup?.(entry.attempt).catch(() => null);
+          const outcome = this.replayOnly ? null : await this.transport?.lookup?.(entry.attempt).catch(() => null);
           if (outcome && validReceipt(outcome.receipt) && outcome.receipt.state !== 'unknown') {
             const receipt = durableReceipt(outcome.receipt);
             final = await journal.settle(entry.attempt.id, receipt);

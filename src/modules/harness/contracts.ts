@@ -2,6 +2,7 @@ import type { PoolClient } from 'pg';
 import type { VerifiedPairEvidence } from '../assessment/domain.js';
 import type { DeliveryStatement, ReaderComponentInput } from '../pdf/types.js';
 import { z } from 'zod';
+import type { PackageDetails } from './package-observation.js';
 
 export const branchSchema = z.enum(['A', 'B']);
 export type Branch = z.infer<typeof branchSchema>;
@@ -35,12 +36,12 @@ export const citationSchema = z.strictObject({
   place: placeSchema,
   quote: text,
   value: text,
-  unit: text,
+  unit: z.string().trim().max(500),
   normalizedValue: text.optional(),
 });
 export const disputeSchema = z.strictObject({
   id,
-  question: questionSchema,
+  question: questionSchema.omit({ id: true }).extend({ id: id.optional() }),
   a: citationSchema.extend({ branch: z.literal('A') }),
   b: citationSchema.extend({ branch: z.literal('B') }),
 }).refine(({a, b}) => a.observationId !== b.observationId);
@@ -55,6 +56,8 @@ export const settingsSchema = z.strictObject({
   maxKnownRejections: z.number().int().min(0).max(5),
 });
 
+const packageReviewSchema = z.strictObject({ scopeId: text, scopeLabel: text,
+  readerVersions: z.strictObject({ A: text, B: text }), routeRevision: text });
 export const jobSchema = z.discriminatedUnion('mode', [
   z.strictObject({
     mode: z.literal('primary'),
@@ -63,9 +66,10 @@ export const jobSchema = z.discriminatedUnion('mode', [
     question: questionSchema.optional(),
     localRefusal: text.optional(),
     observationProtocol: z.literal(2).optional(),
+    packageWindow: z.strictObject({ id, readerVersion: text, routeRevision: text }).optional(),
     settings: settingsSchema.nullable(),
   }),
-  z.strictObject({ mode: z.literal('lead'), dispute: disputeSchema, settings: settingsSchema.nullable() }),
+  z.strictObject({ mode: z.literal('lead'), dispute: disputeSchema, settings: settingsSchema.nullable(), packageReview: packageReviewSchema.optional() }),
   z.strictObject({
     mode: z.literal('verify'),
     branch: branchSchema,
@@ -76,6 +80,7 @@ export const jobSchema = z.discriminatedUnion('mode', [
       explanation: text,
     }),
     settings: settingsSchema.nullable(),
+    packageReview: packageReviewSchema.optional(),
   }),
 ]);
 
@@ -92,7 +97,7 @@ export type ResearchSettings = z.infer<typeof settingsSchema>;
 export interface ScheduledResearchTask {
   jobId: string;
   projectId: string;
-  scopeId: string;
+  scopeId: string | null;
   generationId: string;
   job: ScheduledResearchJob;
 }
@@ -145,6 +150,7 @@ export interface ObservationInput {
   limitation?: string;
   alternatives?: string[];
   sourceRole?: string;
+  package?: PackageDetails;
   components?: readonly ReaderComponentInput[];
 }
 

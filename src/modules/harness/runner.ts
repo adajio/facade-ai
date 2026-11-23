@@ -37,7 +37,8 @@ function taskFromWork(work: LeasedJob): ScheduledResearchTask {
   const job = jobSchema.parse(work.payload);
   const purpose = job.mode === 'primary' ? (job.branch === 'A' ? 'primary_a' : 'primary_b') : 'review';
   const places = job.mode === 'primary' ? [job.place] : [job.dispute.a.place, job.dispute.b.place];
-  if (purpose !== work.purpose || places.some((place) => place.source.projectId !== work.projectId)) {
+  if ((work.scopeId === null) !== (job.mode === 'primary' ? Boolean(job.packageWindow) : Boolean(job.packageReview)) ||
+    purpose !== work.purpose || places.some((place) => place.source.projectId !== work.projectId)) {
     throw new Error('Research assignment does not match its lease');
   }
   return { jobId: work.lease.jobId, projectId: work.projectId, scopeId: work.scopeId, generationId: work.generationId, job };
@@ -61,7 +62,7 @@ export async function resumeInterruptedResearch(
     `SELECT j.id,j.reason FROM gateway_jobs j JOIN gateway_generations g USING(generation_id)
      LEFT JOIN harness_route_bindings b ON b.job_id=j.id
      WHERE g.current AND j.kind=$1 AND j.state='held'
-       AND (j.reason IN ('journal_unavailable','research_profile_unavailable','research_route_not_approved',
+       AND (j.reason IN ('analysis_replay_only','journal_unavailable','research_profile_unavailable','research_route_not_approved',
                          'research_gateway_unconfigured','synthetic_input_not_approved')
          OR (j.reason='route_reconciliation' AND j.next_action='operator_reconcile_route'))
        AND NOT EXISTS (
@@ -160,6 +161,9 @@ async function runAssignment(
   const { review, scopeName } = scheduled.job.mode === 'primary' ? { review: 'standard', scopeName: undefined } :
     await transaction(db, async (tx) => {
       const review = await reviewPairAdmission(tx, work);
+      if (review === 'early' && scheduled.job.mode !== 'primary' && scheduled.job.packageReview) {
+        return { review, scopeName: scheduled.job.packageReview.scopeLabel };
+      }
       if (review !== 'early') return { review, scopeName: undefined };
       const { rows: [scope] } = await tx.query<{ name: string }>('SELECT name FROM project_scopes WHERE id=$1 AND project_id=$2',
         [work.scopeId, work.projectId]);

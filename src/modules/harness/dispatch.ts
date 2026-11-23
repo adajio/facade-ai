@@ -12,7 +12,7 @@ import { occurrenceScope, occurrenceScopeJoin } from './occurrence-scope.js';
 import type { ResearchProfile } from './profile.js';
 import { researchKind } from './runner.js';
 
-interface IntakeJob {
+export interface IntakeJob {
   id: string;
   projectId: string;
   receiptId: string;
@@ -22,12 +22,12 @@ interface IntakeJob {
   format: string;
 }
 
-type OnSeal = (tx: PoolClient, ref: Pick<ResearchTask, 'projectId' | 'scopeId' | 'generationId'>, targets: (TargetQuestion | undefined)[]) => Promise<void>;
+type OnSeal = (tx: PoolClient, ref: Pick<ResearchTask, 'projectId' | 'generationId'> & { scopeId: string }, targets: (TargetQuestion | undefined)[]) => Promise<void>;
 
 type Unit = { id: string; page?: number; box?: Place['box']; refusal?: string };
-const jobFields = `j.id,j.project_id AS "projectId",j.receipt_id AS "receiptId",
+export const jobFields = `j.id,j.project_id AS "projectId",j.receipt_id AS "receiptId",
   j.document_id AS "documentId",j.version_id AS "versionId",o.sha256,v.media_type AS format`;
-const originalJoins = `JOIN intake_originals o ON o.id=j.original_id
+export const originalJoins = `JOIN intake_originals o ON o.id=j.original_id
   JOIN intake_document_versions v ON v.id=j.version_id`;
 
 function unitPlaces(unit: ReaderUnit, format: string): Unit[] {
@@ -49,15 +49,20 @@ function unitPlaces(unit: ReaderUnit, format: string): Unit[] {
     })).flat();
 }
 
-async function buildMap(job: IntakeJob, map: (source: Source) => Promise<PageMap>) {
+export async function buildMap(job: IntakeJob, map: (source: Source) => Promise<PageMap>) {
   const { projectId, documentId, versionId, sha256 } = job;
   try {
     const result = await map({ projectId, documentId, versionId, sha256 });
     const units = result.units.flatMap((unit) => unitPlaces(unit, result.format));
-    return { units: units.length ? units : [{ id: 'original', refusal: 'reader_no_physical_units' }], format: result.format };
+    return {
+      units: units.length ? units : [{ id: 'original', refusal: 'reader_no_physical_units' }],
+      format: result.format, readerVersion: result.readerVersion,
+      physicalProof: result.format === 'pdf' && result.units.length > 0 &&
+        result.units.every((unit, index) => unit.locator?.page === index + 1 && unit.width && unit.height),
+    };
   } catch (error) {
     if (!(error instanceof ReaderError) || ![415, 422].includes(error.statusCode)) throw error;
-    return { units: [{ id: 'original', refusal: error.code }], format: job.format };
+    return { units: [{ id: 'original', refusal: error.code }], format: job.format, readerVersion: null, physicalProof: false };
   }
 }
 
@@ -163,13 +168,16 @@ async function reconcile(
 }
 
 export async function dispatchNext(
-  db: Pool, queue: WorkQueue, map: (source: Source) => Promise<PageMap>, profile: ResearchProfile, onSeal?: OnSeal,
+  db: Pool, queue: WorkQueue, map: (source: Source) => Promise<PageMap>, profile: ResearchProfile, onSeal?: OnSeal, packageProjects: readonly string[] = [],
 ): Promise<boolean> {
   const { rows: [pending] } = await db.query<IntakeJob>(
     `SELECT ${jobFields} FROM intake_reader_jobs j ${originalJoins}
-     WHERE j.dispatched_at IS NULL AND NOT EXISTS (
+     JOIN projects p ON p.id=j.project_id
+     WHERE NOT p.intake_mode AND j.project_id<>ALL($1::uuid[]) AND j.dispatched_at IS NULL AND NOT EXISTS (
+       SELECT 1 FROM harness_package_projects h WHERE h.project_id=j.project_id
+     ) AND NOT EXISTS (
        SELECT 1 FROM harness_map_retries f WHERE f.job_id=j.id AND f.retry_at>clock_timestamp()
-     ) ORDER BY j.created_at,j.id LIMIT 1`);
+     ) ORDER BY j.created_at,j.id LIMIT 1`, [[...packageProjects]]);
   if (pending) {
     let prepared;
     try {
@@ -193,6 +201,9 @@ export async function dispatchNext(
          VALUES($1,$2,$3,$4)`, [pending.versionId, pending.projectId, JSON.stringify(prepared.units), prepared.format]);
       await tx.query('DELETE FROM harness_map_retries WHERE job_id=$1', [pending.id]);
       await tx.query('UPDATE intake_reader_jobs SET dispatched_at=clock_timestamp() WHERE id=$1', [pending.id]);
+      if ((await tx.query('SELECT 1 FROM harness_package_projects WHERE project_id=$1', [pending.projectId])).rowCount) {
+        return;
+      }
       const { rows } = await tx.query<{ id: string }>(
         'SELECT id FROM project_scopes WHERE project_id=$1 ORDER BY id', [pending.projectId]);
       for (const scope of rows) await reconcile(tx, queue, pending.projectId, scope.id, profile, onSeal);
@@ -202,11 +213,14 @@ export async function dispatchNext(
   const { rows: scopes } = await db.query<{ projectId: string; scopeId: string }>(
     `SELECT s.project_id AS "projectId",s.id AS "scopeId"
      FROM project_scopes s
-     WHERE EXISTS(SELECT 1 FROM harness_document_maps m WHERE m.project_id=s.project_id)
+     WHERE s.project_id<>ALL($1::uuid[])
+       AND EXISTS (SELECT 1 FROM projects p WHERE p.id=s.project_id AND NOT p.intake_mode)
+       AND NOT EXISTS (SELECT 1 FROM harness_package_projects p WHERE p.project_id=s.project_id)
+       AND EXISTS(SELECT 1 FROM harness_document_maps m WHERE m.project_id=s.project_id)
        AND NOT EXISTS (
          SELECT 1 FROM harness_generations h JOIN gateway_generations g ON g.generation_id=h.id
          WHERE h.scope_id=s.id AND g.current AND h.sealed_at IS NOT NULL
-       ) ORDER BY s.id`);
+       ) ORDER BY s.id`, [[...packageProjects]]);
   for (const scope of scopes) {
     await transaction(db, async (tx) => {
       await reconcile(tx, queue, scope.projectId, scope.scopeId, profile, onSeal);

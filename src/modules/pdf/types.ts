@@ -48,6 +48,7 @@ export interface ReadRequest {
   representation: Representation;
   dpi?: number;
   query?: string;
+  readerVersion?: string;
 }
 
 export interface ReaderLine {
@@ -157,7 +158,7 @@ export interface ReaderObservationComponent extends ReaderComponentInput {
 
 export interface PinInput {
   evidenceId: string;
-  scope: string;
+  scope: string | null;
   lineId?: string;
   quote?: string;
   value?: string;

@@ -69,9 +69,10 @@ function checkedBox(box: Box | undefined): Box | undefined {
 }
 
 function checkedRead(input: ReadRequest): ReadRequest {
-  const { representation, address, dpi, query } = input;
+  const { representation, address, dpi, query, readerVersion } = input;
   if (!['render', 'native', 'ocr'].includes(representation) || !address || typeof address.unitId !== 'string'
     || !address.unitId.length || address.unitId.length > 200
+    || (readerVersion !== undefined && (typeof readerVersion !== 'string' || !readerVersion || readerVersion.length > 500))
     || (dpi !== undefined && (representation === 'native' || !Number.isSafeInteger(dpi) || dpi <= 0))
     || (query !== undefined && (representation !== 'native' || typeof query !== 'string'
       || !query.trim() || query.length > 500 || query.includes('\0')))) {
@@ -87,7 +88,7 @@ function checkedRead(input: ReadRequest): ReadRequest {
       unitId: address.unitId, box: checkedBox(address.box),
       locator: entries.length ? Object.fromEntries(entries.sort(([a], [b]) => a.localeCompare(b, 'en'))) : undefined,
     },
-    representation, dpi, query: query?.trim(),
+    representation, dpi, query: query?.trim(), readerVersion,
   };
 }
 
@@ -113,13 +114,13 @@ function checkedStatement(input: PinInput): PinInput['deliveryStatement'] {
 function checkedPin(input: PinInput): PinInput {
   const { evidenceId, scope, quote, value, unit, normalizedValue, limitation, lineId, alternatives } = input;
   const statement = checkedStatement(input);
-  const values = [scope, quote, value, unit, limitation, lineId];
-  if (!isReaderId(evidenceId) || !isReaderId(scope) || values.some((val) => val !== undefined
+  const values = [quote, value, unit, limitation, lineId];
+  if (!isReaderId(evidenceId) || (scope !== null && !isReaderId(scope)) || values.some((val) => val !== undefined
     && (typeof val !== 'string' || !val.trim() || val.length > 8000 || val.includes('\0')))
     || (normalizedValue !== undefined && !(typeof normalizedValue === 'string' && normalizedValue.length <= 8000
       && !normalizedValue.includes('\0') || typeof normalizedValue === 'number' && Number.isFinite(normalizedValue)))
     || (!quote && value !== undefined) || (value === undefined && (unit !== undefined || normalizedValue !== undefined))
-    || ((!quote || value === undefined) && !limitation && !statement) || (lineId && !quote)
+    || ((!quote || (scope !== null && value === undefined)) && !limitation && !statement) || (lineId && !quote)
     || (alternatives !== undefined && (!Array.isArray(alternatives) || alternatives.length > 12
       || alternatives.some((value) => typeof value !== 'string' || !value.trim() || value.length > 500
         || value.includes('\0'))))) {
@@ -292,6 +293,9 @@ export function createReaderService(db: Pool, deps: ReaderDependencies, adapters
     if (previous) return { evidence: previous, bytes: await content(previous) };
 
     const { original, adapter, version } = await describe(source);
+    if (request.readerVersion !== undefined && request.readerVersion !== version) {
+      throw new ReaderError('reader_profile_changed', 'Требуется исходный профиль reader', 409);
+    }
     let output = await withOriginal(original, deps, async (path) => {
       const map = await lookupMap(source, version) ?? await insertMap(source, original, version, adapter, path);
       const unit = map.units.find(({ id }) => id === request.address.unitId);
@@ -375,9 +379,16 @@ export function createReaderService(db: Pool, deps: ReaderDependencies, adapters
     if (candidate.box && scale && (candidate.box.width * scale < 1 || candidate.box.height * scale < 1)) {
       throw new ReaderError('reader_address_invalid', 'Рамка мельче одного пикселя выдачи', 422);
     }
-    const linkedScope = await conn.query('SELECT 1 FROM project_scopes WHERE project_id = $1 AND id = $2', [
-      source.projectId, candidate.scope,
-    ]);
+    const linkedScope = candidate.scope === null
+      ? await conn.query(
+        `SELECT 1 FROM gateway_jobs j JOIN gateway_generations g USING(generation_id)
+         JOIN harness_package_branches b ON b.job_id=j.id AND b.active
+         JOIN harness_package_windows w ON w.id=b.window_id AND w.project_id=j.project_id
+         JOIN harness_package_maps m ON m.version_id=w.version_id AND m.fingerprint=w.map_fingerprint AND m.active
+         WHERE j.id=$1 AND j.project_id=$2 AND g.current AND j.scope_id IS NULL
+           AND w.version_id=$3 AND b.branch=$4 AND m.reader_version=$5`,
+        [scope.runId, source.projectId, source.versionId, scope.branch, evidence.readerVersion])
+      : await conn.query('SELECT 1 FROM project_scopes WHERE project_id = $1 AND id = $2', [source.projectId, candidate.scope]);
     if (!linkedScope.rowCount) {
       throw new ReaderError('reader_scope_invalid', 'Область наблюдения не принадлежит проекту', 422);
     }
@@ -453,6 +464,7 @@ export function createReaderService(db: Pool, deps: ReaderDependencies, adapters
   }
 
   return {
+    async readerVersion(format: string) { return await registry.get(format)?.version() ?? null; },
     async map(sourceRef: SourceRef): Promise<PageMap> {
       const source = checkedSource(sourceRef);
       const { original, adapter, version } = await describe(source);

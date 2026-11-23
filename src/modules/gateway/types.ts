@@ -5,12 +5,13 @@ export const BUDGET_USD_NANOS = 10_000_000_000;
 
 export type Purpose = 'local' | 'primary_a' | 'primary_b' | 'review';
 export type ModelPurpose = Exclude<Purpose, 'local'>;
-export type GenerationRef = { projectId: string; scopeId: string; generationId: string };
+export type GenerationRef<S extends string | null = string> = { projectId: string; scopeId: S; generationId: string };
+export type QueueTarget = GenerationRef<string | null>;
 export type Obligation = { id: string; branch: 'A' | 'B'; place: string };
 export type PrimaryResult = { state: 'completed' | 'final_refusal'; evidenceRef: string };
 export type Lease = { jobId: string; workerId: string; epoch: number };
 
-export type EnqueueInput = GenerationRef & {
+export type EnqueueInput = QueueTarget & {
   key: string;
   kind: string;
   purpose: Purpose;
@@ -40,7 +41,7 @@ export type RouteGrant = {
   allowed: boolean;
 };
 
-export type Attempt = GenerationRef & {
+export type Attempt = QueueTarget & {
   id: string;
   jobId: string;
   purpose: ModelPurpose;
@@ -94,7 +95,7 @@ export type CallResult =
   | { status: 'rejected'; attemptId: string; receipt: Extract<Receipt, { state: 'rejected' }> }
   | { status: 'held'; code: string; nextAction: string; attemptId?: string };
 
-export type ModelAuthorization = GenerationRef & {
+export type ModelAuthorization = QueueTarget & {
   jobId: string;
   payload: unknown;
   dataClass: string;

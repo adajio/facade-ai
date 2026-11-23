@@ -1,5 +1,7 @@
 import type { Pool, PoolClient } from 'pg';
 import { occurrenceScope, occurrenceScopeJoin } from './occurrence-scope.js';
+import { authorizedPackageReview } from './package-review.js';
+import { authorizedPackageWindow } from './package-dispatch.js';
 import type { createRuntimePdfService } from '../pdf/index.js';
 import { contains, ReaderError, type ReaderAddress, type Observation, type Representation as ReaderMode } from '../pdf/types.js';
 import {
@@ -30,8 +32,26 @@ export function connectReader(
   db: Pool, service: ReaderService,
   publish: (tx: PoolClient, context: ReaderContext, input: ObservationInput, observation: Observation) => Promise<void>,
 ): ReaderPort {
+  async function checkPackage(context: ReaderContext, connection: Pool | PoolClient = db, support?: 'A' | 'B') {
+    const { task, branch } = context;
+    if (task.scopeId !== null) return undefined;
+    if (task.job.mode !== 'primary') {
+      if (task.job.packageReview && await authorizedPackageReview(connection, task.projectId, task.generationId, task.job, task.jobId)) {
+        return support ? task.job.packageReview.readerVersions[support] : undefined;
+      }
+      throw new ReaderRefusal('analysis_input_denied', 'permanent');
+    }
+    if (!task.job.packageWindow ||
+      !await authorizedPackageWindow(connection, { id: task.jobId, projectId: task.projectId,
+        generationId: task.generationId, branch, place: task.job.place,
+        windowId: task.job.packageWindow.id, readerVersion: task.job.packageWindow.readerVersion })) {
+      throw new ReaderRefusal('analysis_input_denied', 'permanent');
+    }
+    return task.job.packageWindow.readerVersion;
+  }
+
   async function contextPlaces({ task, branch }: ReaderContext, id: string | null, offset: number) {
-    if (task.job.mode !== 'primary') return [];
+    if (task.scopeId === null || task.job.mode !== 'primary') return [];
     const { rows } = await db.query<{ id: string; place: Place; format: string }>(
       `SELECT hp.obligation_id AS id,hp.place,m.format FROM harness_primary_places hp
        JOIN gateway_generations g USING(generation_id) JOIN harness_document_maps m ON m.version_id=hp.version_id
@@ -47,7 +67,7 @@ export function connectReader(
   }
 
   async function reviewWindows({ task }: ReaderContext, id: string | null, offset: number) {
-    if (!task.earlyPair || task.job.mode === 'primary') return [];
+    if (task.scopeId === null || !task.earlyPair || task.job.mode === 'primary') return [];
     const { rows } = await db.query<{ id: string; place: Place; support: 'A' | 'B'; format: string }>(
       `SELECT hp.obligation_id AS id,hp.place,hp.branch AS support,m.format
        FROM harness_live_review_pairs d
@@ -94,19 +114,22 @@ export function connectReader(
     },
     async inventory(context) {
       if (context.task.job.mode !== 'primary') {
+        await checkPackage(context);
         const { a, b } = context.task.job.dispute;
         return [{ support: 'A', place: a.place }, { support: 'B', place: b.place }];
       }
       const { place } = context.task.job;
       try {
+        const expected = await checkPackage(context);
         const map = await service.map(place.source);
+        if (expected && expected !== map.readerVersion) throw new ReaderRefusal('reader_profile_changed', 'temporary');
         return { place, format: map.format, units: map.units.slice(0, 200), totalUnits: map.units.length };
       } catch (error) {
         return refusal(error);
       }
     },
     async next({ task, branch }) {
-      if (task.job.mode !== 'primary') return null;
+      if (task.scopeId === null || task.job.mode !== 'primary') return null;
       const { rows: [row] } = await db.query<{ place: Place }>(
         `SELECT hp.place FROM harness_primary_places hp
          JOIN gateway_jobs j ON j.generation_id=hp.generation_id AND j.obligation_id=hp.obligation_id::text
@@ -117,6 +140,7 @@ export function connectReader(
       return row?.place ?? null;
     },
     async read(context, request: ReadRequest) {
+      const readerVersion = await checkPackage(context, db, request.support);
       const place = assignedPlace(context, request.support);
       const box = ('box' in request ? request.box : undefined) ?? place.box;
       if (place.box && box && !contains(place.box, box)) {
@@ -127,7 +151,7 @@ export function connectReader(
         ? 'render' : request.kind === 'ocr' ? 'ocr' : 'native';
       try {
         const view = await service.open(place.source, executionScope(context), {
-          address, representation, ...(request.kind === 'zoom' ? { dpi: 200 } : {}),
+          address, representation, readerVersion, ...(request.kind === 'zoom' ? { dpi: 200 } : {}),
         });
         const evidence = view.evidence;
         const mediaType = evidence.mediaType as Representation['mediaType'];
@@ -151,7 +175,9 @@ export function connectReader(
       }
     },
     async record(tx, context, input) {
-      const { evidence, alternatives, sourceRole, components, ...observation } = input;
+      const readerVersion = await checkPackage(context, tx);
+      const { evidence, alternatives, sourceRole, components, package: metadata, ...observation } = input;
+      if (readerVersion && evidence.readerVersion !== readerVersion) throw new ReaderRefusal('reader_profile_changed', 'temporary');
       const limitation = alternatives
         ? [observation.limitation, ...alternatives].filter(Boolean).join(' · ').slice(0, 500)
         : observation.limitation;
@@ -159,7 +185,7 @@ export function connectReader(
         const pinned = await service.pin(evidence.place.source, executionScope(context), {
           ...observation, scope: context.task.scopeId, evidenceId: evidence.evidenceId, ...(limitation ? { limitation } : {}),
         }, tx, components);
-        await publish(tx, context, { ...input, sourceRole }, pinned);
+        await publish(tx, context, input, pinned);
         return { observationId: pinned.id };
       } catch (error) {
         return refusal(error);

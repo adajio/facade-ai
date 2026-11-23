@@ -28,6 +28,16 @@ function scopes(line: string) {
   return [...line.matchAll(scope)].map((match) => normalized(match[1].replace(/[.:]+$/u, '')));
 }
 
+export function printedPairVariant(line: string): string | null {
+  const marks = values([line], variant);
+  return marks.size === 1 ? marks.values().next().value! : null;
+}
+
+export function hasPrintedPairScope(line: string, label: string): boolean {
+  const labels = scopes(line);
+  return labels.length > 0 && labels.every((item) => item === normalized(label));
+}
+
 function currentRevision(line: string, label: string): boolean {
   if (ineffective.test(line)) return false;
   return fields(line, revision).some(({ value, match }) => value === label &&

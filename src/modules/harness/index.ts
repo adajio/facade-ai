@@ -7,13 +7,16 @@ import { createGateway, createStep15Gateway, journalFromEnv, type OpenRouterProf
 import { startImports } from '../imports/index.js';
 import { createIntakeStorage } from '../intake/blob.js';
 import { createRuntimePdfService } from '../pdf/index.js';
+import { isReaderId } from '../pdf/service.js';
 import { ReaderError } from '../pdf/types.js';
 import { createRuntimeInquiryPorts, processNextInquiry } from '../questions/index.js';
 import { dispatchNext } from './dispatch.js';
 import type { ResearchTask } from './contracts.js';
 import { validateLivePolicy } from './live-policy.js';
 import { loadResearchProfile, profileHold, researchSlot, type ResearchProfile } from './profile.js';
+import { dispatchPackagePair, packageModelAdmission, preparePackageMap } from './package-dispatch.js';
 import { publication } from './publication.js';
+import { schedulePackageReview } from './package-review.js';
 import { reviewPairAdmission } from './review-pair.js';
 import { connectReader } from './reader.js';
 import { executeResearch, researchKind, resumeInterruptedResearch } from './runner.js';
@@ -21,6 +24,7 @@ import { managedTransport } from './transport.js';
 import { resumeResearchStops } from './stops.js';
 
 export { register } from './stops.js';
+export { readPackageAnalysis, type PackageAnalysis } from './package-analysis.js';
 
 function configuredApprovals(): OpenRouterProfile[] {
   try {
@@ -31,9 +35,13 @@ function configuredApprovals(): OpenRouterProfile[] {
   }
 }
 
-function modelGateway(context: WorkerContext, external: ReturnType<typeof journalFromEnv>, profile: ResearchProfile) {
+function modelGateway(context: WorkerContext, external: ReturnType<typeof journalFromEnv>, profile: ResearchProfile, packageEnabled: boolean, packageProjects: readonly string[]) {
   const managed = process.env.FACADE_HARNESS_MANAGED_URL;
-  const localGateway = () => createGateway(context.db, { journal: external?.journal, reviewAdmission: reviewPairAdmission });
+  const policyOptions = {
+    researchAdmission: packageModelAdmission(packageEnabled, packageProjects, process.env.FACADE_HARNESS_PACKAGE_EFFECTS === 'enabled'),
+    replayOnly: process.env.FACADE_HARNESS_REPLAY_ONLY === '1',
+  };
+  const localGateway = () => createGateway(context.db, { journal: external?.journal, reviewAdmission: reviewPairAdmission, ...policyOptions });
   if (process.env.FACADE_GATEWAY_LIVE_MODE === 'step-15') {
     const apiKey = process.env.FACADE_GATEWAY_OPENROUTER_KEY;
     if (managed || !external || !apiKey?.trim()) return {
@@ -62,12 +70,12 @@ function modelGateway(context: WorkerContext, external: ReturnType<typeof journa
       }
     });
     const gateway = policy.approvals.length === 0 ? localGateway() :
-      createStep15Gateway(context.db, external.journal, { ...approval, profiles: policy.approvals }, reviewPairAdmission);
+      createStep15Gateway(context.db, external.journal, { ...approval, profiles: policy.approvals }, reviewPairAdmission, policyOptions);
     return { gateway, admit: policy.hold, online: true, hasTransport: policy.approvals.length > 0 };
   }
   if (managed && !external) throw new Error('Managed gateway requires a separate intent journal');
   const gateway = managed && external
-    ? createGateway(context.db, { journal: external.journal, transport: managedTransport(managed), reviewAdmission: reviewPairAdmission })
+    ? createGateway(context.db, { journal: external.journal, transport: managedTransport(managed), reviewAdmission: reviewPairAdmission, ...policyOptions })
     : localGateway();
   return {
     gateway, admit: (task: ResearchTask) => profileHold(profile, task),
@@ -100,6 +108,12 @@ async function withReaderSlot<T>(db: Pool, work: () => Promise<T>): Promise<T> {
 export async function startWorker(context: WorkerContext): Promise<void> {
   const { db, logger, config } = context;
   const profile = loadResearchProfile();
+  const packageMode = process.env.FACADE_HARNESS_PACKAGE_PRIMARY;
+  const packageEnabled = packageMode !== 'legacy';
+  const packageProjects = [...new Set((process.env.FACADE_HARNESS_PACKAGE_PROJECTS ?? '').split(',')
+    .map((value) => value.trim()).filter(Boolean))];
+  if (packageProjects.some((id) => !isReaderId(id))) throw new Error('Invalid FACADE_HARNESS_PACKAGE_PROJECTS');
+  if (packageMode !== undefined && packageMode !== 'legacy') throw new Error('Invalid FACADE_HARNESS_PACKAGE_PRIMARY');
   const external = journalFromEnv();
   const controller = new AbortController();
   const signal = AbortSignal.any([context.signal, controller.signal]);
@@ -124,7 +138,7 @@ export async function startWorker(context: WorkerContext): Promise<void> {
   }
 
   try {
-    const { gateway, admit, online, hasTransport } = modelGateway(context, external, profile);
+    const { gateway, admit, online, hasTransport } = modelGateway(context, external, profile, packageEnabled, packageProjects);
     const base = createRuntimePdfService(db, config, { storage, adapters: createFormatAdapters() });
     const service = {
       ...base,
@@ -135,10 +149,15 @@ export async function startWorker(context: WorkerContext): Promise<void> {
     const reader = connectReader(db, service, publish.observation);
     const inquiry = createRuntimeInquiryPorts(db, service, storage.objects);
     lanes.push(
-      poll('dispatch', () => dispatchNext(db, gateway, service.map, profile, publish.onSeal)),
+      poll('dispatch', () => dispatchNext(db, gateway, service.map, profile, publish.onSeal, packageProjects)),
       poll('review', publish.readyReview),
       poll('questions', () => processNextInquiry(db, inquiry, signal)),
       startImports({ ...context, signal }, { storage }),
+    );
+    if (packageEnabled) lanes.push(
+      poll('package map', () => preparePackageMap(db, gateway, service, packageProjects)),
+      poll('package primary scheduler', () => dispatchPackagePair(db, gateway, profile)),
+      poll('package review scheduler', () => schedulePackageReview(db, gateway, profile)),
     );
     if (hasTransport && external) {
       lanes.push(poll('research continuation', () => resumeResearchStops(db, gateway)));
@@ -159,7 +178,8 @@ export async function startWorker(context: WorkerContext): Promise<void> {
           publishOutcome: publish.outcome, loadPriorOutcome: publish.loadPriorOutcome, unsettledPrior: publish.unsettledPrior,
           localLimits: ({ job }) => {
             const configured = profile[researchSlot(job)] ?? job.settings;
-            return { maxTurns: configured.maxTurns, maxKnownRejections: configured.maxKnownRejections };
+            return job.mode === 'primary' && job.packageWindow ? job.settings :
+              { maxTurns: configured.maxTurns, maxKnownRejections: configured.maxKnownRejections };
           },
         }, signal);
         return true;

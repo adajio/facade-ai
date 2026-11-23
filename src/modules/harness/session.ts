@@ -8,6 +8,7 @@ import { contains } from '../pdf/types.js';
 import { canonicalJson, isInventoryRole } from '../assessment/domain.js';
 import { deliveredLines } from '../questions/attribute-aliases.js';
 import { pairSourceEvidence, type PairQuote } from './pair-evidence.js';
+import { packageNonDeliveryGrounded } from './package-observation.js';
 import { escapeRegex } from '../questions/domain.js';
 import {
   checkToolArguments, commands, decodeCompletion, hashBytes, imageMessage, initialMessages, observationArguments, permittedTool, request,
@@ -479,8 +480,12 @@ async function executeTool(
         return { reply: failedTool('reader_component_anchor_mismatch', 'Сохраните значение в назначенном месте. Для отдельных контекстных фрагментов используйте save_compound_observation.') };
       }
       if (task.job.mode !== 'primary') throw new Error('Observation from a non-primary job');
+      if (task.job.packageWindow && !packageNonDeliveryGrounded(input, Boolean(prior.image))) {
+        return { reply: failedTool('package_non_delivery_unproven',
+          'Нужна дословная строка описи с явным утверждением о непередаче и подтверждённой ролью inventory.') };
+      }
       const inventoryStatement = input.deliveryStatement && input.sourceRole && isInventoryRole(input.sourceRole);
-      if (input.sourceRole && !inventoryStatement && !task.job.question?.sourceRoles?.includes(input.sourceRole)) {
+      if (input.sourceRole && !inventoryStatement && !task.job.packageWindow && !task.job.question?.sourceRoles?.includes(input.sourceRole)) {
         return { reply: failedTool('source_role_unassigned', 'Используйте роль из назначения или опустите sourceRole, если она не подтверждается. Для утверждения о передаче роль обязательна.') };
       }
       if (prior.image && input.quote && !input.box) {
@@ -489,14 +494,14 @@ async function executeTool(
       if (prior.image && (input.lineId || input.deliveryStatement?.context)) {
         return { reply: failedTool('reader_quote_mismatch', 'Для изображения используйте box без lineId и контекста строки. Для привязки к строкам откройте extract или ocr.') };
       }
-      if (input.value && input.quote && input.unit) {
+      if (input.value && input.quote) {
         const literal = input.value;
         const numeric = /^[+-]?\d+(?:[.,]\d+)?$/.test(literal);
         const appears = numeric
           ? new RegExp(`(?<![\\d.,+-])${escapeRegex(literal)}(?![\\d]|[.,]\\d)`, 'u').test(input.quote)
           : input.quote.includes(literal);
         if (!appears) return { reply: failedTool('value_not_in_quote', 'Выберите дословную цитату одной строки с указанным value. Соседнюю подпись не объединяйте с числом в quote.') };
-        if (!groundedUnit(prior, { ...input, quote: input.quote, value: input.value, unit: input.unit })) {
+        if (input.unit && !groundedUnit(prior, { ...input, quote: input.quote, value: input.value, unit: input.unit })) {
           return { reply: failedTool('unit_not_in_evidence', 'Подтвердите исходную unit в строке значения, соседней ячейке или заголовке его столбца. Иначе сохраните limitation без числовых полей.') };
         }
       }
@@ -673,7 +678,7 @@ export async function advance(task: ResearchTask, ports: SessionPorts): Promise<
   let result = await send(modelRequest);
   let compoundContract = true;
   let pairContract = task.earlyPair;
-  if (task.earlyPair && result.status === 'held' && result.code === 'effect_conflict' && result.attemptId) {
+  if (task.scopeId !== null && task.earlyPair && result.status === 'held' && result.code === 'effect_conflict' && result.attemptId) {
     const previous = request(task.job, state.currentMessages, 'current', { legacy: true });
     const wire = JSON.stringify(previous);
     if (Buffer.byteLength(wire) <= 16 * 1024 * 1024) {
@@ -687,7 +692,7 @@ export async function advance(task: ResearchTask, ports: SessionPorts): Promise<
   const prePair = task.earlyPair ? [['current', state.currentMessages] as const] : [];
   for (const [wire, messages] of [...prePair, ...previouslySent, ['compound-v1', state.previousCurrentMessages],
     ['observation-v1', state.previousCurrentMessages], ['role-v1', state.roleMessages], ['shared-v1', state.messages]] as const) {
-    if (result.status !== 'held' || result.code !== 'effect_conflict' || !result.attemptId) break;
+    if (task.scopeId === null || result.status !== 'held' || result.code !== 'effect_conflict' || !result.attemptId) break;
     // An existing attempt can only be recovered with its original request hash.
     // The gateway checks that identity before returning a receipt or authorizing a retry.
     const legacy = request(task.job, messages, wire);

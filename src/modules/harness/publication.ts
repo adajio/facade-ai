@@ -18,9 +18,11 @@ import type {
 import { occurrenceScope, occurrenceScopeJoin } from './occurrence-scope.js';
 import type { ResearchProfile } from './profile.js';
 import { researchKind } from './runner.js';
+import { publishPackageReviewOutcome } from './package-review.js';
+import { publishPackageObservation } from './package-observation.js';
 import { pairConfirmed, pairCriteria } from './contracts.js';
 
-type Ref = Pick<ScheduledResearchTask, 'projectId' | 'scopeId' | 'generationId'>;
+type Ref = Pick<ScheduledResearchTask, 'projectId' | 'generationId'> & { scopeId: string };
 
 type FindingRow = {
   finding: Finding; subjectVerified: boolean | null; revision: ObservationPublication['revision'];
@@ -289,7 +291,9 @@ export function publication(db: Pool, queue: WorkQueue, profile: ResearchProfile
       return true;
     },
     async observation(tx: PoolClient, context: ReaderContext, input: ObservationInput, observation: Observation) {
-      const { task } = context;
+      const { task: assignment } = context;
+      if (assignment.scopeId === null) return publishPackageObservation(tx, context, input, observation);
+      const task = { ...assignment, scopeId: assignment.scopeId };
       if (task.job.mode !== 'primary' || !task.job.question) return;
       const target = task.job.question;
       await getLockedGate(tx, task.projectId, task.scopeId);
@@ -350,7 +354,9 @@ export function publication(db: Pool, queue: WorkQueue, profile: ResearchProfile
         [observation.id, task.projectId, task.scopeId, task.generationId, target.id, task.jobId, finding]);
       await updateQuestion(tx, task, target, observation.id);
     },
-    async outcome(tx: PoolClient, task: ScheduledResearchTask, outcome: ResearchOutcome) {
+    async outcome(tx: PoolClient, assignment: ScheduledResearchTask, outcome: ResearchOutcome) {
+      if (assignment.scopeId === null) return publishPackageReviewOutcome(tx, queue, assignment, outcome);
+      const task = { ...assignment, scopeId: assignment.scopeId };
       if (task.job.mode === 'primary') {
         if (!task.job.question) return;
         if (outcome.kind === 'covered') {
@@ -367,6 +373,8 @@ export function publication(db: Pool, queue: WorkQueue, profile: ResearchProfile
         return;
       }
       const { dispute } = task.job;
+      if (!dispute.question.id) return;
+      const question = { ...dispute.question, id: dispute.question.id };
       const stage = task.job.mode === 'lead' ? 'lead' : task.job.branch;
       await tx.query(
         `INSERT INTO harness_review_results(generation_id,dispute_id,stage,result)
@@ -382,7 +390,7 @@ export function publication(db: Pool, queue: WorkQueue, profile: ResearchProfile
           }, tx);
         }
       }
-      await updateQuestion(tx, task, dispute.question, task.jobId);
+      await updateQuestion(tx, task, question, task.jobId);
     },
     async onSeal(tx: PoolClient, ref: Ref, targets: (TargetQuestion | undefined)[]) {
       for (const target of targets) {

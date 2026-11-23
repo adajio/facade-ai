@@ -83,6 +83,11 @@ export function createRuntimePdfService(
 ) {
   const adapters = options.adapters ?? createFormatAdapters();
   const formats = new Set(['pdf', ...adapters.map(({ format }) => format)]);
+  const formatFor = (mediaType: string, path: string) => {
+    if (mediaType === 'application/pdf') return 'pdf';
+    const inferred = resolveFormat(path);
+    return formats.has(inferred) ? inferred : 'unknown';
+  };
   const storage = options.storage ?? createIntakeStorage(config.dataDir);
   const maxOriginalBytes = Number(process.env.FACADE_READER_MAX_ORIGINAL_BYTES ?? 512 * 1024 ** 2);
   if (!Number.isSafeInteger(maxOriginalBytes) || maxOriginalBytes < 1) {
@@ -101,8 +106,7 @@ export function createRuntimePdfService(
       );
       if (!assignment) return null;
       const original = await getOriginal(db, storage, document.projectId, document.versionId, document.documentId);
-      const inferred = resolveFormat(original.relativePath);
-      const format = original.mediaType === 'application/pdf' ? 'pdf' : formats.has(inferred) ? inferred : 'unknown';
+      const format = formatFor(original.mediaType, original.relativePath);
       return {
         ...document, receiptId: assignment.receipt_id, sha256: original.sha256, size: original.size, format,
         relativePath: original.relativePath, open: () => original.open(),
@@ -110,7 +114,7 @@ export function createRuntimePdfService(
     },
   }, adapters);
   return {
-    ...service,
+    ...service, formatFor,
     close: () => { if (!options.storage) storage.objects.close(); },
   };
 }
@@ -129,7 +133,7 @@ export async function register(
   async function projectFor(request: FastifyRequest, table: 'reader_evidence' | 'reader_observations', id: string) {
     const session = await readSession(app.db, request);
     if (!isReaderId(id)) throw unavailable();
-    const { rows } = await app.db.query<{ project_id: string; scope?: string }>(
+    const { rows } = await app.db.query<{ project_id: string; scope: string | null }>(
       table === 'reader_observations'
         ? `SELECT project_id, scope_id AS scope FROM reader_observations WHERE id = $1`
         : `SELECT e.project_id,j.scope_id AS scope FROM reader_evidence e
@@ -137,7 +141,7 @@ export async function register(
     );
     if (!rows[0]) throw unavailable();
     const { project_id: projectId, scope } = rows[0];
-    await authorize(app.db, session, { action: 'project:read', projectId, scopeId: scope });
+    await authorize(app.db, session, { action: 'project:read', projectId, scopeId: scope ?? undefined });
     await touchSession(app.db, session);
     return projectId;
   }

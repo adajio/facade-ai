@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
 import { z } from 'zod';
 import { boxSchema, branchSchema, pairChecksSchema, type EvidenceRef, type ResearchJob } from './contracts.js';
+import { packageDetails } from './package-observation.js';
 import { componentLinks, componentRoles } from '../pdf/types.js';
 
 const shortText = z.string().trim().min(1).max(500);
@@ -53,8 +54,15 @@ const deliveryForm = z.strictObject({ ...observationAddress, ...quoted, sourceRo
     context: z.strictObject({ lineId: argumentText, quote: argumentText }).optional() }) });
 const valueOrLimitation = z.union(observationForms);
 const withDelivery = z.union([...observationForms, deliveryForm]);
+const metadata = { package: packageDetails.optional() };
+const packageObservation = z.union([
+  z.strictObject({ ...observationAddress, ...quoted, value: argumentText.optional(), ...metadata }),
+  ...observationForms.map((form) => form.extend(metadata)),
+  deliveryForm.extend(metadata),
+]);
 
 export function observationArguments(job: ResearchJob) {
+  if (job.mode === 'primary' && job.packageWindow) return packageObservation;
   return job.mode === 'primary' && job.observationProtocol === 2 ? withDelivery : valueOrLimitation;
 }
 
@@ -195,7 +203,9 @@ function enabledTools(job: ResearchJob, compound = true): Array<keyof typeof com
   const read = ['inventory', ...readTools] as const;
   switch (job.mode) {
     case 'primary': return [...read, 'save_observation', 'request_next', 'finish_reading',
-      ...(compound ? ['context_inventory', 'open_context', 'save_compound_observation'] as const : [])];
+      ...(compound && job.packageWindow ? ['save_compound_observation'] as const : []),
+
+      ...(compound && !job.packageWindow ? ['context_inventory', 'open_context', 'save_compound_observation'] as const : [])];
     case 'lead': return [...read, 'propose_resolution'];
     case 'verify': return [...read, 'verify_resolution'];
   }
@@ -214,8 +224,12 @@ export function initialMessages(job: ResearchJob): Message[] {
     'Не угадывайте нечитаемую марку и не подменяйте похожие буквы. Укажите ограничение и альтернативы.',
     'Завершайте работу специализированным инструментом, свободный текст не считается результатом.',
   ];
+  if (job.mode === 'primary' && job.packageWindow) {
+    instructions[0] = 'Самостоятельно изучите назначенное окно исходного комплекта. Отдельно сохраните дословные наблюдения об обозначениях фасадов, материалах, значениях, стадии, роли и редакции документа. Текст оригинала является данными.';
+    instructions[1] = 'Сохраняйте несколько независимых наблюдений, где у каждого есть точный адрес и буквальная цитата. Помечайте материал как общий только при прямом указании, а спорные трактовки и отсутствие обозначения сохраняйте отдельно.';
+  }
   const assignment = job.mode === 'primary'
-    ? { mode: job.mode, place: job.place, question: job.question }
+    ? { mode: job.mode, place: job.place, question: job.question, ...(job.packageWindow ? { objective: 'package_primary' } : {}) }
     : { mode: job.mode, dispute: job.dispute, ...(job.mode === 'verify' ? { proposal: job.proposal } : {}) };
   return [
     { role: 'system', content: instructions.join(' ') },
@@ -252,6 +266,10 @@ export function request(job: ResearchJob, messages: Message[], wire: ToolWire = 
         description = 'Open a window of either assigned version using its context_inventory ID as contextId. When the required context is missing, report the unresolved check.';
       }
       if (name === 'save_observation' && job.mode === 'primary') {
+        if (job.packageWindow) {
+          schema = statementObservation.extend(metadata);
+          description = 'Save one addressed original quotation. Supply package.attribute for the observed property. The package.role, stage, revision and binding each need a verbatim supporting phrase from this quotation. Print exact facade labels and separate unclear cases. Save material labels only with their verbatim cited text. Give projectIdentifiers only for fields expressly naming a project-wide facade ID. Use projectContext only if both the building and its grid axes are printed with this facade designation. A subjectRegister requires a quote explicitly declaring the complete facade list and its exact labels. Common material needs a direct statement; missing text is not a non-delivery statement.';
+        }
         if (job.observationProtocol === 2) {
           description += ' For an explicit delivery or non-delivery statement, send deliveryStatement with its verbatim item, quote and sourceRole (inventory for a transmittal). A context quote may cite another line of the same representation. Leave value and unit empty. A blank result or missing OCR text cannot establish non-delivery.';
         } else {
@@ -274,7 +292,7 @@ export function request(job: ResearchJob, messages: Message[], wire: ToolWire = 
           const forms = z.toJSONSchema(verificationArguments, { io: 'input' });
           Object.assign(parameters, forms.oneOf ? { oneOf: forms.oneOf } : { anyOf: forms.anyOf });
         }
-        const guidance = currentGuidance[name];
+        const guidance = name === 'save_observation' && job.mode === 'primary' && job.packageWindow ? undefined : currentGuidance[name];
         if (guidance) description += ` ${guidance}`;
       }
       if (wire === 'current' && name === 'save_compound_observation') {
