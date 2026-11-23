@@ -76,6 +76,7 @@ export const assessmentReasons: Record<string, string> = {
   semantic_check_missing: 'Содержание ещё не проверено по этому требованию',
   semantic_independence_unproven: 'Независимость проверок не подтверждена',
   semantic_remainder_open: 'Есть непроверенные области по требованиям',
+  facade_profile_basis_stale: 'Требуется заново подтвердить типы фасадов для выбранного профиля',
   physical_map_unverified: 'Полнота физической карты не подтверждена',
   reading_incomplete: 'Применимый охват A/B ещё не подтверждён',
   facade_boundary_unverified: 'Полный перечень фасадов и общий уровень не подтверждены',
