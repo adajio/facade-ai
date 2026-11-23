@@ -107,8 +107,10 @@ test('document work verifies source pairing, role, job revision and unknown effe
   const attemptId = randomUUID();
   await db.query(
     `INSERT INTO gateway_attempts(id,ledger_id,project_id,generation_id,job_id,purpose,effect_key,request_hash,route_id,revision,
-      ceiling_usd_nanos,state) VALUES($1,$2,$3,$4,$5,'primary_a','synthetic',$6,'disabled','test',1,'unknown')`,
+      ceiling_usd_nanos,state) VALUES($1,$2,$3,$4,$5,'primary_a','synthetic',$6,'disabled','test',1,'sending')`,
     [attemptId, randomUUID(), project, generation, jobId, sha]);
+  assert.equal((await get(work)).json().jobs[0].actions.resume.reason, 'response_pending');
+  await db.query("UPDATE gateway_attempts SET state='unknown' WHERE id=$1", [attemptId]);
   const blocked = (await get(work)).json().jobs[0];
   assert.equal(blocked.actions.resume.reason, 'operator_reconcile_attempt');
   assert.equal((await command(target.href, 'POST', engineer, 1, {})).statusCode, 409);

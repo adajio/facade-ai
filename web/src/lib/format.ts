@@ -5,6 +5,7 @@ const labels: Record<string, string> = {
   leased: 'В работе',
   done: 'Завершено',
   waiting_route: 'Ожидается маршрут',
+  response_pending: 'Ожидается ответ маршрута',
   job_not_waiting: 'Доступен только для ожидающей работы',
   no_resumable_stop: 'Для этой остановки ручное продолжение недоступно',
   continuation_requested: 'Запрос уже принят',

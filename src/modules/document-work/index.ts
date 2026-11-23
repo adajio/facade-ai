@@ -16,7 +16,7 @@ type Job = {
   id: string; generationId: string; version: number; priority: number;
   state: 'ready' | 'leased' | 'held' | 'done'; reason: string | null; nextAction: string | null;
   branch: 'A' | 'B'; unitId: string | null; page: number | null; leaseUntil: Date | null;
-  stopId: string | null; stopVersion: number | null; resumeRequested: boolean; effectPending: boolean; routeAvailable: boolean;
+  stopId: string | null; stopVersion: number | null; resumeRequested: boolean; effectState: 'unknown' | 'sending' | null; routeAvailable: boolean;
 };
 
 async function accessDocument(db: Pool, request: FastifyRequest<DocumentRoute>) {
@@ -45,7 +45,8 @@ const jobs = `
     CASE WHEN j.purpose='primary_a' THEN 'A' ELSE 'B' END AS branch,
     j.payload#>>'{place,unitId}' AS "unitId", j.payload#>'{place,page}' AS page,
     s.id AS "stopId",s.sequence AS "stopVersion",s.resume_requested_at IS NOT NULL AS "resumeRequested",
-    EXISTS(SELECT 1 FROM gateway_attempts a WHERE a.job_id=j.id AND a.state IN ('sending','unknown')) AS "effectPending",
+    (SELECT a.state FROM gateway_attempts a WHERE a.job_id=j.id AND a.state IN ('sending','unknown')
+      ORDER BY a.state='unknown' DESC LIMIT 1) AS "effectState",
     EXISTS(SELECT 1 FROM gateway_routes r WHERE r.id=coalesce(b.settings->>'routeId',j.payload#>>'{settings,routeId}')
       AND r.enabled) AS "routeAvailable"
   FROM gateway_jobs j JOIN gateway_generations g USING(generation_id)
@@ -58,11 +59,13 @@ const jobs = `
     AND j.purpose IN ('primary_a','primary_b')`;
 
 const parameters = (document: Document) => [document.projectId, document.versionId, researchKind];
-const priorityReason = (job: Job) => job.effectPending ? 'operator_reconcile_attempt'
-  : job.state !== 'ready' ? 'job_not_waiting' : undefined;
-const resumeReason = (job: Job) => job.effectPending ? 'operator_reconcile_attempt'
-  : job.resumeRequested ? 'continuation_requested'
-  : job.state === 'held' && job.stopId && job.reason === stopped ? undefined : 'no_resumable_stop';
+function effectBlock(job: Job) {
+  if (job.effectState === 'unknown') return 'operator_reconcile_attempt';
+  if (job.effectState === 'sending') return 'response_pending';
+}
+const priorityReason = (job: Job) => effectBlock(job) ?? (job.state !== 'ready' ? 'job_not_waiting' : undefined);
+const resumeReason = (job: Job) => effectBlock(job) ?? (job.resumeRequested ? 'continuation_requested'
+  : job.state === 'held' && job.stopId && job.reason === stopped ? undefined : 'no_resumable_stop');
 
 async function getJob(db: AccessDb, document: Document, jobId: string, lock = false) {
   const { rows: [job] } = await db.query<Job>(
@@ -98,7 +101,7 @@ export async function register(app: FastifyInstance) {
       `WITH work AS MATERIALIZED (${jobs}),
        branch AS (
          SELECT branch,count(*)::int AS total,(count(*) FILTER (WHERE state='done'))::int AS completed,
-           CASE WHEN bool_or("effectPending" OR state='held') THEN 'held'
+           CASE WHEN bool_or("effectState"='unknown' OR state='held') THEN 'held'
                 WHEN bool_or(state='leased') THEN 'running'
                 WHEN bool_or(state='ready' AND "routeAvailable") THEN 'queued'
                 WHEN bool_or(state='ready') THEN 'waiting_route' ELSE 'completed' END AS outcome
@@ -106,7 +109,7 @@ export async function register(app: FastifyInstance) {
        ),
        visible AS (
          SELECT * FROM work
-         ORDER BY "effectPending" DESC, CASE state WHEN 'held' THEN 0 WHEN 'leased' THEN 1 WHEN 'ready' THEN 2 ELSE 3 END,
+         ORDER BY ("effectState"='unknown') DESC NULLS LAST, CASE state WHEN 'held' THEN 0 WHEN 'leased' THEN 1 WHEN 'ready' THEN 2 ELSE 3 END,
            priority DESC,id LIMIT 40
        )
        SELECT
@@ -126,13 +129,14 @@ export async function register(app: FastifyInstance) {
     return {
       ...status,
       jobs: items.map((item) => {
-        const { generationId: _generation, effectPending, resumeRequested: _requested,
+        const { generationId: _generation, effectState, resumeRequested: _requested,
           stopId, stopVersion, routeAvailable, ...job } = item;
         const priorityBlock = engineer ? priorityReason(item) : 'insufficient_permission';
         const resumeBlock = engineer ? resumeReason(item) : 'insufficient_permission';
         return {
           ...job,
-          ...(effectPending ? { reason: 'unknown_charge', nextAction: 'operator_reconcile_attempt' } :
+          ...(effectState === 'unknown' ? { reason: 'unknown_charge', nextAction: 'operator_reconcile_attempt' } :
+            effectState === 'sending' ? { reason: 'response_pending' } :
             job.state === 'ready' && !routeAvailable && !job.reason ? { reason: 'waiting_route' } : {}),
           actions: {
             priority: priorityBlock ? { reason: priorityBlock } : { ...priorityRange, version: job.version },
