@@ -75,23 +75,31 @@ async function bootWorker(directory, objects, use) {
 
 test('accepted and restored originals materialize with isolated reads, progress, dedup and historical versions', {
   skip: !connectionString,
-  timeout: 50_000,
+  timeout: 70_000,
 }, async (t) => {
   const { indexNextProjectMemory, searchProjectMemory, readProjectMemory } = await load('project-memory/index.js');
   const { createRuntimePdfService } = await load('pdf/index.js');
+  const { createFormatAdapters } = await load('formats/index.js');
+  const { connectReader } = await load('harness/reader.js');
+  const { preparePackageMap } = await load('harness/package-dispatch.js');
+  const { createGateway } = await load('gateway/index.js');
   const db = new pg.Pool({ connectionString });
   const directory = await mkdtemp(join(tmpdir(), 'facade-memory-fixture-'));
   t.after(async () => { await db.end(); await rm(directory, { recursive: true, force: true }); });
 
   const objects = new Map();
   const objectWrites = new Map();
+  const objectReads = new Map();
   let interruptAt = 2;
   let artifactWrites = 0;
   const storage = {
     diskGuardBytes: 0,
     objects: {
       async head(key) { return objects.get(key)?.meta; },
-      async get(key) { return Readable.from([objects.get(key).bytes]); },
+      async get(key) {
+        objectReads.set(key, (objectReads.get(key) ?? 0) + 1);
+        return Readable.from([objects.get(key).bytes]);
+      },
       async put(key, meta, input) {
         const bytes = Buffer.concat(await Array.fromAsync(input));
         assert.deepEqual(meta, { sha256: sha(bytes), size: bytes.length });
@@ -200,6 +208,124 @@ test('accepted and restored originals materialize with isolated reads, progress,
   assert.equal((await db.query('SELECT count(*)::int AS count FROM reader_evidence WHERE project_id=$1', [projectId])).rows[0].count, 0);
   assert.equal((await db.query('SELECT count(*)::int AS count FROM reader_observations WHERE project_id=$1', [projectId])).rows[0].count, 0);
 
+  const gateway = createGateway(db);
+  assert.equal(await preparePackageMap(db, gateway, reader, [projectId]), true);
+  const { rows: [window] } = await db.query(`
+    SELECT w.id,w.place,m.reader_version AS "readerVersion",p.generation_id AS "generationId"
+      FROM harness_package_windows w JOIN harness_package_maps m
+        ON m.version_id=w.version_id AND m.fingerprint=w.map_fingerprint AND m.active
+      JOIN harness_package_projects p ON p.project_id=w.project_id
+     WHERE w.version_id=$1 AND w.place->>'unitId'='lines:901'`, [source.versionId]);
+  assert.ok(window);
+  const ref = { projectId, scopeId: null, generationId: window.generationId };
+  async function assignedBranch(branch, rootJobId) {
+    const obligationId = id();
+    await gateway.declarePrimary(ref, { id: obligationId, branch, place: rootJobId ? obligationId : window.id });
+    const job = {
+      mode: 'primary', branch, place: window.place,
+      packageWindow: { id: window.id, readerVersion: window.readerVersion, routeRevision: 'synthetic',
+        ...(rootJobId ? { followup: { rootJobId, blocks: ['synthetic-block'] } } : {}) },
+    };
+    const jobId = await gateway.enqueue({ ...ref, key: id(),
+      kind: rootJobId ? 'harness_package_followup' : 'synthetic-reader', subjectId: source.versionId,
+      obligationId, purpose: branch === 'A' ? 'primary_a' : 'primary_b', payload: job });
+    if (rootJobId) {
+      await db.query(`INSERT INTO harness_package_followups(root_job_id,job_id,window_id,branch,blocks,plan_key)
+        VALUES ($1,$2,$3,$4,'["synthetic-block"]','synthetic')`, [rootJobId, jobId, window.id, branch]);
+    } else {
+      await db.query(`INSERT INTO harness_package_branches(window_id,branch,profile_hash,job_id)
+        VALUES ($1,$2,'synthetic',$3)`, [window.id, branch, jobId]);
+    }
+    return { task: { ...ref, jobId, job }, branch, effectKey: 'extract' };
+  }
+  const [branchA, branchB] = [await assignedBranch('A'), await assignedBranch('B')];
+  const childA = await assignedBranch('A', branchA.task.jobId);
+  const port = connectReader(db, reader, async () => assert.fail('Read created an observation'));
+  const originalObject = objects.get(source.objectKey);
+  const originalReads = () => objectReads.get(source.objectKey) ?? 0;
+  const beforeReuse = originalReads();
+  objects.delete(source.objectKey);
+  const a = await port.read(branchA, { kind: 'extract' });
+  const b = await port.read(branchB, { kind: 'extract' });
+  const child = await port.read(childA, { kind: 'extract' });
+  assert.notEqual(a.evidenceId, b.evidenceId);
+  assert.equal(a.sha256, b.sha256);
+  assert.deepEqual(a.bytes, b.bytes);
+  assert.deepEqual(child.bytes, a.bytes);
+  assert.notEqual(child.evidenceId, a.evidenceId);
+  assert.equal(JSON.parse(a.bytes).lines.length, 50);
+  assert.equal((await port.read(branchA, { kind: 'extract' })).evidenceId, a.evidenceId);
+  const aNext = await port.read({ ...branchA, effectKey: 'extract-again' }, { kind: 'extract' });
+  assert.notEqual(aNext.evidenceId, a.evidenceId);
+  const locator = JSON.parse(b.bytes).address.locator;
+  const exact = await reader.open(source, { runId: branchB.task.jobId, branch: 'B', operationKey: 'exact-address' },
+    { address: { unitId: 'lines:901', locator }, representation: 'native', readerVersion: window.readerVersion });
+  assert.equal(exact.evidence.materializedBlockId, found.hits[0].blockId);
+  assert.deepEqual(exact.bytes, b.bytes);
+  assert.equal(originalReads(), beforeReuse);
+  objects.set(source.objectKey, originalObject);
+  for (const [context, response] of [[branchA, a], [branchB, b], [childA, child]]) {
+    const receipt = await reader.findEvidence(projectId, response.evidenceId);
+    assert.equal(receipt.materializedBlockId, found.hits[0].blockId);
+    assert.equal(receipt.runId, context.task.jobId);
+    assert.equal(receipt.branch, context.branch);
+    assert.equal(receipt.readerVersion, window.readerVersion);
+    assert.equal(receipt.sha256, sha(response.bytes));
+  }
+  const { objectKey: _foreignKey, ...foreignSource } = competing;
+  const foreign = { ...branchA.task.job.place, source: foreignSource };
+  await assert.rejects(port.read({ ...branchA, task: { ...branchA.task, job: { ...branchA.task.job, place: foreign } } },
+    { kind: 'extract' }), { code: 'analysis_input_denied' });
+  await assert.rejects(reader.open(competing, { runId: branchA.task.jobId, branch: 'A', operationKey: 'wrong-project' },
+    { address: { unitId: 'lines:1' }, representation: 'native' }), { code: 'reader_source_mismatch' });
+  const artifactKey = `reader-evidence/${projectId}/${a.sha256}`;
+  const canonical = objects.get(artifactKey);
+  const corrupted = Buffer.from(canonical.bytes);
+  corrupted[0] ^= 1;
+  objects.set(artifactKey, { ...canonical, bytes: corrupted });
+  await assert.rejects(port.read({ ...branchB, effectKey: 'corrupted' }, { kind: 'extract' }),
+    { code: 'reader_artifact_mismatch' });
+  assert.equal(originalReads(), beforeReuse);
+  assert.equal((await db.query(`SELECT 1 FROM reader_evidence WHERE run_id=$1 AND operation_key='corrupted'`,
+    [branchB.task.jobId])).rowCount, 0);
+  objects.set(artifactKey, canonical);
+
+  const selected = await reader.open(source, activeScope(), {
+    address: { unitId: 'lines:901', locator: { line: 950 } }, representation: 'native',
+  });
+  assert.equal(JSON.parse(selected.bytes).lines.length, 1);
+  assert.equal(selected.evidence.materializedBlockId, undefined);
+  assert.equal(originalReads(), beforeReuse + 1);
+  const unsupportedMode = await reader.open(source, activeScope(), { address: { unitId: 'lines:901' }, representation: 'ocr' });
+  assert.ok(unsupportedMode.evidence.limitations.includes('format_ocr_unavailable'));
+  assert.equal(unsupportedMode.evidence.materializedBlockId, undefined);
+  const txt = createFormatAdapters().find(({ format }) => format === 'txt');
+  const alternateProfile = createRuntimePdfService(db, { dataDir: directory }, { storage, adapters: [
+    { ...txt, version: async () => (await txt.version()) + ':synthetic-upgrade' },
+  ] });
+  const alternate = await alternateProfile.open(source, activeScope(), { address: { unitId: 'lines:901' }, representation: 'native' });
+  assert.equal(alternate.evidence.materializedBlockId, undefined);
+  assert.notEqual(alternate.evidence.readerVersion, window.readerVersion);
+  assert.equal(originalReads(), beforeReuse + 3);
+  await assert.rejects(alternateProfile.open(source, activeScope(), {
+    address: { unitId: 'lines:901' }, representation: 'native', readerVersion: window.readerVersion,
+  }), { code: 'reader_profile_changed' });
+  const scopedRef = { projectId, scopeId, generationId: id() };
+  await gateway.openGeneration(scopedRef);
+  const scopedJobId = await gateway.enqueue({ ...scopedRef, key: id(), kind: 'synthetic-reader',
+    subjectId: source.versionId, purpose: 'local', payload: {} });
+  const scopedRead = await reader.open(source, { runId: scopedJobId, branch: 'A', operationKey: 'scope-native' },
+    { address: { unitId: 'lines:901' }, representation: 'native' });
+  assert.equal(scopedRead.evidence.materializedBlockId, undefined);
+  assert.equal(originalReads(), beforeReuse + 4);
+  assert.equal((await db.query('SELECT 1 FROM gateway_attempts WHERE project_id=$1', [projectId])).rowCount, 0);
+  t.diagnostic(JSON.stringify({
+    nativeReuse: { sha256: a.sha256, blockId: found.hits[0].blockId,
+      receipts: [[branchA, a], [branchB, b], [childA, child]].map(([context, result]) =>
+        ({ branch: context.branch, runId: context.task.jobId, evidenceId: result.evidenceId })) },
+    gatewayAttempts: 0,
+  }));
+
   const filtered = await reader.open(source, activeScope(), { address: { unitId: 'lines:901' }, representation: 'native', query: 'лазурное' });
   assert.equal(JSON.parse(filtered.bytes).lines.length, 1);
   const native = await reader.open(source, activeScope(), { address: { unitId: 'lines:901' }, representation: 'native' });
@@ -214,17 +340,12 @@ test('accepted and restored originals materialize with isolated reads, progress,
   await drain();
   assert.equal((await find('тёмное')).hits[0].versionId, replacement.versionId);
   assert.deepEqual((await find('лазурное')).hits.map(({ versionId }) => versionId), [duplicate.versionId]);
-  const originalObject = objects.get(source.objectKey);
   objects.delete(source.objectKey);
   const historicalAddress = { ...project, snapshot: found.snapshot, blockId: found.hits[0].blockId };
   const historical = await readProjectMemory(db, reader, session, historicalAddress);
   objects.set(source.objectKey, originalObject);
   assert.equal(historical.block.versionId, source.versionId);
   assert.equal(historical.lines.at(-1).text, 'Лазурное покрытие L7');
-  const artifactKey = `reader-evidence/${projectId}/${native.evidence.sha256}`;
-  const canonical = objects.get(artifactKey);
-  const corrupted = Buffer.from(canonical.bytes);
-  corrupted[0] ^= 1;
   objects.set(artifactKey, { ...canonical, bytes: corrupted });
   await assert.rejects(readProjectMemory(db, reader, session, historicalAddress), { code: 'reader_artifact_mismatch' });
   objects.set(artifactKey, canonical);
@@ -271,6 +392,11 @@ test('accepted and restored originals materialize with isolated reads, progress,
   const warmSearchMs = (performance.now() - warmStarted) / 3;
   assert.equal(thickness.status, 'partial');
   assert.ok(thickness.remaining.some((block) => block.versionId === pdf.versionId && block.remaining.includes('graphics')));
+  const boxed = await reader.open(pdf, activeScope(), {
+    address: { unitId: '1', box: { x: 0, y: 0, width: 100, height: 100 } }, representation: 'native',
+  });
+  assert.equal(boxed.evidence.materializedBlockId, undefined);
+  assert.deepEqual(boxed.evidence.address.box, { x: 0, y: 0, width: 100, height: 100 });
   const cell = thickness.hits.find((entry) => entry.versionId === xlsx.versionId);
   assert.equal(cell.address.locator.cell, 'B2');
   const table = await readProjectMemory(db, reader, session, { ...project, snapshot: thickness.snapshot, blockId: cell.blockId });

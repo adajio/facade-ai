@@ -144,6 +144,7 @@ export interface Evidence {
   limitations: string[];
   relativePath?: string;
   inputImage?: { sha256: string; size: number; transform: ImageTransform };
+  materializedBlockId?: string;
 }
 
 export interface DeliveryStatement {

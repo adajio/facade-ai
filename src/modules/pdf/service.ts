@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { pipeline } from 'node:stream/promises';
 import type { Pool, PoolClient } from 'pg';
+import { blockId, fingerprint, memoryVersion } from '../project-memory/contracts.js';
 import { groundComponents } from './components.js';
 import {
   type ArtifactStore, type Box, type DocumentKey, type Evidence, type Observation, type ReaderComponentInput,
@@ -243,8 +244,10 @@ export async function readArtifact(
 }
 
 function nativePresentation(bytes: Buffer, unitId?: string): NativePresentation {
-  const value: NativePresentation = JSON.parse(bytes.toString('utf8'));
-  if (!value.address?.unitId || (unitId !== undefined && value.address.unitId !== unitId)
+  let value: NativePresentation | null;
+  try { value = JSON.parse(bytes.toString('utf8')); }
+  catch { value = null; }
+  if (!value?.address?.unitId || (unitId !== undefined && value.address.unitId !== unitId)
     || value.address.box || !Array.isArray(value.lines) || !Array.isArray(value.limitations)) {
     throw new ReaderError('reader_native_presentation_invalid', 'Полное нативное окно не подтверждено', 422);
   }
@@ -397,10 +400,42 @@ export function createReaderService(db: Pool, deps: ReaderDependencies, adapters
     return nativePresentation(bytes);
   }
 
+  async function indexedNative(source: SourceRef, version: string, format: string, request: ReadRequest) {
+    if (request.representation !== 'native' || request.query !== undefined || request.address.box) return;
+    const { unitId, locator } = request.address;
+    const id = blockId(source, version, unitId);
+    const { rows: [stored] } = await db.query<NativeArtifact & { address: ReaderAddress }>(
+      `SELECT b.artifact_sha256 AS sha256,b.artifact_size AS size,b.address
+         FROM project_memory_blocks b
+         JOIN project_memory_versions v USING(project_id,version_id,contract)
+         JOIN reader_maps r USING(project_id,version_id,reader_version)
+        WHERE b.id=$1 AND b.project_id=$2 AND b.version_id=$3 AND b.contract=$4 AND b.unit_id=$5
+          AND v.reader_version=$6 AND r.document_id=$7 AND r.original_sha256=$8 AND r.format=$9
+          AND b.ordinal<v.next_ordinal AND r.units->b.ordinal->>'id'=$5
+          AND b.artifact_sha256 IS NOT NULL AND NOT ('native'=ANY(b.remaining))`,
+      [id, source.projectId, source.versionId, memoryVersion, unitId, version, source.documentId, source.sha256, format],
+    );
+    if (!stored || (locator && fingerprint(locator) !== fingerprint(stored.address.locator ?? {}))) return;
+    const { sha256, size, address } = stored;
+    const bytes = await readArtifact(deps.artifacts, source.projectId, sha256, size);
+    const presentation = nativePresentation(bytes, unitId);
+    if (fingerprint(presentation.address) !== fingerprint(address)) {
+      throw new ReaderError('reader_artifact_mismatch', 'Адрес сохранённого представления расходится с индексом', 424);
+    }
+    const output: ReaderOutput = { ...presentation, bytes, mediaType: 'application/json' };
+    return { id, artifact: { sha256, size }, output };
+  }
+
   async function open(sourceRef: SourceRef, readScope: ReadScope, input: ReadRequest) {
     const source = checkedSource(sourceRef);
     const scope = checkedScope(readScope);
     const request = checkedRead(input);
+    // The harness authorizes the assigned place. The reader also binds a known
+    // job to its project and keeps scoped jobs on the existing original path.
+    const { rows: [job] } = await db.query<{ project_id: string; scope_id: string | null }>(
+      'SELECT project_id,scope_id FROM gateway_jobs WHERE id=$1', [scope.runId],
+    );
+    if (job && job.project_id !== source.projectId) mismatch();
     const requestHash = sha256(JSON.stringify({ source, request }));
     const previous = await replay<Evidence>(db, 'reader_evidence', source.projectId, scope, requestHash);
     if (previous) return { evidence: previous, bytes: await content(previous) };
@@ -409,7 +444,8 @@ export function createReaderService(db: Pool, deps: ReaderDependencies, adapters
     if (request.readerVersion !== undefined && request.readerVersion !== version) {
       throw new ReaderError('reader_profile_changed', 'Требуется исходный профиль reader', 409);
     }
-    let output = await withOriginal(original, deps, async (path) => {
+    const cached = !job?.scope_id ? await indexedNative(source, version, adapter.format, request) : undefined;
+    let output = cached?.output ?? await withOriginal(original, deps, async (path) => {
       const map = await lookupMap(source, version) ?? await insertMap(source, original, version, adapter, path);
       const unit = map.units.find(({ id }) => id === request.address.unitId);
       if (!unit) throw new ReaderError('reader_address_invalid', 'Физическая единица отсутствует в оригинале', 422);
@@ -425,7 +461,7 @@ export function createReaderService(db: Pool, deps: ReaderDependencies, adapters
       const bytes = Buffer.from(JSON.stringify({ address: output.address, lines, limitations }));
       output = { ...output, lines, limitations, bytes, mediaType: 'application/json' };
     }
-    const artifact = await saveArtifact(deps.artifacts, source.projectId, output.bytes);
+    const artifact = cached?.artifact ?? await saveArtifact(deps.artifacts, source.projectId, output.bytes);
     const inputImage = output.inputImage && {
       ...await saveArtifact(deps.artifacts, source.projectId, output.inputImage.bytes),
       transform: output.inputImage.transform,
@@ -435,6 +471,7 @@ export function createReaderService(db: Pool, deps: ReaderDependencies, adapters
       readerVersion: version, format: adapter.format, address: output.address, representation: request.representation,
       mediaType: output.mediaType, ...artifact, transform: output.transform, limitations: output.limitations ?? [],
       relativePath: original.relativePath, inputImage,
+      ...(cached ? { materializedBlockId: cached.id } : {}),
     };
     const stored = await db.query<{ payload: Evidence }>(
       `INSERT INTO reader_evidence
