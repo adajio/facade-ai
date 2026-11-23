@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { managedWorkerOptions } from '../fixtures/managed-worker-support.mjs';
 import { createHash, randomUUID } from 'node:crypto';
 import { readFile, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:http';
@@ -303,8 +304,8 @@ try {
     const concurrentPrimary = await gateway.claim({ workerId: 'early-review-test-primary', kinds: ['harness_research'], leaseMs: 120_000 });
     assert.equal(concurrentPrimary?.lease.jobId, heldPrimary.id);
     await new Promise(resolve => provider.listen(0, '127.0.0.1', resolve));
-    process.env.FACADE_HARNESS_MANAGED_URL = `http://127.0.0.1:${provider.address().port}/managed`;
-    worker = startWorker({ db: app.db, config, signal: shutdown.signal, logger: app.log });
+    const options = managedWorkerOptions(`http://127.0.0.1:${provider.address().port}/managed`, import.meta.url);
+    worker = startWorker({ db: app.db, config, signal: shutdown.signal, logger: app.log }, options);
     let jobs;
     const deadline = Date.now() + 100_000;
     do {

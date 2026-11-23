@@ -5,6 +5,7 @@ import { setTimeout as delay } from "node:timers/promises";
 import { resolve } from "node:path";
 import test from "node:test";
 import { pathToFileURL } from "node:url";
+import { managedWorkerOptions } from "../../../test/fixtures/managed-worker-support.mjs";
 
 const build = process.env.FACADE_TEST_BUILD ?? "dist";
 const fromBuild = (path) => import(pathToFileURL(resolve(build, `src/${path}.js`)).href);
@@ -361,14 +362,15 @@ test("ordinary worker closes only verified input holds and runs a semantic revie
   });
   await new Promise((resolve) => provider.listen(0, "127.0.0.1", resolve));
   let worker, app, journal;
-  const priorManagedUrl = process.env.FACADE_HARNESS_MANAGED_URL;
-  process.env.FACADE_HARNESS_MANAGED_URL = `http://127.0.0.1:${provider.address().port}`;
+  const options = managedWorkerOptions(`http://127.0.0.1:${provider.address().port}`, import.meta.url);
+  const priorProfile = process.env.FACADE_HARNESS_PROFILE;
+  process.env.FACADE_HARNESS_PROFILE = JSON.stringify(options.profile);
   t.after(async () => {
     controller.abort();
     await worker;
     await new Promise((resolve) => provider.close(resolve));
-    if (priorManagedUrl === undefined) delete process.env.FACADE_HARNESS_MANAGED_URL;
-    else process.env.FACADE_HARNESS_MANAGED_URL = priorManagedUrl;
+    if (priorProfile === undefined) delete process.env.FACADE_HARNESS_PROFILE;
+    else process.env.FACADE_HARNESS_PROFILE = priorProfile;
     await journal?.close();
     await app?.close();
   });
@@ -418,7 +420,7 @@ test("ordinary worker closes only verified input holds and runs a semantic revie
   }
   worker = startWorker({ db: app.db, config, signal: controller.signal, logger: {
     warn(message) { warnings.add(message); }, info() {}, error(message) { warnings.add(message); },
-  } });
+  } }, options);
   async function declare(scopeId, filename, text, value, replacesVersionId) {
     const bytes = pdf(text);
     const digest = sha256(bytes);

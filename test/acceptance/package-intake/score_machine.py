@@ -80,6 +80,8 @@ def score(root, frozen, baseline_project, maps=None, replies=None, trace=None):
     assert read_json(root / "sealed-receipt.json")["oracle_sha256"] == oracle_sha, "oracle changed"
     gold = read_json(oracle)
     machine_input = read_json(frozen)
+    assert machine_input.get("mode", "managed-test") == "managed-test"
+    assert machine_input.get("qualifiesProduction", False) is False
     assert machine_input["balance"]["spentUsdNanos"] == 0
     assert machine_input["balance"]["reserveUsdNanos"] == 0
     machine = next(group for group in machine_input["readings"] if group["projectId"] == baseline_project)
@@ -109,6 +111,9 @@ def score(root, frozen, baseline_project, maps=None, replies=None, trace=None):
             **({"attribution": dict(Counter(row["attribution"] for row in scored))} if maps else {}),
         }
     return {
+        "mode": "managed-test",
+        "qualifiesProduction": False,
+        "toolSha256": sha256(Path(__file__).read_bytes()).hexdigest(),
         "oracleSha256": oracle_sha,
         "frozenMachineSha256": sha256(frozen.read_bytes()).hexdigest(),
         "expectedAddressCount": len(targets),

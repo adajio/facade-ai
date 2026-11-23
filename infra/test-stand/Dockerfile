@@ -1,21 +1,29 @@
-# syntax=docker/dockerfile:1
+# syntax=docker/dockerfile:1.19
 FROM node@sha256:be8204d4bd327363357f532187b752ff62759c31bedf98e9e18fc08c9cbd605c AS build
 WORKDIR /app
 COPY dependencies/ ./
 RUN --mount=type=cache,target=/root/.npm npm ci --no-audit --no-fund \
     && npm --prefix web ci --no-audit --no-fund
 COPY tsconfig.json ./
-COPY src ./src
+COPY --exclude='**/test' --exclude='**/*.test.*' src ./src
 COPY apps ./apps
-COPY web ./web
+COPY --exclude=e2e web ./web
 RUN --network=none npm run build \
-    && npm prune --omit=dev --offline --ignore-scripts --no-audit --no-fund
+    && npm prune --omit=dev --offline --ignore-scripts --no-audit --no-fund \
+    && for manifest in src/modules/*/package.json; do \
+        workspace="${manifest%/package.json}"; \
+        mkdir -p "/runtime/$workspace"; \
+        cp "$manifest" "/runtime/$workspace/"; \
+        if [ -d "$workspace/node_modules" ]; then \
+          cp -a "$workspace/node_modules" "/runtime/$workspace/"; \
+        fi; \
+      done
 
 FROM node@sha256:be8204d4bd327363357f532187b752ff62759c31bedf98e9e18fc08c9cbd605c AS core
 WORKDIR /app
 COPY --from=build /app/package.json ./
 COPY --from=build /app/node_modules ./node_modules
-COPY --from=build /app/src/modules ./src/modules
+COPY --from=build /runtime/src/modules ./src/modules
 COPY --from=build /app/dist ./dist
 COPY --from=build /app/web/dist ./web/dist
 COPY db/migrations ./db/migrations

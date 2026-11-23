@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { managedWorkerOptions } from '../../../test/fixtures/managed-worker-support.mjs';
 import { spawnSync } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
 import { mkdtemp, readFile, rm } from 'node:fs/promises';
@@ -90,7 +91,6 @@ test('ordinary upload runs two Mastra readers through PostgreSQL, the reader, qu
     await unblock?.();
     await worker;
     if (provider) await new Promise((resolve) => provider.close(resolve));
-    delete process.env.FACADE_HARNESS_MANAGED_URL;
     await connection?.close();
     await app?.close();
     await journalPool.end();
@@ -287,13 +287,12 @@ test('ordinary upload runs two Mastra readers through PostgreSQL, the reader, qu
   });
   await new Promise((resolve) => provider.listen(0, '127.0.0.1', resolve));
   const managedUrl = `http://127.0.0.1:${provider.address().port}/replay`;
-  process.env.FACADE_HARNESS_MANAGED_URL = managedUrl;
   const warnings = [];
-  function beginWorker() {
+  function beginWorker(withTransport = true) {
     driver = new AbortController();
     worker = startWorker({ db: app.db, config, signal: driver.signal, logger: {
       info() {}, warn(message) { warnings.push(message); }, error(message) { warnings.push(message); },
-    } });
+    } }, withTransport ? managedWorkerOptions(managedUrl, import.meta.url) : undefined);
   }
   async function stopWorker() {
     driver.abort();
@@ -579,8 +578,7 @@ sys.stdout.write('\\n'.join(''.join(t.text or '' for t in p.findall('.//w:t', ns
   }
 
   await stopWorker();
-  delete process.env.FACADE_HARNESS_MANAGED_URL;
-  beginWorker();
+  beginWorker(false);
   const parked = (await command('POST', '/api/projects', {
     name: 'Offline queue recovery', catalogVersionId: catalog.id, scopeName: 'F-A', stage: 'P',
   })).json();
@@ -596,22 +594,24 @@ sys.stdout.write('\\n'.join(''.join(t.text or '' for t in p.findall('.//w:t', ns
   await command('POST', `/api/receipts/${parkedReceipt.receiptId}/seal`, {});
   const workOfParked = async () => (await app.db.query(
     'SELECT id, state, reason, lease_epoch FROM gateway_jobs WHERE project_id=$1 ORDER BY purpose', [parked.id])).rows;
-  const waiting = await until(workOfParked, (rows) => rows.length === 2, 'Map and queue are available without a transport');
+  const waiting = await until(workOfParked, (rows) => rows.length === 2 && rows.every(({ state }) => state === 'held'),
+    'Model work is held without a transport');
   await delay(1600);
-  assert.ok(waiting.every(({ state, lease_epoch }) => state === 'ready' && lease_epoch === 0));
+  assert.ok(waiting.every(({ reason, lease_epoch }) => reason === 'research_profile_unavailable' && lease_epoch === 1));
   assert.deepEqual(await workOfParked(), waiting);
   assert.equal(providerCalls.filter(({ attempt }) => attempt.projectId === parked.id).length, 0);
   await stopWorker();
 
-  for (const [reason, nextAction] of [
+  for (const [index, [reason, nextAction]] of [
     ['route_reconciliation', 'operator_reconcile_route'],
     ['journal_unavailable', 'restore_external_journal'],
-  ]) {
+  ].entries()) {
+    const parkedJob = waiting[index];
+    assert.ok(await gateway.resume(parkedJob.id, [parkedJob.reason]));
     const work = await gateway.claim({ workerId: 'legacy-fixture', kinds: ['harness_research'], leaseMs: 10_000 });
     assert.equal(work?.projectId, parked.id);
     assert.ok(await gateway.suspend(work.lease, { reason, nextAction }));
   }
-  process.env.FACADE_HARNESS_MANAGED_URL = managedUrl;
   beginWorker();
   await until(workOfParked, (rows) => rows.every(({ state }) => state === 'done'), 'Preserved holds recover with the transport');
   assert.equal(providerCalls.filter(({ attempt }) => attempt.projectId === parked.id).length, 8);

@@ -6,7 +6,15 @@ import { createApi } from '/app/dist/src/platform/api.js';
 import { readConfig } from '/app/dist/src/platform/config.js';
 import { createGateway, journalFromEnv } from '/app/dist/src/modules/gateway/index.js';
 import { readPackageAnalysis, startWorker } from '/app/dist/src/modules/harness/index.js';
+import { managedWorkerOptions, toolHash } from '../../fixtures/managed-worker-support.mjs';
 import { startManagedTransport } from './managed-transport.mjs';
+
+const provenance = {
+  mode: 'managed-test', qualifiesProduction: false,
+  workerSha256: toolHash(import.meta.url), transportSha256: toolHash(new URL('./managed-transport.mjs', import.meta.url)),
+  adapterSha256: toolHash(new URL('../../fixtures/managed-worker-support.mjs', import.meta.url)),
+};
+console.log(JSON.stringify(provenance));
 
 const [output, ...inputReports] = process.argv.slice(2);
 assert.equal(output, '/results');
@@ -49,7 +57,7 @@ const server = startManagedTransport({
   onExchange(exchange) {
     assert.ok(!previous.some(({ jobId }) => exchange.jobId === jobId), 'a persisted job was sent again');
     calls.push(exchange);
-    serialized = serialized.then(() => appendFile(tracePath, JSON.stringify(exchange) + '\n'));
+    serialized = serialized.then(() => appendFile(tracePath, JSON.stringify({ ...exchange, ...provenance }) + '\n'));
     return serialized;
   },
   onError(error) {
@@ -86,8 +94,8 @@ try {
     }
   }
   await new Promise((listen) => server.listen(0, '127.0.0.1', listen));
-  process.env.FACADE_HARNESS_MANAGED_URL = 'http://127.0.0.1:' + server.address().port + '/managed';
-  worker = startWorker({ db: app.db, config, logger: app.log, signal: controller.signal })
+  const options = managedWorkerOptions('http://127.0.0.1:' + server.address().port + '/managed', import.meta.url);
+  worker = startWorker({ db: app.db, config, logger: app.log, signal: controller.signal }, options)
     .catch((error) => errors.push({ name: error.name }));
   const deadline = Date.now() + 360_000;
   let stable = 0;
@@ -155,6 +163,7 @@ try {
   await serialized;
   const balance = await external.journal.balance();
   await writeFile(resolve(output, 'managed-machine.json'), JSON.stringify({
+    ...provenance,
     input: 'ordinary intake; managed model transport; scored on a separate closed oracle',
     calls: calls.length, archivedCalls: previous.length, startingBalance, balance, errors, readings, reviews,
   }, null, 2) + '\n', { flag: 'wx', mode: 0o600 });

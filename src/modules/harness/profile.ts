@@ -10,13 +10,6 @@ export function researchSlot(job: ScheduledResearchJob): ResearchSlot {
 
 export function loadResearchProfile(env = process.env): ResearchProfile {
   const profile: ResearchProfile = { A: null, B: null, lead: null };
-  if (!env.FACADE_HARNESS_PROFILE && env.FACADE_GATEWAY_LIVE_MODE !== 'step-15') {
-    const managed = (role: string) => ({
-      routeId: `managed-${role}`, model: `managed/${role}`, dataClass: 'synthetic',
-      maxTurns: 24, maxTokens: 2_048, maxKnownRejections: 2,
-    });
-    return { A: managed('a'), B: managed('b'), lead: managed('lead') };
-  }
   let input: unknown;
   try {
     input = JSON.parse(env.FACADE_HARNESS_PROFILE ?? '{}');

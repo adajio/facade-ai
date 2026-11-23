@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { managedProfile, managedWorkerOptions } from '../../../test/fixtures/managed-worker-support.mjs';
 import { createHash, randomUUID } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import { createServer } from 'node:http';
@@ -100,7 +101,6 @@ test('ordinary intake publishes independent package evidence before questions an
   const { createGateway, PostgresIntentJournal } = await import(built('src/modules/gateway/index.js'));
   const { startWorker, readPackageAnalysis } = await import(built('src/modules/harness/index.js'));
   const { activatePackageProjects, preparePackageMap, dispatchPackagePair } = await import(built('src/modules/harness/package-dispatch.js'));
-  const { loadResearchProfile } = await import(built('src/modules/harness/profile.js'));
   const { Pool } = await import('pg');
   const config = readConfig();
   const external = new Pool({ connectionString: process.env.FACADE_GATEWAY_JOURNAL_URL });
@@ -182,12 +182,11 @@ test('ordinary intake publishes independent package evidence before questions an
     await new Promise((resolve) => provider.close(resolve));
     await app.close();
     await external.end();
-    delete process.env.FACADE_HARNESS_MANAGED_URL;
     delete process.env.FACADE_HARNESS_PACKAGE_EFFECTS;
     delete process.env.FACADE_HARNESS_REPLAY_ONLY;
   });
   await new Promise((resolve) => provider.listen(0, '127.0.0.1', resolve));
-  process.env.FACADE_HARNESS_MANAGED_URL = `http://127.0.0.1:${provider.address().port}`;
+  const options = managedWorkerOptions(`http://127.0.0.1:${provider.address().port}`, import.meta.url);
   const password = `test-${randomUUID()}`;
   await bootstrapAdmin(app.db, { organization: 'Package fixture', login: 'package-fixture', password });
   let credentials = {};
@@ -225,7 +224,7 @@ test('ordinary intake publishes independent package evidence before questions an
 
   function run() {
     driver = new AbortController();
-    worker = startWorker({ db: app.db, config, logger: { warn: (message) => warnings.push(message) }, signal: driver.signal });
+    worker = startWorker({ db: app.db, config, logger: { warn: (message) => warnings.push(message) }, signal: driver.signal }, options);
   }
   const analyze = () => {
     assert.deepEqual(errors, []);
@@ -438,7 +437,7 @@ test('ordinary intake publishes independent package evidence before questions an
     assert.equal(await preparePackageMap(app.db, gateway, map, [existing.id]), true);
     assert.equal(await preparePackageMap(app.db, gateway, map, [existing.id]), false);
 
-    const profile = loadResearchProfile({});
+    const profile = managedProfile();
     for (let index = 0; index < 12; index++) if (!await dispatchPackagePair(app.db, gateway, profile)) break;
     const large = await readPackageAnalysis(app.db, existing.id);
     const competing = await readPackageAnalysis(app.db, small.id);

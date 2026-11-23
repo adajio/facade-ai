@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { createHash, randomUUID } from "node:crypto";
 import { createServer } from "node:http";
 import { setTimeout as delay } from "node:timers/promises";
+import { managedWorkerOptions } from "../../../../test/fixtures/managed-worker-support.mjs";
 
 const targetText = "AX-17 rev B | 2 x 35 mm | 70 mm";
 const neighborText = "AX-17 rev C | 5 x 14 mm | 70 mm";
@@ -78,8 +79,6 @@ export async function verifyOrdinaryDwg({
       res.end();
     }
   });
-  const previousUrl = process.env.FACADE_HARNESS_MANAGED_URL;
-  const previousProfile = process.env.FACADE_HARNESS_PROFILE;
   try {
     for (const [branch, purpose] of [["a", "primary_a"], ["b", "primary_b"]]) {
       const routeId = `managed-${branch}`;
@@ -89,13 +88,12 @@ export async function verifyOrdinaryDwg({
         dataClass: "synthetic", allowed: true });
     }
     await new Promise((resolve, reject) => provider.listen(0, "127.0.0.1", resolve).once("error", reject));
-    process.env.FACADE_HARNESS_MANAGED_URL = `http://127.0.0.1:${provider.address().port}/replay`;
-    delete process.env.FACADE_HARNESS_PROFILE;
+    const options = managedWorkerOptions(`http://127.0.0.1:${provider.address().port}/replay`, import.meta.url);
     source = await upload("schedule.dwg");
     await seal();
     worker = startWorker({ db, config, signal: driver.signal, logger: {
       info() {}, warn(message) { warnings.add(message); }, error(message) { warnings.add(message); },
-    } });
+    } }, options);
     void worker.catch((error) => warnings.add(error.name));
     const stop = Date.now() + 120_000;
     let rows = [];
@@ -142,10 +140,6 @@ export async function verifyOrdinaryDwg({
     driver.abort();
     await Promise.allSettled([worker]);
     if (provider.listening) await new Promise((resolve) => provider.close(resolve));
-    if (previousUrl === undefined) delete process.env.FACADE_HARNESS_MANAGED_URL;
-    else process.env.FACADE_HARNESS_MANAGED_URL = previousUrl;
-    if (previousProfile === undefined) delete process.env.FACADE_HARNESS_PROFILE;
-    else process.env.FACADE_HARNESS_PROFILE = previousProfile;
     await journalConnection.close();
   }
 }

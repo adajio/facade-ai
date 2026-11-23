@@ -81,18 +81,24 @@ function addressedProposal(source) {
   };
 }
 
-function chooseTool(job, history, issued) {
+function remainingProposals(history, attempted) {
+  const key = ({ quote, lineId }) => JSON.stringify([quote, lineId]);
+  const seen = new Set(attempted.map(key));
+  return history.flatMap(citations).flatMap((source) => {
+    const id = key(source);
+    if (seen.has(id)) return [];
+    seen.add(id);
+    return addressedProposal(source) ?? [];
+  });
+}
+
+function chooseTool(job, history, issued, attempted, remaining) {
   if (job.place.page && !issued.some(({ name }) => name === 'survey')) return ['survey', {}];
   if (!issued.some(({ name }) => name === 'extract')) return ['extract', {}];
   const opened = history.flatMap(citations);
   if (!opened.length && !issued.some(({ name }) => name === 'ocr')) return ['ocr', {}];
-  const attempted = issued.filter(({ name }) => name === 'save_observation')
-    .map(({ arguments: args }) => JSON.parse(args));
-  const prior = new Set(attempted.map(({ quote, lineId }) => JSON.stringify([quote, lineId])));
-  const next = opened
-    .filter(({ quote, lineId }) => !prior.has(JSON.stringify([quote, lineId])))
-    .map(addressedProposal).find(Boolean);
-  if (next && attempted.length < 15) return ['save_observation', next];
+  const [next] = remaining;
+  if (next) return ['save_observation', next];
   if (history.some(({ observationId, qualified }) => observationId && qualified)) {
     return ['finish_reading', { status: 'covered', explanation: 'Сохранены цитаты из полученного адресного окна.' }];
   }
@@ -204,7 +210,10 @@ export function startManagedTransport({ projects, onExchange, onError }) {
         if (earlierOwner) assert.equal(earlierOwner, attempt.jobId, 'evidence leaked across reader jobs');
         evidenceOwners.set(evidence.evidenceId, attempt.jobId);
       }
-      const [name, args] = primary ? chooseTool(job, history, issued) : reviewPair(job, history, issued);
+      const attempted = primary ? issued.filter(({ name }) => name === 'save_observation')
+        .map(({ arguments: args }) => JSON.parse(args)) : [];
+      const remaining = primary ? remainingProposals(history, attempted) : [];
+      const [name, args] = primary ? chooseTool(job, history, issued, attempted, remaining) : reviewPair(job, history, issued);
       assert.ok(request.tools.some(({ function: fn }) => fn.name === name));
       const output = { choices: [{ finish_reason: 'tool_calls', message: { role: 'assistant', content: null,
         tool_calls: [{ id: randomUUID(), type: 'function', function: { name, arguments: JSON.stringify(args) } }],
@@ -216,6 +225,7 @@ export function startManagedTransport({ projects, onExchange, onError }) {
           { pair: job.dispute.id, reviewMode: job.mode, supports: assigned, checkStatus: args.checks &&
             Object.fromEntries(Object.entries(args.checks).map(([key, value]) => [key, value.status])) }),
         action: name,
+        ...(primary && { remainingCandidates: remaining.length - (name === 'save_observation' && args.quote ? 1 : 0) }),
         opened: history.filter(({ evidence }) => evidence).map(({ evidence }) => evidence),
         previous: history.at(-1) && { ok: history.at(-1).ok, code: history.at(-1).code, observationId: history.at(-1).observationId },
         ...(args.evidenceId && { submittedEvidenceId: args.evidenceId }),

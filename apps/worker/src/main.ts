@@ -1,9 +1,11 @@
 import { readConfig, reportStartupError, StartupError } from '../../../src/platform/config.js'
 import { openPool } from '../../../src/platform/db.js'
 import { findModules, loadModule } from '../../../src/platform/modules.js'
+import { checkRuntimeInvocation, openProductionDatabase } from '../../../src/platform/runtime-boundary.js'
 import type { WorkerContext } from '../../../src/platform/worker-context.js'
 
 async function main(): Promise<void> {
+  checkRuntimeInvocation()
   const config = readConfig()
   if (!(await findModules()).includes('harness')) {
     throw new StartupError('Harness module is required to start the worker')
@@ -24,8 +26,9 @@ async function main(): Promise<void> {
   process.once('SIGINT', stop)
   process.once('SIGTERM', stop)
 
+  let release: (() => void) | undefined
   try {
-    await db.query('SELECT 1')
+    release = await openProductionDatabase(db)
     await startWorker(context)
     if (!context.signal.aborted) throw new StartupError('Harness returned before shutdown')
   } catch (error) {
@@ -33,6 +36,7 @@ async function main(): Promise<void> {
   } finally {
     process.off('SIGINT', stop)
     process.off('SIGTERM', stop)
+    release?.()
     await db.end()
   }
 }

@@ -2,8 +2,10 @@ import { randomUUID } from 'node:crypto';
 import { setTimeout as delay } from 'node:timers/promises';
 import type { Pool } from 'pg';
 import type { WorkerContext } from '../../platform/worker-context.js';
+import { sealManagedTestDatabase, toolHash } from '../../platform/runtime-boundary.js';
 import { createFormatAdapters } from '../formats/index.js';
 import { createGateway, createStep15Gateway, journalFromEnv, type OpenRouterProfile, type Step15Approval } from '../gateway/index.js';
+import type { ModelTransport } from '../gateway/types.js';
 import { startImports } from '../imports/index.js';
 import { createIntakeStorage } from '../intake/blob.js';
 import { createRuntimePdfService } from '../pdf/index.js';
@@ -20,7 +22,6 @@ import { schedulePackageReview } from './package-review.js';
 import { reviewPairAdmission } from './review-pair.js';
 import { connectReader } from './reader.js';
 import { executeResearch, researchKind, resumeInterruptedResearch } from './runner.js';
-import { managedTransport } from './transport.js';
 import { resumeResearchStops } from './stops.js';
 
 export { register } from './stops.js';
@@ -35,17 +36,31 @@ function configuredApprovals(): OpenRouterProfile[] {
   }
 }
 
-function modelGateway(context: WorkerContext, external: ReturnType<typeof journalFromEnv>, profile: ResearchProfile, packageEnabled: boolean, packageProjects: readonly string[]) {
-  const managed = process.env.FACADE_HARNESS_MANAGED_URL;
+interface ManagedTestOptions {
+  transport: ModelTransport & { kind: 'managed' };
+  profile: ResearchProfile;
+  toolSha256: string;
+}
+
+function modelGateway(context: WorkerContext, external: ReturnType<typeof journalFromEnv>, profile: ResearchProfile, packageEnabled: boolean, packageProjects: readonly string[], test?: ManagedTestOptions) {
   const policyOptions = {
     researchAdmission: packageModelAdmission(packageEnabled, packageProjects, process.env.FACADE_HARNESS_PACKAGE_EFFECTS === 'enabled'),
     replayOnly: process.env.FACADE_HARNESS_REPLAY_ONLY === '1',
   };
   const localGateway = () => createGateway(context.db, { journal: external?.journal, reviewAdmission: reviewPairAdmission, ...policyOptions });
+  if (test) {
+    if (!external || process.env.FACADE_GATEWAY_LIVE_MODE || process.env.FACADE_GATEWAY_OPENROUTER_KEY) {
+      throw new Error('Managed model tests require an isolated journal and disabled live gateway');
+    }
+    const gateway = createGateway(context.db, {
+      journal: external.journal, transport: test.transport, reviewAdmission: reviewPairAdmission, ...policyOptions,
+    });
+    return { gateway, hasTransport: true, mode: 'managed-test', admit: (task: ResearchTask) => profileHold(profile, task) };
+  }
   if (process.env.FACADE_GATEWAY_LIVE_MODE === 'step-15') {
     const apiKey = process.env.FACADE_GATEWAY_OPENROUTER_KEY;
-    if (managed || !external || !apiKey?.trim()) return {
-      gateway: localGateway(), online: true, hasTransport: false,
+    if (!external || !apiKey?.trim()) return {
+      gateway: localGateway(), hasTransport: false, mode: 'disabled',
       admit: (task: ResearchTask) => ({
         reason: 'research_gateway_unconfigured',
         nextAction: `Проверить настройки шлюза для ${researchSlot(task.job)}.`,
@@ -71,15 +86,15 @@ function modelGateway(context: WorkerContext, external: ReturnType<typeof journa
     });
     const gateway = policy.approvals.length === 0 ? localGateway() :
       createStep15Gateway(context.db, external.journal, { ...approval, profiles: policy.approvals }, reviewPairAdmission, policyOptions);
-    return { gateway, admit: policy.hold, online: true, hasTransport: policy.approvals.length > 0 };
+    const hasTransport = policy.approvals.length > 0;
+    return { gateway, admit: policy.hold, hasTransport,
+      mode: hasTransport ? policyOptions.replayOnly ? 'openrouter-replay' : 'openrouter-live' : 'disabled' };
   }
-  if (managed && !external) throw new Error('Managed gateway requires a separate intent journal');
-  const gateway = managed && external
-    ? createGateway(context.db, { journal: external.journal, transport: managedTransport(managed), reviewAdmission: reviewPairAdmission, ...policyOptions })
-    : localGateway();
   return {
-    gateway, admit: (task: ResearchTask) => profileHold(profile, task),
-    online: Boolean(managed), hasTransport: Boolean(managed),
+    gateway: localGateway(), hasTransport: false, mode: 'disabled',
+    admit: (task: ResearchTask) => ({
+      reason: 'research_gateway_unconfigured', nextAction: `Настроить разрешённый шлюз для ${researchSlot(task.job)}.`,
+    }),
   };
 }
 
@@ -105,9 +120,9 @@ async function withReaderSlot<T>(db: Pool, work: () => Promise<T>): Promise<T> {
   }
 }
 
-export async function startWorker(context: WorkerContext): Promise<void> {
+export async function startWorker(context: WorkerContext, test?: ManagedTestOptions): Promise<void> {
   const { db, logger, config } = context;
-  const profile = loadResearchProfile();
+  const profile = test?.profile ?? loadResearchProfile();
   const packageMode = process.env.FACADE_HARNESS_PACKAGE_PRIMARY;
   const packageEnabled = packageMode !== 'legacy';
   const packageProjects = [...new Set((process.env.FACADE_HARNESS_PACKAGE_PROJECTS ?? '').split(',')
@@ -119,6 +134,7 @@ export async function startWorker(context: WorkerContext): Promise<void> {
   const signal = AbortSignal.any([context.signal, controller.signal]);
   const storage = createIntakeStorage(config.dataDir);
   const lanes: Promise<void>[] = [];
+  let seal: Awaited<ReturnType<typeof sealManagedTestDatabase>> | undefined;
 
   async function poll(name: string, next: () => Promise<boolean>, once = false) {
     while (!signal.aborted) {
@@ -138,7 +154,16 @@ export async function startWorker(context: WorkerContext): Promise<void> {
   }
 
   try {
-    const { gateway, admit, online, hasTransport } = modelGateway(context, external, profile, packageEnabled, packageProjects);
+    const { gateway, admit, hasTransport, mode } = modelGateway(context, external, profile, packageEnabled, packageProjects, test);
+    if (test) {
+      if (test.transport.kind !== 'managed' || !/^[a-f0-9]{64}$/.test(test.toolSha256) ||
+        Object.values(profile).some((slot) => slot && (slot.dataClass !== 'synthetic' || !slot.model.startsWith('managed/')))) {
+        throw new Error('Invalid managed model test configuration');
+      }
+      seal = await sealManagedTestDatabase(db);
+    }
+    logger.info?.({ mode, toolSha256: test?.toolSha256 ?? await toolHash(new URL(import.meta.url)),
+      ...(test && { replayOnly: process.env.FACADE_HARNESS_REPLAY_ONLY === '1', qualifiesProduction: false }) });
     if (packageEnabled) await activatePackageProjects(db, gateway, packageProjects);
     const base = createRuntimePdfService(db, config, { storage, adapters: createFormatAdapters() });
     const service = {
@@ -169,7 +194,7 @@ export async function startWorker(context: WorkerContext): Promise<void> {
         return true;
       }, true));
     }
-    for (let lane = 0; online && lane < 3; lane++) {
+    for (let lane = 0; lane < (hasTransport ? 3 : 1); lane++) {
       const workerId = randomUUID();
       lanes.push(poll('research', async () => {
         const work = await gateway.claim({ workerId, kinds: [researchKind], leaseMs: 30_000 });
@@ -190,6 +215,7 @@ export async function startWorker(context: WorkerContext): Promise<void> {
   } finally {
     controller.abort();
     await Promise.allSettled(lanes);
+    seal?.release(true);
     storage.objects.close();
     await external?.close();
   }

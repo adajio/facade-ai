@@ -57,6 +57,21 @@ PYTHONDONTWRITEBYTECODE=1 python3 test/acceptance/summarize_trace.py "$private_m
 
 ## Управляемый прогон собранного приложения
 
+Штатные `start:api` и `start:worker` используют выделенные производственные точки входа. Их параметры не включают тестовый транспорт. Worker пишет в лог `disabled`, `openrouter-live` или `openrouter-replay` и SHA-256 скомпилированного harness. В режиме `disabled` ожидающие модельные задачи получают удержание. Replay требует действующего профиля OpenRouter и совпадения сохранённого вызова. Новая отправка блокируется шлюзом.
+
+Для `managed-test` нужны отдельные БД приложения с именем `test_*`, бакет и журнал. Тестовый запуск ставит постоянную метку `public.facade_managed_test_seal` в БД приложения. При наличии этой метки или старых маршрутов `managed` штатный API и worker отклоняют БД. Держите тестовый API в отдельном контейнере на внутренней сети. Для браузерного сценария с отдельным API запускайте `/app/test/fixtures/managed-test-api.mjs` вместо `start:api` на этой БД.
+
+Соберите и закрепите образ по манифесту исходников. Для проверки обеих целей `core` и `reader` выполните для каждого ID образа следующие команды из корня checkout:
+
+```sh
+docker image inspect --format '{{.Id}} {{.Os}}/{{.Architecture}} {{json .Config.Labels}}' "$IMAGE"
+docker run --rm --network none --read-only \
+  --mount "type=bind,source=$PWD/test/fixtures/inspect-runtime-image.mjs,target=/inspect.mjs,readonly" \
+  "$IMAGE" /inspect.mjs
+```
+
+На отдельном контейнере для приёмки смонтируйте нужные файлы теста на чтение с путями под `/app/test`, сохранёнными относительно checkout. Для пакетного сценария нужны `test/fixtures/managed-worker-support.mjs`, `test/fixtures/managed-test-api.mjs`, `test/acceptance/package-intake/managed-worker.mjs` и `test/acceptance/package-intake/managed-transport.mjs`. Передайте каталоги результатов и приёмочные отчёты отдельно. После прогона сохраните ID образа, Git-ревизию, SHA-256 манифеста сборки, `managed-machine.json` и `managed-trace.ndjson`. Снимок и трасса содержат `mode=managed-test`, `qualifiesProduction=false` и SHA-256 трёх испытательных файлов. В трассе `remainingCandidates` считает ещё не предъявленные предложения после текущей операции. При исчерпании лимита harness итог окна остаётся `held`.
+
 `managed.mjs` запускается из точного Linux-образа стенда, с отдельными тестовой БД, S3 и журналом, уже прошедшими миграции. Он использует скомпилированные модули образа и отправляет исходные байты через штатный HTTP-интерфейс на loopback этого контейнера. Входы, конфигурация каталога и манифест оригиналов монтируются на чтение под `/acceptance/input`, `/acceptance/config`, `/acceptance/manifests`. Для записи результатов монтируется пустой отдельный каталог под `/acceptance/evidence`. Каталоги эталона не монтируются.
 
 `STEP15_RUN_ID` задаёт имя прогона, `STEP15_CASES` — имена пакетов через запятую. Встроенный управляемый транспорт отвечает по тексту, адресам и данным фактически переданной репрезентации. Определение области использует имя папки. Нативные и растровые запросы, фиксация находок, сверки и файл письма проходят через рабочий код. Результаты такой серии характеризуют технический контур и работу симулятора. Доступ OpenRouter в контейнере отключён.

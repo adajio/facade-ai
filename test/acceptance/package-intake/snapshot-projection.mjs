@@ -7,6 +7,8 @@ const [origin, login, passwordPath, machinePath, outputPath] = process.argv.slic
 const rawMachine = await readFile(machinePath);
 const frozen = JSON.parse(rawMachine);
 const hash = (value) => createHash('sha256').update(value).digest('hex');
+assert.equal(frozen.mode ?? 'managed-test', 'managed-test');
+assert.equal(frozen.qualifiesProduction ?? false, false);
 assert.equal(frozen.balance.spentUsdNanos, 0);
 assert.equal(frozen.balance.reserveUsdNanos, 0);
 assert.ok(frozen.readings.length);
@@ -60,6 +62,7 @@ try {
     projects.push({ project, assessment, summary, observations, eligibility });
   }
 } finally {
-  await writeFile(outputPath, JSON.stringify({ machineSha256: hash(rawMachine), projects, http }, null, 2) + '\n',
+  await writeFile(outputPath, JSON.stringify({ mode: 'managed-test', qualifiesProduction: false,
+    toolSha256: hash(await readFile(new URL(import.meta.url))), machineSha256: hash(rawMachine), projects, http }, null, 2) + '\n',
     { flag: 'wx', mode: 0o600 });
 }

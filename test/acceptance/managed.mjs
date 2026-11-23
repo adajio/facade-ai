@@ -4,6 +4,7 @@ import { createServer } from 'node:http';
 import { appendFile, mkdir, readFile, readdir, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
+import { managedWorkerOptions } from '../fixtures/managed-worker-support.mjs';
 
 const root = '/acceptance';
 const output = join(root, 'evidence', process.env.STEP15_RUN_ID);
@@ -40,6 +41,7 @@ let engineerSession;
 let engineerId;
 let worker, stop;
 let provider;
+let options;
 const calls = new Map();
 
 async function request(method, path, payload, headers = {}, timeoutMs = 12000) {
@@ -199,12 +201,12 @@ async function startProvider() {
     }
   });
   await new Promise(resolve => provider.listen(0, '127.0.0.1', resolve));
-  process.env.FACADE_HARNESS_MANAGED_URL = `http://127.0.0.1:${provider.address().port}/replay`;
+  options = managedWorkerOptions(`http://127.0.0.1:${provider.address().port}/replay`, import.meta.url);
 }
 
 function beginWorker() {
   stop = new AbortController();
-  worker = startWorker({ db: app.db, config, signal: stop.signal, logger: app.log });
+  worker = startWorker({ db: app.db, config, signal: stop.signal, logger: app.log }, options);
 }
 
 async function stopWorker() {
@@ -860,7 +862,6 @@ try {
       replays.set(project.id, await rewindOneTestCheckpoint(project, caseName));
     }
   } else {
-    delete process.env.FACADE_HARNESS_MANAGED_URL;
   }
   beginWorker();
   await delay(1500);
