@@ -15,6 +15,11 @@ test('production invocation rejects managed environment and arguments before ope
     const override = spawnSync(process.execPath, [main], { env, encoding: 'utf8' });
     assert.equal(override.status, 1);
     assert.match(override.stderr, /Managed model endpoints require the isolated test entrypoint/);
+    const profiles = spawnSync(process.execPath, [main], { env: { PATH: process.env.PATH,
+      FACADE_HARNESS_PROFILE: JSON.stringify({ lead: { model: 'managed/lead' } }),
+    }, encoding: 'utf8' });
+    assert.equal(profiles.status, 1);
+    assert.match(profiles.stderr, /Managed model profiles require the isolated test entrypoint/);
     const cli = spawnSync(process.execPath, [main, '--managed'], { env: { PATH: process.env.PATH }, encoding: 'utf8' });
     assert.equal(cli.status, 1);
     assert.match(cli.stderr, /Unexpected runtime arguments/);
