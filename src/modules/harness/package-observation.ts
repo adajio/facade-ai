@@ -109,7 +109,7 @@ function contextIdentity(ctx: NonNullable<PackageDetails['binding']>['projectCon
   return JSON.stringify(['building-axes', normalized(building.value), normalized(axes.value)]);
 }
 
-function bindingFor(observation: Observation, details: PackageDetails): PackageBinding {
+function bindingFor(observation: Observation, details: PackageDetails, fullLine?: string): PackageBinding {
   const proposal = details.binding;
   const quote = proposal?.quote && observation.quote?.includes(proposal.quote) ? proposal.quote : null;
   const labels = [...new Set(proposal?.labels.map(normalized))];
@@ -121,7 +121,8 @@ function bindingFor(observation: Observation, details: PackageDetails): PackageB
       return { id: packageCandidateId(observation, label, registered ? 'printed-project-facade-id' : context), label };
     });
   const unconfirmed = proposal?.state === 'identified' && (!labels.length || labels.length !== candidates.length)
-    || proposal?.state === 'common' && (!quote || !packageCommonGrounded(quote) || labels.length > 0);
+    || proposal?.state === 'common' && (!quote || !fullLine || !packageCommonGrounded(quote) ||
+      !packageCommonGrounded(fullLine) || labels.length > 0);
   const state = unconfirmed ? 'unclear' : proposal?.state ?? 'unidentified';
   return { state, candidates: state === 'identified' || state === 'unclear' ? candidates : [], quote,
     reason: unconfirmed ? 'В опоре не подтверждена предложенная принадлежность.'
@@ -136,7 +137,7 @@ export async function publishPackageObservation(
   const details = input.package ?? {};
   const { quote, grounding, deliveryStatement } = observation;
   const text = grounding === 'text' ? quote : undefined;
-  const { rows: [issued] } = grounding === 'text' && details.role
+  const { rows: [issued] } = grounding === 'text' && (details.role || details.binding)
     ? await tx.query<{ content: string | null }>(
       `SELECT event#>>'{reply,body,content}' AS content FROM harness_research_events
        WHERE job_id=$1 AND event#>>'{reply,evidence,evidenceId}'=$2 ORDER BY sequence LIMIT 1`,
@@ -156,7 +157,7 @@ export async function publishPackageObservation(
     ? details.revision : undefined;
   const revisionStatus = revision?.status === 'current' && current.test(revision.quote) && !inactive.test(revision.quote)
     ? 'current' : revision?.status === 'superseded' && inactive.test(revision.quote) ? 'superseded' : 'unknown';
-  const binding = bindingFor(observation, details);
+  const binding = bindingFor(observation, details, fullLine);
   const proposal = details.subjectRegister;
   const register = proposal && revisionStatus === 'current' && (confirmedRole?.value === 'schedule' || confirmedRole?.value === 'inventory') &&
     text?.includes(proposal.quote) && entireRegister.test(proposal.quote) && !exclusion.test(proposal.quote) &&
