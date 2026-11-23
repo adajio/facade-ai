@@ -219,6 +219,34 @@ test('accepted and restored originals materialize with isolated reads, progress,
   assert.equal(historical.lines.at(-1).text, 'Лазурное покрытие L7');
   assert.ok([...objectWrites.values()].every((writes) => writes === 1));
 
+  const lateOld = await accepted('race.txt', Buffer.from('Race fixture obsolete'));
+  assert.equal(await indexNextProjectMemory(db, reader), true); // old worker pins the map
+  const lateNew = await accepted('race.txt', Buffer.from('Race fixture current'), { replaces: lateOld });
+  const startedOld = Promise.withResolvers();
+  const releaseOld = Promise.withResolvers();
+  const oldWorker = indexNextProjectMemory(db, {
+    map: reader.map,
+    async materializeNative(...args) {
+      assert.equal(args[0].versionId, lateOld.versionId);
+      startedOld.resolve();
+      await releaseOld.promise;
+      return reader.materializeNative(...args);
+    },
+  });
+  try {
+    await startedOld.promise;
+    assert.equal(await indexNextProjectMemory(db, reader), false);
+    const pendingReplacement = await find('Race fixture');
+    assert.deepEqual(pendingReplacement.hits, []);
+  } finally {
+    releaseOld.resolve();
+    await oldWorker;
+  }
+  await drain();
+  assert.deepEqual((await find('Race fixture')).hits.map(({ versionId }) => versionId), [lateNew.versionId]);
+  assert.deepEqual((await find('Race fixture', { versionIds: [lateOld.versionId] })).hits.map(({ versionId }) => versionId),
+    [lateOld.versionId]);
+
   const xlsx = await accepted('schedule.xlsx', await nativeFixture('schedule.xlsx'), { mime: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
   const pdf = await accepted('mixed.pdf', await nativeFixture('mixed-raster.pdf'), { mime: 'application/pdf' });
   const mixedStarted = performance.now();
