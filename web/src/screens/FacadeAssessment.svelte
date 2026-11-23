@@ -212,7 +212,11 @@
                 {#if source.stage} · стадия {source.stage}{/if}
                 {#if source.revisionStatus !== 'current'} · действующая редакция требует сверки{/if}
                 {#each source.clarification ?? [] as read (read.branch)}
-                  <div>Адресное дочитывание {read.branch} · {clarificationLabels[read.state]}</div>
+                  {#if read.state === 'route_required'}
+                    <div>Ветвь {read.branch}. Для адресного дочитывания требуется доступ к закреплённому маршруту.</div>
+                  {:else}
+                    <div>Адресное дочитывание {read.branch} · {clarificationLabels[read.state]}</div>
+                  {/if}
                 {/each}
                 {#if source.citation.quote}<blockquote>{source.citation.quote}</blockquote>{/if}
               </li>

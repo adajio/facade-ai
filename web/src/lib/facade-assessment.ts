@@ -51,7 +51,7 @@ export type FacadeAssessment = {
     id: string; property: string; facadeId: string | null; reasons: string[];
     sources: { citation: Citation; binding: FacadeObservation['binding']; variant: string | null;
       stage: string | null; revision: string | null; revisionStatus: string; sourceRole: string;
-      clarification?: { branch: 'A' | 'B'; state: 'ready' | 'leased' | 'held' | 'done' }[] }[];
+      clarification?: { branch: 'A' | 'B'; state: 'route_required' | 'ready' | 'leased' | 'held' | 'done' }[] }[];
   }[] };
   unresolvedMentions?: { items: MentionSource[]; limited: boolean };
   stage: string | null;

@@ -225,8 +225,6 @@ test('addressed PDF and XLSX facts share a stable facade; the branch worker cons
   assert.equal(await dispatchPackageFollowup(db,queue),false,'a revisit is never repeated with the same root and subject');
   const pdfRoot=leased.get(pdf.version_id+'A');
   const open=await publish(pdfRoot,pdf,'Depth 12 mm','12',{package:{attribute:'Depth'}});
-  await db.query(`UPDATE harness_package_structures SET blocks=jsonb_set(blocks,'{0,lineIds}',blocks#>'{0,lineIds}'||to_jsonb($2::text))
-    WHERE window_id=$1`,[pdfRoot.payload.packageWindow.id,open.lineId]);
   await settle();
   const unqualified=await state();
   assert.ok(unqualified.comparisonFollowups.includes(open.id));
@@ -247,6 +245,24 @@ test('addressed PDF and XLSX facts share a stable facade; the branch worker cons
   };
   const historical=await snapshot();
   assert.equal(openSource(historical).clarification,undefined);
+  await db.query(`UPDATE gateway_grants SET allowed=false
+    WHERE project_id=$1 AND route_id=$2 AND purpose='primary_a'`,[projectId,profile.A.routeId]);
+  assert.equal(openSource(await snapshot()).clarification,undefined,'the route is irrelevant until there is an addressable plan');
+  await db.query(`UPDATE harness_package_structures SET blocks=jsonb_set(blocks,'{0,lineIds}',blocks#>'{0,lineIds}'||to_jsonb($2::text))
+    WHERE window_id=$1`,[pdfRoot.payload.packageWindow.id,open.lineId]);
+  assert.equal(await dispatchPackageFollowup(db,queue,false),false);
+  const blocked=await snapshot();
+  assert.deepEqual(openSource(blocked).clarification,[{branch:'A',state:'route_required'}]);
+  assert.deepEqual((await db.query(`SELECT (SELECT count(*)::int FROM harness_package_followups WHERE plan_key LIKE 'comparison:%') AS jobs,
+    (SELECT count(*)::int FROM gateway_attempts) AS attempts`)).rows[0],{jobs:0,attempts:0});
+
+  await db.query('UPDATE gateway_routes SET enabled=false WHERE id=$1',[profile.A.routeId]);
+  await db.query(`UPDATE gateway_grants SET allowed=true
+    WHERE project_id=$1 AND route_id=$2 AND purpose='primary_a'`,[projectId,profile.A.routeId]);
+  assert.equal(await dispatchPackageFollowup(db,queue,false),false);
+  assert.deepEqual(openSource(await snapshot()).clarification,[{branch:'A',state:'route_required'}]);
+  await db.query('UPDATE gateway_routes SET enabled=true WHERE id=$1',[profile.A.routeId]);
+  assert.equal(openSource(await snapshot()).clarification,undefined);
   assert.deepEqual((await Promise.all([dispatchPackageFollowup(db,queue,false),dispatchPackageFollowup(db,queue,false)])).sort(),[false,true]);
   assert.deepEqual(openSource(await snapshot()).clarification,[{branch:'A',state:'ready'}]);
   const claim=()=>queue.claim({workerId:'fixture',kinds:[packageFollowupKind],leaseMs:30_000});
@@ -268,6 +284,7 @@ test('addressed PDF and XLSX facts share a stable facade; the branch worker cons
   assert.equal(await queue.finish(resumed.lease,{kind:'reviewed_no_match'},{state:'completed',evidenceRef:open.evidenceId}),true);
   assert.deepEqual(openSource(await snapshot()).clarification,[{branch:'A',state:'done'}]);
   assert.equal(openSource(await snapshot(historical.version)).clarification,undefined);
+  assert.deepEqual(openSource(await snapshot(blocked.version)).clarification,[{branch:'A',state:'route_required'}]);
   assert.equal(await dispatchPackageFollowup(db,queue,false),false,'unchanged anchor never enqueues twice');
   const {rows:[effects]}=await db.query(`SELECT (SELECT count(*)::int FROM gateway_attempts) AS attempts,
     (SELECT count(*)::int FROM harness_package_review_pairs) AS pairs,(SELECT count(*)::int FROM letters) AS letters`);

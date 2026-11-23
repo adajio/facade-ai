@@ -1,6 +1,7 @@
 import type { PoolClient } from "pg";
 import { contradictoryDeliveryLine, exactDeliveryStatement } from "../../domain/delivery-statement.js";
 import { readPackageAnalysis, type PackageAnalysis, type PackageFact } from "../harness/package-analysis.js";
+import { blockedComparisonReads } from "../harness/package-walk.js";
 import { deliveredLines } from "../questions/attribute-aliases.js";
 import { hasAddressedSubject } from "../questions/subject-evidence.js";
 import { canonicalJson, isInventoryRole, requirementSubjectKey } from "./domain.js";
@@ -149,9 +150,10 @@ export function facadeObservation(fact: PackageFact, originalLine?: string) {
 }
 
 export type FacadeObservation = ReturnType<typeof facadeObservation>;
-export type ComparisonRead = { branch: PackageFact["branch"]; state: "ready" | "leased" | "held" | "done" };
+export type ComparisonRead = { branch: PackageFact["branch"]; state: "route_required" | "ready" | "leased" | "held" | "done" };
 
-async function comparisonReads(tx: PoolClient, projectId: string, windows: PackageAnalysis["windows"], facts: PackageFact[]) {
+async function comparisonReads(tx: PoolClient, projectId: string, windows: PackageAnalysis["windows"], facts: PackageFact[],
+  targetIds: string[]) {
   const { rows } = await tx.query<ComparisonRead & { windowId: string; lineId: string; property: string }>(
     `SELECT f.window_id AS "windowId",f.branch,
       CASE WHEN j.state='leased' AND j.lease_until<=clock_timestamp() THEN 'ready' ELSE j.state END AS state,
@@ -166,7 +168,9 @@ async function comparisonReads(tx: PoolClient, projectId: string, windows: Packa
   const key = (versionId: string, unitId: string, lineId: string, property: string) =>
     canonicalJson([versionId, unitId, lineId, requirementSubjectKey(property)]);
   const byAddress = new Map<string, Map<PackageFact["branch"], ComparisonRead>>();
-  for (const { windowId, lineId, property, branch, state } of rows) {
+  const targetSet = new Set(targetIds);
+  const blocked = await blockedComparisonReads(tx, projectId, facts.filter(({ id }) => targetSet.has(id)));
+  for (const { windowId, lineId, property, branch, state } of [...blocked, ...rows]) {
     const place = places.get(windowId)!;
     const address = key(place.source.versionId, place.unitId, lineId, property);
     const reads = byAddress.get(address) ?? new Map();
@@ -328,7 +332,7 @@ export async function readFacadeInput(tx: PoolClient, projectId: string) {
     reading,
   };
   return { intake, versionIds, evidence, impacts, replacements, holds, semantic, discovery, observations,
-    comparisonReads: await comparisonReads(tx, projectId, windows, activeFacts),
+    comparisonReads: await comparisonReads(tx, projectId, windows, activeFacts, analysis.comparisonFollowups),
     activeWindows: windows.length,
     structurallyReviewedWindows: windows.filter(({ structure }) => structure?.branches.A.complete && structure.branches.B.complete).length,
     completedWindows: coveredWindows.length };

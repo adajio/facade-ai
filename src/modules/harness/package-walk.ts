@@ -5,12 +5,12 @@ import { lockIntakeProject } from '../intake/gate.js';
 import { publishProjectEvent } from '../supplements/events.js';
 import { getCatalog, getProject, matchesDefaultProfile } from '../access/project-state.js';
 import { deliveredLines } from '../questions/attribute-aliases.js';
-import { ReaderRefusal, jobSchema, type BlockCheck, type PackageBlock, type PackageDiscovery, type PackageSemanticCheck, type Place, type ReaderContext } from './contracts.js';
+import { ReaderRefusal, jobSchema, type BlockCheck, type PackageBlock, type PackageDiscovery, type PackageSemanticCheck, type Place, type ReaderContext, type ScheduledResearchJob } from './contracts.js';
 import type { ReaderService } from './reader.js';
 import { memoryVersion } from '../project-memory/contracts.js';
 import { currentProfileHintLines,profileHintPatterns } from './facade-profile-hints.js';
 import { facadeDiscoveryVersion } from './facade-discovery.js';
-import { readComparisonTargets } from './package-analysis.js';
+import { readComparisonTargets, type PackageFact } from './package-analysis.js';
 
 export const packageFollowupKind = 'harness_package_followup';
 
@@ -313,16 +313,25 @@ export async function dispatchPackageFollowup(db: Pool,queue: WorkQueue,allowPro
 type FollowupTarget={rootId:string;windowId:string;projectId:string;generationId:string;payload:unknown;blocks:string[]};
 type SemanticPlan={catalogVersionId:string;stage:string;epoch:string;positions:{facadeId:string|null;positionId:string;scopeEpoch:string}[]};
 
+function followupRoot(job: ScheduledResearchJob) {
+  if (job.mode !== 'primary') return;
+  const { settings, packageWindow } = job;
+  if (settings && packageWindow) return { ...job, settings, packageWindow };
+}
+
+async function followupRouteAllowed(tx: PoolClient, projectId: string, root: NonNullable<ReturnType<typeof followupRoot>>) {
+  const { rowCount } = await tx.query(
+    `SELECT 1 FROM gateway_grants g JOIN gateway_routes r ON r.id=g.route_id AND r.revision=g.revision AND r.enabled
+     WHERE g.project_id=$1 AND g.route_id=$2 AND g.data_class=$3 AND g.purpose=$4 AND g.allowed AND r.revision=$5`,
+    [projectId, root.settings.routeId, root.settings.dataClass, root.branch==='A'?'primary_a':'primary_b', root.packageWindow.routeRevision]);
+  return Boolean(rowCount);
+}
+
 async function putFollowup(tx:PoolClient,queue:WorkQueue,row:FollowupTarget,planKey:string,semantic?:SemanticPlan,
   discovery?:PackageDiscovery, comparison?: { lineId: string; property: string }) {
   await lockIntakeProject(tx,row.projectId);
-  const root=jobSchema.parse(row.payload);
-  if (root.mode!=='primary'||!root.packageWindow||!root.settings) return false;
-  const {rows:grant}=await tx.query(
-    `SELECT 1 FROM gateway_grants g JOIN gateway_routes r ON r.id=g.route_id AND r.revision=g.revision AND r.enabled
-     WHERE g.project_id=$1 AND g.route_id=$2 AND g.data_class=$3 AND g.purpose=$4 AND g.allowed AND r.revision=$5`,
-    [row.projectId,root.settings.routeId,root.settings.dataClass,root.branch==='A'?'primary_a':'primary_b',root.packageWindow.routeRevision]);
-  if(!grant.length)return false;
+  const root = followupRoot(jobSchema.parse(row.payload));
+  if (!root || !await followupRouteAllowed(tx, row.projectId, root)) return false;
   const key='package-followup:'+hash([row.rootId,planKey,row.blocks]);
   const ref={projectId:row.projectId,scopeId:null,generationId:row.generationId};
   await queue.declarePrimary(ref,{id:key,branch:root.branch,place:key},tx);
@@ -338,19 +347,30 @@ async function putFollowup(tx:PoolClient,queue:WorkQueue,row:FollowupTarget,plan
   return true;
 }
 
+const comparisonSlotAvailable = (project: string) => `NOT EXISTS (
+  SELECT 1 FROM harness_package_followups f JOIN gateway_jobs j ON j.id=f.job_id
+  WHERE j.project_id=${project} AND j.state IN ('ready','leased'))
+  AND 4>(SELECT count(*) FROM harness_package_followups f JOIN gateway_jobs j ON j.id=f.job_id WHERE j.state IN ('ready','leased'))`;
+
 async function dispatchComparisonFollowup(tx: PoolClient, queue: WorkQueue) {
   const { rows: projects } = await tx.query<{ projectId: string }>(
     `SELECT p.project_id AS "projectId" FROM harness_package_projects p
      WHERE EXISTS (SELECT 1 FROM harness_package_facts f WHERE f.project_id=p.project_id AND f.attribute IS NOT NULL)
-       AND NOT EXISTS (SELECT 1 FROM harness_package_followups f JOIN gateway_jobs j ON j.id=f.job_id
-         WHERE j.project_id=p.project_id AND j.state IN ('ready','leased'))
-       AND 4>(SELECT count(*) FROM harness_package_followups f JOIN gateway_jobs j ON j.id=f.job_id WHERE j.state IN ('ready','leased'))
+       AND ${comparisonSlotAvailable('p.project_id')}
      ORDER BY p.last_turn,p.project_id`);
   for (const { projectId } of projects) {
     await lockIntakeProject(tx, projectId);
     const targets = await readComparisonTargets(tx, projectId);
-    if (!targets.length) continue;
-    const { rows } = await tx.query<FollowupTarget & { factId: string }>(
+    for await (const {row, planKey, comparison} of unassignedComparisonPlans(tx, projectId, targets)) {
+      if (await putFollowup(tx, queue, row, planKey, undefined, undefined, comparison)) return true;
+    }
+  }
+  return false;
+}
+
+async function* unassignedComparisonPlans(tx: PoolClient, projectId: string, targets: PackageFact[]) {
+  if (!targets.length) return;
+  const { rows } = await tx.query<FollowupTarget & { factId: string }>(
       `SELECT j.id AS "rootId",w.id AS "windowId",w.project_id AS "projectId",j.generation_id AS "generationId",j.payload,
         fact.id AS "factId",ARRAY(SELECT item->>'id' FROM jsonb_array_elements(s.blocks) item
           WHERE item->'lineIds' ? (o.payload->>'lineId')) AS blocks
@@ -361,6 +381,7 @@ async function dispatchComparisonFollowup(tx: PoolClient, queue: WorkQueue) {
        JOIN gateway_jobs origin ON origin.id=fact.job_id
        JOIN gateway_generations g ON g.generation_id=j.generation_id AND g.current
        WHERE fact.id=ANY($1::uuid[]) AND fact.project_id=$2 AND ${activeSource}
+         AND ${comparisonSlotAvailable('w.project_id')}
          AND j.payload#>>'{packageWindow,walkProtocol}'='1'
          AND (j.state='done' OR j.state='held' AND j.reason='turn_limit_final')
          AND (origin.state='done' OR origin.state='held' AND origin.reason='turn_limit_final')
@@ -368,16 +389,30 @@ async function dispatchComparisonFollowup(tx: PoolClient, queue: WorkQueue) {
            AND (a.job_id=j.id OR EXISTS (SELECT 1 FROM harness_package_followups prior
              WHERE prior.root_job_id=j.id AND prior.job_id=a.job_id)))
        ORDER BY j.created_at,j.id,fact.id`, [targets.map(({ id }) => id), projectId]);
-    const facts = new Map(targets.map((fact) => [fact.id, fact]));
-    for (const row of rows) {
-      if (!row.blocks.length) continue;
-      const { observation: { lineId }, attribute } = facts.get(row.factId)!;
-      const plan = 'comparison:' + hash([lineId, attribute!.normalize('NFKC').trim().toLowerCase().replace(/\s+/gu, ' ')]);
-      const { rowCount } = await tx.query('SELECT 1 FROM harness_package_followups WHERE root_job_id=$1 AND plan_key=$2', [row.rootId, plan]);
-      if (!rowCount && await putFollowup(tx, queue, row, plan, undefined, undefined, { lineId: lineId!, property: attribute! })) return true;
+  const facts = new Map(targets.map((fact) => [fact.id, fact]));
+  const seen = new Set<string>();
+  for (const row of rows) {
+    const { observation: { lineId }, attribute } = facts.get(row.factId)!;
+    if (!row.blocks.length || !lineId || !attribute) continue;
+    const planKey = 'comparison:' + hash([lineId, attribute.normalize('NFKC').trim().toLowerCase().replace(/\s+/gu, ' ')]);
+    const key = row.rootId + '/' + planKey;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    const { rowCount } = await tx.query('SELECT 1 FROM harness_package_followups WHERE root_job_id=$1 AND plan_key=$2', [row.rootId, planKey]);
+    if (!rowCount) yield { row, planKey, comparison: { lineId, property: attribute } };
+  }
+}
+
+export async function blockedComparisonReads(tx: PoolClient, projectId: string, targets: PackageFact[]) {
+  const blocked = [];
+  for await (const { row, comparison } of unassignedComparisonPlans(tx, projectId, targets)) {
+    const parsed = jobSchema.safeParse(row.payload);
+    const root = parsed.success && followupRoot(parsed.data);
+    if (root && !await followupRouteAllowed(tx, projectId, root)) {
+      blocked.push({ windowId: row.windowId, branch: root.branch, state: 'route_required' as const, ...comparison });
     }
   }
-  return false;
+  return blocked;
 }
 
 const profileScanPlan='facade-profile-scan';

@@ -10,7 +10,7 @@ export type ComparisonGap = "facade_link_unproven" | "facades_differ" | "variant
 
 type ComparisonSource = { citation: Citation; binding: FacadeObservation["binding"]; variant: string | null;
   stage: string | null; revision: string | null; revisionStatus: FacadeObservation["revisionStatus"];
-  sourceRole: string; valueRole: FacadeFact["finding"]["valueRole"]; clarification?: ComparisonRead[] };
+  sourceRole: string; valueRole?: FacadeFact["finding"]["valueRole"]; clarification?: ComparisonRead[] };
 type ComparisonItem = { id: string; property: string; facadeId: string | null; reasons: ComparisonGap[];
   sources: [ComparisonSource, ComparisonSource] };
 export type ComparisonReview = { items: ComparisonItem[]; limited: boolean };
@@ -147,7 +147,7 @@ export function comparisonReview(facts: FacadeFact[], observations: FacadeObserv
       const source = (fact: FacadeFact, observation: FacadeObservation): ComparisonSource => ({
         citation: fact.finding.citation, binding: observation.binding, variant: fact.variant, stage: fact.stage,
         revision: observation.revision, revisionStatus: observation.revisionStatus, sourceRole: fact.finding.sourceRole,
-        valueRole: fact.finding.valueRole,
+        ...(fact.finding.valueRole ? { valueRole: fact.finding.valueRole } : {}),
         ...(reads.has(observation.id) ? { clarification: reads.get(observation.id) } : {}),
       });
       items.set(comparisonKey, { id, property: a.property!, facadeId, reasons, sources: [source(a, oa), source(b, ob)] });
