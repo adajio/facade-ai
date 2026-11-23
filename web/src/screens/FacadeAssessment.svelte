@@ -20,6 +20,8 @@
   let view = $derived(summary?.contexts.find((item) => item.assessmentContextId === contextId));
   let questions = $derived(view?.questions.filter((item) => !context.filter || item.outcome === context.filter) ?? []);
   let active = $derived(questions.find((item) => item.id === context.objectId));
+  let reviewItems = $derived(summary?.comparisonReview?.items.filter((item) =>
+    !view?.facadeId || !item.facadeId || item.facadeId === view.facadeId) ?? []);
   let busy = $state(false);
   let result = $state('');
   let commandError = $state('');
@@ -151,6 +153,14 @@
     <dl class="details">
       <dt>Машинная оценка</dt><dd>{label(summary.outcome)}</dd>
       <dt>Стадия</dt><dd>{summary.stage ?? 'Ожидает подтверждения'}</dd>
+      {#if summary.profile}
+        <dt>Рабочая матрица</dt>
+        <dd>{summary.profile.state === 'active' && summary.catalog
+          ? summary.catalog.name + ' · редакция ' + summary.catalog.revision : reason(summary.profile.state)}</dd>
+        {#if summary.profile.confirmedKinds.length}
+          <dt>Типы для выбора матрицы</dt><dd>{summary.profile.confirmedKinds.join(', ')}</dd>
+        {/if}
+      {/if}
       <dt>Ревизия оценки</dt><dd>{summary.version}</dd>
       {#each Object.entries(coverageLabels) as [key, text] (key)}
         {@const boundary = summary.coverage[key as keyof FacadeAssessment['coverage']]}
@@ -163,6 +173,9 @@
     </dl>
     {#if summary.limitations.length}
       <ul class="plain-list">{#each summary.limitations as limit (limit)}<li>{reason(limit)}</li>{/each}</ul>
+    {/if}
+    {#if !overview && !historicalVersion && summary.profile?.state !== 'active' && context.project.actions?.includes('project:manage')}
+      <a href={scopedUrl(context.project.id, 'members', {})}>Управление стадией и рабочим каталогом</a>
     {/if}
   </section>
 
@@ -177,6 +190,51 @@
       {#if context.params.has('binding')}
         <FacadeObservations {api} {context} {summary} {open} />
       {/if}
+    </section>
+  {/if}
+
+  {#if !overview && (reviewItems.length || summary.comparisonReview?.limited)}
+    <section class="card">
+      <h2>Междокументные сверки</h2>
+      {#each reviewItems as item (item.id)}
+        <details>
+          <summary>{item.property} · {reason(item.reasons[0])}</summary>
+          {#if item.reasons.length > 1}
+            <ul class="plain-list">{#each item.reasons.slice(1) as gap (gap)}<li>{reason(gap)}</li>{/each}</ul>
+          {/if}
+          <ul class="plain-list">
+            {#each item.sources as source (source.citation.evidenceId)}
+              <li>
+                <strong>{source.citation.label ?? 'Оригинал'}</strong>
+                {#if source.binding.candidates.length} · {source.binding.candidates.map(({ label }) => label).join(', ')}{/if}
+                {#if source.variant} · исполнение {source.variant}{/if}
+                {#if source.revision} · редакция {source.revision}{/if}
+                {#if source.stage} · стадия {source.stage}{/if}
+                {#if source.revisionStatus !== 'current'} · действующая редакция требует сверки{/if}
+                {#if source.citation.quote}<blockquote>{source.citation.quote}</blockquote>{/if}
+              </li>
+            {/each}
+          </ul>
+          <EvidenceButtons citations={item.sources.map(({ citation }) => ({ ...citation, sourceLabel: citation.label }))} {open} />
+        </details>
+      {/each}
+      {#if summary.comparisonReview?.limited}<p>Проверена только часть сочетаний источников.</p>{/if}
+    </section>
+  {/if}
+
+  {#if !overview && summary.unresolvedMentions?.items.length}
+    <section class="card">
+      <h2>Упоминания без установленного фасада</h2>
+      <p>Найдите вторую адресную опору с проектным идентификатором либо обозначением корпуса и осей.</p>
+      <ul class="plain-list">
+        {#each summary.unresolvedMentions.items as item}
+          <li>
+            {item.label} · {item.citation.quote}
+            <EvidenceButtons citations={[item.citation]} {open} />
+          </li>
+        {/each}
+      </ul>
+      {#if summary.unresolvedMentions.limited}<p>Показана часть адресных упоминаний.</p>{/if}
     </section>
   {/if}
 
@@ -228,10 +286,22 @@
         {/if}
       </dl>
       {#if view.facadeId}
-        {#key view.facadeId}
-          <FacadeTypeControl {api} {context} facade={view} assessmentVersion={summary.version}
-            historical={Boolean(historicalVersion)} {open} refreshProject={refreshType} />
-        {/key}
+        {#if view.identity?.sources.length}
+          <h3>Основания принадлежности</h3>
+          <p>{view.identity.state === 'independent' ? 'Подтверждено двумя ветвями' : view.identity.state === 'engineer'
+            ? 'Уточнено инженером' : 'Установлено по адресной опоре одной ветви'}</p>
+          <EvidenceButtons citations={view.identity.sources.map(({ citation }) => citation)} {open} />
+        {/if}
+        {#if view.conflictingTypes?.length}
+          <h3>Разные типы в действующих оригиналах</h3>
+          <p>Сверьте редакции и принадлежность опор перед подтверждением типа.</p>
+          <EvidenceButtons citations={view.conflictingTypes.map(({ kind, citation }) => ({ ...citation, sourceLabel: kind }))} {open} />
+        {:else}
+          {#key view.facadeId}
+            <FacadeTypeControl {api} {context} facade={view} assessmentVersion={summary.version}
+              historical={Boolean(historicalVersion)} {open} refreshProject={refreshType} />
+          {/key}
+        {/if}
       {/if}
       {#if context.canEdit && !historicalVersion && view.questions.length}
         <form onsubmit={(event) => save(event, 'conclusion')}>

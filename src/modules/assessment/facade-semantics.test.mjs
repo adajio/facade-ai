@@ -119,6 +119,8 @@ test("review compares drawing and schedule only for an approved equal value role
   }
   assert.equal(run([a, b], requirement, []).outcome, "needs_review");
   assert.equal(run([a, b]).outcome, "confirmed_conflict");
+  assert.equal(run([a, b], { ...requirement, evidenceRule: { allOf: [{ anyOf: [{ sourceRole: "drawing" }] }] } }).outcome,
+    "confirmed_conflict");
   const [typedRequirement] = requirementsFor([{ ...fixtureRow, comparison, facadeKinds: ["panel"] }],
     { ...context, facadeType: { state: "confirmed", kind: "panel" } }, "P");
   assert.equal(run([a, b], typedRequirement).outcome, "confirmed_conflict");
@@ -156,4 +158,48 @@ test("per-facade verified type changes only the applicable set and expires with 
   assert.equal(facadeTypeView(assignment, fact, "f2", "P").state, "stale");
   assert.equal(facadeTypeView(assignment, fact, "f1", "R").state, "stale");
   assert.equal(facadeTypeView(assignment, { ...fact, revision: "R2" }, "f1", "P").state, "stale");
+});
+
+test("an addressed mark without identity does not silently join or become a conflict", async () => {
+  const { facadeDiscovery } = await built("assessment/facade-input");
+  const { comparisonReview } = await built("assessment/facade-comparison");
+  const base = { evidenceId: "title-a", versionId: "v-a", readerVersion: "fixture", address: { unitId: "1" }, label: "F1",
+    factId: "a", branch: "A", quote: "Project facade id: F1", kind: "registry" };
+  const loose = { ...base, evidenceId: "title-b", versionId: "v-b", factId: "b", branch: "B",
+    kind: "unresolved", quote: "F1" };
+  const id = "persisted-context";
+  const fact = (factId, revisionStatus = "current", state = "identified") => ({ id: factId, revisionStatus, binding: {
+    state, candidates: state === "identified" ? [{ id, label: "F1" }] : [],
+  } });
+  const profile = { facadeId: id, label: "F1", identity: "one_branch", mentions: [base, loose], attributes: {}, conflicts: [] };
+  const unresolved = fact("b", "current", "unclear");
+  const discovery = facadeDiscovery([fact("a"), unresolved], [profile], [base, loose]);
+  assert.equal(discovery.placed(fact("a")), true);
+  assert.equal(discovery.placed(unresolved), false);
+  assert.deepEqual(discovery.unresolved, [loose]);
+  assert.equal(facadeDiscovery([fact("a", "superseded")], [profile], [base]).placed(fact("a")), false);
+  const qualifiedAlias = { ...loose, label: "Qualified alias", kind: "registry" };
+  const strengthened = facadeDiscovery([fact("a"), fact("b")], [profile], [base, qualifiedAlias]);
+  assert.equal(strengthened.placed(fact("b")), true);
+  assert.deepEqual(strengthened.unresolved, []);
+
+  const sample = (observationId, branch, value, membership, variant) => ({ membership, property: "Anchor spacing", stage: "P", variant,
+    addressedValue: true, runId: `run-${branch}`, finding: { kind: "value", format: "pdf", applicability: "active", sourceRole: "drawing",
+      citation: { observationId, evidenceId: `e-${branch}`, branch, documentId: `d-${branch}`, versionId: `v-${branch}`, sha256: branch,
+        address: { unitId: "1" }, value, unit: "mm" } } });
+  const a = sample("a", "A", "40", { kind: "facades", facadeIds: [id] }, "V1");
+  const b = sample("b", "B", "60", { kind: "ambiguous" }, null);
+  const oa = { id: "a", revision: "RA", revisionStatus: "current", binding: fact("a").binding };
+  const ob = { id: "b", revision: null, revisionStatus: "unknown", binding: { state: "unidentified", candidates: [] } };
+  const view = comparisonReview([a, b], [oa, ob], [], null, "P", [], [loose]);
+  assert.equal(view.items.length, 1);
+  assert.deepEqual(view.items[0].reasons, ["facade_link_unproven", "variant_unproven", "revisions_unproven", "comparison_rule_unproven"]);
+  assert.deepEqual(view.items[0].sources.map(({ citation }) => citation.evidenceId), ["e-A", "e-B"]);
+  const other = { ...ob, revision: "RB", revisionStatus: "current", binding: { state: "identified",
+    candidates: [{ id: "other-facade", label: "F1" }] } };
+  const distinct = comparisonReview([a, { ...b, membership: { kind: "facades", facadeIds: ["other-facade"] }, variant: "V1" }],
+    [oa, other], [], null, "P", []);
+  assert.equal(distinct.items[0].reasons[0], "facades_differ");
+  assert.deepEqual(comparisonReview([a, { ...b, finding: { ...b.finding, applicability: "superseded" } }],
+    [oa, ob], [], null, "P", [], [loose]).items, []);
 });

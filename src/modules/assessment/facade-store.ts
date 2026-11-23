@@ -1,12 +1,14 @@
 import { createHash } from "node:crypto";
 import type { PoolClient } from "pg";
-import { getCatalog, getProject, matchesDefaultProfile } from "../access/project-state.js";
+import type { FacadeMention } from "../harness/facade-discovery.js";
+import { catalogOptions, getCatalog, getProject, invariantProfileRequirements, matchesDefaultProfile } from "../access/project-state.js";
 import { lockIntakeProject } from "../intake/gate.js";
 import { publishProjectEvent } from "../supplements/events.js";
 import { canonicalJson, evaluate, requirementSubjectKey } from "./domain.js";
+import { comparisonReview, type ComparisonReview } from "./facade-comparison.js";
 import { readFacadeInput, type FacadeObservation } from "./facade-input.js";
 import { assessSemanticRemainder, facadeVerdict, type SemanticRemainder } from "./facade-semantic.js";
-import { facadeTypeView, readFacadeTypes, type FacadeType } from "./facade-types.js";
+import { conflictingFacadeTypes, facadeTypeView, readFacadeTypes, type FacadeType } from "./facade-types.js";
 import {
   facadeReview, requirementsFor, type CoverageBoundary, type FacadeCandidate, type FacadeContext,
   type FacadeCoverage, type FacadeCoverageProof,
@@ -19,6 +21,17 @@ import {
 type FacadeInput = Awaited<ReturnType<typeof readFacadeInput>>;
 type Catalog = Awaited<ReturnType<typeof getCatalog>>;
 type ActiveContext = Awaited<ReturnType<typeof synchronizeContext>>;
+
+function mentionSource(mention: FacadeMention, observations: Map<string, FacadeObservation>) {
+  const { factId, evidenceId, versionId, branch, quote, address, kind, label, context } = mention;
+  const observation = observations.get(factId);
+  if (!observation || observation.versionId !== versionId) return [];
+  return [{ label, kind, context, citation: { versionId, evidenceId, branch, quote, address,
+    documentId: observation.documentId, sha256: observation.sha256,
+    href: `/api/v1/evidence/${evidenceId}` } }];
+}
+
+type MentionSource = ReturnType<typeof mentionSource>[number];
 
 export function facadeAssessmentHref(projectId: string) {
   return `/api/v1/projects/${projectId}/facade-assessment`;
@@ -64,7 +77,8 @@ async function registerContexts(tx: PoolClient, projectId: string, candidates: F
 }
 
 async function synchronizeContext(tx: PoolClient, projectId: string, context: FacadeContext, stage: string | null,
-  catalog: Catalog | null, input: FacadeInput, coverage: FacadeCoverage, gate: Gate, limitations: string[]) {
+  catalog: Catalog | null, input: FacadeInput, coverage: FacadeCoverage, gate: Gate, limitations: string[],
+  knownSubjectKeys?: ReadonlySet<string>) {
   const existing = await getRevision(tx, projectId, context.id);
   await tx.query(`INSERT INTO assessment_series(project_id,scope_id,assessment_context_id) VALUES($1,$2,$2)
     ON CONFLICT (scope_id) DO NOTHING`, [projectId, context.id]);
@@ -95,10 +109,6 @@ async function synchronizeContext(tx: PoolClient, projectId: string, context: Fa
   const replaceByQuestion = Map.groupBy(input.replacements.filter(({ catalogVersionId }) =>
     catalogVersionId === catalog?.id), ({ questionId }) => questionId);
   const impactsByQuestion = Map.groupBy(input.impacts, ({ questionId }) => questionId);
-  const knownSubjectKeys = new Set(catalog?.requirements.flatMap((row) => [
-    row.part, ...row.aliases ?? [],
-    ...row.evidenceRule?.allOf.flatMap(({ anyOf }) => anyOf.flatMap(({ subject }) => subject ? [subject] : [])) ?? [],
-  ]).map(requirementSubjectKey));
   for (const requirement of rows) {
     const id = byKey.get(requirement.positionId)!;
     const old = oldById.get(id);
@@ -153,6 +163,9 @@ type FacadeSummary = Omit<ContextSnapshot, "scope" | "questions"> & {
   kind: FacadeContext["kind"];
   facadeId: string | null;
   facadeType?: FacadeType;
+  conflictingTypes?: { kind: string; citation: Pick<FacadeObservation, "evidenceId" | "versionId" | "documentId" | "sha256" | "address"> &
+    { quote?: string } }[];
+  identity?: { state: "independent" | "one_branch" | "engineer"; sources: MentionSource[] };
   name: string;
   counts: Record<string, number>;
   questionHolds: { questionId: string; receiptIds: string[] }[];
@@ -181,6 +194,9 @@ type FacadeSnapshot = {
   projectId: string;
   catalogVersionId: string | null;
   catalog: Pick<Catalog, "id" | "key" | "name" | "revision"> | null;
+  profile?: { state: string; confirmedKinds: string[] };
+  comparisonReview?: ComparisonReview;
+  unresolvedMentions?: { items: MentionSource[]; limited: boolean };
   stage: string | null;
   coverage: FacadeCoverage;
   activeWindows: number;
@@ -207,16 +223,28 @@ export async function synchronizeFacadeAssessment(tx: PoolClient, projectId: str
   const contexts = await registerContexts(tx, projectId, input.evidence.facades);
   const assignments = await readFacadeTypes(tx, projectId);
   const observationsById = new Map(input.observations.map((fact) => [fact.id, fact]));
+  const typesByFacade = Map.groupBy(input.observations.filter(({ facadeKindSourceVerified, binding }) =>
+    facadeKindSourceVerified && binding.candidates.length === 1), ({ binding }) => binding.candidates[0].id);
+  const conflicted = new Map<string, FacadeObservation[]>();
   for (const context of contexts) {
     if (!context.facadeId) continue;
     const assignment = assignments.get(context.id);
-    context.facadeType = facadeTypeView(assignment, assignment && observationsById.get(assignment.basis.id), context.facadeId, project.stage);
+    const conflicts = conflictingFacadeTypes(typesByFacade.get(context.facadeId) ?? [], context.facadeId, project.stage);
+    if (conflicts.length) conflicted.set(context.facadeId, conflicts);
+    context.facadeType = facadeTypeView(assignment, assignment && observationsById.get(assignment.basis.id),
+      context.facadeId, project.stage, Boolean(conflicts.length));
   }
   const types = contexts.flatMap(({ facadeId, facadeType }) => facadeId ? [facadeType?.state === "confirmed" ? facadeType.kind : null] : []);
+  const knownKinds = [...new Set(types.filter((type): type is string => type !== null))].sort();
   const staleProfile = project.facadeKindsFromAssignments && (types.includes(null) ||
-    canonicalJson([...new Set(types)].sort()) !== canonicalJson(project.confirmedFacadeKinds));
-  const catalog = pinned && (!project.intakeMode || !staleProfile && matchesDefaultProfile(project, pinned)) ? pinned : null;
-  const catalogLimitations = !catalog ? [pinned ? staleProfile ? "facade_profile_basis_stale" : "catalog_not_applicable" : "catalog_unassigned"] :
+    canonicalJson(knownKinds) !== canonicalJson(project.confirmedFacadeKinds));
+  const retained = staleProfile && pinned ? await invariantProfileRequirements(tx, project, pinned, knownKinds) : [];
+  const catalog = pinned && (!project.intakeMode || !staleProfile && matchesDefaultProfile(project, pinned)) ? pinned :
+    pinned && retained.length ? { ...pinned, requirements: retained } : null;
+  const profileState = !project.stage ? "stage_unknown" : staleProfile ? "facade_profile_basis_stale" :
+    catalog?.requirements.length ? "active" : catalog ? "catalog_empty" : pinned ? "catalog_not_applicable" :
+      (await catalogOptions(tx, project)).reason;
+  const catalogLimitations = staleProfile ? ["facade_profile_basis_stale"] : !catalog ? [pinned ? "catalog_not_applicable" : "catalog_unassigned"] :
     !catalog.requirements.length ? ["catalog_empty"] :
     catalog.requirements.some((row) => !("level" in row) || !["facade", "common"].includes(String(row.level))) ?
       ["catalog_scope_undeclared"] : [];
@@ -232,10 +260,24 @@ export async function synchronizeFacadeAssessment(tx: PoolClient, projectId: str
   }
   const active = [];
   const summaries = [];
+  const knownSubjectKeys = new Set(pinned?.requirements.flatMap((row) => [
+    row.part, ...row.aliases ?? [],
+    ...row.evidenceRule?.allOf.flatMap(({ anyOf }) => anyOf.flatMap(({ subject }) => subject ? [subject] : [])) ?? [],
+  ]).map(requirementSubjectKey));
   for (const context of contexts) {
-    const result = await synchronizeContext(tx, projectId, context, project.stage, catalog, input, coverage, gate, catalogLimitations);
+    const result = await synchronizeContext(tx, projectId, context, project.stage, catalog, input, coverage, gate,
+      catalogLimitations, knownSubjectKeys);
     active.push(result);
-    summaries.push(await summarize(tx, result, gate));
+    const summary = await summarize(tx, result, gate);
+    const identity = context.facadeId ? input.discovery.identity.get(context.facadeId) : undefined;
+    if (identity && identity.identity !== "unresolved") summary.identity = {
+      state: identity.identity, sources: identity.mentions.slice(0, 8).flatMap((mention) => mentionSource(mention, observationsById)),
+    };
+    if (context.facadeId && conflicted.has(context.facadeId)) summary.conflictingTypes = conflicted.get(context.facadeId)!.slice(0, 8)
+      .map(({ proposedFacadeKind, evidenceId, versionId, documentId, sha256, address, quote }) => ({
+        kind: proposedFacadeKind!, citation: { evidenceId, versionId, documentId, sha256, address, ...(quote ? { quote } : {}) },
+      }));
+    summaries.push(summary);
   }
   const questions = summaries.flatMap(({ questions }) => questions);
   if (questions.some(({ semanticRemainder }) => semanticRemainder.state === "open")) limitations.push("semantic_remainder_open");
@@ -255,12 +297,17 @@ export async function synchronizeFacadeAssessment(tx: PoolClient, projectId: str
   const catalogView = catalog ? { id: catalog.id, key: catalog.key, name: catalog.name, revision: catalog.revision } : null;
   const payload: FacadeSnapshot = {
     projectId, catalogVersionId: project.catalogVersionId, catalog: catalogView, stage: project.stage, coverage, limitations, contexts: summaries,
+    profile: { state: profileState, confirmedKinds: staleProfile ? knownKinds : project.confirmedFacadeKinds },
+    comparisonReview: comparisonReview(input.evidence.facts, input.observations, contexts, catalog, project.stage, input.evidence.pairs,
+      input.discovery.unresolved),
+    unresolvedMentions: { limited: input.discovery.unresolved.length > 24,
+      items: input.discovery.unresolved.slice(0, 24).flatMap((mention) => mentionSource(mention, observationsById)) },
     activeWindows: input.activeWindows, completedWindows: input.completedWindows,
     structurallyReviewedWindows: input.structurallyReviewedWindows,
     observations: { counts, proposalCounts, refs: observations.map(({ ref }) => ref).sort() },
     outcome: facadeVerdict(coverage, limitations, questions),
   };
-  if (latest && canonicalJson(latest.payload) === canonicalJson(payload)) return { ...latest, gate, active, input };
+  if (latest && canonicalJson(latest.payload) === canonicalJson(payload)) return { ...latest, gate, active, input, conflicted };
   const previous = new Set(latest?.payload.observations.refs);
   const newObservations = observations.filter(({ ref }) => !previous.has(ref));
   if (newObservations.length) {
@@ -275,7 +322,7 @@ export async function synchronizeFacadeAssessment(tx: PoolClient, projectId: str
   await tx.query(`INSERT INTO facade_assessment_snapshots(project_id,version,payload) VALUES($1,$2,$3)`,
     [projectId, version, payload]);
   await publishProjectEvent(tx, projectId, { type: "facade-assessment.changed", payload: { version } });
-  return { version, payload, gate, active, input };
+  return { version, payload, gate, active, input, conflicted };
 }
 
 export async function readFacadeSnapshot(tx: PoolClient, projectId: string, version?: number) {

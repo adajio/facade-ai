@@ -123,6 +123,24 @@ export function matchesDefaultProfile(project: Project, catalog: Catalog) {
     profile.facadeKinds.every((kind, index) => kind === project.confirmedFacadeKinds[index]));
 }
 
+export async function invariantProfileRequirements(tx: PoolClient, project: Project, pinned: Catalog, knownKinds: string[]) {
+  if (!project.stage || pinned.defaultProfile?.stage !== project.stage || !pinned.requirements.length) return [];
+  const { rows } = await tx.query<{ requirement: CatalogRequirement }>(
+    `WITH possible AS (
+       SELECT requirements FROM catalog_versions
+       WHERE organization_id=$1 AND default_stage=$2 AND default_facade_kinds @> $3::text[]
+         AND jsonb_array_length(requirements)>0
+     )
+     SELECT retained.item AS requirement FROM jsonb_array_elements($4::jsonb) WITH ORDINALITY retained(item, ordinal)
+     WHERE EXISTS (SELECT 1 FROM possible) AND NOT EXISTS (
+       SELECT 1 FROM possible WHERE NOT EXISTS (
+         SELECT 1 FROM jsonb_array_elements(possible.requirements) matched(item) WHERE matched.item=retained.item
+       )
+     ) ORDER BY retained.ordinal`, [project.organizationId, project.stage, knownKinds, JSON.stringify(pinned.requirements)],
+  );
+  return rows.map(({ requirement }) => requirement);
+}
+
 export async function assignCatalog(tx: PoolClient, project: Project, scopes: ProjectScope[], catalogVersionId: string) {
   // Record the old revision before changing the pin, including a solely historical empty catalog.
   if (project.catalogVersionId !== null) {

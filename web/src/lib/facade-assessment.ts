@@ -29,6 +29,7 @@ export type FacadeType = {
 };
 
 export type Boundary = { complete: boolean; reason: string | null; basisIds: string[] };
+type MentionSource = { label: string; kind: string; context?: { building: string; axes: string }; citation: Citation };
 export type FacadeContext = Omit<Assessment, 'scope' | 'catalogVersionId'> & {
   assessmentContextId: string;
   kind: 'facade' | 'common';
@@ -36,12 +37,22 @@ export type FacadeContext = Omit<Assessment, 'scope' | 'catalogVersionId'> & {
   name: string;
   counts: Record<string, number>;
   facadeType?: FacadeType;
+  conflictingTypes?: { kind: string; citation: Citation }[];
+  identity?: { state: 'independent' | 'one_branch' | 'engineer'; sources: MentionSource[] };
   questionHolds: { questionId: string; receiptIds: string[] }[];
 };
 export type FacadeAssessment = {
   projectId: string;
   version: number;
   catalogVersionId: string | null;
+  catalog?: { name: string; revision: number } | null;
+  profile?: { state: string; confirmedKinds: string[] };
+  comparisonReview?: { limited: boolean; items: {
+    id: string; property: string; facadeId: string | null; reasons: string[];
+    sources: { citation: Citation; binding: FacadeObservation['binding']; variant: string | null;
+      stage: string | null; revision: string | null; revisionStatus: string; sourceRole: string }[];
+  }[] };
+  unresolvedMentions?: { items: MentionSource[]; limited: boolean };
   stage: string | null;
   activeWindows: number;
   completedWindows: number;
@@ -63,6 +74,10 @@ export const coverageLabels = {
 export const assessmentReasons: Record<string, string> = {
   catalog_unassigned: 'Нет рабочего каталога',
   catalog_not_applicable: 'Назначенный каталог не применим к текущей стадии и типам фасадов',
+  facades_unconfirmed: 'Подтвердите типы обнаруженных фасадов',
+  no_approved_profile: 'Для подтверждённой стадии и типов пока нет утверждённой матрицы',
+  multiple_profiles: 'Подходит несколько утверждённых матриц. Владелец проекта выбирает рабочую версию',
+  applicable_profile: 'Найдена подходящая матрица. Владелец проекта может закрепить её',
   catalog_empty: 'В каталоге нет требований',
   catalog_scope_undeclared: 'Для строк каталога требуется область применимости',
   catalog_evidence_rule_unset: 'В каталоге не задано правило проверки доказательств по требованию',
@@ -87,4 +102,15 @@ export const assessmentReasons: Record<string, string> = {
   required_evidence_incomplete: 'Комплект обязательных доказательств по требованию неполон',
   alternatives_unverified: 'Проверка возможных альтернатив не завершена',
   pair_verification_required: 'Для подтверждения противоречия нужна сверка пары опор',
+  facade_link_unproven: 'Сверьте корпус, оси или проектный идентификатор фасада в обеих опорах',
+  facades_differ: 'Одинаковое обозначение относится к разным установленным фасадам',
+  variant_unproven: 'Установите исполнение изделия в каждой опоре',
+  variants_differ: 'В опорах указаны разные исполнения изделия',
+  revisions_unproven: 'Сверьте действующие редакции обоих оригиналов',
+  project_stage_unconfirmed: 'Владелец проекта должен подтвердить стадию',
+  source_stage_unproven: 'Подтвердите стадию материала по адресу опоры',
+  source_stages_differ: 'Стадия одного из материалов отличается от стадии проекта',
+  source_role_unproven: 'Сверьте назначение источников по их заголовкам',
+  comparison_rule_unproven: 'Для этой пары требуется применимое правило сопоставимости ролей, назначения значения и приоритета',
+  units_not_comparable: 'Сверьте единицы и величины в обеих опорах',
 };

@@ -20,11 +20,19 @@ function verifiedTypeSource(fact: FacadeObservation | undefined, facadeId: strin
     (!stage || !fact.designStage || requirementSubjectKey(stage) === requirementSubjectKey(fact.designStage));
 }
 
+export function conflictingFacadeTypes(facts: FacadeObservation[], facadeId: string, stage: string | null) {
+  const sources = new Map(facts.flatMap((fact) => {
+    const kind = fact.proposedFacadeKind;
+    return kind && verifiedTypeSource(fact, facadeId, kind, stage) ? [[requirementSubjectKey(kind), fact] as const] : [];
+  }));
+  return sources.size > 1 ? [...sources.values()] : [];
+}
+
 export function facadeTypeView(assignment: Assignment | undefined, fact: FacadeObservation | undefined, facadeId: string,
-  stage: string | null): FacadeType {
+  stage: string | null, conflicted = false): FacadeType {
   if (!assignment) return { state: "unconfirmed", kind: null, basis: null, version: null };
   const { basis, kind, version } = assignment;
-  const current = fact && verifiedTypeSource(fact, facadeId, kind, stage) && fact.id === basis.id &&
+  const current = !conflicted && fact && verifiedTypeSource(fact, facadeId, kind, stage) && fact.id === basis.id &&
     fact.evidenceId === basis.evidenceId && fact.versionId === basis.versionId &&
     fact.binding.version === basis.bindingVersion && fact.revision === basis.revision;
   return { state: current ? "confirmed" : "stale", kind, basis, version };

@@ -1,5 +1,5 @@
 import type { PoolClient } from "pg";
-import { readPackageAnalysis, type PackageFact } from "../harness/package-analysis.js";
+import { readPackageAnalysis, type PackageAnalysis, type PackageFact } from "../harness/package-analysis.js";
 import { deliveredLines } from "../questions/attribute-aliases.js";
 import { hasAddressedSubject } from "../questions/subject-evidence.js";
 import { canonicalJson, isInventoryRole } from "./domain.js";
@@ -12,7 +12,6 @@ type AcceptedVersion = { id: string; sha256: string; documentId: string; label: 
 type Impact = { receiptId: string; questionId: string };
 type ConfirmedStage = { versionId: string; target: ReaderAddress | null; stage: string; evidenceId: string };
 type EvidenceMetadata = Pick<Evidence, "source" | "address" | "representation">;
-const typeAttribute = /^(?:тип фасада|facade (?:kind|type))$/iu;
 const typeClause = /^(?:тип фасада|facade (?:kind|type))\s*[:=–—]\s*([\p{L}\p{N}][\p{L}\p{N} _-]{0,99})\s*$/iu;
 type ReplacementReference = { observationId: string; evidenceId: string; versionId: string; address: Record<string, unknown> };
 export type FacadeReplacement = {
@@ -25,14 +24,15 @@ export type FacadeReplacement = {
 };
 
 function convertFact(fact: PackageFact, accepted: Map<string, AcceptedVersion>, formats: Map<string, string>,
-  stages: Map<string, ConfirmedStage>, evidence: Map<string, EvidenceMetadata>, original: ReaderLine[] | undefined): FacadeFact | null {
+  stages: Map<string, ConfirmedStage>, evidence: Map<string, EvidenceMetadata>, original: ReaderLine[] | undefined,
+  provenFacade: boolean): FacadeFact | null {
   const { source, quote, value, unit, evidenceId, receiptId, runId, lineId, address, components, deliveryStatement } = fact.observation;
   const acceptedOriginal = accepted.get(source.versionId);
   const format = formats.get(fact.windowId);
   if (!acceptedOriginal || acceptedOriginal.sha256 !== source.sha256 || acceptedOriginal.documentId !== source.documentId || !format) return null;
   const { state, candidates, actorId } = fact.binding;
   const anchored = Boolean(fact.binding.quote || actorId);
-  const membership = state === "identified" && anchored && candidates.length ?
+  const membership = state === "identified" && provenFacade && candidates.length ?
     { kind: "facades" as const, facadeIds: candidates.map(({ id }) => id) } :
     state === "common" && anchored ? { kind: "common" as const } :
     { kind: state === "unidentified" ? "unidentified" as const : "ambiguous" as const };
@@ -124,7 +124,7 @@ function typeInLine(line: string) {
 export function facadeObservation(fact: PackageFact, originalLine?: string) {
   const { observation, id, branch, attribute, sourceRole, designStage, revision, revisionStatus, basis, binding, evidenceHref } = fact;
   const quote = observation.quote ?? null;
-  const proposedFacadeKind = attribute && typeAttribute.test(attribute.trim()) && quote && basis.role &&
+  const proposedFacadeKind = quote && basis.role &&
     binding.state === "identified" && revisionStatus !== "superseded" && observation.grounding === "text"
     ? typeInLine(quote) : null;
   const facadeKindSourceVerified = Boolean(proposedFacadeKind && originalLine && quote && originalLine.includes(quote) &&
@@ -138,6 +138,24 @@ export function facadeObservation(fact: PackageFact, originalLine?: string) {
 }
 
 export type FacadeObservation = ReturnType<typeof facadeObservation>;
+
+export function facadeDiscovery(facts: PackageFact[], profiles: PackageAnalysis["facadeProfiles"],
+  mentions: PackageAnalysis["facadeMentions"]) {
+  const current = new Map(facts.filter((fact) => fact.revisionStatus !== "superseded").map((fact) => [fact.id, fact]));
+  // The publication already applies the persisted identity aliases and hides provisional bindings.
+  const placed = ({ id, binding }: PackageFact) => current.has(id) && binding.state === "identified" && binding.candidates.length > 0;
+  const identity = new Map(profiles.filter(({ identity }) => identity !== "unresolved").map((profile) => [profile.facadeId, {
+    ...profile, mentions: profile.mentions.filter(({ factId }) => {
+      const fact = current.get(factId);
+      return fact && placed(fact) && fact.binding.candidates.some(({ id }) => id === profile.facadeId);
+    }),
+  }]));
+  const unresolved = mentions.filter(({ factId }) => {
+    const fact = current.get(factId);
+    return fact && fact.binding.state !== "common" && !placed(fact);
+  });
+  return { placed, identity, unresolved };
+}
 
 export async function readFacadeInput(tx: PoolClient, projectId: string) {
   const { rows: [intake] } = await tx.query<{
@@ -226,8 +244,8 @@ export async function readFacadeInput(tx: PoolClient, projectId: string) {
     `SELECT id,payload FROM reader_evidence WHERE project_id=$1 AND id=ANY($2::uuid[])`, [projectId, evidenceIds],
   )).rows : [];
   const evidenceById = new Map(evidenceRows.map(({ id, payload }) => [id, payload]));
-  const statementIds = activeFacts.filter(({ attribute, observation }) =>
-    observation.deliveryStatement || observation.components?.length || (attribute && typeAttribute.test(attribute.trim()))).map(({ id }) => id);
+  const statementIds = activeFacts.filter(({ observation }) =>
+    observation.deliveryStatement || observation.components?.length || typeInLine(observation.quote ?? "")).map(({ id }) => id);
   const { rows: statements } = statementIds.length ? await tx.query<{ id: string; content: string }>(
     `SELECT o.id,issued.content FROM reader_observations o
        JOIN LATERAL (
@@ -238,8 +256,13 @@ export async function readFacadeInput(tx: PoolClient, projectId: string) {
      WHERE o.project_id=$1 AND o.id=ANY($2::uuid[]) AND o.payload->>'grounding'='text'`, [projectId, statementIds],
   ) : { rows: [] };
   const originalLines = new Map(statements.map(({ id, content }) => [id, deliveredLines(content)]));
+  const discovery = facadeDiscovery(activeFacts, analysis.facadeProfiles, analysis.facadeMentions);
+  const observations = activeFacts.map((fact) => facadeObservation(
+    fact.binding.state === "identified" && !discovery.placed(fact) ? { ...fact, binding: { ...fact.binding, state: "unclear",
+      reason: "Адресное упоминание ещё не подтверждает принадлежность фасаду." } } : fact,
+    originalLines.get(fact.id)?.find(({ id }) => id === fact.observation.lineId)?.text));
   const facts = activeFacts.flatMap((fact) => convertFact(fact, accepted, formats, stageByAddress, evidenceById,
-    originalLines.get(fact.id)) ?? []);
+    originalLines.get(fact.id), discovery.placed(fact)) ?? []);
   const coveredWindows = windows.flatMap((window) => {
     const a = completedReaderJob(window, "A");
     const b = completedReaderJob(window, "B");
@@ -254,16 +277,15 @@ export async function readFacadeInput(tx: PoolClient, projectId: string) {
     { versionIds, basisIds: coveredWindows.flat().sort() } : null;
   const evidence: FacadeReadout = {
     facts,
-    facades: [...new Map(activeFacts.filter(({ binding }) => binding.state === "identified" && (binding.quote || binding.actorId))
+    facades: [...new Map(activeFacts.filter(discovery.placed)
       .flatMap(({ binding }) => binding.candidates).map((item) => [item.id, item])).values()],
     map: analysis.coverage.physicalProof,
     subject: analysis.coverage.subjectProof,
     pairs: analysis.verifiedPairs,
     reading,
   };
-  return { intake, versionIds, evidence, impacts, replacements, holds, semantic,
-    observations: activeFacts.map((fact) => facadeObservation(fact,
-      originalLines.get(fact.id)?.find(({ id }) => id === fact.observation.lineId)?.text)), activeWindows: windows.length,
+  return { intake, versionIds, evidence, impacts, replacements, holds, semantic, discovery, observations,
+    activeWindows: windows.length,
     structurallyReviewedWindows: windows.filter(({ structure }) => structure?.branches.A.complete && structure.branches.B.complete).length,
     completedWindows: coveredWindows.length };
 }

@@ -183,6 +183,8 @@ export function facadeReview(options: {
     const left = byId.get(a);
     const right = byId.get(b);
     if (!left || !right || left.runId === right.runId || proof.version !== pairProofVersion ||
+        (context.kind === "facade" && [left, right].some(({ membership }) =>
+          membership.kind !== "facades" || membership.facadeIds.length !== 1)) ||
         proof.scope !== (context.facadeId ?? "common") || !proof.variant ||
         (left.variant && normalize(left.variant) !== normalize(proof.variant)) ||
         (right.variant && normalize(right.variant) !== normalize(proof.variant)) ||
@@ -206,10 +208,10 @@ export function facadeReview(options: {
     const priority = comparisonSource(requirement.comparison, leftFinding)?.priority;
     if (priority !== undefined && findings.some((finding) => finding.kind === "value" && finding.applicability === "active" &&
       finding.comparisonKey === leftFinding.comparisonKey && (comparisonSource(requirement.comparison, finding)?.priority ?? -1) > priority)) return [];
-    if (requirement.evidenceRule) {
+    if (requirement.evidenceRule && !requirement.comparison) {
       const leftGroups = facadeEvidenceGroups(requirement, left, leftFinding, true);
       const rightGroups = facadeEvidenceGroups(requirement, right, rightFinding, true);
-      if (requirement.comparison ? !leftGroups.length || !rightGroups.length : !leftGroups.some((group) => rightGroups.includes(group))) return [];
+      if (!leftGroups.some((group) => rightGroups.includes(group))) return [];
     }
     activated.set(a, leftFinding);
     activated.set(b, rightFinding);

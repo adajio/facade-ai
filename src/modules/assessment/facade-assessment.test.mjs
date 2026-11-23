@@ -74,6 +74,8 @@ test("facade requirements retain partial local cover and demand a proven pair or
   const pairs = [{ a: "A", b: "B", proof: { version: pairProofVersion, variant: "v1",
     revisionA: "r-a", revisionB: "r-b", scope: "f1" } }];
   assert.equal(decide([a, conflict], partial, pairs).outcome, "confirmed_conflict");
+  assert.equal(decide([a, { ...conflict, membership: { kind: "facades", facadeIds: ["f1", "f2"] } }], partial, pairs)
+    .outcome, "needs_review");
   const needsTitle = { ...conflict, printedRevision: null, variant: null, addressedValue: true,
     finding: { ...conflict.finding, applicability: "unknown" } };
   assert.equal(decide([a, needsTitle], partial, pairs).outcome, "confirmed_conflict");
@@ -140,6 +142,9 @@ test("ordinary intake publishes a local conflict, then keeps sent history after 
   const { createGateway, transaction } = await built("gateway/index");
   const { preparePackageMap, dispatchPackagePair } = await built("harness/package-dispatch");
   const { schedulePackageReview } = await built("harness/package-review");
+  const { reconcileNextFacadeDiscovery } = await built("harness/facade-discovery");
+  const { dispatchPackageFollowup, packageFollowupKind, packageStructure, savePackageBlocks, saveSemanticCheck,
+    scanPackageStructure } = await built("harness/package-walk");
   const { pairSourceEvidence } = await built("harness/pair-evidence");
   const { publication } = await built("harness/publication");
   const { researchKind } = await built("harness/runner");
@@ -177,6 +182,7 @@ test("ordinary intake publishes a local conflict, then keeps sent history after 
   const assessment = () => request("GET", base + "/facade-assessment").then((response) => response.json());
   const pending = await assessment();
   assert.equal(pending.catalogVersionId, null);
+  assert.equal(pending.profile.state, "stage_unknown");
   assert.equal(pending.stage, null);
   assert.deepEqual(pending.observations.counts, { common: 0, identified: 0, unclear: 0, unidentified: 0 });
   assert.equal((await request("GET", pending.observations.href)).json().items.length, 0);
@@ -209,7 +215,7 @@ test("ordinary intake publishes a local conflict, then keeps sent history after 
   }
   const publish = publication(db, gateway, profile);
   const fixtures = new Map();
-  async function uploadReceipt(places) {
+  async function uploadReceipt(places, targetProjectId = projectId) {
     const manifest = places.map((place) => {
       const data = pdf(place.quote);
       const itemId = randomUUID();
@@ -217,7 +223,7 @@ test("ordinary intake publishes a local conflict, then keeps sent history after 
       return { place, data, item: { itemId, kind: "file", relativePath: place.filename, size: data.length,
         mediaType: "application/pdf", sha256: sha(data) } };
     });
-    const { receiptId } = (await request("POST", `/api/projects/${projectId}/receipts`, {
+    const { receiptId } = (await request("POST", `/api/projects/${targetProjectId}/receipts`, {
       mode: "open", items: manifest.map(({ item }) => item),
     }, { status: 201 })).json();
     for (const { item, data } of manifest) {
@@ -229,19 +235,21 @@ test("ordinary intake publishes a local conflict, then keeps sent history after 
     }
     return receiptId;
   }
-  async function finishReading() {
+  async function finishReading(walk = false) {
     for (let attempt = 0; attempt < 25; attempt++) {
       if (!await preparePackageMap(db, gateway, reader, [])) break;
     }
     const stops = [];
     for (let attempt = 0; attempt < 25; attempt++) {
-      const worked = await dispatchPackagePair(db, gateway, profile);
+      const worked = await dispatchPackagePair(db, gateway, profile, walk);
+      if (walk) for (let scan = 0; scan < 25; scan++) if (!await scanPackageStructure(db, reader)) break;
       let work;
       while ((work = await gateway.claim({ workerId: `fixture-${randomUUID()}`, kinds: [researchKind], leaseMs: 60000 }))) {
         const { lease, projectId, scopeId, generationId, payload: job } = work;
         const task = { jobId: lease.jobId, projectId, scopeId, generationId, job };
         const { place, branch } = job;
         const fixture = fixtures.get(place.source.sha256);
+        const readContext = { task, branch };
         const { evidence, bytes } = await reader.open(place.source, { runId: lease.jobId, branch, operationKey: "source" }, {
           representation: "native", address: { unitId: place.unitId, box: place.box },
         });
@@ -257,19 +265,33 @@ test("ordinary intake publishes a local conflict, then keeps sent history after 
         const details = {
           attribute: fixture.attribute, role: { value: fixture.role ?? "drawing", quote: fixture.roleQuote ?? "Drawing" },
           ...(fixture.valueRole ? { valueRole: fixture.valueRole } : {}),
-          stage: { value: "P", quote: grounded.quote },
+          stage: { value: fixture.stage ?? "P", quote: grounded.quote },
           revision: { value: fixture.revision, quote: grounded.quote, status: "current" },
+          ...(fixture.register ? { subjectRegister: fixture.register } : {}),
           binding: fixture.facade ? {
             state: "identified", labels: [fixture.facade], quote: grounded.quote, reason: "Explicit address",
             projectIdentifiers: [{ label: fixture.facade, quote: grounded.quote }],
           } : { state: fixture.common ? "common" : "unidentified", labels: [], quote: grounded.quote, reason: "Printed scope" },
         };
+        let blockChecks = [];
+        if (job.packageWindow.walkProtocol) {
+          const structure = await packageStructure(db, readContext);
+          assert.equal(structure.limitation, null);
+          const visual = structure.blocks.find(({ kind }) => kind === "visual");
+          const render = visual && await reader.open(place.source, { runId: lease.jobId, branch, operationKey: "visual" }, {
+            representation: "render", address: { unitId: place.unitId, box: visual.box },
+          });
+          blockChecks = structure.blocks.map(({ id, kind }) => ({ blockId: id,
+            evidenceId: kind === "visual" ? render.evidence.id : evidence.id, reviewed: true,
+            reason: "Reviewed the controlled addressed block" }));
+        }
         await transaction(db, async (tx) => {
           await tx.query("INSERT INTO harness_research_events(job_id,sequence,event) VALUES ($1,1,$2)", [
             lease.jobId, { kind: "tool", reply: { evidence: { evidenceId: evidence.id }, body: { content: bytes.toString() } } },
           ]);
           const observation = await reader.pin(place.source, { runId: lease.jobId, branch, operationKey: "pin" }, grounded, tx);
           await publish.observation(tx, { task }, { ...grounded, package: details }, observation);
+          if (blockChecks.length) await savePackageBlocks(tx, readContext, blockChecks);
           const outcome = { kind: "covered", observationIds: [observation.id] };
           assert.equal(await gateway.finish(lease, outcome, { state: "completed", evidenceRef: observation.id }, tx), true);
           await publish.outcome(tx, task, outcome);
@@ -277,6 +299,7 @@ test("ordinary intake publishes a local conflict, then keeps sent history after 
       }
       if (!worked) break;
     }
+    for (let attempt = 0; attempt < 25; attempt++) if (!await reconcileNextFacadeDiscovery(db)) break;
     return stops;
   }
   async function verifyConflicts() {
@@ -336,6 +359,7 @@ test("ordinary intake publishes a local conflict, then keeps sent history after 
   const observed = await assessment();
   assert.equal(observed.catalogVersionId, null);
   assert.equal(observed.contexts.filter(({ kind }) => kind === "facade").length, 2);
+  assert.ok(observed.contexts.find(({ name }) => name === "F1").identity.sources.length >= 2);
   const kindBasis = (await request("GET", observed.observations.href + "?proposal=facadeKind")).json().items[0];
   assert.ok(kindBasis?.facadeKindSourceVerified);
   const firstFacade = observed.contexts.find(({ name }) => name === "F1");
@@ -352,9 +376,25 @@ test("ordinary intake publishes a local conflict, then keeps sent history after 
   }, { version: assigned.version })).json();
   await request("PUT", `/api/projects/${projectId}/stage`, { stage: "P", reason: "Synthetic title" }, { version: kinds.version });
   const beforeVerification = await assessment();
+  assert.equal(beforeVerification.profile.state, "active");
   assert.equal(beforeVerification.contexts.find(({ name }) => name === "F1").counts.confirmed_conflict, 0);
   const oldObservations = (await request("GET", beforeVerification.observations.href)).json().items;
   assert.ok(oldObservations.every(({ basis }) => basis.revisionEvidence === undefined));
+  const schedule = oldObservations.filter(({ sourceRole }) => sourceRole === "schedule");
+  assert.equal(schedule.length, 2);
+  const bind = (fact, state, version) => request("POST", `/api/projects/${projectId}/package-facts/${fact.id}/binding`, {
+    state, candidateIds: [firstFacade.facadeId], reason: "Controlled check of the printed project identifier",
+  }, { version });
+  for (const fact of schedule) await bind(fact, "unclear", fact.binding.version);
+  const unclear = await assessment();
+  const gap = unclear.comparisonReview.items.find(({ reasons }) => reasons.includes("facade_link_unproven"));
+  assert.ok(gap);
+  assert.equal(gap.sources.length, 2);
+  for (const source of gap.sources) await request("GET", source.citation.href);
+  assert.equal(unclear.contexts.find(({ name }) => name === "F1").counts.confirmed_conflict, 0);
+  for (const fact of schedule) await bind(fact, "identified", fact.binding.version + 1);
+  const restored = await assessment();
+  const restoredObservations = (await request("GET", restored.observations.href)).json().items;
   await verifyConflicts();
   const early = await assessment();
   assert.equal(early.catalogVersionId, catalog.id);
@@ -375,12 +415,15 @@ test("ordinary intake publishes a local conflict, then keeps sent history after 
     action: "confirm", reason: "Contradictory inventory cannot enter a letter", requestExternal: true,
   }, { version: f2Width.version, status: 422 });
   assert.equal(early.contexts.find(({ name }) => name === "F1").counts.confirmed_conflict, 1);
+  assert.ok(!early.comparisonReview.items.some(({ reasons }) => reasons.includes("facade_link_unproven")));
+  const historicalGap = (await request("GET", base + `/facade-assessment/${unclear.version}`)).json();
+  assert.deepEqual(historicalGap.comparisonReview, unclear.comparisonReview);
   const newObservations = (await request("GET", early.observations.href)).json().items;
   const titled = newObservations.find(({ basis }) => basis.revisionEvidence);
   assert.ok(titled);
   const historicalObservations = (await request("GET", beforeVerification.observations.href)).json().items;
   assert.deepEqual(historicalObservations, oldObservations);
-  assert.equal(historicalObservations.find(({ id }) => id === titled.id).binding.version, titled.binding.version);
+  assert.equal(restoredObservations.find(({ id }) => id === titled.id).binding.version, titled.binding.version);
   const context = (summary) => summary.contexts.find(({ name }) => name === "F1");
   const question = (summary, key) => context(summary).questions.find(({ requirement }) => requirement.positionId === key);
   const decision = async (q, requestExternal = false) => (await request("POST", `/api/v1/questions/${q.id}/decisions`, {
@@ -456,6 +499,106 @@ test("ordinary intake publishes a local conflict, then keeps sent history after 
   const incompatible = await assessment();
   assert.ok(incompatible.limitations.includes("catalog_not_applicable"));
   assert.deepEqual((await request("GET", base + `/letters/eligible?assessmentContextId=${assessmentContextId}`)).json().items, []);
+
+  await t.test("an individually evidenced facade selects its matrix and an independently proven omission enters a letter", async () => {
+    const next = (await request("POST", "/api/projects", { mode: "intake", name: "Synthetic non-delivery" }, { status: 201 })).json();
+    const target = `/api/v1/projects/${next.id}`;
+    const anchor = { ...fields("anchor", "Anchor plan", "facade"), applicability: "stage:RD", facadeKinds: ["panel"] };
+    const inventory = { ...fields("inventory", "Package inventory", "facade"), applicability: "stage:RD",
+      sourceRoles: ["inventory"], evidenceRule: { allOf: [{ anyOf: [{ sourceRole: "inventory", mode: "presence" }] }] } };
+    const variable = { ...fields("variable", "Variable profile clearance", "facade"), applicability: "stage:RD" };
+    const expectedCatalog = (await request("POST", "/api/catalogs", {
+      key: "synthetic-omission", name: "Synthetic RD matrix",
+      defaultProfile: { stage: "RD", facadeKinds: ["panel"], approvalReference: "Synthetic rule" },
+      requirements: [anchor, inventory, variable],
+    }, { status: 201 })).json();
+    await request("POST", "/api/catalogs", {
+      key: "synthetic-mixed", name: "Synthetic mixed RD matrix",
+      defaultProfile: { stage: "RD", facadeKinds: ["panel", "masonry"], approvalReference: "Synthetic alternative rule" },
+      requirements: [anchor, inventory, { ...variable, completenessCriterion: "Separate check of the mixed layout" }],
+    }, { status: 201 });
+    for (const [branch, purpose] of [["A", "primary_a"], ["B", "primary_b"]]) {
+      await gateway.grantRoute({ projectId: next.id, routeId: profile[branch].routeId, revision: "offline", purpose,
+        dataClass: "synthetic", allowed: true });
+    }
+    const staged = (await request("PUT", `/api/projects/${next.id}/stage`, {
+      stage: "RD", reason: "Owner confirms the design stage of the controlled receipt",
+    }, { version: next.version })).json();
+    const identity = "Stage: RD | Revision: RD1 current | Scope: E1 | Project facade id: E1";
+    const commonQuote = "All common materials are listed";
+    const register = "Complete list of facades: E1";
+    const docs = await uploadReceipt([
+      { filename: "register.pdf", attribute: "Package inventory", role: "inventory", roleQuote: "Inventory", stage: "RD",
+        facade: "E1", revision: "RD1", quote: `Inventory | Package inventory | Facade type: panel | ${register} | ${commonQuote} | ${identity}`,
+        register: { labels: ["E1"], quote: register, commonQuote } },
+      { filename: "transmittal.pdf", attribute: "Anchor plan", role: "inventory", roleQuote: "Inventory", stage: "RD",
+        facade: "E1", revision: "RD1", quote: `Inventory | Anchor plan not delivered | ${identity}`,
+        statement: { status: "not_delivered", item: "Anchor plan" } },
+    ], next.id);
+    await request("POST", `/api/receipts/${docs}/seal`, { manifestVersion: 1 });
+    await finishReading(true);
+    const detected = (await request("GET", target + "/facade-assessment")).json();
+    assert.equal(detected.profile.state, "facades_unconfirmed");
+    const context = detected.contexts.find(({ name }) => name === "E1");
+    const proposed = (await request("GET", detected.observations.href + "?proposal=facadeKind")).json().items[0];
+    assert.ok(context && proposed.facadeKindSourceVerified);
+    await request("PUT", target + `/facade-assessment/facades/${context.facadeId}/kind`, {
+      kind: "panel", observationId: proposed.id, reason: "Verified type on the current register",
+    }, { version: staged.version });
+    const open = (await request("GET", target + "/facade-assessment")).json();
+    assert.equal(open.catalogVersionId, expectedCatalog.id);
+    assert.equal(open.profile.state, "active");
+    const questionAt = (summary, key) => summary.contexts.find(({ facadeId }) => facadeId === context.facadeId)
+      .questions.find(({ requirement }) => requirement.positionId === key);
+    assert.equal(questionAt(open, "anchor").machine.outcome, "needs_review");
+    for (let attempt = 0; attempt < 12; attempt++) {
+      if (!await dispatchPackageFollowup(db, gateway)) break;
+      const work = await gateway.claim({ workerId: `proof-${randomUUID()}`, kinds: [packageFollowupKind], leaseMs: 60000 });
+      assert.ok(work);
+      const { lease, projectId, scopeId, generationId, payload: job } = work;
+      const task = { jobId: lease.jobId, projectId, scopeId, generationId, job };
+      const readContext = { task, branch: job.branch };
+      const structure = await packageStructure(db, readContext);
+      const basisIds = [...new Set(structure.earlierBranchChecks.map(({ evidenceId }) => evidenceId))];
+      const outcome = { kind: "reviewed_no_match", evidenceIds: basisIds };
+      await transaction(db, async (tx) => {
+        for (const { positionId } of job.packageWindow.followup.semantic.positions) {
+          await saveSemanticCheck(tx, readContext, { catalogVersionId: expectedCatalog.id, stage: "RD", facadeId: context.facadeId,
+            positionId, basisIds, disposition: "alternatives_checked", reason: "Both addressed blocks checked for this requirement and alternatives" });
+        }
+        assert.ok(await gateway.finish(lease, outcome, { state: "completed", evidenceRef: basisIds[0] }, tx));
+        await publish.outcome(tx, task, outcome);
+      });
+    }
+    const proven = (await request("GET", target + "/facade-assessment")).json();
+    assert.ok(Object.values(proven.coverage).every(({ complete }) => complete), JSON.stringify(proven.coverage));
+    const q = questionAt(proven, "anchor");
+    assert.equal(q.semanticRemainder.state, "complete");
+    assert.equal(q.machine.outcome, "confirmed_missing");
+    assert.ok(q.machine.citations.every(({ quote }) => quote.includes("Anchor plan not delivered")));
+    const signed = await decision(q, true);
+    const external = await request("POST", target + "/letters", { assessmentContextId: context.assessmentContextId,
+      recipient, items: [{ questionId: q.id, questionVersion: signed.version, decisionId: signed.id }] }, { status: 201 });
+    assert.ok(external.json().id);
+    const inventoryQuestion = questionAt(proven, "inventory");
+    assert.equal(inventoryQuestion.machine.outcome, "covered");
+    const inventoryDecision = await decision(inventoryQuestion);
+    await uploadReceipt([{ filename: "new-facade.pdf", attribute: "Designation", stage: "RD", revision: "RD2", facade: "E2",
+      quote: "Drawing | Designation | Stage: RD | Revision: RD2 current | Scope: E2 | Project facade id: E2" }], next.id);
+    await finishReading(true);
+    const partial = (await request("GET", target + "/facade-assessment")).json();
+    assert.equal(partial.profile.state, "facade_profile_basis_stale");
+    assert.equal(partial.contexts.find(({ name }) => name === "E2").facadeType.state, "unconfirmed");
+    assert.equal(questionAt(partial, "inventory").version, inventoryDecision.version);
+    assert.equal(questionAt(partial, "inventory").decision.id, inventoryDecision.id);
+    assert.equal(questionAt(partial, "variable"), undefined);
+    assert.equal(questionAt(partial, "anchor").machine.outcome, "needs_review");
+    const savedLetter = external.json();
+    await request("GET", `/api/v1/letters/${savedLetter.id}/revisions/${savedLetter.revisionId}`);
+    const { rows: [ledger] } = await db.query("SELECT count(*)::int AS attempts FROM gateway_attempts WHERE project_id=$1", [next.id]);
+    assert.equal(ledger.attempts, 0);
+  });
+
   const { rows: [scopeViewer] } = await db.query(
     "INSERT INTO users(organization_id,login,password_hash,state) VALUES($1,'scope-viewer',$2,'active') RETURNING id",
     [organizationId, await passwordHash(password)]);
@@ -466,5 +609,7 @@ test("ordinary intake publishes a local conflict, then keeps sent history after 
   assert.notEqual(userId, scopeViewer.id);
   session = credentials(await request("POST", "/api/sessions", { login: "scope-viewer", password }));
   await request("GET", base + "/facade-assessment", undefined, { status: 404 });
+  await request("GET", base + `/facade-assessment/${unclear.version}`, undefined, { status: 404 });
+  await request("GET", gap.sources[0].citation.href, undefined, { status: 404 });
   await request("GET", early.observations.href, undefined, { status: 404 });
 });

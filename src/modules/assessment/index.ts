@@ -178,6 +178,8 @@ function registerRoutes(app: FastifyInstance, prefix: string) {
       const current = await synchronizeFacadeAssessment(tx, projectId);
       const facade = current.active.find(({ context }) => context.facadeId === facadeId)?.context;
       if (!facade) throw new AssessmentError(404, "facade_not_found", "Фасад недоступен в текущей оценке.");
+      if (current.conflicted.has(facadeId)) throw new AssessmentError(422, "facade_type_conflicting_evidence",
+        "В действующих оригиналах указаны разные типы. Сверьте редакции и принадлежность опор.");
       await recordFacadeType(tx, { projectId, contextId: facade.id, facadeId, kind, reason, actorId: actor.userId,
         stage: project.stage, fact: current.input.observations.find(({ id }) => id === observationId) });
 
