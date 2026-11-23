@@ -1,17 +1,18 @@
 import type { PoolClient } from "pg";
+import { contradictoryDeliveryLine, exactDeliveryStatement } from "../../domain/delivery-statement.js";
 import { readPackageAnalysis, type PackageAnalysis, type PackageFact } from "../harness/package-analysis.js";
 import { deliveredLines } from "../questions/attribute-aliases.js";
 import { hasAddressedSubject } from "../questions/subject-evidence.js";
 import { canonicalJson, isInventoryRole } from "./domain.js";
-import type { Evidence, ReaderAddress, ReaderLine } from "../pdf/types.js";
-import { exactDeliveryStatement, nonDeliveryFromOriginal, type FacadeFact, type FacadeReadout } from "./facade-model.js";
+import type { ReaderAddress, ReaderLine } from "../pdf/types.js";
+import { deliveryEvidenceIds, fullDeliveryLine, type DeliveryEvidence } from "./facade-delivery.js";
+import { nonDeliveryFromOriginal, type FacadeFact, type FacadeReadout } from "./facade-model.js";
 import { completedReaderJob, indexSemanticInput } from "./facade-semantic.js";
 import type { Gate } from "./store.js";
 
 type AcceptedVersion = { id: string; sha256: string; documentId: string; label: string };
 type Impact = { receiptId: string; questionId: string };
 type ConfirmedStage = { versionId: string; target: ReaderAddress | null; stage: string; evidenceId: string };
-type EvidenceMetadata = Pick<Evidence, "source" | "address" | "representation">;
 const typeClause = /^(?:тип фасада|facade (?:kind|type))\s*[:=–—]\s*([\p{L}\p{N}][\p{L}\p{N} _-]{0,99})\s*$/iu;
 type ReplacementReference = { observationId: string; evidenceId: string; versionId: string; address: Record<string, unknown> };
 export type FacadeReplacement = {
@@ -23,8 +24,8 @@ export type FacadeReplacement = {
   replacements: ReplacementReference[];
 };
 
-function convertFact(fact: PackageFact, accepted: Map<string, AcceptedVersion>, formats: Map<string, string>,
-  stages: Map<string, ConfirmedStage>, evidence: Map<string, EvidenceMetadata>, original: ReaderLine[] | undefined,
+export function convertFact(fact: PackageFact, accepted: Map<string, AcceptedVersion>, formats: Map<string, string>,
+  stages: Map<string, ConfirmedStage>, evidence: Map<string, DeliveryEvidence>, original: ReaderLine[] | undefined,
   provenFacade: boolean): FacadeFact | null {
   const { source, quote, value, unit, evidenceId, receiptId, runId, lineId, address, components, deliveryStatement } = fact.observation;
   const acceptedOriginal = accepted.get(source.versionId);
@@ -58,11 +59,16 @@ function convertFact(fact: PackageFact, accepted: Map<string, AcceptedVersion>, 
   const valueRoleBasis = valueRoleProof?.quote && roleAddress && roleQuote?.includes(valueRoleProof.quote)
     ? { ...valueRoleProof, evidenceId: rolePart?.evidenceId ?? evidenceId, address: { ...roleAddress } } : undefined;
   const literalInventory = active && fact.observation.grounding === "text" && Boolean(quote) && isInventoryRole(fact.sourceRole);
-  const originalLine = original?.find(({ id }) => id === lineId)?.text;
-  const absence = literalInventory && !fact.observation.alternatives?.length &&
-    deliveryStatement?.status === "not_delivered" && nonDeliveryFromOriginal(quote!, originalLine, deliveryStatement.item);
+  const issuedMatches = original?.filter(({ id }) => id === lineId);
+  const issuedLine = issuedMatches?.length === 1 ? issuedMatches[0] : undefined;
+  const full = deliveryStatement?.status === "not_delivered" ? fullDeliveryLine(fact, format, evidence, issuedLine) : undefined;
+  const originalLine = deliveryStatement?.status === "not_delivered" ? full?.line.text : issuedLine?.text;
+  const canEstablishAbsence = literalInventory && !fact.observation.alternatives?.length && deliveryStatement?.status === "not_delivered";
+  const absence = canEstablishAbsence && nonDeliveryFromOriginal(full?.companion?.quote ?? quote!, originalLine, deliveryStatement.item);
+  const hasLegacyCrop = canEstablishAbsence && !fact.basis.deliveryLine && Boolean(evidence.get(evidenceId)?.address.box) &&
+    Boolean(issuedLine?.text.includes(quote!)) && exactDeliveryStatement(quote!, deliveryStatement.item, "not_delivered");
   const positiveInOriginal = originalLine && deliveryStatement &&
-    exactDeliveryStatement(originalLine, deliveryStatement.item, "delivered");
+    contradictoryDeliveryLine(originalLine, deliveryStatement.item);
   const negativeInOriginal = originalLine && deliveryStatement &&
     exactDeliveryStatement(originalLine, deliveryStatement.item, "not_delivered");
   const deliveryUncertainty = positiveInOriginal && negativeInOriginal ||
@@ -87,6 +93,10 @@ function convertFact(fact: PackageFact, accepted: Map<string, AcceptedVersion>, 
     materials: fact.materials.map(({ label }) => label),
     variant: fact.variant,
     addressedValue: Boolean(subjectVerified),
+    ...(format === "pdf" && lineId && (hasLegacyCrop || absence && full?.identity) ? {
+      deliveryLocation: canonicalJson([source, receiptId, fact.observation.readerVersion, address.unitId, lineId, deliveryStatement.item]),
+    } : {}),
+    ...(absence && full?.identity ? { deliveryLineIdentity: full.identity } : {}),
     printedRevision: fact.basis.revision ? fact.revision : null,
     stage: confirmation?.stage ?? printedStage,
     runId,
@@ -105,6 +115,7 @@ function convertFact(fact: PackageFact, accepted: Map<string, AcceptedVersion>, 
         quote: quote ?? "", value: value ?? null, unit: unit ?? null, href: fact.evidenceHref,
         ...(components ? { components } : {}),
         ...(deliveryStatement ? { deliveryStatement } : {}),
+        ...(absence && full?.companion ? { deliveryBasis: full.companion } : {}),
         ...(deliveryUncertainty ? { deliveryUncertainty } : {}),
         ...(confirmation ? { stageConfirmation: { stage: confirmation.stage, evidenceId: confirmation.evidenceId } } : {}),
         ...(valueRoleBasis ? { valueRoleBasis } : {}),
@@ -238,9 +249,9 @@ export async function readFacadeInput(tx: PoolClient, projectId: string) {
   const activeFacts = analysis.facts.filter(({ observation, windowId }) =>
     accepted.get(observation.source.versionId)?.sha256 === observation.source.sha256 && formats.has(windowId));
   const evidenceIds = [...new Set(activeFacts.flatMap(({ observation, basis }) =>
-    [observation.evidenceId, ...(basis.revisionEvidence ? [basis.revisionEvidence.evidenceId] : []),
+    [observation.evidenceId, ...deliveryEvidenceIds(basis), ...(basis.revisionEvidence ? [basis.revisionEvidence.evidenceId] : []),
       ...Object.values(basis.parts ?? {}).map(({ evidenceId }) => evidenceId)]))];
-  const evidenceRows = evidenceIds.length ? (await tx.query<{ id: string; payload: EvidenceMetadata }>(
+  const evidenceRows = evidenceIds.length ? (await tx.query<{ id: string; payload: DeliveryEvidence }>(
     `SELECT id,payload FROM reader_evidence WHERE project_id=$1 AND id=ANY($2::uuid[])`, [projectId, evidenceIds],
   )).rows : [];
   const evidenceById = new Map(evidenceRows.map(({ id, payload }) => [id, payload]));

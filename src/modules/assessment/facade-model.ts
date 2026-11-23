@@ -1,3 +1,4 @@
+import { contradictoryDeliveryLine, exactDeliveryStatement } from "../../domain/delivery-statement.js";
 import type { CatalogRequirement } from "../access/input.js";
 import { allowsCatalogPair, comparisonSource } from "../access/catalog-comparison.js";
 import {
@@ -7,6 +8,8 @@ import {
 import { approvedEvidenceSubjects, facadeEvidenceGroups, proveFacadeRule } from "./facade-rule.js";
 import type { FacadeType } from "./facade-types.js";
 import { catalogRequirement, normalizeFormat } from "./store.js";
+
+export { exactDeliveryStatement };
 
 export type FacadeCandidate = { id: string; label: string };
 export type FacadeMembership =
@@ -21,6 +24,8 @@ export type FacadeFact = {
   variant: string | null;
   printedRevision: string | null;
   addressedValue?: boolean;
+  deliveryLineIdentity?: string;
+  deliveryLocation?: string;
   stage: string | null;
   runId: string;
   finding: Finding;
@@ -54,25 +59,9 @@ export type FacadeContext = {
 
 const normalize = (value: string) => value.normalize("NFKC").toLowerCase().trim().replace(/\s+/gu, " ");
 
-/** Accept an explicit statement whose predicate applies to the named item in the same clause. */
-export function exactDeliveryStatement(quote: string, item: string, status: "delivered" | "not_delivered"): boolean {
-  const escaped = normalize(item).replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
-  if (!escaped) return false;
-  const subject = `(?:the )?(?:(?:document|file|item|материал|документ|файл|позиция) )?[«"“]?${escaped}[»"”]?`;
-  const englishVerb = "(?:supplied|provided|delivered|included|sent|transmitted)";
-  const russianVerb = "(?:передан[аоы]?|предоставлен[аоы]?|поставлен[аоы]?|направлен[аоы]?|приложен[аоы]?|включ[её]н[аоы]?)";
-  const negative = status === "not_delivered";
-  const english = "(?:(?:was|is|has been) )?" + (negative ? "not " : "") + englishVerb;
-  const russian = negative ? "(?:не " + russianVerb + "|отсутствует)" : russianVerb;
-  const inPackage = "(?: in (?:this|the|current) (?:package|submission|delivery)| в (?:текущем )?(?:пакете|комплекте|составе))?";
-  const pattern = new RegExp("^(?:" + subject + "(?: [–—-] |: | )(?:" + english + "|" + russian + ")" + inPackage +
-    "|(?:" + russian + "|" + (negative ? "not " : "") + englishVerb + ")(?:[: ]+)" + subject + ")[.!]?$", "u");
-  return quote.split(/[|·;,\n]|(?<=[.!?])\s+/u).some((clause) => pattern.test(normalize(clause)));
-}
-
 export function nonDeliveryFromOriginal(quote: string, originalLine: string | undefined, item: string): boolean {
   return Boolean(originalLine?.includes(quote) && exactDeliveryStatement(quote, item, "not_delivered") &&
-    exactDeliveryStatement(originalLine, item, "not_delivered") && !exactDeliveryStatement(originalLine, item, "delivered"));
+    exactDeliveryStatement(originalLine, item, "not_delivered") && !contradictoryDeliveryLine(originalLine, item));
 }
 
 export function requirementsFor(rows: CatalogRequirement[], context: FacadeContext, stage: string | null) {
@@ -123,7 +112,12 @@ export function facadeReview(options: {
   const comparisonKey = (property: string | null, variant: string | null, valueRole: Finding["valueRole"]) => canonicalJson([context.id, requirement.positionId,
     variant && normalize(variant), property && matchesRequirementSubject(requirement, property) ? requirementSubjectKey(requirement.part) :
       requirementSubjectKey(property ?? ""), ...(valueRole ? [valueRole] : [])]);
-  let findings: Finding[] = scoped.map(({ finding, variant, stage: sourceStage, property }) => ({
+  const reverified = new Set(scoped.flatMap(({ deliveryLocation, finding, stage: sourceStage }) =>
+    deliveryLocation && finding.kind === "absence" && finding.applicability === "active" &&
+      stage && sourceStage && normalize(sourceStage) === normalize(stage) ? [deliveryLocation] : []));
+  const resolvedCrop = (fact: FacadeFact) => fact.deliveryLocation && reverified.has(fact.deliveryLocation) &&
+    fact.finding.citation.deliveryUncertainty === "original_statement_unverified" && inFacadeContext(fact, context);
+  let findings: Finding[] = scoped.filter((fact) => !resolvedCrop(fact)).map(({ finding, variant, stage: sourceStage, property }) => ({
     ...finding,
     ...(finding.nonDelivery ? { nonDelivery: { ...finding.nonDelivery, questionId } } : {}),
     format: normalizeFormat(finding.format),
@@ -139,12 +133,13 @@ export function facadeReview(options: {
 
   const positiveOrUncertain = relevant.some((fact) =>
     fact.finding.applicability !== "superseded" && fact.finding.kind !== "absence" &&
+    !resolvedCrop(fact) &&
     (inFacadeContext(fact, context) || ["ambiguous", "unidentified"].includes(fact.membership.kind)) &&
     (fact.finding.sourceRole === "unknown" || requirement.sourceRoles.includes(fact.finding.sourceRole) ||
       fact.finding.citation.deliveryStatement?.status === "delivered" || Boolean(fact.finding.citation.deliveryUncertainty)));
   const plausibleUnknown = sameStage.some((fact) => {
     const { sourceRole, format, applicability, kind } = fact.finding;
-    return applicability !== "superseded" && kind !== "absence" &&
+    return applicability !== "superseded" && kind !== "absence" && !resolvedCrop(fact) &&
       (inFacadeContext(fact, context) || fact.membership.kind === "ambiguous" || fact.membership.kind === "unidentified") &&
       requirement.formats.includes(normalizeFormat(format)) &&
       (sourceRole === "unknown" || requirement.sourceRoles.includes(sourceRole)) &&
@@ -156,12 +151,13 @@ export function facadeReview(options: {
   const absence = findings.filter(({ kind, applicability, sourceRole, citation, nonDelivery }) =>
     kind === "absence" && applicability === "active" && isInventoryRole(sourceRole) &&
     nonDelivery?.kind === "explicit_non_delivery" && citation.deliveryStatement?.status === "not_delivered" &&
-    exactDeliveryStatement(citation.quote, citation.deliveryStatement.item, "not_delivered") &&
+    exactDeliveryStatement(citation.deliveryBasis?.quote ?? citation.quote, citation.deliveryStatement.item, "not_delivered") &&
     matchesRequirementSubject(requirement, citation.deliveryStatement.item));
   const byId = new Map(scoped.map((fact) => [fact.finding.citation.observationId, fact]));
   const findingById = new Map(findings.map((finding) => [finding.citation.observationId, finding]));
   const sameStatement = ({ citation }: Finding) => canonicalJson([
-    citation.versionId, citation.sha256, citation.receiptId, citation.address, citation.quote, citation.deliveryStatement?.item,
+    citation.versionId, citation.sha256, citation.receiptId, citation.deliveryStatement?.item,
+    byId.get(citation.observationId)?.deliveryLineIdentity ?? [citation.address, citation.quote],
   ]);
   const negativeByPlace = Map.groupBy(absence, sameStatement);
   const verifiedAbsences = [...negativeByPlace.values()].flatMap((group) => group.some(({ citation: a }) => a.branch === "A" &&
