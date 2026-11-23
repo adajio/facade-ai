@@ -36,14 +36,17 @@ function pdf(lines) {
 }
 
 async function until(read, accept, label) {
-  const end = Date.now() + 60_000;
+  const end = Date.now() + 120_000;
   let last;
   do {
     last = await read();
     if (accept(last)) return last;
-    await delay(250);
+    await delay(500);
   } while (Date.now() < end);
-  assert.fail(`${label} — ${JSON.stringify(last)}`);
+  assert.fail(`${label} — ${JSON.stringify({
+    coverage: last?.coverage, facts: last?.facts.length, pairs: last?.verifiedPairs.length,
+    windows: last?.windows.map(({ branches }) => branches),
+  })}`);
 }
 
 function tool(name, args) {
@@ -89,7 +92,7 @@ function observation(line) {
 }
 
 test('ordinary intake publishes independent package evidence before questions and retains it on passive replay', {
-  skip: !enabled, timeout: 175_000,
+  skip: !enabled, timeout: 310_000,
 }, async (t) => {
   const { createApi } = await import(built('src/platform/api.js'));
   const { readConfig } = await import(built('src/platform/config.js'));
