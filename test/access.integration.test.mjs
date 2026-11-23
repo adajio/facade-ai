@@ -190,9 +190,33 @@ test('access v1.1 on Fastify and PostgreSQL', { skip: !enabled, timeout: 240_000
     assert.equal((await options(path)).value.reason, 'no_approved_profile');
     const invalidLevel = await publish(owner, 'working-invalid-level', [{ ...catalogRule, level: 'document' }], profile, 422);
     assert.equal(invalidLevel.value.code, 'invalid_requirement_level');
-    const approved = (await publish(owner, 'working-a', [{ ...catalogRule, level: 'facade' }], profile)).value;
+    const aliases = ['Ведомость анкеров', 'Крепёж ведомости'];
+    const evidenceRule = { allOf: [{ anyOf: [
+      { sourceRole: 'основной', formats: ['PDF'], subject: 'Ведомость анкеров', representations: ['native'] },
+      { sourceRole: 'основной', mode: 'presence', formats: ['XLSX'] },
+    ] }], distinctOriginals: true };
+    await publish(owner, 'working-invalid-alias', [{ ...catalogRule, aliases: [' '] }], profile, 422);
+    await publish(owner, 'working-too-many-aliases', [{ ...catalogRule, aliases: Array.from({ length: 31 }, (_, n) => String(n)) }], profile, 422);
+    for (const [index, rule] of [
+      { allOf: [] },
+      { allOf: [{ anyOf: [] }] },
+      { allOf: [{ anyOf: [{ sourceRole: 'other' }] }] },
+      { allOf: [{ anyOf: [{ sourceRole: 'основной', formats: ['DWG'] }] }] },
+      { allOf: [{ anyOf: [{ sourceRole: 'основной', representations: ['other'] }] }] },
+      { allOf: [{ anyOf: [{ sourceRole: 'основной', mode: 'other' }] }] },
+    ].entries()) {
+      const invalidRule = await publish(owner, 'working-invalid-rule-' + index, [{ ...catalogRule, evidenceRule: rule }], profile, 422);
+      assert.equal(invalidRule.value.code, 'invalid_evidence_rule');
+    }
+    const approved = (await publish(owner, 'working-a', [{
+      ...catalogRule, level: 'facade', aliases: [...aliases, ' Ведомость анкеров '], evidenceRule,
+    }], profile)).value;
     assert.equal(approved.requirements[0].level, 'facade');
+    assert.deepEqual(approved.requirements[0].aliases, aliases);
+    assert.deepEqual(approved.requirements[0].evidenceRule, evidenceRule);
     assert.equal((await read()).value.catalogVersionId, approved.id);
+    assert.deepEqual((await read()).value.catalog.requirements[0].aliases, aliases);
+    assert.deepEqual((await read()).value.catalog.requirements[0].evidenceRule, evidenceRule);
     const second = (await create(creator, 'second-intake')).value;
     const secondPath = `/projects/${second.id}`;
     const secondStage = (await confirm(secondPath, creator, 'second-stage', second.version)).value;
@@ -282,6 +306,7 @@ test('access v1.1 on Fastify and PostgreSQL', { skip: !enabled, timeout: 240_000
   });
   assert.equal(catalog2.revision, 2);
   assert.equal(catalog3.revision, 3);
+  assert.deepEqual(catalog.requirements[0], catalogRule);
 
   let project;
   let scope1;

@@ -18,7 +18,9 @@ test.describe('Рабочее место на штатном API', () => {
     expect(project).toMatchObject({ stage: null, catalog: null, catalogVersionId: null, scopes: [], role: 'project_manager' });
     await page.getByRole('link', { name: 'Участники' }).click();
     await expect(page.getByText('Нет рабочего каталога.', { exact: true })).toBeVisible();
-    await expect(page.getByText('Стадия проекта не установлена.')).toBeVisible();
+    await expect(page.getByText('Стадия уточняется.')).toBeVisible();
+    await expect(page.getByLabel('Код стадии')).toBeHidden();
+    await page.getByText('Указать стадию вручную', { exact: true }).click();
     await page.getByLabel('Код стадии').fill('РД');
     await page.getByLabel('Основание подтверждения').fill('Решение по синтетическому проекту');
     await page.getByRole('button', { name: 'Подтвердить стадию проекта' }).click();
@@ -38,10 +40,13 @@ test.describe('Рабочее место на штатном API', () => {
     await page.getByRole('button', { name: 'Добавить обязательную часть' }).click();
     await page.getByLabel('Код части').fill('P-1');
     await page.getByLabel('Наименование').fill('Учебный чертёж');
+    await page.getByLabel('Другие названия требования через запятую').fill('Монтажная схема, Схема фасада');
     await page.getByLabel('Уровень требования').selectOption('facade');
     await page.getByLabel('Форматы').fill('PDF');
     await page.getByLabel('Роли источников').fill('drawing');
     await page.getByLabel('Критерий полноты').fill('Указан материал');
+    await page.getByRole('button', { name: 'Задать правило доказательств' }).click();
+    await page.getByLabel('Роль источника', { exact: true }).selectOption('drawing');
     await page.getByLabel('Адресат').fill('Проектировщик');
     const [response] = await Promise.all([
       page.waitForResponse((result) => new URL(result.url()).pathname === '/api/catalogs' && result.request().method() === 'POST'),
@@ -50,7 +55,8 @@ test.describe('Рабочее место на штатном API', () => {
     expect(response.status()).toBe(201);
     expect(await response.json()).toMatchObject({
       defaultProfile: { stage: 'РД', facadeKinds: ['synthetic-kind'] },
-      requirements: [{ level: 'facade' }],
+      requirements: [{ level: 'facade', aliases: ['Монтажная схема', 'Схема фасада'],
+        evidenceRule: { allOf: [{ anyOf: [{ sourceRole: 'drawing' }] }] } }],
     });
   });
 });

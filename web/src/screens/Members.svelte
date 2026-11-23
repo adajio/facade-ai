@@ -7,6 +7,7 @@
   import { date, label } from '../lib/format';
   import { projectApi } from '../lib/workspace';
   import Notice from '../lib/Notice.svelte';
+  import ProjectProposals from '../lib/ProjectProposals.svelte';
 
   type Member = { userId: string; login: string; role: string; expiresAt?: string; scopeId?: string; reason?: string };
   type Page = { members: Member[]; version: number; nextCursor?: string | null };
@@ -174,16 +175,28 @@
     {:else if project.stageStatus === 'legacy_unconfirmed'}
       <p>Стадия проекта не подтверждена. Исторические стадии указаны в областях.</p>
     {:else}
-      <p>Стадия проекта не установлена.</p>
+      <p>Стадия уточняется.</p>
     {/if}
     {#if project.confirmedFacadeKinds?.length}<p>Подтверждённые типы фасадов: {project.confirmedFacadeKinds.join(', ')}</p>{/if}
-    <form onsubmit={(event) => {
-      event.preventDefault();
-      void modify('/stage', 'PUT', { stage, reason: stageReason }, 'Стадия проекта сохранена.');
-    }}>
-      <label>Код стадии<input required maxlength="200" bind:value={stage} /></label>
-      <label>Основание подтверждения<input required maxlength="500" bind:value={stageReason} /></label>
-      <div class="actions"><button class="primary" disabled={busy || version == null || !stage.trim() || !stageReason.trim()}>Подтвердить стадию проекта</button></div>
-    </form>
+    {#if project.intakeMode}
+      <ProjectProposals {api} {project} disabled={busy || version == null}
+        confirmStage={(stage, evidenceId) => modify('/stage', 'PUT', {
+          stage, reason: 'Подтверждено по исходному документу.', evidenceIds: [evidenceId],
+        }, 'Стадия проекта сохранена.')}
+        confirmFacadeKinds={(facadeKinds, evidenceIds) => modify('/facade-assessment/facade-kinds', 'PUT', {
+          facadeKinds, reason: 'Подтверждено по исходным документам.', evidenceIds,
+        }, 'Типы фасадов сохранены.')} />
+    {/if}
+    <details>
+      <summary>Указать стадию вручную</summary>
+      <form onsubmit={(event) => {
+        event.preventDefault();
+        void modify('/stage', 'PUT', { stage, reason: stageReason }, 'Стадия проекта сохранена.');
+      }}>
+        <label>Код стадии<input required maxlength="200" bind:value={stage} /></label>
+        <label>Основание подтверждения<input required maxlength="500" bind:value={stageReason} /></label>
+        <div class="actions"><button class="primary" disabled={busy || version == null || !stage.trim() || !stageReason.trim()}>Подтвердить стадию проекта</button></div>
+      </form>
+    </details>
   </section>
 </div>

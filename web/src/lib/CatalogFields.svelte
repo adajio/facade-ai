@@ -1,14 +1,20 @@
 <script lang="ts" module>
+  import EvidenceRuleFields, { copyEvidenceRule, type EvidenceRule } from './EvidenceRuleFields.svelte';
+
   export type Requirement = {
-    key: string; part: string; formats: string[]; equivalents: string[];
+    key: string; part: string; aliases?: string[]; formats: string[]; equivalents: string[];
     applicability: string; level?: 'facade' | 'common';
-    sourceRoles: string[]; completenessCriterion: string; addressee: string;
+    sourceRoles: string[]; completenessCriterion: string; evidenceRule?: EvidenceRule; addressee: string;
   };
   export function blank(): Requirement {
     return { key: '', part: '', formats: [], equivalents: [], applicability: 'all', sourceRoles: [], completenessCriterion: '', addressee: '' };
   }
   export function copy(source: Requirement[]): Requirement[] {
-    return source.map((item) => ({ ...item, formats: [...item.formats], equivalents: [...item.equivalents], sourceRoles: [...item.sourceRoles] }));
+    return source.map((item) => ({
+      ...item, ...(item.aliases === undefined ? {} : { aliases: [...item.aliases] }),
+      ...(item.evidenceRule === undefined ? {} : { evidenceRule: copyEvidenceRule(item.evidenceRule) }),
+      formats: [...item.formats], equivalents: [...item.equivalents], sourceRoles: [...item.sourceRoles],
+    }));
   }
 </script>
 <script lang="ts">
@@ -24,6 +30,10 @@
       <label>Наименование<input required bind:value={requirement.part} /></label>
       <label>Область действия<input required bind:value={requirement.applicability} /></label>
     </div>
+    <label>Другие названия требования через запятую
+      <input value={requirement.aliases?.join(', ') ?? ''}
+        onchange={(event) => requirement.aliases = parse(event.currentTarget.value)} />
+    </label>
     <label>Уровень требования
       <select bind:value={requirement.level}>
         <option value={undefined}>По правилу области</option>
@@ -37,6 +47,8 @@
       <label>Роли источников<input required value={requirement.sourceRoles.join(', ')} onchange={(e) => requirement.sourceRoles = parse(e.currentTarget.value)} /></label>
     </div>
     <label>Критерий полноты<input required bind:value={requirement.completenessCriterion} /></label>
+    <EvidenceRuleFields bind:rule={requirement.evidenceRule} roles={requirement.sourceRoles}
+      formats={[...requirement.formats, ...requirement.equivalents]} />
     <label>Адресат<input required bind:value={requirement.addressee} /></label>
     <button type="button" class="quiet" onclick={() => requirements = requirements.filter((_, item) => item !== index)}>Удалить часть</button>
   </fieldset>

@@ -1,5 +1,6 @@
 import type { FastifyInstance } from 'fastify';
 import type { Pool, PoolClient } from 'pg';
+import { lockIntakeProject } from '../intake/gate.js';
 import { requireAccess, uuid } from './auth.js';
 import { executeCommand } from './commands.js';
 import { invalid, unavailable } from './errors.js';
@@ -98,6 +99,7 @@ export function registerStages(app: FastifyInstance, db: Pool) {
     const result = await executeCommand(db, request, {
       requirement: { action: 'project:engineer', projectId }, operation: 'document.stage.confirm', input,
       version: async (tx) => {
+        await lockIntakeProject(tx, projectId);
         // Serialize first writes as well, when there is no confirmation row to lock.
         const { rowCount } = await tx.query(
           'SELECT 1 FROM intake_document_versions WHERE project_id = $1 AND id = $2 FOR NO KEY UPDATE', [projectId, versionId],
