@@ -3,7 +3,7 @@ import type { FastifyInstance } from 'fastify';
 import { Gateway, type ReviewAdmission, type ResearchAdmission } from './gateway.js';
 import { PostgresIntentJournal } from './journal.js';
 import { openRouterTransport, type Step15Approval } from './openrouter.js';
-import { GatewayError, type ModelTransport } from './types.js';
+import { BUDGET_USD_NANOS, GatewayError, positiveInteger, type ModelTransport } from './types.js';
 import { registerOperatorRoutes } from './operator.js';
 
 export { Gateway } from './gateway.js';
@@ -34,8 +34,16 @@ export function createStep15Gateway(
 }
 
 export function journalFromEnv(env: NodeJS.ProcessEnv = process.env): { journal: PostgresIntentJournal; close: () => Promise<void> } | null {
-  if (!env.FACADE_GATEWAY_JOURNAL_URL && !env.FACADE_GATEWAY_LEDGER_ID) return null;
+  const expectedLimit = env.FACADE_GATEWAY_EXPECTED_JOURNAL_LIMIT_USD_NANOS;
+  if (!env.FACADE_GATEWAY_JOURNAL_URL && !env.FACADE_GATEWAY_LEDGER_ID && expectedLimit === undefined) return null;
   if (!env.FACADE_GATEWAY_JOURNAL_URL || !env.FACADE_GATEWAY_LEDGER_ID) throw new GatewayError('journal_config_incomplete');
+  let expectedLimitUsdNanos: number | undefined;
+  if (expectedLimit !== undefined) {
+    expectedLimitUsdNanos = Number(expectedLimit);
+    if (!/^[1-9]\d*$/.test(expectedLimit) || !positiveInteger(expectedLimitUsdNanos, BUDGET_USD_NANOS)) {
+      throw new GatewayError('journal_config_invalid');
+    }
+  }
   let external: URL;
   try { external = new URL(env.FACADE_GATEWAY_JOURNAL_URL); }
   catch { throw new GatewayError('journal_config_invalid'); }
@@ -49,7 +57,7 @@ export function journalFromEnv(env: NodeJS.ProcessEnv = process.env): { journal:
     query_timeout: 3500, statement_timeout: 3000,
   });
   pool.on('error', () => { /* Admission will fail closed on the next journal operation. */ });
-  return { journal: new PostgresIntentJournal(pool, env.FACADE_GATEWAY_LEDGER_ID), close: () => pool.end() };
+  return { journal: new PostgresIntentJournal(pool, env.FACADE_GATEWAY_LEDGER_ID, expectedLimitUsdNanos), close: () => pool.end() };
 }
 
 export async function register(app: FastifyInstance): Promise<void> {

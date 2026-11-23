@@ -3,6 +3,7 @@
 CREATE TABLE gateway_external_ledger (
   singleton boolean PRIMARY KEY DEFAULT true CHECK (singleton),
   ledger_id uuid NOT NULL,
+  limit_usd_nanos bigint NOT NULL DEFAULT 10000000000 CHECK (limit_usd_nanos BETWEEN 1 AND 10000000000),
   frozen boolean NOT NULL DEFAULT false
 );
 
@@ -30,6 +31,36 @@ CREATE INDEX gateway_external_primary ON gateway_external_attempts(generation_id
   WHERE purpose IN ('primary_a','primary_b') AND state IN ('sending','unknown');
 CREATE UNIQUE INDEX gateway_external_charge ON gateway_external_attempts((receipt->>'providerId'))
   WHERE state='paid';
+
+-- Protect reduced ledgers even if an older gateway connects to the same database.
+-- Settlement remains writable so the ledger can record an unexpected charge and freeze.
+CREATE FUNCTION gateway_enforce_reduced_budget() RETURNS trigger LANGUAGE plpgsql AS $$
+DECLARE
+  ledger_limit bigint;
+  committed bigint;
+BEGIN
+  SELECT limit_usd_nanos INTO STRICT ledger_limit FROM gateway_external_ledger WHERE singleton FOR UPDATE;
+  IF ledger_limit = 10000000000 THEN
+    RETURN NEW;
+  END IF;
+  SELECT coalesce(sum(spent_usd_nanos),0) +
+    coalesce(sum(ceiling_usd_nanos) FILTER (WHERE state IN ('prepared','sending','unknown')),0)
+    INTO committed FROM gateway_external_attempts;
+  IF TG_OP = 'INSERT' THEN
+    committed := committed + NEW.ceiling_usd_nanos;
+  END IF;
+  IF committed > ledger_limit THEN
+    RAISE EXCEPTION 'gateway budget exhausted' USING ERRCODE = '23514';
+  END IF;
+  RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER gateway_guard_reservation BEFORE INSERT ON gateway_external_attempts
+  FOR EACH ROW WHEN (NEW.state = 'prepared') EXECUTE FUNCTION gateway_enforce_reduced_budget();
+CREATE TRIGGER gateway_guard_dispatch BEFORE UPDATE OF state ON gateway_external_attempts
+  FOR EACH ROW WHEN (OLD.state = 'prepared' AND NEW.state = 'sending')
+  EXECUTE FUNCTION gateway_enforce_reduced_budget();
 
 CREATE TABLE gateway_external_reconciliation (
   actor_id text NOT NULL,

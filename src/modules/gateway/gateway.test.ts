@@ -74,12 +74,12 @@ async function isolated(t: TestContext, url: string, file?: string): Promise<pg.
   return pool;
 }
 
-async function setup(t: TestContext, policy: RoutePolicy = baseRoute) {
+async function setup(t: TestContext, policy: RoutePolicy = baseRoute, limit = BUDGET_USD_NANOS) {
   const [db, outside, provider] = await Promise.all([
     isolated(t, appUrl!, appSql), isolated(t, journalUrl!, journalSql), isolated(t, providerUrl!),
   ]);
   const ledgerId = randomUUID();
-  await outside.query('INSERT INTO gateway_external_ledger(ledger_id) VALUES ($1)', [ledgerId]);
+  await outside.query('INSERT INTO gateway_external_ledger(ledger_id,limit_usd_nanos) VALUES ($1,$2)', [ledgerId, limit]);
   await provider.query(`CREATE TABLE provider_log(
     id uuid PRIMARY KEY, state text NOT NULL, cost bigint NOT NULL, effect_key text NOT NULL,
     created_at timestamptz NOT NULL DEFAULT clock_timestamp()
@@ -739,6 +739,58 @@ test('known 429 permits one explicit retry and concurrent projects share the exa
   assert.equal(state.budget.spentUsdNanos, BUDGET_USD_NANOS);
   t.diagnostic('one known 429 and one explicit retry; a concurrent project is denied at a $10 reserve and again at $10 spent');
   assert.equal(state.budget.reserveUsdNanos, 0);
+});
+
+test('a persisted $5 cap blocks dispatch and counts unknown effects after a gateway restart', sqlCase, async t => {
+  const limit = 5_000_000_000;
+  const policy = { ...baseRoute, ceilingUsdNanos: 3_000_000_000 };
+  const s = await setup(t, policy, limit);
+  const one = project();
+  const two = project();
+  for (const ref of [one, two]) {
+    await s.gateway.openGeneration(ref);
+    await s.gateway.sealGeneration(ref, manifest);
+    await grant(s.gateway, ref, true, policy);
+  }
+  const first = await lease(s.gateway, one, 'reduced-one', obligationA);
+  const second = await lease(s.gateway, two, 'reduced-two', obligationA);
+  s.setBehavior(async () => 'disconnect');
+  const unknown = isHeld(await s.gateway.call(call(first)), 'unknown_charge');
+  const pinned = new PostgresIntentJournal(s.outside, s.journal.ledgerId, limit);
+  const reopened = new Gateway(s.db, pinned, s.transport);
+  const mismatch = new PostgresIntentJournal(s.outside, s.journal.ledgerId, BUDGET_USD_NANOS);
+  await assert.rejects(mismatch.balance(), /journal_limit_mismatch/);
+  assert.equal(isHeld(await reopened.call(call(first)), 'unknown_charge').attemptId, unknown.attemptId);
+  isHeld(await reopened.call(call(second)), 'budget_exhausted');
+  await assert.rejects(s.outside.query(`INSERT INTO gateway_external_attempts
+    (id,effect_key,project_id,generation_id,route_id,purpose,ceiling_usd_nanos,metadata,state)
+    VALUES ($1,'old-gateway-attempt',$2,$3,$4,'primary_a',$5,'{}','prepared')`,
+  [randomUUID(), two.projectId, two.generationId, policy.id, policy.ceilingUsdNanos]), /gateway budget exhausted/);
+  assert.deepEqual(await pinned.balance(), {
+    frozen: false, limitUsdNanos: limit, spentUsdNanos: 0,
+    reserveUsdNanos: policy.ceilingUsdNanos, remainingUsdNanos: 2_000_000_000,
+  });
+  const small = { ...policy, id: 'reduced-small', ceilingUsdNanos: 2_000_000_000 };
+  await reopened.configureRoute(small);
+  await grant(reopened, two, true, small);
+  s.setCost(small.ceilingUsdNanos);
+  s.setBehavior(async () => 'paid');
+  assert.equal((await reopened.call(call(second, small.id))).status, 'paid');
+  assert.deepEqual(await pinned.balance(), {
+    frozen: false, limitUsdNanos: limit, spentUsdNanos: small.ceilingUsdNanos,
+    reserveUsdNanos: policy.ceilingUsdNanos, remainingUsdNanos: 0,
+  });
+  assert.equal((await s.read()).provider.length, 2);
+});
+
+test('a journal created before the cap column keeps $10 and rejects a pinned $5 expectation', sqlCase, async t => {
+  const s = await setup(t);
+  await s.outside.query(`DROP FUNCTION gateway_enforce_reduced_budget() CASCADE;
+                         ALTER TABLE gateway_external_ledger DROP COLUMN limit_usd_nanos`);
+  const expectedFive = new PostgresIntentJournal(s.outside, s.journal.ledgerId, 5_000_000_000);
+  await assert.rejects(expectedFive.balance(), /journal_limit_mismatch/);
+  assert.equal((await s.journal.balance()).limitUsdNanos, BUDGET_USD_NANOS);
+  assert.equal((await s.journal.balance()).remainingUsdNanos, BUDGET_USD_NANOS);
 });
 
 test('compact visual reserves admit both primary branches against the shared ledger', sqlCase, async t => {

@@ -1,6 +1,6 @@
 import type { Pool, PoolClient } from 'pg';
 import {
-  BUDGET_USD_NANOS, GatewayError, encode, hash, transaction,
+  BUDGET_USD_NANOS, GatewayError, encode, hash, positiveInteger, transaction,
   type Attempt, type JournalEntry, type KnownReceipt, type Receipt, type RoutePolicy,
 } from './types.js';
 
@@ -42,15 +42,24 @@ function sameSettlement(left: Receipt | null, right: Receipt): boolean {
 }
 
 export class PostgresIntentJournal {
-  constructor(private readonly pool: Pool, readonly ledgerId: string) {}
+  constructor(private readonly pool: Pool, readonly ledgerId: string, private readonly expectedLimitUsdNanos?: number) {}
 
-  private async bound(tx: PoolClient): Promise<boolean> {
+  private async bound(tx: PoolClient) {
     await tx.query('SET LOCAL synchronous_commit=on');
-    const result = await tx.query<{ frozen: boolean }>(
-      'SELECT frozen FROM gateway_external_ledger WHERE singleton AND ledger_id=$1 FOR UPDATE', [this.ledgerId],
+    // Deployed journals without the limit column keep their original ten-dollar cap.
+    const result = await tx.query<{ frozen: boolean; limitUsdNanos: string }>(
+      `SELECT frozen, coalesce((to_jsonb(ledger)->>'limit_usd_nanos')::bigint,$2::bigint)::text AS "limitUsdNanos"
+       FROM gateway_external_ledger ledger WHERE singleton AND ledger_id=$1 FOR UPDATE`,
+      [this.ledgerId, BUDGET_USD_NANOS],
     );
     if (!result.rows[0]) throw new GatewayError('journal_identity_mismatch');
-    return result.rows[0].frozen;
+    const { frozen } = result.rows[0];
+    const limitUsdNanos = Number(result.rows[0].limitUsdNanos);
+    if (!positiveInteger(limitUsdNanos, BUDGET_USD_NANOS) ||
+        (this.expectedLimitUsdNanos !== undefined && this.expectedLimitUsdNanos !== limitUsdNanos)) {
+      throw new GatewayError('journal_limit_mismatch');
+    }
+    return { frozen, limitUsdNanos };
   }
 
   private async byId(tx: PoolClient, id: string): Promise<JournalRow> {
@@ -102,16 +111,16 @@ export class PostgresIntentJournal {
 
   async balance() {
     return transaction(this.pool, async tx => {
-      const frozen = await this.bound(tx);
+      const { frozen, limitUsdNanos } = await this.bound(tx);
       const budget = await this.budget(tx);
-      return { limitUsdNanos: BUDGET_USD_NANOS, frozen, ...budget,
-        remainingUsdNanos: Math.max(0, BUDGET_USD_NANOS - budget.reserveUsdNanos - budget.spentUsdNanos) };
+      return { limitUsdNanos, frozen, ...budget,
+        remainingUsdNanos: Math.max(0, limitUsdNanos - budget.reserveUsdNanos - budget.spentUsdNanos) };
     });
   }
 
   async prepare(attempt: Attempt): Promise<JournalEntry | string> {
     return transaction(this.pool, async tx => {
-      const frozen = await this.bound(tx);
+      const { frozen, limitUsdNanos } = await this.bound(tx);
       const current = await this.latest(tx, attempt.effectKey);
       if (current?.attempt.id === attempt.id) return current;
       if (current && current.attempt.requestHash !== attempt.requestHash) return 'effect_conflict';
@@ -119,7 +128,7 @@ export class PostgresIntentJournal {
         || await this.hasRouteIsolation(tx, current.attempt.id))) return current;
       if (frozen) return 'budget_frozen';
       const budget = await this.budget(tx);
-      if (budget.spentUsdNanos + budget.reserveUsdNanos + attempt.ceilingUsdNanos > BUDGET_USD_NANOS) {
+      if (budget.spentUsdNanos + budget.reserveUsdNanos + attempt.ceilingUsdNanos > limitUsdNanos) {
         return 'budget_exhausted';
       }
       const result = await tx.query<JournalRow>(
@@ -135,7 +144,7 @@ export class PostgresIntentJournal {
 
   async claim(id: string, route: RoutePolicy, earlyReview = false): Promise<'claimed' | string> {
     return transaction(this.pool, async tx => {
-      const frozen = await this.bound(tx);
+      const { frozen, limitUsdNanos } = await this.bound(tx);
       const entry = await this.byId(tx, id);
       if (entry.state !== 'prepared') return 'effect_already_claimed';
       if (frozen) return 'budget_frozen';
@@ -159,7 +168,7 @@ export class PostgresIntentJournal {
       if (gate.route_busy) return 'route_busy';
       if (gate.rate_limited) return 'route_rate_limited';
       const budget = await this.budget(tx);
-      if (budget.reserveUsdNanos + budget.spentUsdNanos > BUDGET_USD_NANOS) return 'budget_exhausted';
+      if (budget.reserveUsdNanos + budget.spentUsdNanos > limitUsdNanos) return 'budget_exhausted';
       await tx.query(
         `UPDATE gateway_external_attempts SET state='sending', started_at=clock_timestamp(),
          slot_until=clock_timestamp()+$2::int*interval '1 millisecond' WHERE id=$1`,
