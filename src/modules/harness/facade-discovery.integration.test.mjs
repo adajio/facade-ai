@@ -11,7 +11,9 @@ const built=(path)=>process.env.FACADE_HARNESS_TEST_DIST
   ?pathToFileURL(join(process.env.FACADE_HARNESS_TEST_DIST,path)).href:new URL(`../../../dist/${path}`,import.meta.url).href;
 const sha=(text)=>createHash('sha256').update(text).digest('hex');
 
-test('addressed PDF and XLSX facts share a stable facade; the branch worker consumes memory and preserves history', {skip:!enabled||viewUpgrade==='verify'}, async(t)=>{
+test('addressed PDF and XLSX facts share a stable facade; the branch worker consumes memory and preserves history', {
+  skip:!enabled||viewUpgrade==='verify'||viewUpgrade==='verify-claim',
+}, async(t)=>{
   const url=process.env.DATABASE_URL;
   const database=new URL(url).pathname.slice(1);
   assert.match(database,/^test_facade_identity_[a-z0-9_]+$/u);
@@ -83,8 +85,12 @@ test('addressed PDF and XLSX facts share a stable facade; the branch worker cons
     const address={unitId:place.unitId,...(options.locator?{locator:options.locator}:{})};
     const observation={id,evidenceId,runId:job.lease.jobId,branch,scope:null,source:place.source,
       receiptId:row.receipt_id,address,lineId,readerVersion:'test',grounding:'text',quote,value,unit:'mm'};
+    const componentLineId=options.bindingComponent?randomUUID():undefined;
+    if(options.bindingComponent)observation.components=[{evidenceId,lineId:componentLineId,quote:options.bindingComponent.quote,
+      source:place.source,address,readerVersion:'test',binding:{kind:'context',lineId:componentLineId,text:options.bindingComponent.quote}}];
     const evidence={evidenceId,place,readerVersion:'test',sha256:sha(quote)};
-    const content=JSON.stringify([{id:lineId,text:quote,locator:options.locator},...(options.headers??[])]);
+    const content=JSON.stringify([{id:lineId,text:options.openedLine??quote,locator:options.locator},
+      ...(options.bindingComponent?[{id:componentLineId,text:options.bindingComponent.line}]:[]),...(options.headers??[])]);
     const client=await db.connect();
     try{
       await client.query('BEGIN');
@@ -118,6 +124,19 @@ test('addressed PDF and XLSX facts share a stable facade; the branch worker cons
   const viewFact=await publish(leased.get(pdf.version_id+'A'),pdf,representative,'11',{
     package:{binding:{state:'identified',labels:['Detail-73'],quote:representative,reason:'Candidate from the view name.'}},
   });
+  const cropped='Facade: AA-77';
+  const ownView='View: Sequence-39';
+  const openedLine=`${cropped} | ${ownView} | Refers to ${mark} | Building: Forge | Axes: 6-8`;
+  const croppedFact=viewUpgrade==='seed'?undefined:await publish(leased.get(pdf.version_id+'A'),pdf,cropped,'11',{
+    openedLine,package:{binding:{state:'identified',labels:['AA-77'],quote:cropped,reason:'Candidate from a narrow quote.'}},
+  });
+  const ownFact=viewUpgrade==='seed'?undefined:await publish(leased.get(pdf.version_id+'A'),pdf,ownView,'11',{
+    openedLine,package:{binding:{state:'identified',labels:['Sequence-39'],quote:ownView,reason:'Candidate from the addressed view.'}},
+  });
+  const composedFact=viewUpgrade?.startsWith('seed')?undefined:await publish(leased.get(pdf.version_id+'A'),pdf,'Render sequence 39','11',{
+    bindingComponent:{quote:ownView,line:openedLine},package:{references:{binding:0},
+      binding:{state:'identified',labels:['Sequence-39'],quote:ownView,reason:'The addressed binding component.'}},
+  });
   await publish(leased.get(pdf.version_id+'A'),pdf,'Схема восточного фасада','11');
   await publish(leased.get(pdf.version_id+'B'),pdf,'Схема восточного фасада','11');
   const referenceText=text('19','Project facade ref','Physical schedule');
@@ -131,8 +150,9 @@ test('addressed PDF and XLSX facts share a stable facade; the branch worker cons
   await settle();
   const state=()=>readPackageAnalysis(db,projectId);
   const first=await state();
-  if(viewUpgrade==='seed') {
-    assert.deepEqual(first.candidates.map(({label})=>label).sort(),['Detail-73',mark]);
+  if(viewUpgrade==='seed'||viewUpgrade==='seed-claim') {
+    assert.deepEqual(first.candidates.map(({label})=>label).sort(),viewUpgrade==='seed'?['Detail-73',mark]:[mark]);
+    if(croppedFact)assert.equal(first.facts.find(({id})=>id===croppedFact.id).binding.candidates[0]?.label,mark);
     const {binding}=first.facts.find(({id})=>id===tableFact.id);
     await db.query(`INSERT INTO harness_package_bindings(fact_id,version,state,candidates,reason,actor_id)
       VALUES($1,$2,'identified',$3,'Manual decision on a different original',$4)`,
@@ -144,6 +164,10 @@ test('addressed PDF and XLSX facts share a stable facade; the branch worker cons
   assert.equal(first.facadeProfiles[0].identity,'independent');
   assert.equal(first.facts.find(({id})=>id===viewFact.id).binding.candidates[0]?.id,facadeId);
   assert.deepEqual(first.facadeMentions.find(({factId})=>factId===viewFact.id).relation,{sourceLabel:'Detail-73',targetLabels:[mark]});
+  assert.equal(first.facts.find(({id})=>id===croppedFact.id).binding.state,'unclear');
+  assert.equal(first.facadeMentions.find(({factId})=>factId===croppedFact.id).relation,undefined);
+  assert.equal(first.facts.find(({id})=>id===ownFact.id).binding.candidates[0]?.id,facadeId);
+  assert.equal(first.facts.find(({id})=>id===composedFact.id).binding.candidates[0]?.id,facadeId);
   assert.ok(first.reviewCandidates.some(({a,b,scope})=>a===pdfFact.id&&b===tableFact.id&&scope.id===facadeId));
   assert.ok(references.every(({id})=>first.facts.find((f)=>f.id===id).binding.candidates[0]?.id===facadeId));
   assert.equal(first.facts.find(({id})=>id===alias.id).binding.state,'unclear');
@@ -224,13 +248,15 @@ test('addressed PDF and XLSX facts share a stable facade; the branch worker cons
   assert.equal((await db.query('SELECT count(*)::int AS n FROM harness_package_bindings WHERE fact_id=$1',[tableFact.id])).rows[0].n,last+1);
 });
 
-test('migration reinterprets a stored view reference while preserving prior and manual bindings', {skip:!enabled||viewUpgrade!=='verify'}, async(t)=>{
+test('migration reinterprets a stored view reference while preserving prior and manual bindings', {
+  skip:!enabled||!['verify','verify-claim'].includes(viewUpgrade),
+}, async(t)=>{
   const connectionString=process.env.DATABASE_URL;
-  assert.match(new URL(connectionString).pathname,/^\/test_facade_identity_view_upgrade$/u);
+  assert.match(new URL(connectionString).pathname,/^\/test_facade_identity_view_(?:upgrade|claim)$/u);
   const db=new pg.Pool({connectionString});
   t.after(()=>db.end());
   const {readPackageAnalysis}=await import(built('src/modules/harness/package-analysis.js'));
-  const {reconcileNextFacadeDiscovery}=await import(built('src/modules/harness/facade-discovery.js'));
+  const {facadeDiscoveryVersion,reconcileNextFacadeDiscovery}=await import(built('src/modules/harness/facade-discovery.js'));
   const {rows:[{id:projectId}]}=await db.query("SELECT id FROM projects WHERE name='Addressed'");
   const before=await readPackageAnalysis(db,projectId);
   const manual=before.facts.find(({binding})=>binding.actorId);
@@ -246,8 +272,28 @@ test('migration reinterprets a stored view reference while preserving prior and 
   const {rows:[history]}=await db.query(`SELECT d.prior_mentions AS mentions,
     EXISTS(SELECT 1 FROM harness_package_bindings b CROSS JOIN LATERAL jsonb_array_elements(b.candidates) c
       WHERE b.fact_id=d.fact_id AND c->>'label'='Detail-73') AS retained
-    FROM harness_facade_discovery d WHERE d.fact_id=$1 AND d.resolved AND d.discovery_version=2`,[addressed.factId]);
-  assert.ok(history.retained);
-  assert.equal(history.mentions[0].version,1);
-  assert.deepEqual(history.mentions[0].mentions.map(({label})=>label),['Detail-73']);
+    FROM harness_facade_discovery d WHERE d.fact_id=$1 AND d.resolved AND d.discovery_version=$2`,[addressed.factId,facadeDiscoveryVersion]);
+  if(viewUpgrade==='verify') {
+    assert.ok(history.retained);
+    assert.equal(history.mentions[0].version,1);
+    assert.deepEqual(history.mentions[0].mentions.map(({label})=>label),['Detail-73']);
+  }else{
+    const cropped=after.facts.find(({observation})=>observation.quote==='Facade: AA-77');
+    const own=after.facts.find(({observation})=>observation.quote==='View: Sequence-39');
+    assert.equal(cropped.binding.state,'unclear');
+    assert.equal(own.binding.candidates[0].id,before.candidates[0].id);
+    const {rows:[prior]}=await db.query(`SELECT d.prior_mentions AS mentions,
+      EXISTS(SELECT 1 FROM harness_package_bindings b WHERE b.fact_id=d.fact_id AND b.version<$2 AND b.state='identified'
+        AND b.candidates->0->>'id'=$3) AS retained
+      FROM harness_facade_discovery d WHERE d.fact_id=$1 AND d.discovery_version=$4`,
+    [cropped.id,cropped.binding.version,before.candidates[0].id,facadeDiscoveryVersion]);
+    assert.ok(prior.retained);
+    assert.equal(prior.mentions[0].version,2);
+    assert.equal(prior.mentions[0].mentions[0].relation.targetLabels[0],'VB-27');
+    await db.query('INSERT INTO harness_facade_discovery_dirty(project_id) VALUES($1)',[projectId]);
+    while(await reconcileNextFacadeDiscovery(db)){}
+    const repeated=await readPackageAnalysis(db,projectId);
+    assert.deepEqual(repeated.facts.map(({binding})=>binding),after.facts.map(({binding})=>binding));
+    assert.deepEqual(repeated.facadeMentions,after.facadeMentions);
+  }
 });

@@ -155,3 +155,38 @@ test('an addressed view refers to the registered facade without opening its own 
   assert.ok(byContext.get(contextual));
   assert.equal(byContext.get(linked)?.id,byContext.get(contextual)?.id);
 });
+
+test('a cropped quotation cannot take a following view’s facade reference',()=>{
+  const registry=mark('Project facade ID: MX-61 | Building: Hall | Axes: 4-5');
+  const first='Facade: AA-51';
+  const second='View: Elevation-42';
+  const body=`${first} | ${second} | Refers to MX-61 | Building: Hall | Axes: 4-5`;
+  const mentions=(quote:string,full=body)=>{
+    const {obs,ref}=opened(quote,'A',registry.versionId);
+    return collectFacadeMentions(obs,{quote,candidates:[]},ref,[{id:ref.lineId,text:full}]);
+  };
+  const [other]=mentions(first);
+  const [owned]=mentions(second);
+  const scopes=resolveFacadeMentions(projectId,[registry,other,owned]);
+  assert.equal(scopes.has(other),false);
+  assert.equal(other.relation,undefined);
+  assert.equal(scopes.get(owned)?.id,scopes.get(registry)?.id);
+  assert.equal(owned.quote,`${second} | Refers to MX-61 | Building: Hall | Axes: 4-5`);
+  for(const [quote,line] of [
+    [first,`${first} | Refers to MX-61 | ${first} | Refers to MX-61`],
+    [first,`${first} | an unlabelled inset | Refers to MX-61`],
+    [`${first} | ${second}`,body],
+    ['Refers to MX-61','Refers to MX-61 | Building: Hall | Axes: 4-5'],
+  ]) {
+    const possible=mentions(quote,line);
+    assert.ok(possible.length);
+    assert.ok(possible.every(({kind})=>kind==='unresolved'));
+    assert.equal(resolveFacadeMentions(projectId,[registry,...possible]).size,1);
+  }
+  const {obs,ref}=opened(second,'A',registry.versionId);
+  const [pinned]=collectFacadeMentions(obs,{quote:second,candidates:[]},ref,[
+    {id:'different-line',text:`${second} | Refers to another facade`},{id:ref.lineId,text:body},
+  ]);
+  assert.equal(pinned.label,'MX-61');
+  assert.equal(pinned.lineId,ref.lineId);
+});

@@ -8,7 +8,7 @@ import { publishProjectEvent } from '../supplements/events.js';
 import type { PackageBinding, PackageFact } from './package-analysis.js';
 import { affirmedFacadeKind } from './facade-type-evidence.js';
 
-export const facadeDiscoveryVersion=2;
+export const facadeDiscoveryVersion=3;
 
 export type FacadeEvidence = {
   factId: string; branch: 'A' | 'B'; evidenceId: string; versionId: string; readerVersion: string;
@@ -36,12 +36,14 @@ const clauses = /[|;·\r\n]/u;
 const facadeHeading = /^(?:facade(?:\s+(?:mark|designation|id))?|фасад|(?:марка|обозначение|код) фасада)\s*[:№=]?$/iu;
 const registered = /^(?:project facade (?:identifier|id)|идентификатор фасада проекта|код фасада проекта)\s*[:№=]\s*(.+)$/iu;
 const referred = /^(?:project facade (?:reference|ref)|ссылка на (?:код|идентификатор) фасада проекта)\s*[:№=]\s*(.+)$/iu;
-const viewName = /^(?:view(?: name)?|detail view|вид|наименование вида)\s*[:№=]\s*(.+)$/iu;
+const viewName = /^(?:view(?: name)?|detail(?: view)?|section|elevation|вид|наименование вида|узел|разрез)\s*[:№=]\s*(.+)$/iu;
+const otherViewName = /^(?:view|detail|section|elevation|вид|узел|разрез)\s+(.+)$/iu;
 const viewReference = /(?:^|\s)(refers to|reference to|does not refer to|not referring to|не относится к|не ссылается на|относится к|ссылается на)(?=\s|[:№=]|$)\s*[:№=]?\s*(.*)$/iu;
 const designation = /^(?:facade(?:\s+(?:mark|designation|id))?|фасад|(?:марка|обозначение|код) фасада)\s*[:№=]\s*(.+)$/iu;
 const inlineDesignation = /^(?:facade|фасад)\s+([\p{L}\p{N}_.\/‐‑‒–—-]+)(?=\s+(?:в\s+|по\s+|in\s+|at\s+|axes\s+|grid\s+|корпус|building|block))/iu;
 const buildingField = /^(?:building|block|корпус|здани[ея]|секция)\s*[:№=]\s*(.+)$/iu;
 const axesField = /^(?:axes|grid|оси|осях)\s*[:№=]\s*(.+)$/iu;
+const claimMetadata = /^(?:(?:stage|revision|variant|стадия|редакция|исполнение)\s*[:№=]\s*\S|(?:current|effective|superseded)\s+revision\s+\S)/iu;
 const inlineBuilding = /(?<!\p{L})(?:корпус(?:а|е)?|здани[еяи]|building|block)\s*[:№=]?\s+([\p{L}\p{N}_.‐‑‒–—-]+)/iu;
 const inlineAxes = /(?<!\p{L})(?:в\s+осях|по\s+осям|axes|grid)\s*[:№=]?\s+([\p{L}\p{N}_.\/‐‑‒–—-]+(?:\s*[-‐‑‒–—/]\s*[\p{L}\p{N}_.]+)?)/iu;
 const normalize = (value: string) => value.normalize('NFC').trim();
@@ -137,8 +139,8 @@ function referencedFacade(line: string) {
   });
   if(!statements.length)return;
   const {prefix}=statements[0];
-  const sourceLabel=prefix?(uniqueField(prefix,viewName)??uniqueField(prefix,designation)??prefix):
-    uniqueField(line,viewName)??uniqueField(line,designation);
+  const sourceLabel=uniqueField(prefix||line,viewName)??uniqueField(prefix||line,designation)??
+    uniqueField(prefix||line,otherViewName)??uniqueField(prefix||line,registered)??uniqueField(prefix||line,inlineDesignation);
   const labels=new Map<string,string>();
   let ambiguous=false;
   for (const {predicate,literal} of statements) {
@@ -158,22 +160,65 @@ function referencedFacade(line: string) {
     kind:unique?'reference' as const:'unresolved' as const,relation:{...(sourceLabel?{sourceLabel}:{}),targetLabels},...context};
 }
 
+function scopedViewClaim(line: string, quote: string) {
+  const start=line.indexOf(quote);
+  if(start<0||line.indexOf(quote,start+1)>=0)return;
+  const end=start+quote.length;
+  const parts=[...line.matchAll(/[^|;·\r\n]+/gu)].flatMap((part)=>{
+    const text=part[0].trim();
+    if(!text)return [];
+    const reference=viewReference.exec(text);
+    const prefix=reference?text.slice(0,reference.index).trim():text;
+    const owner=viewName.test(prefix)||otherViewName.test(prefix)||designation.test(prefix)||registered.test(prefix)||
+      referred.test(prefix)||inlineDesignation.test(prefix)||Boolean(directionalMark(prefix)?.heading);
+    return [{text,at:part.index+part[0].length-part[0].trimStart().length,owner,reference,
+      boundary:owner||Boolean(reference&&prefix)}];
+  });
+  const starts=parts.flatMap(({boundary},index)=>boundary?[index]:[]);
+  for(const [index,from] of starts.entries()) {
+    const to=starts[index+1]??parts.length;
+    const first=parts[from];
+    const boundary=parts[to]?.at??line.length;
+    if((index>0&&start<first.at)||end<=first.at||end>boundary)continue;
+    if(!first.owner)return;
+    const selected=parts.slice(from,to);
+    const firstUnscoped=selected.findIndex(({text,reference},part)=>part>0&&
+      !reference&&!buildingField.test(text)&&!axesField.test(text)&&!claimMetadata.test(text));
+    if(firstUnscoped<0)return line.slice(first.at,boundary).replace(/[|;·\s]+$/u,'');
+    const scopedEnd=selected[firstUnscoped].at;
+    // An unlabelled clause can introduce another subject. Do not attach a later link or qualifiers across it.
+    if(end>scopedEnd||selected.slice(firstUnscoped+1).some(({reference})=>reference))return;
+    return line.slice(first.at,scopedEnd).replace(/[|;·\s]+$/u,'');
+  }
+}
+
 export function collectFacadeMentions(observation: Observation, initial: Pick<PackageBinding,'quote'|'candidates'>,
   reference: FacadeEvidence, lines: ReaderLine[], evidenceByLine: ReadonlyMap<string,string> = new Map()): FacadeMention[] {
   const { quote, lineId } = reference;
-  const line = lines.find(({ id, text }) => id === lineId && text.includes(quote));
+  const addressed=lines.filter(({id})=>id===lineId);
+  const line=addressed.length===1&&addressed[0].text.includes(quote)?addressed[0]:undefined;
   const possible = new Set(initial.candidates.map(({ label }) => normalize(label)));
   if (!line || observation.grounding !== 'text') {
     return [...possible].map((label) => ({ ...reference, label, kind: 'unresolved' }));
   }
-  const relation=referencedFacade(line.text);
-  if(relation)return [{...reference,quote:line.text,...relation}];
   const projectMarks = fields(quote, registered);
   const referenceMarks = fields(quote, referred);
   const localMarks = localFacadeFields(quote);
   const column = facadeColumn(lines, line);
   for(const label of [...projectMarks,...referenceMarks,...localMarks.map(({label})=>label)])possible.add(label);
   if (column && quote === line.text && quote.length <= 160) possible.add(normalize(quote));
+  let scopeLine=line.text;
+  if(line.text.split(clauses).some((part)=>viewReference.test(part))) {
+    const scoped=scopedViewClaim(line.text,quote);
+    if(!scoped) {
+      const relation=referencedFacade(quote);
+      if(relation)return [{...reference,...relation,kind:'unresolved',context:undefined,contextQuote:undefined,partialContext:undefined}];
+      return [...possible].map((label)=>({...reference,label,kind:'unresolved'}));
+    }
+    scopeLine=scoped;
+    const relation=referencedFacade(scoped);
+    if(relation)return [{...reference,quote:scoped,...relation}];
+  }
   return [...possible].map((label) => {
     const mark = foldedLabel(label);
     const isRegistry = [...projectMarks].some((label)=>foldedLabel(label)===mark);
@@ -181,7 +226,7 @@ export function collectFacadeMentions(observation: Observation, initial: Pick<Pa
     const orientation=directionalMark(label);
     const local=localMarks.find(({label,token})=>foldedLabel(label)===mark||token&&token===orientation?.token);
     const isCell = column && foldedLabel(line.text) === mark;
-    const scope=isRegistry||isReference||local?.heading ? addressedContext(line.text,local?.token??mark):undefined;
+    const scope=isRegistry||isReference||local?.heading ? addressedContext(scopeLine,local?.token??mark):undefined;
     const kind = isRegistry ? 'registry' : isReference ? 'reference' : local?.heading && scope?.context ? 'context' : local || isCell ? 'designation' : 'unresolved';
     return { ...reference, label, kind, ...scope, ...(local?.token?{lookupToken:local.token}:{}),
       ...(isCell && column ? { qualifier: { evidenceId:evidenceByLine.get(column.id)??reference.evidenceId, lineId: column.id, quote: column.text,
@@ -302,7 +347,7 @@ async function recordDiscovery(tx: PoolClient, row: DiscoveryRow) {
   const { observation, original, basis }=row;
   const part=basis.parts?.binding;
   const component=part && observation.components?.find(({ evidenceId,lineId })=>part.evidenceId===evidenceId&&part.lineId===lineId);
-  const quote=original.quote??observation.quote;
+  const quote=original.quote??part?.quote??observation.quote;
   let mentions: FacadeMention[]=[];
   if (quote) {
     const evidenceId=part?.evidenceId??observation.evidenceId;
@@ -320,10 +365,14 @@ async function recordDiscovery(tx: PoolClient, row: DiscoveryRow) {
        ORDER BY event#>>'{reply,evidence,evidenceId}',sequence`,[observation.runId,evidenceIds]);
     const lines=new Map<string,ReaderLine>();
     const evidenceByLine=new Map<string,string>();
-    for(const id of evidenceIds)for(const line of deliveredLines(opened.find((claim)=>claim.evidenceId===id)?.content??null)) {
-      if(lines.has(line.id)||line.id===lineId&&id!==evidenceId)continue;
-      lines.set(line.id,line);
-      evidenceByLine.set(line.id,id);
+    for(const id of evidenceIds) {
+      const provided=deliveredLines(opened.find((claim)=>claim.evidenceId===id)?.content??null);
+      const oneAnchor=id===evidenceId&&provided.filter(({id})=>id===lineId).length===1;
+      for(const line of provided) {
+        if(lines.has(line.id)||line.id===lineId&&!oneAnchor)continue;
+        lines.set(line.id,line);
+        evidenceByLine.set(line.id,id);
+      }
     }
     mentions=collectFacadeMentions(observation,original,reference,[...lines.values()],evidenceByLine);
   }
