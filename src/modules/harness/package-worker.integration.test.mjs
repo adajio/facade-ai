@@ -233,13 +233,12 @@ test('ordinary intake publishes independent package evidence before questions an
   });
   t.after(async () => {
     driver?.abort();
-    try { await worker; } finally {
-      await new Promise((resolve) => provider.close(resolve));
-    }
-    await app.close();
-    await external.end();
+    const stopped = await Promise.allSettled([worker, new Promise((resolve) => provider.close(resolve))]);
+    const closed = await Promise.allSettled([app.close(), external.end()]);
     delete process.env.FACADE_HARNESS_PACKAGE_EFFECTS;
     delete process.env.FACADE_HARNESS_REPLAY_ONLY;
+    const failure = [...stopped, ...closed].find(({ status }) => status === 'rejected');
+    if (failure) throw failure.reason;
   });
   await new Promise((resolve) => provider.listen(0, '127.0.0.1', resolve));
   const options = managedWorkerOptions(`http://127.0.0.1:${provider.address().port}`, import.meta.url);
