@@ -6,7 +6,7 @@ import { comparisonSource } from "../access/catalog-comparison.js";
 import type { FacadeFact } from "./facade-model.js";
 import { normalizeFormat } from "./store.js";
 
-type Candidate = { original: string; ids: [string, string]; priority: number };
+type Candidate = { original: string; ids: [string, string]; priority: number; comparisonKey: string | null };
 
 function place({ citation }: Finding) {
   return canonicalJson([citation.sha256, citation.address]);
@@ -39,34 +39,35 @@ export function proveFacadeRule(requirement: Requirement, facts: Map<string, Fac
   const priorityOf = (finding: Finding) => comparisonSource(requirement.comparison, finding)?.priority ?? 0;
   const qualified = new Set<Finding>();
   const candidates = rule.allOf.map(({ anyOf }) => {
-    let highest = 0;
+    const highest = new Map<string, number>();
     const options = anyOf.flatMap((option) => {
-    const eligibleFindings = findings.filter((finding) => {
-      const fact = facts.get(finding.citation.observationId);
-      return fact && eligible(requirement, option, fact, finding);
-    });
-    if (option.mode !== "presence") {
-      for (const finding of eligibleFindings) {
-        qualified.add(finding);
-        highest = Math.max(highest, priorityOf(finding));
+      const presence = option.mode === "presence";
+      const eligibleFindings = findings.filter((finding) => {
+        const fact = facts.get(finding.citation.observationId);
+        return fact && eligible(requirement, option, fact, finding);
+      });
+      if (!presence) {
+        for (const finding of eligibleFindings) {
+          qualified.add(finding);
+          highest.set(finding.comparisonKey, Math.max(highest.get(finding.comparisonKey) ?? 0, priorityOf(finding)));
+        }
       }
-    }
-    const places = Map.groupBy(eligibleFindings, place);
-    const supports: Candidate[] = [];
-    for (const group of places.values()) {
-      for (const left of group.filter(({ citation }) => citation.branch === "A")) {
-        const a = left.citation;
-        const right = group.find(({ citation: b, comparisonKey }) =>
-          b.branch === "B" && comparisonKey === left.comparisonKey &&
-          facts.get(a.observationId)?.runId !== facts.get(b.observationId)?.runId &&
-          (option.mode === "presence" || compareCitationValues(a, b) === "equal"));
-        if (right) supports.push({ original: a.sha256, ids: [a.observationId, right.citation.observationId],
-          priority: option.mode === "presence" ? 0 : priorityOf(left) });
+      const places = Map.groupBy(eligibleFindings, place);
+      const supports: Candidate[] = [];
+      for (const group of places.values()) {
+        for (const left of group.filter(({ citation }) => citation.branch === "A")) {
+          const a = left.citation;
+          const right = group.find(({ citation: b, comparisonKey }) =>
+            b.branch === "B" && comparisonKey === left.comparisonKey &&
+            facts.get(a.observationId)?.runId !== facts.get(b.observationId)?.runId &&
+            (presence || compareCitationValues(a, b) === "equal"));
+          if (right) supports.push({ original: a.sha256, ids: [a.observationId, right.citation.observationId],
+            priority: presence ? 0 : priorityOf(left), comparisonKey: presence ? null : left.comparisonKey });
+        }
       }
-    }
-    return supports;
+      return supports;
     });
-    return options.filter(({ priority }) => priority === highest);
+    return options.filter(({ priority, comparisonKey }) => comparisonKey === null || priority === highest.get(comparisonKey));
   });
   if (candidates.some((group) => !group.length)) return [];
   const measured = Map.groupBy([...qualified].filter(({ kind }) => kind === "value"),

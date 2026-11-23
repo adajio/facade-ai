@@ -57,6 +57,16 @@ const branches = ["A", "B"] as const;
 const terminal = new Set(["covered", "reviewed_no_match"]);
 const maxItems = 25;
 
+export function completedReaderJob(window: PackageWindow, branch: "A" | "B") {
+  const root = window.branches[branch];
+  if (terminal.has(root.status)) return root.jobId;
+  if (root.status !== "held" || !root.jobId || root.reason !== "turn_limit_final") return null;
+  const structure: (NonNullable<PackageWindow["structure"]>["branches"][typeof branch] &
+    { completedFollowupId?: string | null }) | undefined = window.structure?.branches[branch];
+  if (!structure?.complete) return null;
+  return structure.completedFollowupId ?? null;
+}
+
 const identity = (catalog: string | null, facade: string | null, position: string, stage: string) =>
   JSON.stringify([catalog, facade, position, requirementSubjectKey(stage)]);
 
@@ -83,7 +93,7 @@ export function assessSemanticRemainder(input: {
   const applicable = admitted.length ? admitted : [index.windows];
   const totalWindows = applicable.reduce((sum, windows) => sum + windows.length, 0);
   const contextCurrent = !requirement.facadeKinds?.length || context.facadeType?.state === "confirmed";
-  const relevant = (stage && contextCurrent
+  const relevant = (stage && contextCurrent && requirement.evidenceRule
     ? index.checks.get(identity(catalogVersionId, context.facadeId, requirement.positionId, stage)) ?? [] : []).filter((check) =>
     check.disposition === "alternatives_checked" && !check.subject &&
     (!check.facadeKind || (context.facadeType?.state === "confirmed" &&
@@ -99,7 +109,7 @@ export function assessSemanticRemainder(input: {
   for (const [windowId, proofs] of byWindow) {
     const window = index.byWindow.get(windowId);
     if (!window || (admitted.length && !formats.has(normalizeFormat(window.format))) ||
-        branches.some((branch) => !terminal.has(window.branches[branch].status) || !window.structure?.branches[branch].complete)) continue;
+        branches.some((branch) => !completedReaderJob(window, branch) || !window.structure?.branches[branch].complete)) continue;
     const options = (branch: "A" | "B") => proofs.filter((check) =>
       check.branch === branch && check.readerVersion === window.readerVersion && check.basisIds.length &&
       (check.primaryJobId ? check.primaryJobId === window.branches[branch].jobId :
@@ -123,7 +133,7 @@ export function assessSemanticRemainder(input: {
       if (verified.has(window.id)) continue;
       const at = { windowId: window.id, versionId: window.place.source.versionId, unitId: window.place.unitId,
         ...(window.place.box ? { box: window.place.box } : {}) };
-      const pending = branches.filter((branch) => !terminal.has(window.branches[branch].status));
+      const pending = branches.filter((branch) => !completedReaderJob(window, branch));
       const structural = branches.filter((branch) => !window.structure?.branches[branch].complete);
       const attemptsMissing = attempted.get(window.id) ?? [...branches];
       const blockIds = structural.flatMap((branch) => window.structure?.branches[branch].remaining.map(({ blockId }) => blockId) ?? []);
@@ -140,6 +150,7 @@ export function assessSemanticRemainder(input: {
   if (!totalWindows) reasons.push("semantic_no_mapped_material");
   if (!contextCurrent) reasons.push("facade_type_unconfirmed");
   if (requirement.applicability !== "applicable") reasons.push("applicability_unknown");
+  if (!requirement.evidenceRule) reasons.push("catalog_evidence_rule_unset");
   const alternativesVerified = !reasons.length && verified.size === totalWindows;
   return {
     remainder: { state: reasons.length ? "open" : "complete", totalWindows, verifiedWindows: verified.size, alternativesVerified, reasons,

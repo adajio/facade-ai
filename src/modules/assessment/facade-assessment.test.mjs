@@ -150,9 +150,10 @@ test("ordinary intake publishes a local conflict, then keeps sent history after 
   const app = Fastify();
   app.decorate("db", db);
   app.decorate("config", { dataDir: process.env.FACADE_DATA_DIR });
-  for (const name of ["access", "intake", "pdf", "assessment", "letters", "questions", "supplements", "harness/stops"]) {
+  for (const name of ["access", "intake", "pdf", "assessment", "letters", "questions", "supplements"]) {
     await app.register((await built(`${name}/index`)).register);
   }
+  await app.register((await built("harness/stops")).register);
   const reader = createRuntimePdfService(db, app.config);
   t.after(async () => { await reader.close(); await app.close(); await db.end(); });
   const login = "package-assessment";
@@ -187,10 +188,13 @@ test("ordinary intake publishes a local conflict, then keeps sent history after 
     sourceRoles: ["drawing"], completenessCriterion: "Addressed measure", addressee: recipient,
     evidenceRule: { allOf: [{ anyOf: [{ sourceRole: "drawing" }] }] },
   });
+  const thickness = { ...fields("thickness", "Thickness", "facade"), sourceRoles: ["drawing", "schedule"],
+    comparison: { sources: ["drawing", "schedule"].map((sourceRole) => ({ sourceRole, valueRole: "design", priority: 5 })) },
+    evidenceRule: { allOf: [{ anyOf: ["drawing", "schedule"].map((sourceRole) => ({ sourceRole, valueRole: "design" })) }] } };
   const catalog = (await request("POST", "/api/catalogs", {
     key: "synthetic", name: "Synthetic matrix",
     defaultProfile: { stage: "P", facadeKinds: ["panel"], approvalReference: "Synthetic rule" },
-    requirements: [fields("thickness", "Thickness", "facade"), fields("width", "Width", "facade"), fields("clearance", "Clearance", "common")],
+    requirements: [thickness, fields("width", "Width", "facade"), fields("clearance", "Clearance", "common")],
   }, { status: 201 })).json();
   const gateway = createGateway(db, { replayOnly: true });
   const profile = { lead: null };
@@ -252,6 +256,7 @@ test("ordinary intake publishes a local conflict, then keeps sent history after 
           ...(fixture.statement ? { deliveryStatement: fixture.statement } : {}) };
         const details = {
           attribute: fixture.attribute, role: { value: fixture.role ?? "drawing", quote: fixture.roleQuote ?? "Drawing" },
+          ...(fixture.valueRole ? { valueRole: fixture.valueRole } : {}),
           stage: { value: "P", quote: grounded.quote },
           revision: { value: fixture.revision, quote: grounded.quote, status: "current" },
           binding: fixture.facade ? {
@@ -307,14 +312,16 @@ test("ordinary intake publishes a local conflict, then keeps sent history after 
       }
     }
   }
-  const drawing = (filename, attribute, value, revision, facade = "F1") => ({
-    filename, attribute, value, revision, facade,
-    quote: `Drawing ${attribute} ${value} mm | Stage P | Revision ${revision} current | Variant V1 | Scope: ${facade} | Project facade id: ${facade}`,
-  });
+  const drawing = (filename, attribute, value, revision, facade = "F1", role = "drawing") => {
+    const roleQuote = role === "drawing" ? "Drawing" : "Schedule";
+    return { filename, attribute, value, revision, facade, role, roleQuote,
+      ...(attribute === "Thickness" ? { valueRole: { kind: "design", quote: "Design value" } } : {}),
+      quote: `${roleQuote} ${attribute} ${value} mm | Design value | Stage P | Revision ${revision} current | Variant V1 | Scope: ${facade} | Project facade id: ${facade}` };
+  };
   // A persisted result from the earlier publisher retained only the negative part of a contradictory line.
   const savedQuote = "Width not delivered | Stage P | Revision R9 current | Scope: F2 | Project facade id: F2 | Inventory";
   const initial = await uploadReceipt([
-    drawing("first.pdf", "Thickness", "10", "R1"), drawing("second.pdf", "Thickness", "20", "R2"),
+    drawing("first.pdf", "Thickness", "10", "R1"), drawing("second.pdf", "Thickness", "20", "R2", "F1", "schedule"),
     drawing("width.pdf", "Width", "100", "R3"),
     drawing("south.pdf", "Thickness", "200", "R4", "F2"),
     { filename: "common.pdf", attribute: "Clearance", value: "17", revision: "R5", common: true,
@@ -364,6 +371,9 @@ test("ordinary intake publishes a local conflict, then keeps sent history after 
   assert.ok(f2Width.machine.citations.length > 0);
   assert.ok(f2Width.machine.citations.every(({ deliveryUncertainty }) => deliveryUncertainty === "contradictory_original"));
   assert.ok(f2Width.machine.limitations.includes("delivery_statement_conflict"));
+  await request("POST", `/api/v1/questions/${f2Width.id}/decisions`, {
+    action: "confirm", reason: "Contradictory inventory cannot enter a letter", requestExternal: true,
+  }, { version: f2Width.version, status: 422 });
   assert.equal(early.contexts.find(({ name }) => name === "F1").counts.confirmed_conflict, 1);
   const newObservations = (await request("GET", early.observations.href)).json().items;
   const titled = newObservations.find(({ basis }) => basis.revisionEvidence);
@@ -377,6 +387,7 @@ test("ordinary intake publishes a local conflict, then keeps sent history after 
     action: "confirm", reason: "Synthetic review", requestExternal,
   }, { version: q.version, status: 201 })).json();
   const conflict = question(early, "thickness");
+  assert.ok(conflict.machine.citations.every(({ valueRoleBasis }) => valueRoleBasis?.kind === "design"));
   const confirmed = await decision(conflict, true);
   const nearby = await decision(question(early, "width"));
   const decided = await assessment();

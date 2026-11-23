@@ -65,7 +65,7 @@ export async function replaceFacadeSources(tx: PoolClient, input: {
     const groups = facadeEvidenceGroups(requirement, fact, finding);
     if (finding.applicability !== "active" || !finding.sourceRole ||
         (proposed && (!fact.property || !groups.length || !supplementIds.length)) ||
-        (!proposed && supplementIds.length)) {
+        (!proposed && (supplementIds.length || (!groups.length && finding.kind !== "absence")))) {
       throw invalid("support_unverified", "Проверьте действующую редакцию, применимость и формат опоры.");
     }
     const proof = await open({
@@ -87,9 +87,11 @@ export async function replaceFacadeSources(tx: PoolClient, input: {
   const replaced: Awaited<ReturnType<typeof verify>>[] = [];
   for (const ref of selected) replacements.push(await verify(ref, true));
   for (const ref of retired) replaced.push(await verify(ref, false));
-  if (replaced.some(({ groups, valueRole, variant }) => groups.length && !replacements.some((item) =>
-    groups.some((group) => item.groups.includes(group)) && (!valueRole || item.valueRole === valueRole) &&
-    (!variant || item.variant === variant)))) {
+  const sameRequirement = (old: typeof replaced[number], item: typeof replacements[number]) => !old.groups.length ||
+    (old.groups.some((group) => item.groups.includes(group)) && (!old.valueRole || item.valueRole === old.valueRole) &&
+      (!old.variant || item.variant === old.variant));
+  if (replaced.some((old) => !replacements.some((item) => sameRequirement(old, item))) ||
+      replacements.some((item) => !replaced.some((old) => sameRequirement(old, item)))) {
     throw invalid("replacement_requirement_mismatch", "Новые опоры должны подтверждать заменяемую часть, назначение значения и вариант.");
   }
   const receiptIds = [...new Set(replacements.flatMap(({ supplementIds }) => supplementIds))].sort();

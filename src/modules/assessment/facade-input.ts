@@ -5,7 +5,7 @@ import { hasAddressedSubject } from "../questions/subject-evidence.js";
 import { canonicalJson, isInventoryRole } from "./domain.js";
 import type { Evidence, ReaderAddress, ReaderLine } from "../pdf/types.js";
 import { exactDeliveryStatement, nonDeliveryFromOriginal, type FacadeFact, type FacadeReadout } from "./facade-model.js";
-import { indexSemanticInput } from "./facade-semantic.js";
+import { completedReaderJob, indexSemanticInput } from "./facade-semantic.js";
 import type { Gate } from "./store.js";
 
 type AcceptedVersion = { id: string; sha256: string; documentId: string; label: string };
@@ -23,8 +23,6 @@ export type FacadeReplacement = {
   replaced: ReplacementReference[];
   replacements: ReplacementReference[];
 };
-
-const completeBranch = (state: string) => state === "covered" || state === "reviewed_no_match";
 
 function convertFact(fact: PackageFact, accepted: Map<string, AcceptedVersion>, formats: Map<string, string>,
   stages: Map<string, ConfirmedStage>, evidence: Map<string, EvidenceMetadata>, original: ReaderLine[] | undefined): FacadeFact | null {
@@ -242,15 +240,18 @@ export async function readFacadeInput(tx: PoolClient, projectId: string) {
   const originalLines = new Map(statements.map(({ id, content }) => [id, deliveredLines(content)]));
   const facts = activeFacts.flatMap((fact) => convertFact(fact, accepted, formats, stageByAddress, evidenceById,
     originalLines.get(fact.id)) ?? []);
-  const coveredWindows = windows.filter(({ branches }) => completeBranch(branches.A.status) &&
-    completeBranch(branches.B.status) && branches.A.jobId && branches.B.jobId && branches.A.jobId !== branches.B.jobId);
+  const coveredWindows = windows.flatMap((window) => {
+    const a = completedReaderJob(window, "A");
+    const b = completedReaderJob(window, "B");
+    return a && b && a !== b ? [[a, b]] : [];
+  });
   const mappedVersionIds = [...new Set(windows.map(({ place }) => place.source.versionId))].sort();
   const versionIds = versions.map(({ id }) => id);
   const mapped = new Set(mappedVersionIds);
   const semantic = indexSemanticInput(windows, analysis.semanticChecks ?? [], versionIds.filter((id) => !mapped.has(id)));
   const reading = windows.length > 0 && coveredWindows.length === windows.length &&
     canonicalJson(mappedVersionIds) === canonicalJson(versionIds) ?
-    { versionIds, basisIds: coveredWindows.flatMap(({ branches }) => [branches.A.jobId!, branches.B.jobId!]).sort() } : null;
+    { versionIds, basisIds: coveredWindows.flat().sort() } : null;
   const evidence: FacadeReadout = {
     facts,
     facades: [...new Map(activeFacts.filter(({ binding }) => binding.state === "identified" && (binding.quote || binding.actorId))

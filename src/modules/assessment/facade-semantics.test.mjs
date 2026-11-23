@@ -11,7 +11,7 @@ const fixtureRow = {
 const context = { id: "context-f1", kind: "facade", facadeId: "f1", name: "F1" };
 
 test("completed windows, missing semantic checks, and complete position proof remain distinct", async () => {
-  const { assessSemanticRemainder, facadeVerdict, indexSemanticInput } = await built("assessment/facade-semantic");
+  const { assessSemanticRemainder, completedReaderJob, facadeVerdict, indexSemanticInput } = await built("assessment/facade-semantic");
   const { requirementsFor } = await built("assessment/facade-model");
   const [requirement] = requirementsFor([fixtureRow], context, "P");
   const typed = { ...context, facadeType: { state: "confirmed", kind: "panel" } };
@@ -49,6 +49,13 @@ test("completed windows, missing semantic checks, and complete position proof re
   }
   const followed = paired("schedule").map((item) => ({ ...item, primaryJobId: item.jobId, jobId: `followup-${item.jobId}` }));
   assert.equal(assess([...paired("drawing"), ...followed]).remainder.verifiedWindows, 2);
+  windows[1].branches.B = { status: "held", reason: "turn_limit_final", jobId: "schedule-B" };
+  windows[1].structure.branches.B.followup = { jobId: "refused-followup", status: "done" };
+  assert.equal(assess([...paired("drawing"), ...followed]).remainder.items[0].reason, "reading_pending");
+  windows[1].structure.branches.B.followup = { jobId: "newer-followup", status: "leased" };
+  windows[1].structure.branches.B.completedFollowupId = "followup-schedule-B";
+  assert.equal(completedReaderJob(windows[1], "B"), "followup-schedule-B");
+  assert.equal(assess([...paired("drawing"), ...followed]).remainder.verifiedWindows, 2);
   const complete = assess([...paired("drawing"), ...paired("schedule")]);
   assert.equal(complete.remainder.state, "complete");
   assert.equal(complete.basisIds.length, 4);
@@ -59,6 +66,9 @@ test("completed windows, missing semantic checks, and complete position proof re
   assert.equal(assessSemanticRemainder({ index: indexSemanticInput(windows, allChecks, []),
     requirement: { ...requirement, facadeKinds: ["panel"] }, context, catalogVersionId: "catalog-1", stage: "P" })
     .remainder.reasons.includes("facade_type_unconfirmed"), true);
+  assert.equal(assessSemanticRemainder({ index: indexSemanticInput(windows, allChecks, []),
+    requirement: { ...requirement, evidenceRule: undefined }, context, catalogVersionId: "catalog-1", stage: "P" })
+    .remainder.reasons.includes("catalog_evidence_rule_unset"), true);
   const localFacts = assess([...paired("drawing"), ...paired("schedule")]
     .map((check) => ({ ...check, disposition: "supported" })));
   assert.equal(localFacts.remainder.state, "open");
@@ -108,6 +118,9 @@ test("review compares drawing and schedule only for an approved equal value role
   }
   assert.equal(run([a, b], requirement, []).outcome, "needs_review");
   assert.equal(run([a, b]).outcome, "confirmed_conflict");
+  const [typedRequirement] = requirementsFor([{ ...fixtureRow, comparison, facadeKinds: ["panel"] }],
+    { ...context, facadeType: { state: "confirmed", kind: "panel" } }, "P");
+  assert.equal(run([a, b], typedRequirement).outcome, "confirmed_conflict");
   for (const valueRole of ["as_built", "limit", undefined]) {
     assert.equal(run([a, { ...b, finding: { ...b.finding, valueRole } }]).outcome, "needs_review");
   }
