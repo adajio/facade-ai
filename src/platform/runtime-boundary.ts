@@ -3,16 +3,18 @@ import { readFile } from 'node:fs/promises'
 import type { Pool, PoolClient } from 'pg'
 import { StartupError } from './config.js'
 
+function isManagedSlot(slot: unknown): boolean {
+  if (slot === null || typeof slot !== 'object') return false
+  const { routeId, model } = slot as Record<string, unknown>
+  return (typeof routeId === 'string' && /^managed-/i.test(routeId)) ||
+    (typeof model === 'string' && /^managed\//i.test(model))
+}
+
 function hasManagedSlots(serialized: string | undefined): boolean {
   let profiles: unknown
   try { profiles = JSON.parse(serialized ?? '{}') } catch { return false }
-  if (profiles === null || typeof profiles !== 'object') return false
-  return Object.values(profiles).some((slot: unknown) => {
-    if (slot === null || typeof slot !== 'object') return false
-    const { routeId, model } = slot as Record<string, unknown>
-    return (typeof routeId === 'string' && /^managed-/i.test(routeId)) ||
-      (typeof model === 'string' && /^managed\//i.test(model))
-  })
+  return profiles !== null && typeof profiles === 'object' &&
+    (isManagedSlot(profiles) || Object.values(profiles).some(isManagedSlot))
 }
 
 export function checkRuntimeInvocation(): void {
@@ -20,7 +22,8 @@ export function checkRuntimeInvocation(): void {
   if (process.env.FACADE_HARNESS_MANAGED_URL?.trim()) {
     throw new StartupError('Managed model endpoints require the isolated test entrypoint')
   }
-  if (hasManagedSlots(process.env.FACADE_HARNESS_PROFILE) || hasManagedSlots(process.env.FACADE_GATEWAY_STEP15_PROFILES)) {
+  if ([process.env.FACADE_HARNESS_PROFILE, process.env.FACADE_GATEWAY_STEP15_PROFILES,
+    process.env.FACADE_COPILOT_PROFILE].some(hasManagedSlots)) {
     throw new StartupError('Managed model profiles require the isolated test entrypoint')
   }
   if (process.env.NODE_TLS_REJECT_UNAUTHORIZED === '0') {
