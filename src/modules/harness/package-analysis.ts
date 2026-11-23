@@ -252,6 +252,8 @@ export async function readPackageAnalysis(db: Pool | PoolClient, projectId: stri
     ? { versionIds, basisIds: versions.rows.map(({ basis }) => basis!) } : null;
   const facadeIds = candidates.map(({ id }) => id).sort();
   const registers = rows.filter((fact) => fact.register?.commonChecked && fact.binding.state === 'identified' &&
+    fact.revisionStatus === 'current' && Boolean(fact.basis.role && fact.basis.revision) &&
+    (fact.sourceRole === 'schedule' || fact.sourceRole === 'inventory') &&
     JSON.stringify(fact.binding.candidates.map(({ id }) => id).sort()) === JSON.stringify(facadeIds));
   const a = registers.find((fact) => fact.branch === 'A');
   const b = a && registers.find((fact) => fact.branch === 'B' && fact.observation.runId !== a.observation.runId &&
