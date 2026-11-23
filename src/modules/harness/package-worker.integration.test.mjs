@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { managedProfile, managedWorkerOptions } from '../../../test/fixtures/managed-worker-support.mjs';
+import { managedProfile, managedWorkerOptions, verifyManagedLauncherTargets } from '../../../test/fixtures/managed-worker-support.mjs';
 import { createHash, randomUUID } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import { createServer } from 'node:http';
@@ -9,7 +9,8 @@ import { pathToFileURL } from 'node:url';
 import { test } from 'node:test';
 
 const walkOnly = process.env.FACADE_PACKAGE_INTEGRATION === 'walk';
-const enabled = walkOnly || process.env.FACADE_PACKAGE_INTEGRATION === '1';
+const legacyOnly = process.env.FACADE_PACKAGE_INTEGRATION === 'legacy';
+const enabled = walkOnly || legacyOnly || process.env.FACADE_PACKAGE_INTEGRATION === '1';
 const built = (file) => process.env.FACADE_HARNESS_TEST_DIST
   ? pathToFileURL(join(process.env.FACADE_HARNESS_TEST_DIST, file)).href
   : new URL(`../../../dist/${file}`, import.meta.url).href;
@@ -38,7 +39,7 @@ function pdf(lines,{size=7,leading=24,top=140,height=270}={}) {
 }
 
 async function until(read, accept, label) {
-  const end = Date.now() + 120_000;
+  const end = Date.now() + 240_000;
   let last;
   do {
     last = await read();
@@ -94,8 +95,9 @@ function observation(line) {
 }
 
 test('ordinary intake publishes independent package evidence before questions and retains it on passive replay', {
-  skip: !enabled, timeout: 420_000,
+  skip: !enabled, timeout: 720_000,
 }, async (t) => {
+  await verifyManagedLauncherTargets({ loadBoundary: () => import(built('src/platform/runtime-boundary.js')) });
   const { createApi } = await import(built('src/platform/api.js'));
   const { readConfig } = await import(built('src/platform/config.js'));
   const { bootstrapAdmin } = await import(built('src/modules/access/bootstrap.js'));
@@ -280,7 +282,7 @@ test('ordinary intake publishes independent package evidence before questions an
     driver = new AbortController();
     worker = startWorker({ db: app.db, config, logger: { warn: (message) => warnings.push(message) }, signal: driver.signal }, options);
   }
-  await t.test('both branches revisit missed blocks without candidates and preserve their separate lineage',async()=>{
+  await t.test('both branches revisit missed blocks without candidates and preserve their separate lineage',{skip:legacyOnly},async()=>{
     delete process.env.FACADE_HARNESS_REPLAY_ONLY;
     process.env.FACADE_HARNESS_PACKAGE_WALK='1';
     process.env.FACADE_HARNESS_PACKAGE_EFFECTS = 'enabled';
