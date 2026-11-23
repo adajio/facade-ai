@@ -27,6 +27,24 @@ const packageSources = `JOIN projects p ON p.id=j.project_id
 const enabledProject = (parameter: string) => `(p.intake_mode OR p.id=ANY(${parameter}::uuid[])
   OR EXISTS (SELECT 1 FROM harness_package_projects h WHERE h.project_id=p.id))`;
 
+async function ensurePackageGeneration(tx: PoolClient, queue: WorkQueue, projectId: string) {
+  const project = await tx.query('SELECT 1 FROM harness_package_projects WHERE project_id=$1', [projectId]);
+  if (project.rowCount) return;
+  const generationId = randomUUID();
+  await queue.openGeneration({ projectId, scopeId: null, generationId }, tx);
+  await tx.query('INSERT INTO harness_package_projects(project_id,generation_id) VALUES($1,$2)', [projectId, generationId]);
+}
+
+export async function activatePackageProjects(db: Pool, queue: WorkQueue, projectIds: readonly string[]) {
+  for (const projectId of projectIds) {
+    await transaction(db, async (tx) => {
+      await lockIntakeProject(tx, projectId);
+      const target = await tx.query('SELECT 1 FROM projects WHERE id=$1', [projectId]);
+      if (target.rowCount) await ensurePackageGeneration(tx, queue, projectId);
+    });
+  }
+}
+
 export async function preparePackageMap(
   db: Pool, queue: WorkQueue, service: Pick<ReaderService, 'map' | 'readerVersion' | 'formatFor'>, packageProjects: readonly string[],
 ) {
@@ -74,12 +92,7 @@ export async function preparePackageMap(
       await tx.query('DELETE FROM harness_package_map_retries WHERE version_id=$1', [job.versionId]);
       return;
     }
-    const project = await tx.query('SELECT 1 FROM harness_package_projects WHERE project_id=$1', [job.projectId]);
-    if (!project.rowCount) {
-      const generationId = randomUUID();
-      await queue.openGeneration({ projectId: job.projectId, scopeId: null, generationId }, tx);
-      await tx.query('INSERT INTO harness_package_projects(project_id,generation_id) VALUES($1,$2)', [job.projectId, generationId]);
-    }
+    await ensurePackageGeneration(tx, queue, job.projectId);
     await tx.query('UPDATE harness_package_maps SET active=false WHERE version_id=$1 AND active', [job.versionId]);
     await tx.query(
       `INSERT INTO harness_package_maps(project_id,version_id,fingerprint,reader_version,requested_reader_version,format,refusal,physical_proof,physical_basis_id,physical_limitation)

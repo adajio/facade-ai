@@ -14,7 +14,7 @@ import { dispatchNext } from './dispatch.js';
 import type { ResearchTask } from './contracts.js';
 import { validateLivePolicy } from './live-policy.js';
 import { loadResearchProfile, profileHold, researchSlot, type ResearchProfile } from './profile.js';
-import { dispatchPackagePair, packageModelAdmission, preparePackageMap } from './package-dispatch.js';
+import { activatePackageProjects, dispatchPackagePair, packageModelAdmission, preparePackageMap } from './package-dispatch.js';
 import { publication } from './publication.js';
 import { schedulePackageReview } from './package-review.js';
 import { reviewPairAdmission } from './review-pair.js';
@@ -139,6 +139,7 @@ export async function startWorker(context: WorkerContext): Promise<void> {
 
   try {
     const { gateway, admit, online, hasTransport } = modelGateway(context, external, profile, packageEnabled, packageProjects);
+    if (packageEnabled) await activatePackageProjects(db, gateway, packageProjects);
     const base = createRuntimePdfService(db, config, { storage, adapters: createFormatAdapters() });
     const service = {
       ...base,
