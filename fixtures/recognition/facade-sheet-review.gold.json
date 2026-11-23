@@ -1,0 +1,17 @@
+{
+  "fixture": "facade-sheet-review.pdf",
+  "sha256": "7f6335506fb38ee0374eeb18964bd9cb6532a133ddd2a274edbbe3fce94c0dba",
+  "coordinates": "physical PDF page from 1; points from top left; [left,top,right,bottom]",
+  "pageSize": [840, 595],
+  "pageCount": 3,
+  "revision": "R1",
+  "index": {"page": 1, "section": "Ведомость листов", "dataRows": 3, "listedFacadePages": [2,3], "mentionsWidthTable": false},
+  "requiredFacts": [
+    {"page": 2, "region": [477,182,803,246], "facade": "А", "variant": "AL-01", "parameter": "thickness", "literal": "2,0", "unit": "мм", "normalizedMm": "2", "source": "native"},
+    {"page": 2, "region": [594,339,802,411], "facade": "А", "variant": "AL-01", "parameter": "width", "literal": "1,200", "unit": "м", "normalizedMm": "1200", "source": "raster"},
+    {"page": 3, "region": [477,182,803,246], "facade": "Б", "variant": "AL-02", "parameter": "thickness", "literal": "3,0", "unit": "мм", "normalizedMm": "3", "source": "native"}
+  ],
+  "requiredNote": {"page": 3, "text": "Размеры относятся только к фасаду Б."},
+  "forbidden": ["conflicting thickness across different variants", "width missing", "width transferred to facade Б", "unverified or silently skipped region counted as proof of absence"],
+  "letterScope": "Только три размеченных параметра. Для этого объёма не возникает запроса о ширине или расхождении толщин."
+}

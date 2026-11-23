@@ -1,0 +1,50 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ModelInputReceipt — один адресованный материал в сериализованном запросе адаптера",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "attemptId", "workId", "turnId", "branchId", "inputSnapshotId", "modelRevisionId", "documentRevisionId", "viewRevisionId", "locatorId", "origin", "contentPartIndex", "part"],
+  "properties": {
+    "schemaVersion": {"const": 1},
+    "attemptId": {"$ref": "#/$defs/id"},
+    "workId": {"$ref": "#/$defs/id"},
+    "turnId": {"$ref": "#/$defs/id"},
+    "branchId": {"enum": ["A", "B"]},
+    "inputSnapshotId": {"$ref": "#/$defs/id"},
+    "modelRevisionId": {"$ref": "#/$defs/id"},
+    "documentRevisionId": {"$ref": "#/$defs/id"},
+    "viewRevisionId": {"$ref": "#/$defs/id"},
+    "locatorId": {"$ref": "#/$defs/id"},
+    "contentPartIndex": {"type": "integer", "minimum": 0, "description": "Порядковый номер части среди всех частей запроса в порядке сериализации, с нуля."},
+    "origin": {
+      "oneOf": [
+        {"type": "object", "additionalProperties": false, "required": ["kind"], "properties": {"kind": {"const": "initial_overview"}}},
+        {"type": "object", "additionalProperties": false, "required": ["kind", "toolCallId"], "properties": {"kind": {"const": "tool_result"}, "toolCallId": {"$ref": "#/$defs/id"}}}
+      ]
+    },
+    "part": {
+      "oneOf": [
+        {
+          "type": "object", "additionalProperties": false,
+          "required": ["kind", "sha256", "parentRenderSha256", "transformId", "mimeType", "widthPx", "heightPx"],
+          "properties": {
+            "kind": {"enum": ["inline_image", "provider_file"]},
+            "sha256": {"$ref": "#/$defs/hash"}, "parentRenderSha256": {"$ref": "#/$defs/hash"},
+            "transformId": {"$ref": "#/$defs/id"}, "mimeType": {"enum": ["image/png", "image/jpeg"]},
+            "widthPx": {"$ref": "#/$defs/pixels"}, "heightPx": {"$ref": "#/$defs/pixels"},
+            "providerFileId": {"$ref": "#/$defs/id"}, "uploadReceiptId": {"$ref": "#/$defs/id"}
+          },
+          "if": {"properties": {"kind": {"const": "provider_file"}}},
+          "then": {"required": ["providerFileId", "uploadReceiptId"]},
+          "else": {"not": {"anyOf": [{"required": ["providerFileId"]}, {"required": ["uploadReceiptId"]}]}}
+        },
+        {"type": "object", "additionalProperties": false, "required": ["kind", "reason", "sha256"], "properties": {"kind": {"const": "text_only"}, "reason": {"$ref": "#/$defs/id"}, "sha256": {"$ref": "#/$defs/hash"}}}
+      ]
+    }
+  },
+  "$defs": {
+    "id": {"type": "string", "minLength": 1},
+    "hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "pixels": {"type": "integer", "minimum": 1}
+  }
+}

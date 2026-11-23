@@ -1,0 +1,29 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Validated research unit receipt",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "workId", "inputRevision", "outcome", "candidates", "diagnostics"],
+  "properties": {
+    "schemaVersion": {"const": 1},
+    "workId": {"type": "string", "minLength": 1},
+    "inputRevision": {"type": "string", "minLength": 1},
+    "outcome": {"enum": ["complete", "partial", "no_match", "exhausted", "unusable", "held"]},
+    "candidates": {"type": "array", "items": {"$ref": "claim-candidate.v1.schema.json"}},
+    "diagnostics": {"type": "array", "items": {"type": "string", "minLength": 1}}
+  },
+  "allOf": [
+    {
+      "if": {"properties": {"outcome": {"enum": ["no_match", "unusable", "held"]}}},
+      "then": {"properties": {"candidates": {"maxItems": 0}}}
+    },
+    {
+      "if": {"properties": {"outcome": {"enum": ["partial", "exhausted", "unusable", "held"]}}},
+      "then": {"properties": {"diagnostics": {"minItems": 1}}}
+    },
+    {
+      "if": {"properties": {"outcome": {"const": "complete"}}},
+      "then": {"properties": {"candidates": {"minItems": 1}}}
+    }
+  ]
+}

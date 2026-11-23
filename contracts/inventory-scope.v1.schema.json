@@ -1,0 +1,26 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Область сверки состава для одного предметного вывода",
+  "description": "Квитанция источников, на которых проверялось отсутствие. Привязка ссылок к области, полнота перечисления и применимость доказательства проверяются предметными правилами.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "inventoryAssessmentId", "obligationId", "snapshotId", "scope", "receiptIds", "asOf", "result", "unresolvedDependencies"],
+  "properties": {
+    "schemaVersion": {"const": 1},
+    "inventoryAssessmentId": {"$ref": "#/$defs/id"},
+    "obligationId": {"$ref": "#/$defs/id"},
+    "snapshotId": {"$ref": "#/$defs/id"},
+    "scope": {"enum": ["receipt", "project_as_of"]},
+    "receiptIds": {"type": "array", "items": {"$ref": "#/$defs/id"}, "minItems": 1, "uniqueItems": true},
+    "asOf": {"type": "string", "format": "date-time", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}([.][0-9]+)?(Z|[+-][0-9]{2}:[0-9]{2})$", "description": "Время среза состава; исторические даты поставок могут оставаться неизвестными."},
+    "result": {"enum": ["bounded", "open"]},
+    "unresolvedDependencies": {"type": "array", "items": {"$ref": "#/$defs/id"}, "uniqueItems": true},
+    "projectBoundaryEvidenceId": {"$ref": "#/$defs/id"}
+  },
+  "allOf": [
+    {"if": {"properties": {"scope": {"const": "receipt"}}}, "then": {"properties": {"receiptIds": {"maxItems": 1}, "projectBoundaryEvidenceId": false}}},
+    {"if": {"properties": {"result": {"const": "bounded"}}}, "then": {"properties": {"unresolvedDependencies": {"maxItems": 0}}}, "else": {"properties": {"unresolvedDependencies": {"minItems": 1}}}},
+    {"if": {"properties": {"scope": {"const": "project_as_of"}, "result": {"const": "bounded"}}}, "then": {"required": ["projectBoundaryEvidenceId"]}}
+  ],
+  "$defs": {"id": {"type": "string", "minLength": 1}}
+}

@@ -1,0 +1,23 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Independent review receipt",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "workId", "candidateRevision", "verdict", "reason", "checkedPlaces"],
+  "properties": {
+    "schemaVersion": {"const": 1},
+    "workId": {"type": "string", "minLength": 1},
+    "candidateRevision": {"type": "string", "minLength": 1},
+    "verdict": {"enum": ["supported", "rejected", "needs_evidence"]},
+    "reason": {"type": "string", "minLength": 1},
+    "checkedPlaces": {
+      "type": "array", "uniqueItems": true,
+      "items": {"type": "object", "additionalProperties": false, "required": ["documentRevisionId", "locatorId"], "properties": {
+        "documentRevisionId": {"type": "string", "minLength": 1},
+        "locatorId": {"type": "string", "minLength": 1}
+      }}
+    }
+  },
+  "if": {"properties": {"verdict": {"const": "supported"}}},
+  "then": {"properties": {"checkedPlaces": {"minItems": 1}}}
+}
