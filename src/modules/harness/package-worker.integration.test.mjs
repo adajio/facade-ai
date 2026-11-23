@@ -96,7 +96,7 @@ test('ordinary intake publishes independent package evidence before questions an
   const { bootstrapAdmin } = await import(built('src/modules/access/bootstrap.js'));
   const { createGateway, PostgresIntentJournal } = await import(built('src/modules/gateway/index.js'));
   const { startWorker, readPackageAnalysis } = await import(built('src/modules/harness/index.js'));
-  const { preparePackageMap, dispatchPackagePair } = await import(built('src/modules/harness/package-dispatch.js'));
+  const { activatePackageProjects, preparePackageMap, dispatchPackagePair } = await import(built('src/modules/harness/package-dispatch.js'));
   const { loadResearchProfile } = await import(built('src/modules/harness/profile.js'));
   const { Pool } = await import('pg');
   const config = readConfig();
@@ -342,6 +342,10 @@ test('ordinary intake publishes independent package evidence before questions an
         })) };
       },
     };
+    await activatePackageProjects(app.db, gateway, [existing.id]);
+    const target = (await app.db.query('SELECT generation_id FROM harness_package_projects WHERE project_id=$1', [existing.id])).rows[0];
+    await activatePackageProjects(app.db, gateway, [existing.id]);
+    assert.deepEqual((await app.db.query('SELECT generation_id FROM harness_package_projects WHERE project_id=$1', [existing.id])).rows[0], target);
     assert.equal(await preparePackageMap(app.db, gateway, map, [existing.id]), true);
     assert.equal(await preparePackageMap(app.db, gateway, map, [existing.id]), true);
     assert.equal(await preparePackageMap(app.db, gateway, map, [existing.id]), false);
@@ -360,6 +364,19 @@ test('ordinary intake publishes independent package evidence before questions an
     assert.equal((await readPackageAnalysis(app.db, other.id)).windows.length, 0);
     assert.deepEqual((await app.db.query(`SELECT id,effect_key,state,ceiling_usd_nanos FROM gateway_attempts
       WHERE project_id=$1 ORDER BY state`, [existing.id])).rows, before);
+    const switched = { ...map, readerVersion: async () => readerVersion + ';fixture-profile=v2',
+      async map(source) { return { ...await map.map(source), readerVersion: await this.readerVersion() }; } };
+    // The same source and frames are read under a new derived-map contract.
+    for (let index = 0; index < 4; index++) assert.equal(await preparePackageMap(app.db, gateway, switched, [existing.id]), true);
+    assert.equal(await preparePackageMap(app.db, gateway, switched, [existing.id]), false);
+    for (let index = 0; index < 12; index++) if (!await dispatchPackagePair(app.db, gateway, profile)) break;
+    const changed = await readPackageAnalysis(app.db, existing.id);
+    assert.notEqual(changed.windows[0].id, large.windows[0].id);
+    assert.deepEqual(changed.windows[0].place, large.windows[0].place);
+    assert.equal(changed.coverage.completedWindows, 0);
+    assert.deepEqual(Object.values(changed.windows[0].branches).map(({ reason }) => reason),
+      ['prior_paid_window_incompatible', 'prior_effect_unsettled']);
+    await command('GET', contextual.basis.revisionEvidence.href, undefined);
     assert.equal((await legacyGateway.call(seen[0].call)).replay, true);
     assert.equal((await legacyGateway.call(seen[1].call)).code, 'unknown_charge');
     const stopId = randomUUID();
