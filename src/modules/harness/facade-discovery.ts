@@ -38,6 +38,7 @@ const registered = /^(?:project facade (?:identifier|id)|идентификат�
 const referred = /^(?:project facade (?:reference|ref)|ссылка на (?:код|идентификатор) фасада проекта)\s*[:№=]\s*(.+)$/iu;
 const viewName = /^(?:view(?: name)?|detail(?: view)?|section|elevation|вид|наименование вида|узел|разрез)\s*[:№=]\s*(.+)$/iu;
 const otherViewName = /^(?:view|detail|section|elevation|вид|узел|разрез)\s+(.+)$/iu;
+const explicitViewField = /(?:^|[,\s])(?:facade(?:\s+(?:mark|designation|id))?|view(?: name)?|detail(?: view)?|section|elevation|фасад|вид|наименование вида|узел|разрез)\s*[:№=]/giu;
 const viewReference = /(?:^|\s)(refers to|reference to|does not refer to|not referring to|не относится к|не ссылается на|относится к|ссылается на)(?=\s|[:№=]|$)\s*[:№=]?\s*(.*)$/iu;
 const designation = /^(?:facade(?:\s+(?:mark|designation|id))?|фасад|(?:марка|обозначение|код) фасада)\s*[:№=]\s*(.+)$/iu;
 const inlineDesignation = /^(?:facade|фасад)\s+([\p{L}\p{N}_.\/‐‑‒–—-]+)(?=\s+(?:в\s+|по\s+|in\s+|at\s+|axes\s+|grid\s+|корпус|building|block))/iu;
@@ -169,10 +170,11 @@ function scopedViewClaim(line: string, quote: string) {
     if(!text)return [];
     const reference=viewReference.exec(text);
     const prefix=reference?text.slice(0,reference.index).trim():text;
-    const owner=viewName.test(prefix)||otherViewName.test(prefix)||designation.test(prefix)||registered.test(prefix)||
+    const named=viewName.test(prefix)||otherViewName.test(prefix)||designation.test(prefix)||registered.test(prefix)||
       referred.test(prefix)||inlineDesignation.test(prefix)||Boolean(directionalMark(prefix)?.heading);
+    const owner=named&&[...prefix.matchAll(explicitViewField)].length<=1;
     return [{text,at:part.index+part[0].length-part[0].trimStart().length,owner,reference,
-      ownerLength:prefix.length,boundary:owner||Boolean(reference&&prefix)}];
+      ownerLength:prefix.length,boundary:named||Boolean(reference&&prefix)}];
   });
   const starts=parts.flatMap(({boundary},index)=>boundary?[index]:[]);
   for(const [index,from] of starts.entries()) {

@@ -174,6 +174,7 @@ test('a cropped quotation cannot take a following view’s facade reference',()=
   assert.equal(owned.quote,`${second} | Refers to MX-61 | Building: Hall | Axes: 4-5`);
   for(const [quote,line] of [
     [first,`${first} | Refers to MX-61 | ${first} | Refers to MX-61`],
+    [first,`${first}, ${second} refers to MX-61`],
     [first,`${first} | an unlabelled inset | Refers to MX-61`],
     [`${first} | ${second}`,body],
     ['Refers to MX-61','Refers to MX-61 | Building: Hall | Axes: 4-5'],
