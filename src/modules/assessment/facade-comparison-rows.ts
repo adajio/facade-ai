@@ -198,6 +198,7 @@ const markField = /^(?:mark|марка)$/iu;
 const variantField = /^(?:variant|execution|исполнение|вариант)$/iu;
 const titleField = /^(?:view|view title|drawing title|вид|название вида|название листа)$/iu;
 const titleText = /^\p{L}[\p{L}\p{N} ._,/()—–-]{0,119}$/u;
+const bareMetadata = /^(?:revision|rev\.?|variant|execution|mark|stage|редакция|ревизия|исполнение|вариант|марка|стадия)\s+/iu;
 const printedCode = /^(?:\p{L}{1,3}|(?=[\p{L}\p{N}_.-]*\d)[\p{L}\p{N}_.-]{1,24})$/u;
 const printedCurrent = /^(?:current|effective|действующая|актуальная)$/iu;
 const drawingAnnotation = /^(?:(?:scale|масштаб)\s*:?\s*\d+\s*:\s*\d+|(?:dimensions in|размеры в)\s+(?:mm|cm|m|мм|см|м|millimet(?:er|re)s)|(?:detail reference|ссылка на узел)\s*:\s*(?:view|вид)\s+\d+(?:\s*\/\s*[\p{L}][\p{L}\p{N} ._-]{0,39})?)$/iu;
@@ -216,7 +217,7 @@ function drawingLineKind(text: string) {
   if (row.some(({ name }) => documentRoleField.test(name) || revisionField.test(name) || stageField.test(name))) return "header";
   if (row.some(({ name }) => facadeField.test(name) || buildingField.test(name) || axesField.test(name))) return "scope";
   if (row.some(({ name }) => markField.test(name) || variantField.test(name))) return "item";
-  if (titleText.test(text) || row.length === 1 && clauses(text).length === 1 &&
+  if (titleText.test(text) && !bareMetadata.test(text) || row.length === 1 && clauses(text).length === 1 &&
       titleField.test(row[0].name) && titleText.test(row[0].value)) return "title";
   return "unknown";
 }
@@ -225,7 +226,7 @@ function drawingLineKind(text: string) {
 function localDrawingView(row: CanonicalRow, page: CanonicalRow[], witness: Witness, issued: ReaderLine[],
   group: Witness[]): DrawingView | undefined {
   if (page.some((line) =>
-      line.artifactSha256 !== row.artifactSha256 || !line.address.box || !validBox(line.address.box) ||
+      inactive.test(line.text) || line.artifactSha256 !== row.artifactSha256 || !line.address.box || !validBox(line.address.box) ||
       line.address.unitId !== row.address.unitId || canonicalJson(line.address.locator) !== canonicalJson(row.address.locator)) ||
       new Set(page.map(({ lineId }) => lineId)).size !== page.length) return;
   const { title: titles = [], header: headers = [], scope: scopes = [], item: items = [], unknown = [] } =

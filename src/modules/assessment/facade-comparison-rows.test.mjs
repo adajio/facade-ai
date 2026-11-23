@@ -240,6 +240,8 @@ test("local drawing metadata is held when the view, scope, revision, or evidence
     ["explicit local override", { extra: "Override: use variant V8 for bracket reach" }],
     ["other revision", { header: "Document role: drawing | Stage: RD | Revision: M3 | Revision: M4 | current" }],
     ["superseded revision", { header: "Document role: drawing | Stage: RD | Revision: M3 | superseded" }],
+    ["inactive sheet heading", { title: "Superseded drawing" }],
+    ["bare metadata in place of a title", { title: "Variant V8" }],
     ["missing scope identity", { identity: "Facade: K-29 | Building: West" }],
     ["metadata outside the issued native bytes", { omitIssued: "1.0.3.0" }],
   ];
