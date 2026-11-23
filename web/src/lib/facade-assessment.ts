@@ -51,6 +51,7 @@ export type FacadeAssessment = {
     id: string; property: string; facadeId: string | null; reasons: string[];
     sources: { citation: Citation; binding: FacadeObservation['binding']; variant: string | null;
       stage: string | null; revision: string | null; revisionStatus: string; sourceRole: string;
+      row?: { value: Citation & { lineId: string; address: SourceAddress }; context: Citation & { lineId: string } };
       clarification?: { branch: 'A' | 'B'; state: 'route_required' | 'ready' | 'leased' | 'held' | 'done' }[] }[];
   }[] };
   unresolvedMentions?: { items: MentionSource[]; limited: boolean };
@@ -107,6 +108,7 @@ export const assessmentReasons: Record<string, string> = {
   required_evidence_incomplete: 'Комплект обязательных доказательств по требованию неполон',
   alternatives_unverified: 'Проверка возможных альтернатив не завершена',
   pair_verification_required: 'Для подтверждения противоречия нужна сверка пары опор',
+  comparability_unproven: 'Сопоставимость опор требует подтверждения',
   facade_link_unproven: 'Сверьте корпус, оси или проектный идентификатор фасада в обеих опорах',
   facades_differ: 'Одинаковое обозначение относится к разным установленным фасадам',
   variant_unproven: 'Установите исполнение изделия в каждой опоре',

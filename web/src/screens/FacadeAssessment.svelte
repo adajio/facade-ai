@@ -218,7 +218,27 @@
                     <div>Адресное дочитывание {read.branch} · {clarificationLabels[read.state]}</div>
                   {/if}
                 {/each}
-                {#if source.citation.quote}<blockquote>{source.citation.quote}</blockquote>{/if}
+                {#if source.row}
+                  <div>
+                    Ветвь {source.citation.branch} ·
+                    {#if source.row.value.address.locator?.cell}
+                      {source.row.value.address.locator.sheet}!{source.row.value.address.locator.cell}
+                    {:else}
+                      стр. {source.row.value.address.locator?.page}, строка {source.row.value.lineId}
+                    {/if}
+                  </div>
+                  <blockquote>{source.row.value.quote}</blockquote>
+                  {#if source.row.context.quote !== source.row.value.quote}
+                    <blockquote>{source.row.context.quote}</blockquote>
+                  {/if}
+                  {#if source.row.context.evidenceId !== source.citation.evidenceId}
+                    <EvidenceButtons citations={[{ ...source.row.context, branch: source.citation.branch,
+                      documentId: source.citation.documentId, versionId: source.citation.versionId,
+                      sha256: source.citation.sha256, sourceLabel: 'Контекст строки' }]} {open} />
+                  {/if}
+                {:else if source.citation.quote}
+                  <blockquote>{source.citation.quote}</blockquote>
+                {/if}
               </li>
             {/each}
           </ul>

@@ -299,7 +299,7 @@ export async function synchronizeFacadeAssessment(tx: PoolClient, projectId: str
     projectId, catalogVersionId: project.catalogVersionId, catalog: catalogView, stage: project.stage, coverage, limitations, contexts: summaries,
     profile: { state: profileState, confirmedKinds: staleProfile ? knownKinds : project.confirmedFacadeKinds },
     comparisonReview: comparisonReview(input.evidence.facts, input.observations, contexts, catalog, project.stage, input.evidence.pairs,
-      input.discovery.unresolved, input.comparisonReads),
+      input.discovery.unresolved, input.comparisonReads, input.comparisonRows),
     unresolvedMentions: { limited: input.discovery.unresolved.length > 24,
       items: input.discovery.unresolved.slice(0, 24).flatMap((mention) => mentionSource(mention, observationsById)) },
     activeWindows: input.activeWindows, completedWindows: input.completedWindows,

@@ -5,7 +5,8 @@ import { blockedComparisonReads } from "../harness/package-walk.js";
 import { deliveredLines } from "../questions/attribute-aliases.js";
 import { hasAddressedSubject } from "../questions/subject-evidence.js";
 import { canonicalJson, isInventoryRole, requirementSubjectKey } from "./domain.js";
-import type { ReaderAddress, ReaderLine } from "../pdf/types.js";
+import type { Evidence, ReaderAddress, ReaderLine } from "../pdf/types.js";
+import { comparisonRows, readCanonicalComparisonRows, type IssuedComparisonEvidence } from "./facade-comparison-rows.js";
 import { deliveryEvidenceIds, fullDeliveryLine, type DeliveryEvidence } from "./facade-delivery.js";
 import { nonDeliveryFromOriginal, type FacadeFact, type FacadeReadout } from "./facade-model.js";
 import { completedReaderJob, indexSemanticInput } from "./facade-semantic.js";
@@ -287,22 +288,30 @@ export async function readFacadeInput(tx: PoolClient, projectId: string) {
   const evidenceIds = [...new Set(activeFacts.flatMap(({ observation, basis }) =>
     [observation.evidenceId, ...deliveryEvidenceIds(basis), ...(basis.revisionEvidence ? [basis.revisionEvidence.evidenceId] : []),
       ...Object.values(basis.parts ?? {}).map(({ evidenceId }) => evidenceId)]))];
-  const evidenceRows = evidenceIds.length ? (await tx.query<{ id: string; payload: DeliveryEvidence }>(
+  const evidenceRows = evidenceIds.length ? (await tx.query<{ id: string; payload: Evidence }>(
     `SELECT id,payload FROM reader_evidence WHERE project_id=$1 AND id=ANY($2::uuid[])`, [projectId, evidenceIds],
   )).rows : [];
   const evidenceById = new Map(evidenceRows.map(({ id, payload }) => [id, payload]));
   const statementIds = activeFacts.filter(({ observation }) =>
     observation.deliveryStatement || observation.components?.length || typeInLine(observation.quote ?? "")).map(({ id }) => id);
-  const { rows: statements } = statementIds.length ? await tx.query<{ id: string; content: string }>(
-    `SELECT o.id,issued.content FROM reader_observations o
+  const statementSet = new Set(statementIds);
+  const rowIds = activeFacts.filter(({ id, windowId, observation, attribute }) => statementSet.has(id) ||
+    (["pdf", "xlsx"].includes(formats.get(windowId) ?? "") && (attribute || observation.value))).map(({ id }) => id);
+  const { rows: statements } = rowIds.length ? await tx.query<IssuedComparisonEvidence>(
+    `SELECT o.evidence_id AS "evidenceId", o.run_id AS "runId", issued.content
+       FROM (SELECT DISTINCT evidence_id,run_id FROM reader_observations
+         WHERE project_id=$1 AND id=ANY($2::uuid[]) AND payload->>'grounding'='text') o
        JOIN LATERAL (
          SELECT event#>>'{reply,body,content}' AS content FROM harness_research_events
          WHERE job_id=o.run_id AND event#>>'{reply,evidence,evidenceId}'=o.evidence_id::text
          ORDER BY sequence LIMIT 1
-       ) issued ON true
-     WHERE o.project_id=$1 AND o.id=ANY($2::uuid[]) AND o.payload->>'grounding'='text'`, [projectId, statementIds],
+       ) issued ON true`, [projectId, rowIds],
   ) : { rows: [] };
-  const originalLines = new Map(statements.map(({ id, content }) => [id, deliveredLines(content)]));
+  const statementsByEvidence = new Map(statements.map((event) => [event.evidenceId, event]));
+  const originalLines = new Map(activeFacts.flatMap(({ id, observation }) => {
+    const statement = statementSet.has(id) && statementsByEvidence.get(observation.evidenceId);
+    return statement && statement.runId === observation.runId ? [[id, deliveredLines(statement.content)] as const] : [];
+  }));
   const discovery = facadeDiscovery(activeFacts, analysis.facadeProfiles, analysis.facadeMentions);
   const observations = activeFacts.map((fact) => facadeObservation(
     fact.binding.state === "identified" && !discovery.placed(fact) ? { ...fact, binding: { ...fact.binding, state: "unclear",
@@ -332,6 +341,8 @@ export async function readFacadeInput(tx: PoolClient, projectId: string) {
     reading,
   };
   return { intake, versionIds, evidence, impacts, replacements, holds, semantic, discovery, observations,
+    comparisonRows: comparisonRows(activeFacts, formats, evidenceById, statements, [...discovery.identity.values()],
+      await readCanonicalComparisonRows(tx, projectId, activeFacts, evidenceById)),
     comparisonReads: await comparisonReads(tx, projectId, windows, activeFacts, analysis.comparisonFollowups),
     activeWindows: windows.length,
     structurallyReviewedWindows: windows.filter(({ structure }) => structure?.branches.A.complete && structure.branches.B.complete).length,
