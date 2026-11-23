@@ -42,7 +42,8 @@ export async function preparePackageMap(
        ON expected.media=v.media_type AND expected.extension IS NOT DISTINCT FROM source.extension
      LEFT JOIN harness_package_maps m ON m.version_id=j.version_id AND m.active
      WHERE ${enabledProject('$2')}
-       AND (m.version_id IS NULL OR m.requested_reader_version IS DISTINCT FROM expected.version)
+       AND (m.version_id IS NULL OR m.requested_reader_version IS DISTINCT FROM expected.version
+         OR m.physical_basis_id IS NULL AND m.physical_limitation IS NULL)
        AND NOT EXISTS (SELECT 1 FROM harness_package_map_retries r WHERE r.version_id=j.version_id AND r.retry_at>clock_timestamp())
      ORDER BY j.created_at,j.id LIMIT 1`, [JSON.stringify(versions), [...packageProjects]]);
   if (!job) return false;
@@ -61,9 +62,18 @@ export async function preparePackageMap(
   const fingerprint = hash([mapContract, job.versionId, job.sha256, job.requested, map.format, map.units]);
   await transaction(db, async (tx) => {
     await lockIntakeProject(tx, job.projectId);
+    const basis = 'basisId' in map.physical ? map.physical.basisId : null;
+    const limitation = 'limitation' in map.physical ? map.physical.limitation : null;
     const current = await tx.query<{ fingerprint: string }>(
       'SELECT fingerprint FROM harness_package_maps WHERE version_id=$1 AND active', [job.versionId]);
-    if (current.rows[0]?.fingerprint === fingerprint) return;
+    if (current.rows[0]?.fingerprint === fingerprint) {
+      await tx.query(
+        `UPDATE harness_package_maps SET physical_proof=$2,physical_basis_id=$3,physical_limitation=$4,active=true
+         WHERE version_id=$1 AND active AND physical_basis_id IS NULL AND physical_limitation IS NULL`,
+        [job.versionId, Boolean(basis), basis, limitation]);
+      await tx.query('DELETE FROM harness_package_map_retries WHERE version_id=$1', [job.versionId]);
+      return;
+    }
     const project = await tx.query('SELECT 1 FROM harness_package_projects WHERE project_id=$1', [job.projectId]);
     if (!project.rowCount) {
       const generationId = randomUUID();
@@ -72,10 +82,12 @@ export async function preparePackageMap(
     }
     await tx.query('UPDATE harness_package_maps SET active=false WHERE version_id=$1 AND active', [job.versionId]);
     await tx.query(
-      `INSERT INTO harness_package_maps(project_id,version_id,fingerprint,reader_version,requested_reader_version,format,refusal,physical_proof)
-       VALUES($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT(version_id,fingerprint) DO UPDATE SET active=true`,
+      `INSERT INTO harness_package_maps(project_id,version_id,fingerprint,reader_version,requested_reader_version,format,refusal,physical_proof,physical_basis_id,physical_limitation)
+       VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) ON CONFLICT(version_id,fingerprint) DO UPDATE
+       SET active=true,physical_proof=EXCLUDED.physical_proof,physical_basis_id=EXCLUDED.physical_basis_id,
+         physical_limitation=EXCLUDED.physical_limitation`,
       [job.projectId, job.versionId, fingerprint, map.readerVersion, job.requested, map.format,
-       map.units[0]?.refusal ?? null, map.physicalProof]);
+       map.units[0]?.refusal ?? null, Boolean(basis), basis, limitation]);
     const windows = map.units.map(({ id: unitId, refusal, ...address }) => ({
       place: { source: { projectId: job.projectId, versionId: job.versionId, documentId: job.documentId, sha256: job.sha256 },
         unitId, ...address },

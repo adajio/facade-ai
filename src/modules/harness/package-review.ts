@@ -54,27 +54,25 @@ export async function schedulePackageReview(db: Pool, queue: WorkQueue, profile:
       }
       const analysis = await readPackageAnalysis(tx, project.projectId);
       const byId = new Map(analysis.facts.map((fact) => [fact.id, fact]));
-      for (const { a, b, proof } of analysis.reviewCandidates) {
+      for (const { a, b, scope } of analysis.reviewCandidates) {
         const left = byId.get(a)!;
         const right = byId.get(b)!;
-        const label = proof.scope === 'common' ? 'common' : analysis.candidates.find(({ id }) => id === proof.scope)?.label;
-        if (!label) continue;
+        const { label } = scope;
+        const variant = left.variant ?? right.variant;
         const id = randomUUID();
         const job: LeadJob = { mode: 'lead', settings: pinned.lead.settings, dispute: {
-          id, question: { subject: label, property: left.attribute!, variant: proof.variant },
+          id, question: { subject: label, property: left.attribute!, ...(variant ? { variant } : {}) },
           a: citation(left, 'A'), b: citation(right, 'B'),
-        }, packageReview: { scopeId: proof.scope, scopeLabel: label, routeRevision: pinned.lead.revision,
+        }, packageReview: { scopeId: scope.id, scopeLabel: label, routeRevision: pinned.lead.revision,
           readerVersions: { A: left.observation.readerVersion, B: right.observation.readerVersion } } };
         const sources = [job.dispute.a, job.dispute.b].map(({ place, value, unit }) => hash([place, value, unit])).sort();
-        const signature = hash([proof.scope, proof.variant, left.attribute, sources]);
-        const wireProof = { ...proof, revisionA: proof.revisionA.toLowerCase(), revisionB: proof.revisionB.toLowerCase(),
-          scope: label.normalize('NFKC').trim().toLowerCase().replace(/\s+/gu, ' ') };
+        const signature = hash([scope.id, variant, left.attribute, sources]);
         const result = await tx.query(
           `INSERT INTO harness_package_review_pairs(id,project_id,generation_id,a_fact_id,b_fact_id,a_binding_version,b_binding_version,
-            proof,wire_proof,assignment,verification_profiles,signature)
-           VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) ON CONFLICT DO NOTHING`,
+            assignment,verification_profiles,signature)
+           VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) ON CONFLICT DO NOTHING`,
           [id, project.projectId, project.generationId, a, b, left.binding.version, right.binding.version,
-           proof, wireProof, job, { A: pinned.A, B: pinned.B }, signature]);
+           job, { A: pinned.A, B: pinned.B }, signature]);
         if (!result.rowCount) continue;
         const lead = await queue.enqueue({ ...project, scopeId: null, kind: researchKind, purpose: 'review',
           key: 'package-lead:' + id, subjectId: id, payload: job, priority: 1 }, tx);
@@ -121,11 +119,19 @@ export async function authorizedPackageReview(db: Pool | PoolClient, projectId: 
 export async function publishPackageReviewOutcome(tx: PoolClient, queue: WorkQueue, task: ScheduledResearchTask, outcome: ResearchOutcome) {
   if (task.job.mode !== 'lead' || !task.job.packageReview || outcome.kind !== 'proposal' || !outcome.verifiedPair) return;
   const { job } = task;
-  const { rows: [pair] } = await tx.query<{ profiles: Record<Branch, PinnedRoute> }>(
-    `SELECT verification_profiles AS profiles FROM harness_package_review_pairs
-     WHERE id=$1 AND lead_job_id=$2 AND project_id=$3 AND wire_proof=$4`,
-    [job.dispute.id, task.jobId, task.projectId, outcome.verifiedPair]);
+  const { rows: [pair] } = await tx.query<{ profiles: Record<Branch, PinnedRoute>; revisionA: string | null; revisionB: string | null }>(
+    `SELECT verification_profiles AS profiles,a.revision AS "revisionA",b.revision AS "revisionB" FROM harness_package_review_pairs p
+     JOIN harness_package_facts a ON a.id=p.a_fact_id JOIN harness_package_facts b ON b.id=p.b_fact_id
+     WHERE p.id=$1 AND lead_job_id=$2 AND p.project_id=$3`,
+    [job.dispute.id, task.jobId, task.projectId]);
   if (!pair || !await authorizedPackageReview(tx, task.projectId, task.generationId, job, task.jobId)) return;
+  const wireProof = outcome.verifiedPair;
+  if ((pair.revisionA && pair.revisionA.toLowerCase() !== wireProof.revisionA) ||
+    (pair.revisionB && pair.revisionB.toLowerCase() !== wireProof.revisionB)) return;
+  const proof = { ...wireProof, scope: job.packageReview.scopeId,
+    revisionA: pair.revisionA ?? wireProof.revisionA, revisionB: pair.revisionB ?? wireProof.revisionB };
+  await tx.query('UPDATE harness_package_review_pairs SET proof=$2,wire_proof=$3 WHERE id=$1',
+    [job.dispute.id, proof, wireProof]);
   const verifyJobs = [];
   for (const branch of ['A', 'B'] as const) {
     const { settings, revision } = pair.profiles[branch];

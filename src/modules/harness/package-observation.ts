@@ -1,6 +1,7 @@
 import type { PoolClient } from 'pg';
 import { z } from 'zod';
 import { hash } from '../gateway/types.js';
+import { deliveredLines } from '../questions/attribute-aliases.js';
 import type { Observation } from '../pdf/types.js';
 import { type ObservationInput, type ReaderContext } from './contracts.js';
 import { packageRoles, type PackageBinding, type PackageSourceRole } from './package-analysis.js';
@@ -26,11 +27,12 @@ export const packageDetails = z.strictObject({
 
 export type PackageDetails = z.infer<typeof packageDetails>;
 
-export function packageNonDeliveryGrounded(input: Omit<ObservationInput, 'evidence'>, image: boolean) {
+export function packageNonDeliveryGrounded(input: Omit<ObservationInput, 'evidence'>, image: boolean, fullLine?: string) {
   if (input.deliveryStatement?.status !== 'not_delivered') return true;
   const role = input.package?.role;
   return !image && Boolean(input.quote && directlyNotDelivered(input.quote, input.deliveryStatement.item) &&
-    role?.value === 'inventory' && input.quote.includes(role.quote) && roleWords.inventory!.test(role.quote));
+    role?.value === 'inventory' && input.quote.includes(role.quote) && roleWords.inventory!.test(role.quote) &&
+    (!fullLine || !directlyDelivered(fullLine, input.deliveryStatement.item)));
 }
 
 const common = /(?:\b(?:(?:applies to|for) all facades?|common materials?|entire building)\b|для\s+все[хм]?\s+фасад|общ(?:ие|ий|ая|его)\s+(?:материал|раздел|требован)|для\s+здания\s+в\s+целом)/iu;
@@ -42,12 +44,22 @@ export function packageCommonGrounded(quote: string) {
 }
 const entireRegister = /(?:\b(?:complete|full|exhaustive)\s+(?:list|schedule|register)\s+of\s+facades?\b|(?:полн\p{L}*|исчерпывающ\p{L}*)\s+(?:перечень|список|ведомость)\s+фасад)/iu;
 const absent = /(?:\b(?:not (?:supplied|provided|delivered|included|sent)|omitted|was not transmitted)\b|не\s+(?:(?:передан|предоставлен|поставлен|направлен|приложен)(?:а|о|ы)?(?!\p{L})|вош[её]л(?!\p{L}))|отсутствует\s+в\s+(?:составе|комплекте))/iu;
+const delivered = /(?:\b(?:supplied|provided|delivered|included|sent|transmitted)\b|(?:передан|предоставлен|поставлен|направлен|приложен)(?:а|о|ы)?(?!\p{L}))/iu;
+
 function directlyNotDelivered(quote: string, item: string) {
+  return statementAbout(quote, item, absent);
+}
+
+function directlyDelivered(quote: string, item: string) {
+  return statementAbout(quote, item, delivered, absent);
+}
+
+function statementAbout(quote: string, item: string, expression: RegExp, excluding?: RegExp) {
   const separator = /[|;·]+/u;
   const adjacent = /^[\s:—–-]*(?:(?:is|was|бы(?:л|ла|ло|ли))\s+)?[\s:—–-]*$/iu;
   return quote.split(separator).some((clause) => {
-    const predicate = absent.exec(clause);
-    if (!predicate) return false;
+    const predicate = expression.exec(clause);
+    if (!predicate || excluding?.test(clause)) return false;
     const before = clause.slice(0, predicate.index);
     const after = clause.slice(predicate.index + predicate[0].length);
     const beforeIndex = before.lastIndexOf(item);
@@ -124,8 +136,19 @@ export async function publishPackageObservation(
   const details = input.package ?? {};
   const { quote, grounding, deliveryStatement } = observation;
   const text = grounding === 'text' ? quote : undefined;
-  const role = details.role && quote?.includes(details.role.quote) && roleWords[details.role.value]?.test(details.role.quote)
-    ? details.role : undefined;
+  const { rows: [issued] } = grounding === 'text' && details.role
+    ? await tx.query<{ content: string | null }>(
+      `SELECT event#>>'{reply,body,content}' AS content FROM harness_research_events
+       WHERE job_id=$1 AND event#>>'{reply,evidence,evidenceId}'=$2 ORDER BY sequence LIMIT 1`,
+      [task.jobId, observation.evidenceId])
+    : { rows: [] };
+  const fullLine = deliveredLines(issued?.content ?? null).find(({ id }) => id === observation.lineId)?.text;
+  const segments = fullLine?.split(/[|;·]/u).map((segment) => segment.trim().replace(
+    /^(?:document(?: type| role)?|type|title|тип документа|вид документа|документ)\s*:\s*/iu, ''));
+  const role = details.role;
+  const isCommercial = Boolean(segments?.some((segment) => roleWords.other!.exec(segment)?.index === 0));
+  const confirmedRole = role && quote?.includes(role.quote) && (!isCommercial || role.value === 'other') &&
+    segments?.some((segment) => segment.includes(role.quote) && roleWords[role.value]?.exec(segment)?.index === 0) ? role : undefined;
   const stage = details.stage && quote?.includes(details.stage.quote) && hasLiteral(details.stage.quote, details.stage.value)
     ? details.stage : undefined;
   const revision = details.revision && quote?.includes(details.revision.quote) &&
@@ -135,7 +158,8 @@ export async function publishPackageObservation(
     ? 'current' : revision?.status === 'superseded' && inactive.test(revision.quote) ? 'superseded' : 'unknown';
   const binding = bindingFor(observation, details);
   const proposal = details.subjectRegister;
-  const register = proposal && text?.includes(proposal.quote) && entireRegister.test(proposal.quote) && !exclusion.test(proposal.quote) &&
+  const register = proposal && revisionStatus === 'current' && (confirmedRole?.value === 'schedule' || confirmedRole?.value === 'inventory') &&
+    text?.includes(proposal.quote) && entireRegister.test(proposal.quote) && !exclusion.test(proposal.quote) &&
     binding.state === 'identified' && proposal.labels.every((name) => binding.candidates.some(({ label }) => name === label)) &&
     binding.candidates.every(({ label }) => proposal.labels.includes(label))
     ? { quote: proposal.quote, commonChecked: Boolean(proposal.commonQuote && text.includes(proposal.commonQuote) && commonRegister.test(proposal.commonQuote) && !exclusion.test(proposal.commonQuote)) }
@@ -145,12 +169,12 @@ export async function publishPackageObservation(
   const materials = details.materials?.filter((material) => quote?.includes(material.quote) &&
     hasLiteral(material.quote, material.label)).map((material) => ({ ...material,
       id: packageCandidateId(observation, material.label) })) ?? [];
-  const basis = { role: role?.quote, stage: stage?.quote, revision: revision?.quote };
+  const basis = { role: confirmedRole?.quote, stage: stage?.quote, revision: revision?.quote };
   await tx.query(
     `INSERT INTO harness_package_facts(id,project_id,window_id,job_id,attribute,source_role,design_stage,revision,revision_status,basis,subject_register,materials)
      VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) ON CONFLICT(id) DO NOTHING`,
     [observation.id, task.projectId, task.job.packageWindow.id, task.jobId, attribute,
-     role?.value ?? 'unknown', stage?.value ?? null, revision?.value ?? null, revisionStatus, basis, register, JSON.stringify(materials)]);
+     confirmedRole?.value ?? 'unknown', stage?.value ?? null, revision?.value ?? null, revisionStatus, basis, register, JSON.stringify(materials)]);
   await tx.query(
     `INSERT INTO harness_package_bindings(fact_id,version,state,candidates,quote,reason)
      VALUES($1,1,$2,$3,$4,$5) ON CONFLICT DO NOTHING`,

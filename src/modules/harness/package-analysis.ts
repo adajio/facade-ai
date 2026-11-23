@@ -2,7 +2,7 @@ import type { Pool, PoolClient } from 'pg';
 import type { Branch, Place } from './contracts.js';
 import type { Observation } from '../pdf/types.js';
 import type { VerifiedPairEvidence } from '../assessment/domain.js';
-import { hasPrintedPairScope, pairSourceEvidence, printedPairVariant } from './pair-evidence.js';
+import { printedPairVariant } from './pair-evidence.js';
 
 export const packageRoles = ['drawing', 'detail', 'schedule', 'specification', 'calculation', 'inventory',
   'correspondence', 'model', 'other', 'unknown'] as const;
@@ -58,7 +58,7 @@ export interface PackageAnalysis {
   candidates: PackageBinding['candidates'];
   windows: PackageWindow[];
   comparisons: PackageComparison[];
-  reviewCandidates: { a: string; b: string; proof: VerifiedPairEvidence }[];
+  reviewCandidates: { a: string; b: string; scope: { id: string; label: string } }[];
   verifiedPairs: { a: string; b: string; proof: VerifiedPairEvidence }[];
   coverage: {
     inventory: 'open' | 'closed';
@@ -70,6 +70,7 @@ export interface PackageAnalysis {
     physicalBoundary: 'mapped_places' | 'verified';
     facadeBoundary: 'observed_facades' | 'verified';
     physicalProof: PackageCoverageProof | null;
+    physicalLimitations: { versionId: string; reason: string }[];
     subjectProof: (PackageCoverageProof & { facadeIds: string[]; commonChecked: boolean }) | null;
   };
 }
@@ -137,26 +138,16 @@ function bindingScope(a: PackageFact, b: PackageFact) {
 }
 
 function pairCandidate(a: PackageFact, b: PackageFact, scope: { id: string; label: string } | undefined) {
-  const aq = a.observation.quote;
-  const bq = b.observation.quote;
-  if (!scope || !aq || !bq || a.observation.grounding !== 'text' || b.observation.grounding !== 'text' ||
-    a.observation.source.documentId === b.observation.source.documentId || a.observation.source.sha256 === b.observation.source.sha256 ||
-    !a.basis.role || !b.basis.role || a.sourceRole !== b.sourceRole || ['other','inventory','correspondence','unknown'].includes(a.sourceRole) || a.revisionStatus !== 'current' || b.revisionStatus !== 'current' ||
-    !a.basis.revision || !b.basis.revision || a.variant !== b.variant || !a.variant || !a.observation.value || !b.observation.value ||
-    a.designStage !== b.designStage ||
-    !hasPrintedPairScope(aq, scope.label) || !hasPrintedPairScope(bq, scope.label)) return;
-  const quotes = [
-    { support: 'A' as const, evidenceId: a.observation.evidenceId, quote: aq, line: aq },
-    { support: 'B' as const, evidenceId: b.observation.evidenceId, quote: bq, line: bq },
-  ];
-  const result = pairSourceEvidence({
-    variants: quotes, revisions: quotes, applicability: quotes, anchors: { A: [aq], B: [bq] },
-    scopeName: scope.label, confirmVariant: true, confirmRevision: true, confirmApplicability: true,
-  });
-  if ('proof' in result && result.proof && a.revision && b.revision &&
-    result.proof.revisionA === a.revision.toLowerCase() && result.proof.revisionB === b.revision.toLowerCase()) {
-    return { a: a.id, b: b.id, proof: { ...result.proof, revisionA: a.revision, revisionB: b.revision, scope: scope.id } };
-  }
+  const left = a.observation;
+  const right = b.observation;
+  if (!scope || !left.quote || !right.quote || left.grounding !== 'text' || right.grounding !== 'text' ||
+    left.source.documentId === right.source.documentId || left.source.sha256 === right.source.sha256 ||
+    !a.basis.role || !b.basis.role || a.sourceRole !== b.sourceRole ||
+    ['other', 'inventory', 'correspondence', 'unknown'].includes(a.sourceRole) ||
+    a.revisionStatus === 'superseded' || b.revisionStatus === 'superseded' ||
+    (a.variant && b.variant && a.variant !== b.variant) ||
+    (a.designStage && b.designStage && a.designStage !== b.designStage)) return;
+  return { a: a.id, b: b.id, scope };
 }
 
 function normalizedValue(value: string | undefined) {
@@ -189,7 +180,9 @@ function compare(facts: PackageFact[]) {
         left.address.unitId === right.address.unitId && left.lineId && left.lineId === right.lineId;
       const scope = bindingScope(a, b);
       if (!sameLocation && !scope) continue;
-      const different = left.value !== undefined && right.value !== undefined && normalizedValue(left.value) !== normalizedValue(right.value) && left.unit === right.unit;
+      const different = left.value !== undefined && right.value !== undefined &&
+        Boolean(left.unit) === Boolean(right.unit) &&
+        (left.unit !== right.unit || normalizedValue(left.value) !== normalizedValue(right.value));
       const proposal = different ? pairCandidate(a, b, scope) : undefined;
       if (proposal) reviewCandidates.push(proposal);
       if (comparisons.length >= 200) continue;
@@ -205,13 +198,12 @@ function compare(facts: PackageFact[]) {
 export async function readPackageAnalysis(db: Pool | PoolClient, projectId: string): Promise<PackageAnalysis> {
   // The assessment caller supplies its existing transaction.
   const args = [projectId];
-  const versions = await db.query<{ id: string; map: boolean; refusal: string | null; basis: string | null }>(
-    `WITH accepted AS (${accepted}) SELECT a.version_id AS id,coalesce(m.physical_proof,false) AS map,m.refusal,
-        (SELECT e.id FROM reader_evidence e JOIN harness_package_branches b ON b.job_id=e.run_id AND b.active
-          JOIN harness_package_windows w ON w.id=b.window_id AND w.map_fingerprint=m.fingerprint
-          WHERE e.version_id=m.version_id AND e.reader_version=m.reader_version AND e.project_id=m.project_id
-          ORDER BY e.created_at,e.id LIMIT 1) AS basis
-       FROM accepted a LEFT JOIN harness_package_maps m ON m.version_id=a.version_id AND m.active ORDER BY a.version_id`, args);
+  const versions = await db.query<{ id: string; refusal: string | null; basis: string | null; limitation: string | null }>(
+    `WITH accepted AS (${accepted}) SELECT a.version_id AS id,m.refusal,m.physical_basis_id AS basis,
+        coalesce(m.physical_limitation,r.reason) AS limitation
+       FROM accepted a LEFT JOIN harness_package_maps m ON m.version_id=a.version_id AND m.active
+       LEFT JOIN harness_package_map_retries r ON r.version_id=a.version_id
+       ORDER BY a.version_id`, args);
   const { rows: windowRows } = await db.query<WindowRow>(
     `WITH accepted AS (${accepted})
      SELECT w.id,w.place,m.reader_version AS "readerVersion",m.format,
@@ -256,7 +248,7 @@ export async function readPackageAnalysis(db: Pool | PoolClient, projectId: stri
   const completedWindows = windows.filter(({ branches }) => Object.values(branches)
     .every(({ status }) => status === 'covered' || status === 'reviewed_no_match')).length;
   const versionIds = versions.rows.map(({ id }) => id);
-  const physicalProof = versionIds.length && versions.rows.every(({ map, basis }) => map && basis)
+  const physicalProof = versionIds.length && versions.rows.every(({ basis }) => basis)
     ? { versionIds, basisIds: versions.rows.map(({ basis }) => basis!) } : null;
   const facadeIds = candidates.map(({ id }) => id).sort();
   const registers = rows.filter((fact) => fact.register?.commonChecked && fact.binding.state === 'identified' &&
@@ -266,7 +258,8 @@ export async function readPackageAnalysis(db: Pool | PoolClient, projectId: stri
     fact.observation.source.versionId === a.observation.source.versionId &&
     fact.observation.address.unitId === a.observation.address.unitId && fact.register?.quote === a.register?.quote);
   const subjectProof = a && b && inventory.closed && physicalProof && completedWindows === windows.length &&
-    !facts.some(({ binding }) => binding.state === 'unclear')
+    !facts.some(({ binding, attribute, observation, materials }) => binding.state === 'unclear' ||
+      (binding.state === 'unidentified' && (attribute || observation.value !== undefined || materials.length)))
     ? { versionIds, basisIds: [a.id, b.id], facadeIds, commonChecked: true } : null;
   const mappedVersions = new Set(windows.map(({ place }) => place.source.versionId)).size;
   const comparison = compare(facts);
@@ -277,16 +270,18 @@ export async function readPackageAnalysis(db: Pool | PoolClient, projectId: stri
      JOIN gateway_jobs b ON b.id=p.b_job_id AND b.state='done'
      WHERE p.project_id=$1
        AND lead.result->>'kind'='proposal' AND a.result->>'verdict'='supported' AND b.result->>'verdict'='supported'
-       AND (lead.result->'verifiedPair')=p.wire_proof AND (a.result->'verifiedPair')=p.wire_proof AND (b.result->'verifiedPair')=p.wire_proof
+       AND p.proof IS NOT NULL AND (lead.result->'verifiedPair')=p.wire_proof AND (a.result->'verifiedPair')=p.wire_proof AND (b.result->'verifiedPair')=p.wire_proof
        AND NOT EXISTS (SELECT 1 FROM harness_package_bindings x WHERE x.fact_id=p.a_fact_id AND x.version>p.a_binding_version)
        AND NOT EXISTS (SELECT 1 FROM harness_package_bindings x WHERE x.fact_id=p.b_fact_id AND x.version>p.b_binding_version)`, args);
   const current = new Map(comparison.reviewCandidates.map((pair) => [pair.a + '/' + pair.b, pair]));
-  const verifiedPairs = reviewed.rows.filter((pair) => current.has(pair.a + '/' + pair.b));
+  const verifiedPairs = reviewed.rows.filter((pair) => current.get(pair.a + '/' + pair.b)?.scope.id === pair.proof.scope);
   return { facts, candidates, windows, ...comparison, verifiedPairs, coverage: {
     inventory: inventory.closed ? 'closed' : 'open', acceptedVersions: versionIds.length, mappedVersions,
     refusedVersions: versions.rows.filter(({ refusal }) => refusal !== null).length,
     pendingVersions: versionIds.length - mappedVersions, completedWindows,
     physicalBoundary: physicalProof ? 'verified' : 'mapped_places', facadeBoundary: subjectProof ? 'verified' : 'observed_facades',
     physicalProof, subjectProof,
+    physicalLimitations: versions.rows.flatMap(({ id, basis, limitation }) =>
+      basis ? [] : [{ versionId: id, reason: limitation ?? 'physical_inventory_pending' }]),
   } };
 }

@@ -38,7 +38,7 @@ export function hasPrintedPairScope(line: string, label: string): boolean {
   return labels.length > 0 && labels.every((item) => item === normalized(label));
 }
 
-function currentRevision(line: string, label: string): boolean {
+export function currentRevision(line: string, label: string): boolean {
   if (ineffective.test(line)) return false;
   return fields(line, revision).some(({ value, match }) => value === label &&
     (currentPrefix.test(line.slice(0, match.index)) || currentSuffix.test(line.slice(match.index + match[0].length))));
@@ -55,7 +55,7 @@ function oneValue(quotes: PairQuote[], anchors: string[], field: RegExp): string
 export function pairSourceEvidence(input: {
   variants: PairQuote[]; revisions: PairQuote[]; applicability: PairQuote[];
   anchors: Supports; scopeName: string; assignedVariant?: string;
-  confirmVariant: boolean; confirmRevision: boolean; confirmApplicability: boolean;
+  confirmVariant: boolean; confirmRevision: boolean; confirmApplicability: boolean; scopeAcrossVersion?: boolean;
 }): { proof?: VerifiedPairEvidence } | { failure: PairFailure } {
   const { anchors, scopeName, confirmVariant, confirmRevision, confirmApplicability } = input;
   function fail(code: string, nextAction: string) { return { failure: { code, nextAction } }; }
@@ -85,7 +85,7 @@ export function pairSourceEvidence(input: {
   const effectiveForScope = (side: Branch, label: string) => input.revisions.some(({ support, evidenceId, quote }) => {
     if (support !== side || !currentRevision(quote, label)) return false;
     return scopes(quote).includes(expectedScope) || input.applicability.some((addressed) =>
-      addressed.support === side && addressed.evidenceId === evidenceId && scopes(addressed.quote).includes(expectedScope));
+      addressed.support === side && (input.scopeAcrossVersion || addressed.evidenceId === evidenceId) && scopes(addressed.quote).includes(expectedScope));
   });
   if (revisionA && revisionB && revisionA !== revisionB &&
     (!effectiveForScope('A', revisionA) || !effectiveForScope('B', revisionB))) {

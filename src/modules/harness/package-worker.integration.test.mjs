@@ -15,7 +15,7 @@ const sha = (bytes) => createHash('sha256').update(bytes).digest('hex');
 
 function pdf(lines) {
   const drawing = lines.map((line) => `(${line}) Tj`).join(' 0 -24 Td ');
-  const stream = `BT /T 9 Tf 20 140 Td ${drawing} ET`;
+  const stream = `BT /T 7 Tf 20 140 Td ${drawing} ET`;
   const objects = [
     '<< /Type /Catalog /Pages 2 0 R >>',
     '<< /Type /Pages /Kids [4 0 R] /Count 1 >>',
@@ -55,7 +55,7 @@ function tool(name, args) {
 
 const primaryDrawing = 'Drawing | current revision R1 | variant V9 | scope: K-47 | project facade ID: K-47 | Gap 30 mm';
 const opposingDrawing = 'Drawing | current revision R2 | variant V9 | scope: K-47 | project facade ID: K-47 | Gap 41 mm';
-const register = 'Complete list of facades | project facade ID: K-47 | project facade ID: M-18 | all common materials listed';
+const register = 'Schedule | current revision R1 | Complete list of facades | project facade ID: K-47 | project facade ID: M-18 | all common materials listed';
 const notDelivered = 'Transmittal | current revision R1 | project facade ID: M-18 | thermal report not delivered';
 const common = 'Specification | applies to all facades | current revision R1 | System vent';
 function observation(line) {
@@ -64,7 +64,8 @@ function observation(line) {
   const revision = /current revision (\w+)/.exec(line.text);
   const role = lower.includes('drawing') ? { value: 'drawing', quote: 'Drawing' }
     : lower.includes('specification') ? { value: 'specification', quote: 'Specification' }
-      : lower.includes('transmittal') ? { value: 'inventory', quote: 'Transmittal' } : undefined;
+      : lower.includes('transmittal') ? { value: 'inventory', quote: 'Transmittal' }
+        : lower.includes('schedule') ? { value: 'schedule', quote: 'Schedule' } : undefined;
   const attribute = lower.includes('gap') ? 'Gap' : lower.includes('thermal report') ? 'thermal report' :
     lower.includes('system vent') ? 'System vent' : lower.includes('mar?') ? 'Material identifier' : 'Facade register';
   const value = /Gap (\d+) mm/.exec(line.text)?.[1];
@@ -92,8 +93,10 @@ test('ordinary intake publishes independent package evidence before questions an
   const { createApi } = await import(built('src/platform/api.js'));
   const { readConfig } = await import(built('src/platform/config.js'));
   const { bootstrapAdmin } = await import(built('src/modules/access/bootstrap.js'));
-  const { createGateway } = await import(built('src/modules/gateway/index.js'));
+  const { createGateway, PostgresIntentJournal } = await import(built('src/modules/gateway/index.js'));
   const { startWorker, readPackageAnalysis } = await import(built('src/modules/harness/index.js'));
+  const { preparePackageMap, dispatchPackagePair } = await import(built('src/modules/harness/package-dispatch.js'));
+  const { loadResearchProfile } = await import(built('src/modules/harness/profile.js'));
   const { Pool } = await import('pg');
   const config = readConfig();
   const external = new Pool({ connectionString: process.env.FACADE_GATEWAY_JOURNAL_URL });
@@ -194,14 +197,14 @@ test('ordinary intake publishes independent package evidence before questions an
   }
   const receipt = (await command('POST', `/api/projects/${project.id}/receipts`, { source: 'upload' })).json();
   const receiptUrl = `/api/receipts/${receipt.receiptId}`;
-  async function upload(relativePath, pdfBytes) {
-    const { uploadId } = (await command('POST', receiptUrl + '/uploads', {
+  async function upload(relativePath, pdfBytes, target = receiptUrl) {
+    const { uploadId } = (await command('POST', target + '/uploads', {
       relativePath, size: pdfBytes.length, sha256: sha(pdfBytes), mediaType: 'application/pdf',
     })).json();
     await command('PUT', `/api/uploads/${uploadId}/parts/1`, pdfBytes, {
       'content-type': 'application/octet-stream', 'x-part-sha256': sha(pdfBytes), 'content-length': String(pdfBytes.length),
     });
-    await command('POST', `/api/uploads/${uploadId}/complete`, {});
+    return (await command('POST', `/api/uploads/${uploadId}/complete`, {})).json();
   }
 
   function run() {
@@ -256,4 +259,92 @@ test('ordinary intake publishes independent package evidence before questions an
   assert.equal(calls.length, callsBeforeRestart);
   const journal = await external.query('SELECT coalesce(sum(spent_usd_nanos),0)::int AS spend FROM gateway_external_attempts');
   assert.equal(journal.rows[0].spend, 0);
+  driver.abort();
+  await worker;
+
+  await t.test('addressed legacy transition preserves paid keys and unknown reserve under fair slot caps', async () => {
+    const catalog = (await command('POST', '/api/catalogs', { key: 'legacy', name: 'Legacy',
+      requirements: [{ key: 'gap', part: 'Gap', formats: ['pdf'], equivalents: [], applicability: 'all',
+        sourceRoles: ['drawing'], completenessCriterion: 'Addressed value', addressee: 'customer' }] })).json();
+    async function newProject(name, legacy = false) {
+      const project = (await command('POST', '/api/projects', legacy
+        ? { name, catalogVersionId: catalog.id, scopeName: 'Existing scope' } : { name, mode: 'intake' })).json();
+      const receipt = (await command('POST', `/api/projects/${project.id}/receipts`, { source: 'upload' })).json();
+      await upload('transition.pdf', pdf([name]), `/api/receipts/${receipt.receiptId}`);
+      await command('POST', `/api/receipts/${receipt.receiptId}/seal`, {});
+      return project;
+    }
+    const existing = await newProject('Existing package', true);
+    const other = await newProject('Untouched historical package', true);
+    const small = await newProject('Competing intake package');
+    for (const project of [existing, small]) {
+      for (const [routeId, purpose] of [['managed-a','primary_a'], ['managed-b','primary_b']]) {
+        await gateway.grantRoute({ projectId: project.id, routeId, revision: 'fixture-v1', purpose, dataClass: 'synthetic', allowed: true });
+      }
+    }
+    const { rows: [original] } = await app.db.query(
+      `SELECT j.project_id AS "projectId",j.document_id AS "documentId",j.version_id AS "versionId", o.sha256
+       FROM intake_reader_jobs j JOIN intake_originals o ON o.id=j.original_id WHERE j.project_id=$1`, [existing.id]);
+    const place = { source: original, unitId: '1', page: 1 };
+    const legacyRef = { projectId: existing.id, scopeId: existing.scopes[0].id, generationId: randomUUID() };
+    let sends = 0;
+    const legacyGateway = createGateway(app.db, { journal: new PostgresIntentJournal(external, process.env.FACADE_GATEWAY_LEDGER_ID),
+      transport: { kind: 'managed', async send(attempt) {
+        sends++;
+        return attempt.purpose === 'primary_a'
+          ? { receipt: { state: 'paid', providerId: 'legacy-paid', costUsdNanos: 0, evidenceRef: 'synthetic:old' }, output: { original: true } }
+          : { receipt: { state: 'unknown', code: 'fixture-lost-receipt' } };
+      } } });
+    await legacyGateway.openGeneration(legacyRef);
+    for (const branch of ['A', 'B']) {
+      const id = 'legacy-' + branch;
+      await legacyGateway.declarePrimary(legacyRef, { id, branch, place: 'original-window' });
+      await legacyGateway.enqueue({ ...legacyRef, key: id, kind: 'legacy_fixture_research', subjectId: original.versionId,
+        purpose: branch === 'A' ? 'primary_a' : 'primary_b', obligationId: id, payload: { mode: 'primary', branch, place } });
+    }
+    const seen = [];
+    for (const expected of ['paid', 'held']) {
+      const work = await legacyGateway.claim({ workerId: 'legacy-fixture', kinds: ['legacy_fixture_research'], leaseMs: 60_000 });
+      const branch = work.payload.branch.toLowerCase();
+      const call = { lease: work.lease, effectKey: 'legacy-step-' + branch, routeId: 'managed-' + branch,
+        dataClass: 'synthetic', request: { original: branch }, inputRefs: [] };
+      const result = await legacyGateway.call(call);
+      assert.equal(result.status, expected);
+      seen.push({ call, result });
+    }
+    const before = (await app.db.query(`SELECT id,effect_key,state,ceiling_usd_nanos FROM gateway_attempts
+      WHERE project_id=$1 ORDER BY state`, [existing.id])).rows;
+    assert.deepEqual(before.map(({ state }) => state), ['paid', 'unknown']);
+    const readerVersion = complete.windows[0].readerVersion;
+    const map = {
+      formatFor: () => 'pdf', readerVersion: async () => readerVersion,
+      async map(source) {
+        const count = source.projectId === existing.id ? 2625 : 3;
+        return { format: 'pdf', source, readerVersion, units: Array.from({ length: count }, (_, index) => ({
+          id: String(index + 1), width: 600, height: 400, locator: { page: index + 1 },
+        })) };
+      },
+    };
+    assert.equal(await preparePackageMap(app.db, gateway, map, [existing.id]), true);
+    assert.equal(await preparePackageMap(app.db, gateway, map, [existing.id]), true);
+    assert.equal(await preparePackageMap(app.db, gateway, map, [existing.id]), false);
+
+    const profile = loadResearchProfile({});
+    for (let index = 0; index < 12; index++) if (!await dispatchPackagePair(app.db, gateway, profile)) break;
+    const large = await readPackageAnalysis(app.db, existing.id);
+    const competing = await readPackageAnalysis(app.db, small.id);
+    assert.equal(large.windows.length, 2625);
+    assert.equal(large.coverage.completedWindows, 0);
+    assert.deepEqual(Object.values(large.windows[0].branches).map(({ reason }) => reason),
+      ['prior_paid_window_incompatible', 'prior_effect_unsettled']);
+    assert.equal(large.windows.flatMap(({ branches }) => Object.values(branches)).filter(({ jobId }) => jobId).length, 8);
+    assert.equal(competing.windows.length, 3);
+    assert.ok(competing.windows.every(({ branches }) => branches.A.jobId && branches.B.jobId));
+    assert.equal((await readPackageAnalysis(app.db, other.id)).windows.length, 0);
+    assert.deepEqual((await app.db.query(`SELECT id,effect_key,state,ceiling_usd_nanos FROM gateway_attempts
+      WHERE project_id=$1 ORDER BY state`, [existing.id])).rows, before);
+    assert.equal((await legacyGateway.call(seen[0].call)).replay, true);
+    assert.equal((await legacyGateway.call(seen[1].call)).code, 'unknown_charge');
+    assert.equal(sends, 2);
+  });
 });

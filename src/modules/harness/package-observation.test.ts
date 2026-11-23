@@ -15,6 +15,8 @@ test('package non-delivery requires the referenced item to govern the negative p
   assert.equal(packageNonDeliveryGrounded(input('Опись | Теплотехнический расчёт — не передан'), false), true);
   assert.equal(packageNonDeliveryGrounded(input('Опись | не передан Теплотехнический расчёт'), false), true);
   assert.equal(packageNonDeliveryGrounded(input('Опись | не передан Теплотехнический расчёт'), true), false);
+  assert.equal(packageNonDeliveryGrounded(input('Опись | не передан Теплотехнический расчёт'), false,
+    'Опись | не передан Теплотехнический расчёт | Теплотехнический расчёт передан'), false);
 });
 
 test('common materials require a positive statement that covers the entire building', () => {

@@ -67,7 +67,17 @@ export function connectReader(
   }
 
   async function reviewWindows({ task }: ReaderContext, id: string | null, offset: number) {
-    if (task.scopeId === null || !task.earlyPair || task.job.mode === 'primary') return [];
+    if (!task.earlyPair || task.job.mode === 'primary') return [];
+    if (task.scopeId === null) {
+      if (!task.job.packageReview || !await authorizedPackageReview(db, task.projectId, task.generationId, task.job, task.jobId)) return [];
+      const { a, b } = task.job.dispute;
+      const { rows } = await db.query<{ id: string; place: Place; support: 'A' | 'B'; format: string }>(
+        `SELECT w.id,w.place,m.format,CASE WHEN w.version_id=$2 THEN 'A' ELSE 'B' END AS support
+         FROM harness_package_windows w JOIN harness_package_maps m ON m.version_id=w.version_id AND m.fingerprint=w.map_fingerprint AND m.active
+         WHERE w.project_id=$1 AND w.version_id IN ($2,$3) AND ($4::uuid IS NULL OR w.id=$4)
+         ORDER BY w.ordinal,support,w.id LIMIT 33 OFFSET $5`, [task.projectId,a.place.source.versionId,b.place.source.versionId,id,offset]);
+      return rows;
+    }
     const { rows } = await db.query<{ id: string; place: Place; support: 'A' | 'B'; format: string }>(
       `SELECT hp.obligation_id AS id,hp.place,hp.branch AS support,m.format
        FROM harness_live_review_pairs d
@@ -98,8 +108,10 @@ export function connectReader(
       if (!authorized) throw new ReaderRefusal('context_window_unavailable', 'permanent');
       const { place } = authorized;
       try {
+        const support = 'support' in authorized ? authorized.support as 'A' | 'B' : undefined;
+        const readerVersion = await checkPackage(context, db, support);
         const { evidence, bytes } = await service.open(place.source, executionScope(context), {
-          address: { unitId: place.unitId, ...(place.box ? { box: place.box } : {}) }, representation,
+          address: { unitId: place.unitId, ...(place.box ? { box: place.box } : {}) }, representation, readerVersion,
         });
         if (evidence.source.versionId !== place.source.versionId || evidence.source.sha256 !== place.source.sha256
           || evidence.address.unitId !== place.unitId || evidence.mediaType !== 'application/json') {

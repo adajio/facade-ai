@@ -1,8 +1,9 @@
 import { randomUUID } from 'node:crypto';
 import type { Pool, PoolClient } from 'pg';
 import { getLockedGate, getQuestions, synchronize } from '../assessment/store.js';
+import { verifyPhysicalInventory } from '../formats/physical-inventory.js';
 import type { WorkQueue } from '../gateway/queue.js';
-import { transaction, type Obligation } from '../gateway/types.js';
+import { hash, transaction, type Obligation } from '../gateway/types.js';
 import { lockIntakeProject } from '../intake/gate.js';
 import type { PageMap, ReaderUnit } from '../pdf/types.js';
 import { ReaderError } from '../pdf/types.js';
@@ -54,15 +55,17 @@ export async function buildMap(job: IntakeJob, map: (source: Source) => Promise<
   try {
     const result = await map({ projectId, documentId, versionId, sha256 });
     const units = result.units.flatMap((unit) => unitPlaces(unit, result.format));
-    return {
-      units: units.length ? units : [{ id: 'original', refusal: 'reader_no_physical_units' }],
-      format: result.format, readerVersion: result.readerVersion,
-      physicalProof: result.format === 'pdf' && result.units.length > 0 &&
-        result.units.every((unit, index) => unit.locator?.page === index + 1 && unit.width && unit.height),
-    };
+    const physical = result.format !== 'pdf' ? verifyPhysicalInventory(result)
+      : result.units.length > 0 && result.units.every((unit, index) =>
+        unit.locator?.page === index + 1 && unit.width && unit.height)
+        ? { basisId: 'inventory-v1:' + hash([result.source.versionId, result.source.sha256, result.readerVersion, result.units.map(({ id, width, height, locator }) => [id, width!, height!, locator!])]) }
+        : { limitation: 'pdf_physical_inventory_unavailable' };
+    return { units: units.length ? units : [{ id: 'original', refusal: 'reader_no_physical_units' }],
+      format: result.format, readerVersion: result.readerVersion, physical };
   } catch (error) {
     if (!(error instanceof ReaderError) || ![415, 422].includes(error.statusCode)) throw error;
-    return { units: [{ id: 'original', refusal: error.code }], format: job.format, readerVersion: null, physicalProof: false };
+    return { units: [{ id: 'original', refusal: error.code }], format: job.format, readerVersion: null,
+      physical: { limitation: error.code } };
   }
 }
 

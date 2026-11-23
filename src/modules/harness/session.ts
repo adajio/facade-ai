@@ -7,8 +7,8 @@ import { pairConfirmed, pairCriteria, ReaderRefusal, type PairChecks } from './c
 import { contains } from '../pdf/types.js';
 import { canonicalJson, isInventoryRole } from '../assessment/domain.js';
 import { deliveredLines } from '../questions/attribute-aliases.js';
-import { pairSourceEvidence, type PairQuote } from './pair-evidence.js';
-import { packageNonDeliveryGrounded } from './package-observation.js';
+import { currentRevision, hasPrintedPairScope, pairSourceEvidence, type PairQuote } from './pair-evidence.js';
+import { packageCommonGrounded, packageNonDeliveryGrounded } from './package-observation.js';
 import { escapeRegex } from '../questions/domain.js';
 import {
   checkToolArguments, commands, decodeCompletion, hashBytes, imageMessage, initialMessages, observationArguments, permittedTool, request,
@@ -216,10 +216,25 @@ function checkPairEvidence(
   if (!task.pairScopeName) return { refusal: failedTool('review_pair_stale', 'Откройте актуальную область вопроса.') };
   const result = pairSourceEvidence({ variants: addressed.get('variant')!, revisions: addressed.get('revision')!,
     applicability: addressed.get('applicability')!, anchors, scopeName: task.pairScopeName,
+    scopeAcrossVersion: Boolean(task.job.packageReview),
     assignedVariant: question.variant, confirmVariant: checks.variant.status === 'confirmed',
     confirmRevision: checks.revision.status === 'confirmed', confirmApplicability: checks.applicability.status === 'confirmed',
   });
   if ('failure' in result) return { refusal: failedTool(result.failure.code, result.failure.nextAction) };
+  if (task.job.packageReview && pairConfirmed(checks) && result.proof) {
+    const { scopeLabel, scopeId } = task.job.packageReview;
+    const applicability = addressed.get('applicability')!;
+    const revisions = addressed.get('revision')!;
+    for (const support of ['A', 'B'] as const) {
+      const revision = support === 'A' ? result.proof.revisionA : result.proof.revisionB;
+      if (!applicability.some((quote) => quote.support === support &&
+        (hasPrintedPairScope(quote.quote, scopeLabel) || scopeId === 'common' && packageCommonGrounded(quote.quote))) ||
+        !revisions.some((quote) => quote.support === support && currentRevision(quote.quote, revision))) {
+        return { refusal: failedTool('package_pair_applicability_unproven',
+          'Нужна действующая редакция и явно указанная область на каждой опоре. Откройте титул или оставьте сверку неопределённой.') };
+      }
+    }
+  }
   return { proof: pairConfirmed(checks) ? result.proof : undefined };
 }
 
@@ -480,7 +495,10 @@ async function executeTool(
         return { reply: failedTool('reader_component_anchor_mismatch', 'Сохраните значение в назначенном месте. Для отдельных контекстных фрагментов используйте save_compound_observation.') };
       }
       if (task.job.mode !== 'primary') throw new Error('Observation from a non-primary job');
-      if (task.job.packageWindow && !packageNonDeliveryGrounded(input, Boolean(prior.image))) {
+      const representation = prior.body as { content?: string };
+      const fullLine = input.deliveryStatement && input.quote ? deliveredLines(representation.content ?? null)
+        .find(({ id, text }) => (!input.lineId || id === input.lineId) && text.includes(input.quote!))?.text : undefined;
+      if (task.job.packageWindow && !packageNonDeliveryGrounded(input, Boolean(prior.image), fullLine)) {
         return { reply: failedTool('package_non_delivery_unproven',
           'Нужна дословная строка описи с явным утверждением о непередаче и подтверждённой ролью inventory.') };
       }
