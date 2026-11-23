@@ -49,10 +49,14 @@ export const coverageLabels = {
 
 export const assessmentReasons: Record<string, string> = {
   catalog_unassigned: 'Нет рабочего каталога',
+  catalog_not_applicable: 'Назначенный каталог не применим к текущей стадии и типам фасадов',
   catalog_empty: 'В каталоге нет требований',
   catalog_scope_undeclared: 'Для строк каталога требуется область применимости',
+  catalog_evidence_rule_unset: 'В каталоге не задано правило проверки доказательств по требованию',
   stage_unknown: 'Стадия не установлена',
   inventory_open: 'Опись ещё не зафиксирована',
+  inventory_items_excluded: 'Из описи исключены отдельные позиции',
+  inventory_import_incomplete: 'Не все операции импорта завершились успешно',
   physical_map_unverified: 'Полнота физической карты не подтверждена',
   reading_incomplete: 'Применимый охват A/B ещё не подтверждён',
   facade_boundary_unverified: 'Полный перечень фасадов и общий уровень не подтверждены',
@@ -60,4 +64,7 @@ export const assessmentReasons: Record<string, string> = {
   supplement_review_required: 'Необходим пересмотр с учётом досылки',
   no_applicable_requirements: 'Применимых требований пока нет',
   requirement_not_proven: 'Доказательства по требованию неполны',
+  required_evidence_incomplete: 'Комплект обязательных доказательств по требованию неполон',
+  alternatives_unverified: 'Проверка возможных альтернатив не завершена',
+  pair_verification_required: 'Для подтверждения противоречия нужна сверка пары опор',
 };
