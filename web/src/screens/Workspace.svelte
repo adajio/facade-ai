@@ -14,6 +14,7 @@
   import Questions from './Questions.svelte';
   import Letters from './Letters.svelte';
   import Members from './Members.svelte';
+  import Fragments from './Fragments.svelte';
 
   let { api, project, route, masked, refresh, onDenied, setDocumentPage }: {
     api: Api; project: Project; route: Route; masked: boolean; refresh: (foreground?: boolean) => Promise<void>;
@@ -21,6 +22,7 @@
   } = $props();
 
   let section = $derived(route.section ?? 'overview');
+  let fragmentSection = $derived(section === 'fragments');
   let projectId = $derived(project.id);
   let scopes = $derived(project.scopes ?? []);
   let requestedScope = $derived(route.params.get('scope') ?? '');
@@ -52,6 +54,9 @@
     return scopedUrl(project.id, next, {
       scope: replacement || undefined,
       ...(sameContext && next === section ? { filter, slice: pinnedSlice } : {}),
+      ...(next === 'fragments' && section === 'fragments' && isEngineer(project) ? {
+        document: route.params.get('document'), version: route.params.get('version'), page: route.params.get('page'),
+      } : {}),
     });
   }
 
@@ -63,7 +68,7 @@
   $effect(() => {
     const base = projectApi(projectId);
     const activeScope = scopeId;
-    if (masked) return;
+    if (masked || fragmentSection) return;
     void loopRevision;
     const controller = new AbortController();
     let timer: ReturnType<typeof setTimeout>;
@@ -129,7 +134,7 @@
     void section;
     void scopeId;
     void objectId;
-    const evidence = evidenceId;
+    const evidence = section === 'fragments' ? null : evidenceId;
     const observation = observationId;
     const component = evidenceComponent;
     untrack(() => {
@@ -210,7 +215,7 @@
     <h2>{project.name}</h2>
     <nav aria-label="Разделы проекта">
       {#each nav as [key, name] (key)}
-        {#if key !== 'members' || available(project, 'project:manage')}
+        {#if (!project.scopeId || key === 'fragments') && (key !== 'members' || available(project, 'project:manage'))}
           <a href={scopeLink(key)} aria-current={key === section ? 'page' : undefined}>{name}</a>
         {/if}
       {/each}
@@ -236,7 +241,7 @@
         {#if available(project, 'project:manage') && (!project.intakeMode || scopes.length)}
           <button type="button" onclick={() => scopeForm = !scopeForm}>Добавить область</button>
         {/if}
-        {#if projection}<span class="meta">Срез {projection.projectionVersion}</span>{/if}
+        {#if projection && section !== 'fragments'}<span class="meta">Срез {projection.projectionVersion}</span>{/if}
       </div>
       {#if scopeForm}
         <form class="card" onsubmit={addScope}>
@@ -248,7 +253,7 @@
           <div class="actions"><button class="primary" disabled={scopeBusy}>Сохранить область</button></div>
         </form>
       {/if}
-      {#if subscriptionError}<Notice message={'Синхронизация проекта · ' + subscriptionError} />{/if}
+      {#if subscriptionError && !fragmentSection}<Notice message={'Синхронизация проекта · ' + subscriptionError} />{/if}
       {#if pinnedSlice && projection && pinnedSlice !== projection.sliceId}
         {@const currentQuery = Object.fromEntries([...route.params].filter(([key]) => key !== 'slice'))}
         <p class="notice">Появился новый срез. <a href={scopedUrl(project.id, section, currentQuery, route.objectId)}>Открыть актуальный</a></p>
@@ -269,6 +274,8 @@
             {/if}
           {:else if section === 'questions' || section === 'facts'}
             <Questions {api} {context} mode={section} {renew} open={openEvidence} />
+          {:else if section === 'fragments'}
+            <Fragments {api} {context} />
           {:else if section === 'letters'}
             <Letters {api} {context} {renew} open={openEvidence} />
           {:else if section === 'members' && available(project, 'project:manage')}

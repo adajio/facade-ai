@@ -4,7 +4,7 @@
   import { label } from '../lib/format';
   import { ApiError, denied, describe, id, interrupted, type Api } from '../lib/http';
   import type { Occurrence } from '../lib/intake';
-  import { V1, type OpenEvidence, type WorkspaceProps } from '../lib/workspace';
+  import { V1, scopedUrl, type OpenEvidence, type WorkspaceProps } from '../lib/workspace';
   import Notice from '../lib/Notice.svelte';
   import WorkJob, { type Job } from './DocumentJob.svelte';
 
@@ -159,6 +159,11 @@
         {#if isPdf}
           <button id="document-open-original" class="primary" type="button"
             onclick={() => setPage(pages.includes(page) || !pages.length ? page : pages[0], true)}>Открыть оригинал</button>
+          {#if context.canEdit && context.scopeId}
+            <a class="button" href={scopedUrl(context.project.id, 'fragments', {
+              scope: context.scopeId, document: documentId, version: versionId, page,
+            })}>Подготовить фрагмент</a>
+          {/if}
         {/if}
         <a class="button" href={original} download={occurrence.relativePath.split('/').at(-1)}>Скачать оригинал</a>
       </div>

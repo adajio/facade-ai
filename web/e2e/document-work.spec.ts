@@ -109,7 +109,9 @@ test('Комплект без стадии, оригинал PDF, адрес л�
   const firstPage = page.locator('iframe[title="Оригинал PDF, страница 1"]');
   await expect(firstPage).toHaveAttribute('src', href + '#page=1');
   await expectRenderedPage(firstPage, 'red', 'pdf-page-1', testInfo);
-  await page.getByRole('button', { name: 'Следующая страница' }).press('Enter');
+  const nextPage = page.getByRole('button', { name: 'Следующая страница' });
+  await expect(nextPage).toBeEnabled();
+  await nextPage.press('Enter');
   const secondPage = page.locator('iframe[title="Оригинал PDF, страница 2"]');
   await expect(secondPage).toHaveAttribute('src', href + '#page=2');
   await expectRenderedPage(secondPage, 'green', 'pdf-page-2-before-event', testInfo);

@@ -101,12 +101,14 @@ function collectLines(words: Word[]): ReaderLine[] {
   return [...lines.values()];
 }
 
-function wordRows(tsv: Buffer, source: 'native' | 'ocr', viewport: Box, transform?: ImageTransform): ReaderLine[] {
+function wordRows(tsv: Buffer, source: 'native' | 'ocr', viewport: Box, transform?: ImageTransform,
+  containedWords = false): ReaderLine[] {
   const rows = tsv.toString('utf8').replaceAll('\r\n', '\n').split('\n');
   if (!rows.shift()?.startsWith('level\tpage_num\t')) {
     throw new ReaderError(`pdf_${source}_invalid`, 'Инструмент вернул неизвестный формат координат', 422);
   }
   const words: Word[] = [];
+  let segment = 0;
   for (const row of rows) {
     const columns = row.split('\t');
     if (columns[0] !== '5') continue;
@@ -114,13 +116,19 @@ function wordRows(tsv: Buffer, source: 'native' | 'ocr', viewport: Box, transfor
     const text = columns.slice(11).join('\t').trim();
     if (![left, top, width, height].every(Number.isFinite) || width <= 0 || height <= 0 || !text) continue;
     const pixelsPerPoint = transform?.pixelsPerPoint ?? 1;
-    const box = intersect(viewport, {
+    const word = {
       x: (left + (transform?.pixelOriginX ?? 0)) / pixelsPerPoint,
       y: (top + (transform?.pixelOriginY ?? 0)) / pixelsPerPoint,
       width: width / pixelsPerPoint,
       height: height / pixelsPerPoint,
-    });
-    if (box) words.push({ lineId: columns.slice(1, 5).join('.'), text, box });
+    };
+    const box = containedWords ? (contains(viewport, word) ? word : undefined) : intersect(viewport, word);
+    if (!box) {
+      segment++;
+      continue;
+    }
+    const lineId = columns.slice(1, 5).join('.');
+    words.push({ lineId: containedWords ? `${lineId}:${segment}` : lineId, text, box });
   }
   return collectLines(words);
 }
@@ -183,7 +191,7 @@ export function createPdfAdapter(options: { ocrLanguages?: string; profile?: str
       return version;
     },
     inspect,
-    async read(path, request, unit) {
+    async read(path, request, unit, containedWords) {
       if (!unit.width || !unit.height) {
         throw new ReaderError('pdf_geometry_unavailable', 'Размер видимой страницы недоступен', 422);
       }
@@ -197,7 +205,7 @@ export function createPdfAdapter(options: { ocrLanguages?: string; profile?: str
       const address = { unitId: page, locator: unit.locator, ...(request.address.box ? { box } : {}) };
       if (request.representation === 'native') {
         const tsv = await command('pdftotext', ['-f', page, '-l', page, '-cropbox', '-enc', 'UTF-8', '-tsv', path, '-'], 'pdf_native');
-        return textOutput(address, wordRows(tsv, 'native', box), 'pdf_native_empty');
+        return textOutput(address, wordRows(tsv, 'native', box, undefined, containedWords), 'pdf_native_empty');
       }
       const desiredDpi = request.representation === 'ocr' ? 240 : request.address.box ? 288 : 144;
       const fitDpi = Math.floor(72 * Math.min((maxSide - 2) / Math.max(box.width, box.height),

@@ -4,6 +4,7 @@
   import { Commands } from '../lib/commands';
   import { type Project, type Session } from '../lib/contracts';
   import { projectUrl } from '../lib/routes';
+  import { scopedUrl } from '../lib/workspace';
   import { date, label } from '../lib/format';
   import Notice from '../lib/Notice.svelte';
 
@@ -103,7 +104,9 @@
           <tbody>
             {#each projects as project (project.id)}
               <tr>
-                <td><a class="row-link" href={projectUrl(project.id)}>{project.name}</a></td>
+                <td><a class="row-link" href={project.scopeId
+                  ? scopedUrl(project.id, 'fragments', { scope: project.scopeId })
+                  : projectUrl(project.id)}>{project.name}</a></td>
                 <td>{label(project.role)}</td>
                 <td>{project.catalog ? project.catalog.name + ' · ' + project.catalog.revision : project.scopeId ? '—' : 'Нет рабочего каталога'}</td>
                 <td>{date(project.updatedAt)}</td>

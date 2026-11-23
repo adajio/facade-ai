@@ -193,7 +193,7 @@ test('ordinary intake publishes independent package evidence before questions an
   let credentials = {};
   async function command(method, url, payload, headers = {}, expected) {
     const response = await app.inject({ method, url, payload, headers: { origin: 'http://127.0.0.1:3000', host: '127.0.0.1:3000',
-      ...credentials, ...headers, 'idempotency-key': randomUUID() } });
+      ...credentials, 'idempotency-key': randomUUID(), ...headers } });
     assert.ok(expected ? response.statusCode === expected : response.statusCode < 300,
       `${method} ${url} received ${response.statusCode} ${response.body}`);
     return response;
@@ -234,7 +234,7 @@ test('ordinary intake publishes independent package evidence before questions an
   };
   process.env.FACADE_HARNESS_REPLAY_ONLY = '1';
   run();
-  await upload('first.pdf', pdf([primaryDrawing, register, notDelivered, common]));
+  const first = await upload('first.pdf', pdf([primaryDrawing, register, notDelivered, common]));
   const passive = await until(analyze, ({ windows }) => windows.some(({ branches }) => branches.A.status === 'held'), 'passive hold');
   assert.equal(calls.length, 0);
   assert.equal(passive.facts.length, 0);
@@ -242,6 +242,53 @@ test('ordinary intake publishes independent package evidence before questions an
 
   driver.abort();
   await worker;
+  const projectPath = '/api/projects/' + project.id;
+  const scope = (await command('POST', projectPath + '/scopes', { stage: 'RD', name: 'First facade only' })).json();
+  const viewerLogin = 'package-viewer';
+  const viewerPassword = 'test-' + randomUUID();
+  const invitation = (await command('POST', '/api/users/invitations', { login: viewerLogin })).json();
+  await command('POST', '/api/invitations/complete', { password: viewerPassword, token: invitation.token });
+  const projectVersion = (await command('GET', projectPath)).json().version;
+  await command('PUT', projectPath + '/members/' + invitation.userId, {
+    role: 'viewer', scopeId: scope.id, expiresAt: new Date(Date.now() + 3600_000).toISOString(), reason: 'Synthetic scope grant',
+  }, { 'if-match': `"${projectVersion}"` });
+  const viewer = await command('POST', '/api/sessions', { login: viewerLogin, password: viewerPassword }, { cookie: '' });
+  const viewerHeaders = { cookie: viewer.headers['set-cookie'].split(';')[0], 'x-csrf-token': viewer.json().csrfToken };
+  const fragments = `${projectPath}/scopes/${scope.id}/fragment-publications`;
+  const raw = `/api/documents/${first.documentId}/versions/${first.versionId}/content`;
+  const rawRange = { ...viewerHeaders, range: 'bytes=0-7' };
+  assert.deepEqual((await command('GET', fragments, undefined, viewerHeaders)).json().items, []);
+  await command('GET', raw, undefined, rawRange, 404);
+  const selection = {
+    documentId: first.documentId, versionId: first.versionId,
+    page: 1, kind: 'quote', quote: 'Gap 30 mm', box: { x: 10, y: 110, width: 620, height: 24 },
+    reason: 'Exact quote for the first facade',
+  };
+  await command('POST', fragments, { ...selection, versionId: randomUUID() }, {}, 404);
+  await command('POST', fragments, { ...selection, box: { x: 0, y: 0, width: 640, height: 270 } }, {}, 422);
+  const createKey = { 'idempotency-key': randomUUID() };
+  const blocker = await app.db.connect();
+  try {
+    await blocker.query('BEGIN');
+    await blocker.query("SELECT pg_advisory_xact_lock(hashtextextended('facade/heavy-local-slot',0))");
+    const busy = await command('POST', fragments, selection, createKey, 503);
+    assert.equal(busy.json().code, 'reader_resource_wait');
+  } finally {
+    await blocker.query('ROLLBACK');
+    blocker.release();
+  }
+  const fragment = (await command('POST', fragments, selection, createKey, 201)).json();
+  const replayed = await command('POST', fragments, selection, createKey, 201);
+  assert.equal(replayed.headers['idempotency-replayed'], 'true');
+  assert.deepEqual(replayed.json(), fragment);
+  const cardPath = fragments + '/' + fragment.id;
+  await command('GET', cardPath, undefined, viewerHeaders, 404);
+  const grant = { 'if-match': '"1"', 'idempotency-key': randomUUID() };
+  const grantBody = { reason: 'Checked the selected original' };
+  await command('POST', cardPath + '/grant', grantBody, grant);
+  const granted = (await command('GET', cardPath, undefined, viewerHeaders)).json();
+  assert.deepEqual(granted, { id: fragment.id, page: 1, box: selection.box, quote: selection.quote, version: 2, state: 'granted' });
+
   delete process.env.FACADE_HARNESS_REPLAY_ONLY;
   process.env.FACADE_HARNESS_PACKAGE_EFFECTS = 'enabled';
   run();
@@ -270,6 +317,38 @@ test('ordinary intake publishes independent package evidence before questions an
   assert.ok(complete.windows.every(({ branches }) => branches.A.jobId !== branches.B.jobId));
   const fact = complete.facts[0];
   await command('GET', fact.evidenceHref, undefined);
+  await t.test('package bindings leave the fragment publication as the only scoped disclosure', async () => {
+    const mixedFacts = complete.facts.filter(({ observation }) => observation.source.versionId === first.versionId);
+    assert.ok(mixedFacts.some(({ binding }) => binding.candidates.some(({ label }) => label === 'K-47')));
+    assert.ok(mixedFacts.some(({ binding }) => binding.candidates.some(({ label }) => label === 'M-18')));
+    const mixedEvidence = new Set();
+    for (const { observation, evidenceHref } of mixedFacts) {
+      mixedEvidence.add(evidenceHref);
+      await command('GET', '/api/v1/observations/' + observation.id, undefined, viewerHeaders, 404);
+    }
+    for (const evidence of mixedEvidence) {
+      for (const path of [evidence, evidence + '/content', evidence + '/ocr-input']) {
+        await command('GET', path, undefined, rawRange, 404);
+      }
+    }
+    await command('HEAD', raw, undefined, viewerHeaders, 404);
+    await command('GET', raw, undefined, rawRange, 404);
+    await command('GET', raw.replace('/api/documents/', '/api/v1/documents/').replace('/content', '/reader/units'),
+      undefined, viewerHeaders, 404);
+    await command('GET', `${projectPath}/facade-assessment/${assessment.version}/observations`, undefined, viewerHeaders, 404);
+    const scopedEvents = (await command('GET', `${projectPath}/events?after=0&scopeId=${scope.id}`, undefined, viewerHeaders)).json();
+    assert.ok(scopedEvents.events.length);
+    assert.ok(scopedEvents.events.every(({ type, payload }) => type === 'project.changed' && Object.keys(payload).length === 0));
+    assert.deepEqual((await command('GET', cardPath, undefined, viewerHeaders)).json(), granted);
+    assert.deepEqual((await command('GET', fragments, undefined, viewerHeaders)).json().items.map(({ id }) => id), [fragment.id]);
+    const revocation = await command('POST', cardPath + '/revoke', { reason: 'Finished review' }, { 'if-match': '"2"' });
+    assert.equal(revocation.json().version, 3);
+    assert.equal((await command('POST', cardPath + '/grant', grantBody, grant)).headers['idempotency-replayed'], 'true');
+    await command('GET', cardPath, undefined, viewerHeaders, 404);
+    assert.deepEqual((await command('GET', fragments, undefined, viewerHeaders)).json().items, []);
+    const history = (await command('GET', cardPath)).json().history;
+    assert.deepEqual(history.map(({ version }) => version), [1, 2, 3]);
+  });
   const event = await app.db.query("SELECT 1 FROM supplement_project_events WHERE project_id=$1 AND type='package-analysis.changed'", [project.id]);
   assert.ok(event.rowCount);
 

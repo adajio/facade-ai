@@ -3,7 +3,7 @@
   import AuthForm from './lib/AuthForm.svelte';
   import Notice from './lib/Notice.svelte';
   import { Api, denied, describe, id, interrupted } from './lib/http';
-  import { projectOf, type Session, type Project, type ProjectRead } from './lib/contracts';
+  import { projectOf, type Session, type Project, type ProjectRead, type Scope } from './lib/contracts';
   import { readRoute, returnPath } from './lib/routes';
   import Projects from './screens/Projects.svelte';
   import Workspace from './screens/Workspace.svelte';
@@ -85,12 +85,27 @@
         return;
       }
       api.setCsrf(fresh.csrfToken);
-      const next = projectId
-        ? projectOf(await api.json<ProjectRead>('/api/projects/' + id(projectId), { signal }))
-        : undefined;
-      const scopeLimit = fresh.projects.find((item) => item.id === projectId)?.scopeId;
-      if (next && scopeLimit) next.scopes = next.scopes.filter((scope) => scope.id === scopeLimit);
-      if (next) next.scopeId = scopeLimit;
+      const entry = fresh.projects.find((item) => item.id === projectId);
+      let next: Project | undefined;
+      if (projectId) {
+        const path = '/api/projects/' + id(projectId);
+        if (!entry?.scopeId || route.section !== 'fragments') {
+          try {
+            next = projectOf(await api.json<ProjectRead>(path, { signal }));
+          } catch (error) {
+            if (route.section !== 'fragments' || !denied(error) || entry) throw error;
+          }
+        }
+        if (!next) {
+          const scopeId = entry?.scopeId ?? route.params.get('scope');
+          if (!scopeId) { lockScreen('denied'); return; }
+          const scope = await api.json<Scope & { role: string; actions: string[] }>(path + '/scopes/' + id(scopeId), { signal });
+          next = {
+            id: projectId, name: entry?.name ?? scope.name, version: entry?.version ?? scope.version,
+            scopes: [scope], scopeId: scope.id, role: scope.role, actions: scope.actions,
+          };
+        }
+      }
       signal.throwIfAborted();
       if (page !== route.page || projectId !== route.projectId) return;
       if (project && next && project.id === next.id &&
@@ -149,7 +164,8 @@
     const last = route;
     activeLocation = window.location.pathname + window.location.search;
     route = readRoute(window.location);
-    if (route.projectId !== last.projectId || route.page !== last.page) {
+    if (route.projectId !== last.projectId || route.page !== last.page ||
+        (project?.scopeId && route.section !== last.section)) {
       lockScreen('checking');
       void verify(true);
     } else if (foreground) {

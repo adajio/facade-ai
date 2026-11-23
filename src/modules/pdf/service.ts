@@ -245,12 +245,65 @@ export function createReaderService(db: Pool, deps: ReaderDependencies, adapters
   const registry = new Map(adapters.map((adapter) => [adapter.format, adapter]));
   if (registry.size !== adapters.length) throw new Error('Duplicate reader adapter format');
 
-  async function describe(source: SourceRef): Promise<{ original: Original; adapter: ReaderAdapter; version: string }> {
-    const original = await deps.resolveOriginal(source);
+  async function describe(source: SourceRef, tx?: PoolClient): Promise<{ original: Original; adapter: ReaderAdapter; version: string }> {
+    const original = await deps.resolveOriginal(source, tx);
     if (!original || !sameSource(original, source) || !isReaderId(original.receiptId)) mismatch();
     const adapter = registry.get(original.format);
     if (!adapter) throw new ReaderError('reader_format_unsupported', 'Для формата нет reader', 422);
     return { original, adapter, version: await adapter.version() };
+  }
+
+  // This path returns only a bounded PDF selection and never creates public reader evidence.
+  async function readPdfFragment(sourceRef: SourceRef, input: { page: number; box: Box; quote?: string }, tx: PoolClient) {
+    const source = checkedSource(sourceRef);
+    const { rows: [slot] } = await tx.query<{ acquired: boolean }>(
+      "SELECT pg_try_advisory_xact_lock(hashtextextended('facade/heavy-local-slot',0)) AS acquired",
+    );
+    if (!slot.acquired) throw new ReaderError('reader_resource_wait', 'Reader занят. Повторите подготовку фрагмента позже', 503);
+    const { original, adapter, version } = await describe(source, tx);
+    if (adapter.format !== 'pdf') throw new ReaderError('fragment_pdf_required', 'Для публикации нужен оригинал PDF', 422);
+    return withOriginal(original, deps, async (path) => {
+      const unitId = String(input.page);
+      const map = await lookupMap(source, version, tx);
+      const unit = (map?.units ?? await adapter.inspect(path)).find(({ id }) => id === unitId);
+      const box = checkedBox(input.box)!;
+      if (!unit?.width || !unit.height || !contains({ x: 0, y: 0, width: unit.width, height: unit.height }, box)
+        || (box.x === 0 && box.y === 0 && box.width >= unit.width && box.height >= unit.height)) {
+        throw new ReaderError('fragment_address_invalid', 'Укажите рамку фрагмента внутри страницы PDF', 422);
+      }
+      if (input.quote !== undefined) {
+        const output = await adapter.read(path, { representation: 'native', address: { unitId, box } }, unit, true);
+        const matches = (output.lines ?? []).filter(({ text }) => text.includes(input.quote!));
+        if (matches.length !== 1 || matches[0].text.indexOf(input.quote) !== matches[0].text.lastIndexOf(input.quote)) {
+          throw new ReaderError('fragment_quote_unverified', 'Цитата должна дословно и однозначно находиться внутри рамки', 422);
+        }
+        return { box, readerVersion: version, quote: input.quote };
+      }
+
+      // Align inward to the PDF raster so rounding cannot include adjacent pixels.
+      const scale = 2;
+      const x = Math.ceil(box.x * scale);
+      const y = Math.ceil(box.y * scale);
+      const width = Math.floor((box.x + box.width) * scale) - x;
+      const height = Math.floor((box.y + box.height) * scale) - y;
+      if (width < 1 || height < 1 || width * height > 1_000_000) {
+        throw new ReaderError('fragment_crop_limit', 'Измените размер рамки. Допустимо до 1 млн пикселей', 422);
+      }
+      const crop = { x: x / scale, y: y / scale, width: width / scale, height: height / scale };
+      const output = await adapter.read(path, {
+        representation: 'render', address: { unitId, box: crop }, dpi: 72 * scale,
+      }, unit);
+      const t = output.transform;
+      if (output.mediaType !== 'image/png' || !t || t.pixelsPerPoint !== scale
+        || t.pixelOriginX !== x || t.pixelOriginY !== y || t.width > width || t.height > height
+        || output.bytes.length > 4 * 1024 * 1024) {
+        throw new ReaderError('fragment_crop_invalid', 'Изображение не соответствует рамке публикации', 422);
+      }
+      return {
+        box: { ...crop, width: t.width / scale, height: t.height / scale },
+        readerVersion: version, image: output.bytes,
+      };
+    });
   }
 
   async function lookupMap(source: SourceRef, version: string, tx?: PoolClient): Promise<PageMap | undefined> {
@@ -479,7 +532,7 @@ export function createReaderService(db: Pool, deps: ReaderDependencies, adapters
       );
       if (rows[0]) return mapFromRow(rows[0]);
     },
-    open, pin, findEvidence, content,
+    open, pin, findEvidence, content, readPdfFragment,
     async findObservation(projectId: string, id: string): Promise<Observation | undefined> {
       const { rows } = await db.query<{ payload: Observation }>(
         'SELECT payload FROM reader_observations WHERE project_id = $1 AND id = $2', [projectId, id],

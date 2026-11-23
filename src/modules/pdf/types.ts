@@ -1,4 +1,5 @@
 import type { Readable } from 'node:stream';
+import type { PoolClient } from 'pg';
 
 export interface DocumentKey {
   projectId: string;
@@ -18,7 +19,7 @@ export interface Original extends SourceRef {
   open(): Promise<Readable>;
 }
 
-export type ResolveOriginal = (document: DocumentKey) => Promise<Original | null>;
+export type ResolveOriginal = (document: DocumentKey, tx?: PoolClient) => Promise<Original | null>;
 
 export interface Box {
   x: number;
@@ -84,7 +85,7 @@ export interface ReaderAdapter {
   format: string;
   version(): Promise<string>;
   inspect(path: string): Promise<ReaderUnit[]>;
-  read(path: string, request: ReadRequest, unit: ReaderUnit): Promise<ReaderOutput>;
+  read(path: string, request: ReadRequest, unit: ReaderUnit, containedWords?: boolean): Promise<ReaderOutput>;
 }
 
 /** Private, immutable, content-addressed storage. A put must verify or atomically create the object. */

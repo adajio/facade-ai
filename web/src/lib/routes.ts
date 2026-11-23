@@ -3,6 +3,7 @@ export const sections = {
   receipts: 'Поступления',
   completeness: 'Комплектность',
   facts: 'Сведения',
+  fragments: 'Фрагменты',
   questions: 'Вопросы',
   letters: 'Письма',
   members: 'Участники',

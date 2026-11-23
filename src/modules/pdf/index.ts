@@ -98,14 +98,15 @@ export function createRuntimePdfService(
     scratchDir: join(config.dataDir, 'reader-scratch'),
     scratchReserveBytes: storage.diskGuardBytes,
     maxOriginalBytes,
-    async resolveOriginal(document) {
-      const { rows: [assignment] } = await db.query<{ receipt_id: string }>(
+    async resolveOriginal(document, tx) {
+      const conn = tx ?? db;
+      const { rows: [assignment] } = await conn.query<{ receipt_id: string }>(
         `SELECT receipt_id FROM intake_reader_jobs
          WHERE project_id = $1 AND document_id = $2 AND version_id = $3`,
         [document.projectId, document.documentId, document.versionId],
       );
       if (!assignment) return null;
-      const original = await getOriginal(db, storage, document.projectId, document.versionId, document.documentId);
+      const original = await getOriginal(conn, storage, document.projectId, document.versionId, document.documentId);
       const format = formatFor(original.mediaType, original.relativePath);
       return {
         ...document, receiptId: assignment.receipt_id, sha256: original.sha256, size: original.size, format,
