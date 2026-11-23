@@ -3,6 +3,7 @@ import { expect, test } from '@playwright/test';
 const projectId = '10000000-1000-4000-8000-000000000001';
 const receiptId = '20000000-2000-4000-8000-000000000001';
 const olderReceiptId = '20000000-2000-4000-8000-000000000002';
+const openReceiptId = '20000000-2000-4000-8000-000000000003';
 const versionId = '30000000-3000-4000-8000-000000000001';
 const occurrenceId = '40000000-4000-4000-8000-000000000001';
 const documentId = '50000000-5000-4000-8000-000000000001';
@@ -16,9 +17,18 @@ const project = {
 };
 const position = { sliceId: oldSlice, cursor: '0', projectionVersion: '0' };
 const receipt = { receiptId, number: 17, sealed: true, inventoryOpen: false, source: 'upload' };
+const openReceipt = { receiptId: openReceiptId, number: 19, sealed: false, inventoryOpen: true, source: 'upload' };
+const openInventory = {
+  ...openReceipt, projectId, uploads: [], imports: [], occurrences: [],
+  manifest: {
+    mode: 'open', version: 2, items: [{
+      itemId: occurrenceId, kind: 'file', relativePath: 'ожидающий.pdf', status: 'declared', size: 10, confirmedBytes: 0,
+    }],
+  },
+};
 const inventory = {
   ...receipt, projectId, manifest: null, uploads: [], imports: [],
-  occurrences: [{ occurrenceId, versionId, documentId, relativePath: 'лист.pdf', mediaType: 'application/pdf', status: 'accepted' }],
+  occurrences: [{ occurrenceId, versionId, documentId, relativePath: 'закреплённый лист.pdf', mediaType: 'application/pdf', status: 'accepted' }],
 };
 
 test.beforeEach(async ({ page }) => {
@@ -36,6 +46,10 @@ test.beforeEach(async ({ page }) => {
     if (pathname === api + '/work-slices/current') return route.fulfill({ json: { workSliceId: currentSlice } });
     if (pathname === api + '/work-slices/' + oldSlice + '/receipts') {
       if (searchParams.has('cursor')) return route.fulfill({ status: 409, json: { code: 'snapshot_required' } });
+      if (searchParams.get('receiptId') === receiptId) return route.fulfill({ json: {
+        receipts: [receipt], total: 1, workSliceId: oldSlice, filter: 'processing', nextCursor: null,
+        selection: 'present', selectedReceipt: receipt,
+      } });
       return route.fulfill({ json: {
         receipts: [{ ...receipt, receiptId: olderReceiptId, number: 5 }],
         total: 2, workSliceId: oldSlice, filter: 'processing', nextCursor: 'expired-page',
@@ -43,14 +57,23 @@ test.beforeEach(async ({ page }) => {
     }
     if (pathname === api + '/work-slices/' + currentSlice + '/receipts') {
       const filter = searchParams.get('filter');
+      const selectedId = searchParams.get('receiptId');
+      const selected = selectedId === openReceiptId ? openReceipt : receipt;
+      const filtered = filter === 'open' && !selected.inventoryOpen;
       return route.fulfill({ json: {
-        receipts: filter === 'open' ? [] : [receipt], total: filter === 'open' ? 0 : 1,
+        receipts: filtered ? [] : [selected], total: filtered ? 0 : 1,
         workSliceId: currentSlice, filter, nextCursor: null,
-        ...(searchParams.has('receiptId') ? { selection: filter === 'open' ? 'filtered' : 'present' } : {}),
+        ...(selectedId ? { selection: filtered ? 'filtered' : 'present', selectedReceipt: selected } : {}),
       } });
     }
     if (pathname === api + '/receipts') return route.fulfill({ json: { receipts: [], nextCursor: null } });
-    if (pathname === '/api/receipts/' + receiptId + '/inventory') return route.fulfill({ json: inventory });
+    if (pathname === api + '/work-slices/' + currentSlice + '/receipts/' + receiptId + '/inventory') {
+      return route.fulfill({ json: { ...inventory, workSliceId: currentSlice, inventoryRevision: '1:1', historical: true } });
+    }
+    if (pathname === api + '/work-slices/' + oldSlice + '/receipts/' + receiptId + '/inventory') {
+      return route.fulfill({ status: 409, json: { code: 'inventory_snapshot_unavailable' } });
+    }
+    if (pathname === '/api/receipts/' + openReceiptId + '/inventory') return route.fulfill({ json: openInventory });
     if (pathname.endsWith('/supplements/links') || pathname.endsWith('/import-inventory')) return route.fulfill({ json: { items: [] } });
     if (pathname.endsWith('/content')) return route.fulfill({ headers: { 'content-type': 'application/pdf' }, body: '' });
     if (pathname.endsWith('/reader/units')) return route.fulfill({ json: { source: { documentId, versionId }, units: [] } });
@@ -62,6 +85,11 @@ test.beforeEach(async ({ page }) => {
 });
 
 test('Читает первую страницу нового среза и восстанавливает строку при возврате из карточки', async ({ page }) => {
+  const closedInventoryRequests: string[] = [];
+  page.on('request', request => {
+    const path = new URL(request.url()).pathname;
+    if (path.endsWith('/' + receiptId + '/inventory')) closedInventoryRequests.push(path);
+  });
   await page.goto(receipts + '?workSlice=' + oldSlice + '&filter=processing');
   await expect(page.getByRole('link', { name: 'Поступление №5' })).toBeVisible();
   await page.getByRole('button', { name: 'Ещё поступления' }).click();
@@ -79,7 +107,7 @@ test('Читает первую страницу нового среза и во
   await page.getByRole('link', { name: 'Карточка документа' }).click();
 
   await page.reload();
-  await expect(page.getByRole('heading', { name: 'лист.pdf' })).toBeVisible();
+  await expect(page.getByRole('heading', { name: 'закреплённый лист.pdf' })).toBeVisible();
   const card = new URL(page.url());
   expect(card.searchParams.get('workSlice')).toBe(currentSlice);
   expect(card.searchParams.get('filter')).toBe('processing');
@@ -92,6 +120,35 @@ test('Читает первую страницу нового среза и во
   await page.getByRole('navigation', { name: 'Фильтры поступлений' }).getByRole('link', { name: 'Опись открыта' }).click();
   await expect(page.getByText('Выбранное поступление не входит в этот фильтр.')).toBeVisible();
   expect(new URL(page.url()).searchParams.get('workSlice')).toBe(currentSlice);
+  await expect(page.locator('#occurrence-' + occurrenceId)).toBeVisible();
+  expect(closedInventoryRequests.length).toBeGreaterThan(0);
+  expect([...new Set(closedInventoryRequests)]).toEqual([
+    api + '/work-slices/' + currentSlice + '/receipts/' + receiptId + '/inventory',
+  ]);
+});
+
+test('Открытое поступление загружает актуальную опись и показывает докачку', async ({ page }) => {
+  const inventoryRequests: string[] = [];
+  page.on('request', request => {
+    const path = new URL(request.url()).pathname;
+    if (path.endsWith('/' + openReceiptId + '/inventory')) inventoryRequests.push(path);
+  });
+  await page.goto(receipts + '/' + openReceiptId + '?workSlice=' + currentSlice + '&filter=open');
+  await expect(page.getByText('ожидающий.pdf')).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Продолжить передачу' })).toBeEnabled();
+  expect([...new Set(inventoryRequests)]).toEqual(['/api/receipts/' + openReceiptId + '/inventory']);
+});
+
+test('Недоступная закреплённая опись требует явного перехода к актуальному срезу', async ({ page }) => {
+  await page.goto(receipts + '/' + receiptId + '?workSlice=' + oldSlice + '&filter=processing&row=' + occurrenceId);
+  await expect(page.getByText('Закреплённая опись недоступна.')).toBeVisible();
+  await expect(page.getByRole('link', { name: 'Карточка документа' })).toHaveCount(0);
+  await page.getByRole('button', { name: 'Открыть актуальную опись' }).click();
+  await expect(page.locator('#occurrence-' + occurrenceId)).toBeFocused();
+  const url = new URL(page.url());
+  expect(url.searchParams.get('workSlice')).toBe(currentSlice);
+  expect(url.searchParams.get('filter')).toBe('processing');
+  expect(url.searchParams.get('row')).toBe(occurrenceId);
 });
 
 test('Смена фильтра оставляет в реестре только строки нового запроса', async ({ page }) => {

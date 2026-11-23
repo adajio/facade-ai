@@ -15,7 +15,10 @@
 
   type ReceiptList = { receipts: Receipt[]; nextCursor?: number | string | null };
   type ReceiptSelection = 'present' | 'filtered' | 'missing';
-  type WorkReceiptList = ReceiptList & { total: number; workSliceId: string; filter: WorkReceiptFilter; selection?: ReceiptSelection };
+  type WorkReceiptList = ReceiptList & {
+    total: number; workSliceId: string; filter: WorkReceiptFilter; selection?: ReceiptSelection; selectedReceipt?: Receipt;
+  };
+  type PinnedInventory = Inventory & { workSliceId: string; historical: boolean };
   type Link = { id: string; receiptId: string; letterId: string; sentId: string; itemId?: string };
   type ImportEntry = { id: string; relativePath?: string; path?: string; status?: string; reason?: string; restriction?: string };
 
@@ -27,7 +30,10 @@
   let resolvedWorkSlice = $state('');
   let totalReceipts = $state<number>();
   let selection = $state<ReceiptSelection>();
+  let selectedReceipt = $state<Receipt>();
   let sliceRefreshed = $state(false);
+  let inventoryUnavailable = $state(false);
+  let refreshingInventory = $state(false);
   let inventory = $state<Inventory>();
   let technicalEntries = $state<ImportEntry[]>([]);
   let entriesCursor = $state<string | null>(null);
@@ -100,17 +106,12 @@
     const project = context.project.id;
     const opened = context.objectId;
     const stored = pendingReceipt(project);
-    if (!stored) return;
+    if (!stored || opened === stored) return;
     const stop = new AbortController();
     api.json<Inventory>(receiptPath(stored) + '/inventory', { signal: stop.signal })
       .then((value) => {
-        if (value.projectId !== project || !value.manifest) return;
-        if (opened === stored) {
-          if (pendingReceipt(project) === stored) pendingReceipt(project, null);
-          continuation = '';
-        } else {
-          continuation = stored;
-        }
+        if (value.projectId !== project || value.receiptId !== stored || !value.manifest) return;
+        continuation = stored;
       })
       .catch(() => {});
     return () => stop.abort();
@@ -133,6 +134,14 @@
   let listContext = $derived(JSON.stringify([
     context.project.id, context.scopeId, filter, requestedWorkSlice, receiptSelection, context.params.get('slice'),
   ]));
+  let detailWorkSlice = $derived(
+    usesWorkSlice && selectedReceipt?.receiptId === activeReceipt && selectedReceipt.inventoryOpen === false
+      ? resolvedWorkSlice : '',
+  );
+  let awaitingReceiptSelection = $derived(
+    usesWorkSlice && activeReceipt === receiptSelection && selectedReceipt?.receiptId !== activeReceipt,
+  );
+  let inventoryRefresh = $derived(detailWorkSlice ? 0 : context.refreshKey);
   let previousListContext = '';
   let retainedWorkSlice = '';
   let listRequest: AbortController | undefined;
@@ -172,6 +181,7 @@
       resolvedWorkSlice = '';
       totalReceipts = undefined;
       selection = undefined;
+      selectedReceipt = undefined;
       sliceRefreshed = false;
     } else {
       slice = retainedWorkSlice;
@@ -205,29 +215,59 @@
     return () => stop.abort();
   });
 
+  let previousInventoryPath = '';
   $effect(() => {
     const receipt = activeReceipt;
-    const project = context.project.id;
-    void context.refreshKey;
-    if (!receipt) return;
-    const stop = new AbortController();
+    const project = projectId;
+    const slice = detailWorkSlice;
+    void inventoryRefresh;
+    const path = !receipt || awaitingReceiptSelection ? '' : inventoryPath(project, receipt, slice);
+    if (previousInventoryPath !== path) {
+      inventory = undefined;
+      links = [];
+      technicalEntries = [];
+      entriesCursor = null;
+    }
+    previousInventoryPath = path;
+    inventoryUnavailable = false;
     detailError = '';
-    api.json<Inventory>(receiptPath(receipt) + '/inventory', { signal: stop.signal })
-      .then((value) => {
-        if (value.projectId !== project) {
-          inventory = undefined;
-          detailError = 'Поступление недоступно.';
-          return;
-        }
-        inventory = value;
-      })
-      .catch((problem) => { if (!interrupted(problem)) { inventory = undefined; detailError = describe(problem); } });
-    api.json<{ items: Link[] }>(query(projectApi(project) + '/supplements/links', { receiptId: receipt }), { signal: stop.signal })
-      .then((page) => links = page.items)
-      .catch((problem) => { if (!interrupted(problem)) links = []; });
-    api.json<Page<ImportEntry> & { entries?: ImportEntry[] }>(receiptPath(receipt) + '/import-inventory', { signal: stop.signal })
-      .then((page) => { technicalEntries = page.entries ?? page.items ?? []; entriesCursor = page.nextCursor ?? null; })
-      .catch((problem) => { if (!interrupted(problem)) technicalEntries = []; });
+    if (!path) return;
+
+    const stop = new AbortController();
+    const { signal } = stop;
+    void api.json<Inventory | PinnedInventory>(path, { signal }).then((value) => {
+      if (signal.aborted) return;
+      if (value.projectId !== project || value.receiptId !== receipt || (slice &&
+          (!('workSliceId' in value) || value.workSliceId !== slice || !value.historical ||
+           !value.sealed || value.inventoryOpen))) {
+        inventory = undefined;
+        detailError = 'Сервер не подтвердил выбранную опись.';
+        return;
+      }
+      inventory = value;
+      if (value.manifest && pendingReceipt(project) === receipt) {
+        pendingReceipt(project, null);
+        continuation = '';
+      }
+    }).catch((problem) => {
+      if (signal.aborted) return;
+      inventory = undefined;
+      inventoryUnavailable = Boolean(slice) && (needsCurrentSlice(problem) ||
+        problem instanceof ApiError && problem.status === 409 && problem.code === 'inventory_snapshot_unavailable');
+      detailError = inventoryUnavailable ? 'Закреплённая опись недоступна.' : describe(problem);
+    });
+    if (!slice) {
+      api.json<{ items: Link[] }>(query(projectApi(project) + '/supplements/links', { receiptId: receipt }), { signal })
+        .then((page) => { if (!signal.aborted) links = page.items; })
+        .catch(() => { if (!signal.aborted) links = []; });
+      api.json<Page<ImportEntry> & { entries?: ImportEntry[] }>(receiptPath(receipt) + '/import-inventory', { signal })
+        .then((page) => {
+          if (signal.aborted) return;
+          technicalEntries = page.entries ?? page.items ?? [];
+          entriesCursor = page.nextCursor ?? null;
+        })
+        .catch(() => { if (!signal.aborted) { technicalEntries = []; entriesCursor = null; } });
+    }
     return () => stop.abort();
   });
 
@@ -252,11 +292,53 @@
     }, receipt);
   }
 
-  async function enterInventory(receiptId: string) {
-    if (context.objectId === receiptId) return;
-    openInventoryLink = url(receiptId);
+  function inventoryPath(project: string, receipt: string, slice?: string) {
+    return (slice ? workSliceApi(project, slice) + '/receipts/' + id(receipt) : receiptPath(receipt)) + '/inventory';
+  }
+
+  async function navigateToInventory(href: string) {
+    openInventoryLink = href;
     await tick();
     navigationLink?.click();
+  }
+
+  async function enterInventory(receiptId: string) {
+    if (context.objectId === receiptId) return;
+    if (usesWorkSlice) {
+      // A newly created receipt belongs to a new slice.
+      try {
+        const fresh = await currentWorkSlice(projectId, workScope, AbortSignal.timeout(5000));
+        await navigateToInventory(url(receiptId, { workSlice: fresh, filter }));
+        return;
+      } catch {
+        await navigateToInventory(url(receiptId, { workSlice: '', filter: filter === 'open' ? 'open' : '' }));
+        return;
+      }
+    }
+    await navigateToInventory(url(receiptId));
+  }
+
+  async function openCurrentInventory() {
+    if (refreshingInventory || !receiptSelection) return;
+    const receipt = receiptSelection;
+    const location = listContext;
+    refreshingInventory = true;
+    try {
+      const fresh = await currentWorkSlice(projectId, workScope, AbortSignal.timeout(5000));
+      if (listContext !== location) return;
+      if (fresh === resolvedWorkSlice) {
+        detailError = selection === 'missing'
+          ? 'Поступление отсутствует и в актуальном срезе.'
+          : 'Актуальный срез пока не подтвердил опись.';
+        return;
+      }
+      const params = Object.fromEntries(context.params);
+      await navigateToInventory(url(receipt, { ...params, workSlice: fresh, filter }));
+    } catch (problem) {
+      if (listContext === location) detailError = describe(problem);
+    } finally {
+      refreshingInventory = false;
+    }
   }
 
   function needsCurrentSlice(problem: unknown) {
@@ -298,7 +380,10 @@
       retainedWorkSlice = page.workSliceId;
       resolvedWorkSlice = page.workSliceId;
       totalReceipts = page.total;
-      if (!append) selection = page.selection;
+      if (!append) {
+        selection = page.selection;
+        selectedReceipt = page.selectedReceipt;
+      }
     }
     if (append) {
       const prior = new Set(list.map(item => item.receiptId));
@@ -345,18 +430,19 @@
   }
 
   async function loadTechnical() {
-    if (!entriesCursor || technicalPaging) return;
+    if (!entriesCursor || technicalPaging || detailWorkSlice) return;
     const observed = context.refreshKey;
+    const receipt = activeReceipt;
     technicalPaging = true;
     try {
       const page = await api.json<{ entries: ImportEntry[]; nextCursor?: string }>(
-        query(receiptPath(activeReceipt) + '/import-inventory', { cursor: entriesCursor }),
+        query(receiptPath(receipt) + '/import-inventory', { cursor: entriesCursor }),
       );
-      if (observed !== context.refreshKey) return;
+      if (observed !== context.refreshKey || receipt !== activeReceipt || detailWorkSlice) return;
       technicalEntries = [...technicalEntries, ...page.entries];
       entriesCursor = page.nextCursor ?? null;
     } catch (problem) {
-      importError = describe(problem);
+      if (receipt === activeReceipt && !detailWorkSlice) importError = describe(problem);
     } finally {
       technicalPaging = false;
     }
@@ -427,8 +513,8 @@
   }
 
   async function readInventory(receiptId: string, signal: AbortSignal) {
-    const value = await api.json<Inventory>(receiptPath(receiptId) + '/inventory', { signal });
-    if (value.projectId !== context.project.id) throw new Error('Поступление недоступно.');
+    const value = await api.json<Inventory>(inventoryPath(projectId, receiptId), { signal });
+    if (value.projectId !== projectId || value.receiptId !== receiptId) throw new Error('Поступление недоступно.');
     inventory = value;
     active = receiptId;
     return value;
@@ -746,6 +832,9 @@
 
 <IntakeHolds {api} {context} {projection} {renew} receiptId={activeReceipt} />
 <Notice kind="error" message={detailError} />
+{#if selection === 'missing' || inventoryUnavailable}
+  <button type="button" disabled={refreshingInventory} onclick={openCurrentInventory}>Открыть актуальную опись</button>
+{/if}
 {#if inventory && inventory.receiptId === activeReceipt && inventory.projectId === context.project.id}
   <section class="card" aria-labelledby="receipt-title">
     <div class="card-header">
