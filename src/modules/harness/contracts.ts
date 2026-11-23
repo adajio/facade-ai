@@ -105,14 +105,19 @@ export interface ScheduledResearchTask {
 export type ResearchTask = ScheduledResearchTask & { job: ResearchJob; earlyPair?: true; pairScopeName?: string };
 
 export const pairCriteria = ['variant', 'revision', 'applicability', 'comparability'] as const;
+const pairEvidence = z.strictObject({ evidenceId: id, quote: text });
 const pairCheck = z.strictObject({
   status: z.enum(['confirmed', 'unclear', 'incompatible']), reason: text,
-  sources: z.array(z.strictObject({ evidenceId: id, quote: text })).max(8),
+  sources: z.array(pairEvidence).max(8),
 });
+const packagePairCheck = pairCheck.extend({ sources: z.array(pairEvidence.extend({ lineId: text.optional() })).max(8) });
 export const pairChecksSchema = z.strictObject({
   variant: pairCheck, revision: pairCheck, applicability: pairCheck, comparability: pairCheck,
 });
-export type PairChecks = z.infer<typeof pairChecksSchema>;
+export const packagePairChecksSchema = z.strictObject({
+  variant: packagePairCheck, revision: packagePairCheck, applicability: packagePairCheck, comparability: packagePairCheck,
+});
+export type PairChecks = z.infer<typeof packagePairChecksSchema>;
 export function pairConfirmed(checks: PairChecks | undefined): boolean {
   return !!checks && pairCriteria.every((criterion) => checks[criterion].status === 'confirmed');
 }

@@ -7,12 +7,12 @@ import { pairConfirmed, pairCriteria, ReaderRefusal, type PairChecks } from './c
 import { contains } from '../pdf/types.js';
 import { canonicalJson, isInventoryRole } from '../assessment/domain.js';
 import { deliveredLines } from '../questions/attribute-aliases.js';
-import { currentRevision, hasPrintedPairScope, pairSourceEvidence, type PairQuote } from './pair-evidence.js';
+import { currentRevision, hasPrintedPairScope, locatePairQuote, pairSourceEvidence, type PairQuote } from './pair-evidence.js';
 import { packageCommonGrounded, packageNonDeliveryGrounded } from './package-observation.js';
 import { escapeRegex } from '../questions/domain.js';
 import {
   checkToolArguments, commands, decodeCompletion, hashBytes, imageMessage, initialMessages, observationArguments, permittedTool, request,
-  pairCommands, toolMessage, type AssistantMessage, type FunctionCall, type ToolReply,
+  reviewCommands, toolMessage, type AssistantMessage, type FunctionCall, type ToolReply,
 } from './openrouter.js';
 
 type AssistantEvent = {
@@ -186,15 +186,16 @@ function checkPairEvidence(
   for (const criterion of pairCriteria) {
     const check = checks[criterion];
     const quotes: PairQuote[] = [];
-    for (const { evidenceId, quote } of check.sources) {
+    for (const { evidenceId, quote, lineId } of check.sources) {
       const reply = state.delivered.has(evidenceId) ? state.replies.get(evidenceId) : undefined;
       if (!reply?.evidence || !reply.support) return { refusal: failedTool('evidence_not_delivered', evidenceCorrection) };
       const body = reply.body as { content?: unknown };
       const lines = typeof body.content === 'string' ? deliveredLines(body.content) : [];
-      const matched = [...new Set(lines.filter(({ text }) => text.includes(quote)).map(({ text }) => text))];
+      const matched = locatePairQuote(lines, quote, lineId);
       if (matched.length !== 1) return { refusal: failedTool(matched.length ? 'pair_quote_ambiguous' : 'pair_quote_not_found',
-        'Укажите дословную цитату, однозначно адресующую одну строку открытой опоры или OCR.') };
-      quotes.push({ support: reply.support, evidenceId, quote, line: matched[0] });
+        task.job.packageReview ? 'Укажите дословную цитату с единственным физическим адресом или передайте lineId из открытого места.'
+          : 'Откройте место точнее и укажите дословную цитату с единственным физическим адресом.') };
+      quotes.push({ support: reply.support, evidenceId, quote, line: matched[0].text });
     }
     if (check.status === 'confirmed' && new Set(quotes.map(({ support }) => support)).size !== 2) {
       return { refusal: failedTool('pair_check_evidence_required',
@@ -573,7 +574,7 @@ async function executeTool(
     case 'propose_resolution': {
       if (task.job.mode !== 'lead') throw new Error('Proposal from a non-lead job');
       const proposal: Omit<Extract<ResearchOutcome, { kind: 'proposal' }>, 'kind'> = earlyPair
-        ? pairCommands.propose_resolution.parse(parsed.data) : commands.propose_resolution.parse(parsed.data);
+        ? reviewCommands(task.job).propose_resolution.parse(parsed.data) : commands.propose_resolution.parse(parsed.data);
       const { a, b } = task.job.dispute;
       if (proposal.aObservationId !== a.observationId || proposal.bObservationId !== b.observationId) {
         return { reply: failedTool('proposal_pair_mismatch', 'Возьмите aObservationId и bObservationId из закреплённой пары в задании.') };
@@ -593,7 +594,7 @@ async function executeTool(
     case 'verify_resolution': {
       if (task.job.mode !== 'verify') throw new Error('Verification from a non-verification job');
       const input: Omit<Extract<ResearchOutcome, { kind: 'verification' }>, 'kind'> = earlyPair
-        ? pairCommands.verify_resolution.parse(parsed.data) : commands.verify_resolution.parse(parsed.data);
+        ? reviewCommands(task.job).verify_resolution.parse(parsed.data) : commands.verify_resolution.parse(parsed.data);
       const { a, b } = task.job.dispute;
       const evidence = reviewEvidence(state, input.evidenceIds, [a, b]);
       if (!evidence.delivered) return { reply: failedTool('evidence_not_delivered', evidenceCorrection) };

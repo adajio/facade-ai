@@ -1,4 +1,6 @@
 import type { Pool, PoolClient } from 'pg';
+import { getCatalog, getProject, matchesDefaultProfile } from '../access/project-state.js';
+import type { CatalogRequirement } from '../access/input.js';
 import type { Branch, Place } from './contracts.js';
 import type { Observation } from '../pdf/types.js';
 import type { VerifiedPairEvidence } from '../assessment/domain.js';
@@ -30,7 +32,7 @@ export interface PackageFact {
   variant: string | null;
   revisionStatus: 'current' | 'superseded' | 'unknown';
   basis: { role?: string; stage?: string; revision?: string;
-    revisionEvidence?: { evidenceId: string; quote: string; href: string } };
+    revisionEvidence?: { evidenceId: string; quote: string; lineId?: string; href: string } };
   binding: PackageBinding;
   materials: { id: string; label: string; quote: string }[];
 }
@@ -59,7 +61,7 @@ export interface PackageAnalysis {
   candidates: PackageBinding['candidates'];
   windows: PackageWindow[];
   comparisons: PackageComparison[];
-  reviewCandidates: { a: string; b: string; scope: { id: string; label: string } }[];
+  reviewCandidates: { a: string; b: string; property: string; scope: { id: string; label: string } }[];
   verifiedPairs: { a: string; b: string; proof: VerifiedPairEvidence;
     titles: { A: ReviewTitle | null; B: ReviewTitle | null } }[];
   coverage: {
@@ -77,7 +79,7 @@ export interface PackageAnalysis {
   };
 }
 
-type ReviewTitle = { evidenceId: string; quote: string };
+type ReviewTitle = { evidenceId: string; quote: string; lineId?: string };
 
 interface PackageCoverageProof {
   versionIds: string[];
@@ -154,29 +156,73 @@ function pairCandidate(a: PackageFact, b: PackageFact, scope: { id: string; labe
   return { a: a.id, b: b.id, scope };
 }
 
-function normalizedValue(value: string | undefined) {
-  const literal = value?.trim().normalize('NFC');
-  const numeric = literal && /^([+-]?)(\d+)(?:[.,](\d+))?$/.exec(literal);
-  if (!numeric) return literal;
-  const [, sign, integer, decimals = ''] = numeric;
-  const whole = integer.replace(/^0+(?=\d)/, '');
-  const fraction = decimals.replace(/0+$/, '');
-  return `${sign === '-' && (whole !== '0' || fraction) ? '-' : ''}${whole}${fraction ? '.' + fraction : ''}`;
+function normalizeAttribute(value: string) {
+  return value.normalize('NFKC').trim().toLowerCase().replace(/\s+/gu, ' ');
 }
 
-function compare(facts: PackageFact[]) {
+export function packageCatalogAliases(requirements: Pick<CatalogRequirement, 'key' | 'part' | 'aliases'>[]) {
+  const distinct = new Map<string, Map<string, string>>();
+  for (const { key, part, aliases } of requirements) {
+    for (const text of [part, ...(aliases ?? [])]) {
+      const name = normalizeAttribute(text);
+      const positions = distinct.get(name) ?? new Map<string, string>();
+      positions.set(key, part);
+      distinct.set(name, positions);
+    }
+  }
+  return new Map([...distinct].flatMap(([name, positions]) =>
+    positions.size === 1 ? [[name, positions.values().next().value!] as const] : []));
+}
+
+async function approvedAliases(db: Pool | PoolClient, projectId: string) {
+  const project = await getProject(db, projectId);
+  if (!project.catalogVersionId) return new Map<string, string>();
+  const catalog = await getCatalog(db, project.organizationId, project.catalogVersionId);
+  if (project.intakeMode && !matchesDefaultProfile(project, catalog)) return new Map<string, string>();
+  return packageCatalogAliases(catalog.requirements.filter(({ applicability }) => {
+    const rule = normalizeAttribute(applicability);
+    return !rule.startsWith('stage:') || normalizeAttribute(project.stage ?? '') === rule.slice(6).trim();
+  }));
+}
+
+const lengthPowers = new Map([['m', 3], ['м', 3], ['cm', 1], ['см', 1], ['mm', 0], ['мм', 0]]);
+
+function possibleDisagreement(left: Observation, right: Observation) {
+  if (left.value === undefined || right.value === undefined || Boolean(left.unit) !== Boolean(right.unit)) return false;
+  const [a, b] = [left, right].map(({ value, unit }) => ({
+    literal: value!.trim().normalize('NFC'), unit: unit?.trim() ?? '',
+  }));
+  const leftPower = lengthPowers.get(a.unit);
+  const rightPower = lengthPowers.get(b.unit);
+  const numeric = /^([+-]?)(\d{1,48})(?:[.,](\d{1,48}))?$/u;
+  const l = numeric.exec(a.literal);
+  const r = numeric.exec(b.literal);
+  if (l && r && (a.unit === b.unit || leftPower !== undefined && rightPower !== undefined)) {
+    const fractionA = l[3] ?? '';
+    const fractionB = r[3] ?? '';
+    const exponentA = (leftPower ?? 0) - fractionA.length;
+    const exponentB = (rightPower ?? 0) - fractionB.length;
+    const exponent = Math.min(exponentA, exponentB);
+    return BigInt(l[1] + l[2] + fractionA) * 10n ** BigInt(exponentA - exponent) !==
+      BigInt(r[1] + r[2] + fractionB) * 10n ** BigInt(exponentB - exponent);
+  }
+  return a.unit !== b.unit || a.literal !== b.literal;
+}
+
+export function comparePackageFacts(facts: PackageFact[], aliases: ReadonlyMap<string, string> = new Map()) {
   const comparisons: PackageComparison[] = [];
   const reviewCandidates: PackageAnalysis['reviewCandidates'] = [];
-  const grouped = new Map<string, { A: PackageFact[]; B: PackageFact[] }>();
+  const grouped = new Map<string, { A: PackageFact[]; B: PackageFact[]; property: string }>();
   for (const fact of facts) {
     if (!fact.attribute || fact.observation.grounding === 'limited' || fact.observation.limitation) continue;
-    const key = fact.attribute.normalize('NFC').trim().toLowerCase();
-    const group = grouped.get(key) ?? { A: [], B: [] };
+    const property = aliases.get(normalizeAttribute(fact.attribute)) ?? fact.attribute;
+    const key = normalizeAttribute(property);
+    const group = grouped.get(key) ?? { A: [], B: [], property };
     group[fact.branch].push(fact);
     grouped.set(key, group);
   }
   // Bound the interactive pair list. Assessment separately uses the complete evidence set.
-  for (const { A, B } of grouped.values()) {
+  for (const { A, B, property } of grouped.values()) {
     for (const a of A) for (const b of B) {
       const left = a.observation;
       const right = b.observation;
@@ -184,14 +230,13 @@ function compare(facts: PackageFact[]) {
         left.address.unitId === right.address.unitId && left.lineId && left.lineId === right.lineId;
       const scope = bindingScope(a, b);
       if (!sameLocation && !scope) continue;
-      const different = left.value !== undefined && right.value !== undefined &&
-        Boolean(left.unit) === Boolean(right.unit) &&
-        (left.unit !== right.unit || normalizedValue(left.value) !== normalizedValue(right.value));
+      const different = possibleDisagreement(left, right);
       const proposal = different ? pairCandidate(a, b, scope) : undefined;
-      if (proposal) reviewCandidates.push(proposal);
+      if (proposal) reviewCandidates.push({ ...proposal, property });
       if (comparisons.length >= 200) continue;
       const comparable = sameLocation && left.unit === right.unit && a.variant === b.variant;
-      const equal = normalizedValue(left.value) === normalizedValue(right.value) && left.deliveryStatement?.status === right.deliveryStatement?.status;
+      const equal = !different && (left.value === undefined) === (right.value === undefined) &&
+        left.deliveryStatement?.status === right.deliveryStatement?.status;
       comparisons.push({ aFactId: a.id, bFactId: b.id, status: comparable ? equal ? 'agreement' : 'reading_disagreement'
         : 'applicability_unclear' });
     }
@@ -268,7 +313,7 @@ export async function readPackageAnalysis(db: Pool | PoolClient, projectId: stri
       (binding.state === 'unidentified' && (attribute || observation.value !== undefined || materials.length)))
     ? { versionIds, basisIds: [a.id, b.id], facadeIds, commonChecked: true } : null;
   const mappedVersions = new Set(windows.map(({ place }) => place.source.versionId)).size;
-  const comparison = compare(facts);
+  const comparison = comparePackageFacts(facts, facts.length ? await approvedAliases(db, projectId) : undefined);
   const reviewed = await db.query<PackageAnalysis['verifiedPairs'][number]>(
     `SELECT p.a_fact_id AS a,p.b_fact_id AS b,p.proof,
        jsonb_build_object('A',a_title.title,'B',b_title.title) AS titles

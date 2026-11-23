@@ -54,14 +54,14 @@ export async function schedulePackageReview(db: Pool, queue: WorkQueue, profile:
       }
       const analysis = await readPackageAnalysis(tx, project.projectId);
       const byId = new Map(analysis.facts.map((fact) => [fact.id, fact]));
-      for (const { a, b, scope } of analysis.reviewCandidates) {
+      for (const { a, b, scope, property } of analysis.reviewCandidates) {
         const left = byId.get(a)!;
         const right = byId.get(b)!;
         const { label } = scope;
         const variant = left.variant ?? right.variant;
         const id = randomUUID();
         const job: LeadJob = { mode: 'lead', settings: pinned.lead.settings, dispute: {
-          id, question: { subject: label, property: left.attribute!, ...(variant ? { variant } : {}) },
+          id, question: { subject: label, property, ...(variant ? { variant } : {}) },
           a: citation(left, 'A'), b: citation(right, 'B'),
         }, packageReview: { scopeId: scope.id, scopeLabel: label, routeRevision: pinned.lead.revision,
           readerVersions: { A: left.observation.readerVersion, B: right.observation.readerVersion } } };

@@ -1,4 +1,5 @@
 import { pairProofVersion, type VerifiedPairEvidence } from '../assessment/domain.js';
+import type { ReaderLine } from '../pdf/types.js';
 import type { Branch } from './contracts.js';
 
 export type PairQuote = { support: Branch; evidenceId: string; quote: string; line: string };
@@ -26,6 +27,10 @@ function values(lines: string[], field: RegExp) {
 
 function scopes(line: string) {
   return [...line.matchAll(scope)].map((match) => normalized(match[1].replace(/[.:]+$/u, '')));
+}
+
+export function locatePairQuote(lines: ReaderLine[], quote: string, lineId?: string) {
+  return lines.filter(({ id, text }) => (lineId === undefined || lineId === id) && text.includes(quote));
 }
 
 export function printedPairVariant(line: string): string | null {

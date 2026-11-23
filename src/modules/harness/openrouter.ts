@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
 import { z } from 'zod';
-import { boxSchema, branchSchema, pairChecksSchema, type EvidenceRef, type ResearchJob } from './contracts.js';
+import { boxSchema, branchSchema, packagePairChecksSchema, pairChecksSchema, type EvidenceRef, type ResearchJob } from './contracts.js';
 import { packageDetails } from './package-observation.js';
 import { componentLinks, componentRoles } from '../pdf/types.js';
 
@@ -112,15 +112,22 @@ const currentCommands = {
   verify_resolution: verificationArguments,
 };
 
-export const pairCommands = {
+const pairCommands = {
   propose_resolution: currentCommands.propose_resolution.extend({ checks: pairChecksSchema, evidenceIds: verificationFields.evidenceIds }),
   verify_resolution: commands.verify_resolution.extend({ checks: pairChecksSchema, explanation: argumentText }),
 };
+const packagePairCommands = {
+  propose_resolution: pairCommands.propose_resolution.extend({ checks: packagePairChecksSchema }),
+  verify_resolution: pairCommands.verify_resolution.extend({ checks: packagePairChecksSchema }),
+};
+export function reviewCommands(job: ResearchJob) {
+  return job.mode !== 'primary' && job.packageReview ? packagePairCommands : pairCommands;
+}
 const isPairCommand = (name: keyof typeof commands): name is keyof typeof pairCommands =>
   name === 'propose_resolution' || name === 'verify_resolution';
 
 export function checkToolArguments(job: ResearchJob, name: keyof typeof commands, args: unknown, earlyPair = false) {
-  const schema = earlyPair && isPairCommand(name) ? pairCommands[name] :
+  const schema = earlyPair && isPairCommand(name) ? reviewCommands(job)[name] :
     name === 'save_observation' ? observationArguments(job) : currentCommands[name];
   return schema.safeParse(args);
 }
@@ -255,7 +262,8 @@ export function request(job: ResearchJob, messages: Message[], wire: ToolWire = 
       let schema: z.ZodType = hasObservationForms && name !== 'verify_resolution' ? currentCommands[name] : commands[name];
       let description = toolDescriptions[name];
       if (earlyPair && isPairCommand(name)) {
-        schema = pairCommands[name];
+        schema = reviewCommands(job)[name];
+        if (job.mode !== 'primary' && job.packageReview) description += ' Include the physical lineId if the exact quote appears at several locations in one returned view.';
         description += ' Reopen both assigned originals independently. Check the same implementation (variant), effective revision of each source, scope and applicability to the assigned subject, and whether units and measured properties are comparable. For each confirmed check, provide a verbatim quote linked to freshly opened evidence from each support. For revision use the printed revision and explain why it is effective here. Look for titles and adjacent windows with context_inventory. Mark unclear when the relevant revision or variant cannot be established. The top-level evidenceIds must contain fresh reads of both original measurement windows. Never infer applicability merely from unequal numbers.';
         if (pair && 'scopeName' in pair) description += ' Cite each printed variant code. Different variants are incompatible. If revision codes differ, cite where each source explicitly states that its revision is current for the scopeName in the assignment. Cite the scope itself in the same opened place. A revision code alone does not authorize differing revisions. Use unclear when either statement is missing.';
       }

@@ -373,8 +373,9 @@ test('ordinary intake publishes independent package evidence before questions an
     assert.equal((await readPackageAnalysis(app.db, other.id)).windows.length, 0);
     assert.deepEqual((await app.db.query(`SELECT id,effect_key,state,ceiling_usd_nanos FROM gateway_attempts
       WHERE project_id=$1 ORDER BY state`, [existing.id])).rows, before);
-    const switched = { ...map, readerVersion: async () => readerVersion + ';fixture-profile=v2',
-      async map(source) { return { ...await map.map(source), readerVersion: await this.readerVersion() }; } };
+    const nextReaderVersion = readerVersion + ';fixture-profile=v2';
+    const switched = { ...map, readerVersion: async () => nextReaderVersion,
+      async map(source) { return { ...await map.map(source), readerVersion: nextReaderVersion }; } };
     // The same source and frames are read under a new derived-map contract.
     for (let index = 0; index < 4; index++) assert.equal(await preparePackageMap(app.db, gateway, switched, [existing.id]), true);
     assert.equal(await preparePackageMap(app.db, gateway, switched, [existing.id]), false);
