@@ -5,11 +5,13 @@ import { setTimeout as delay } from "node:timers/promises";
 import { resolve } from "node:path";
 import test from "node:test";
 import { pathToFileURL } from "node:url";
-import { managedWorkerOptions } from "../../../test/fixtures/managed-worker-support.mjs";
+import { managedWorkerOptions, verifyManagedLauncherTargets } from "../../../test/fixtures/managed-worker-support.mjs";
 
 const build = process.env.FACADE_TEST_BUILD ?? "dist";
 const fromBuild = (path) => import(pathToFileURL(resolve(build, `src/${path}.js`)).href);
 const sha256 = (bytes) => createHash("sha256").update(bytes).digest("hex");
+const managedWorkerRun = Boolean(process.env.FACADE_QUESTIONS_WORKER_INTEGRATION && process.env.FACADE_GATEWAY_JOURNAL_URL);
+if (managedWorkerRun) await verifyManagedLauncherTargets({ loadBoundary: () => fromBuild("platform/runtime-boundary") });
 
 // Real reader input, generated per address so byte deduplication cannot masquerade as an independent original.
 function pdf(...lines) {
@@ -285,7 +287,7 @@ test("semantic check uses only an assigned gateway lease and repeats the effect 
 });
 
 test("ordinary worker closes only verified input holds and runs a semantic review through the gateway", {
-  skip: !process.env.FACADE_QUESTIONS_WORKER_INTEGRATION || !process.env.FACADE_GATEWAY_JOURNAL_URL,
+  skip: !managedWorkerRun,
   timeout: 240_000,
 }, async (t) => {
   const { createApi } = await fromBuild("platform/api");

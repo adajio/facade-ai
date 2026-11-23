@@ -6,7 +6,7 @@ import { createApi } from '/app/dist/src/platform/api.js';
 import { readConfig } from '/app/dist/src/platform/config.js';
 import { createGateway, journalFromEnv } from '/app/dist/src/modules/gateway/index.js';
 import { readPackageAnalysis, startWorker } from '/app/dist/src/modules/harness/index.js';
-import { managedWorkerOptions, toolHash } from '../../fixtures/managed-worker-support.mjs';
+import { managedWorkerOptions, toolHash, verifyManagedLauncherTargets } from '../../fixtures/managed-worker-support.mjs';
 import { startManagedTransport } from './managed-transport.mjs';
 
 const provenance = {
@@ -42,6 +42,7 @@ assert.ok(!previousFile || previousFile === '/results/previous-trace.ndjson');
 const previous = previousFile ? (await readFile(previousFile, 'utf8')).trim().split('\n').map(JSON.parse) : [];
 assert.ok(previous.every(({ projectId }) => projects.has(projectId)));
 const config = readConfig();
+await verifyManagedLauncherTargets();
 const app = await createApi(config);
 const external = journalFromEnv();
 assert.ok(external);

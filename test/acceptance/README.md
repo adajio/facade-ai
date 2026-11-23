@@ -59,7 +59,14 @@ PYTHONDONTWRITEBYTECODE=1 python3 test/acceptance/summarize_trace.py "$private_m
 
 Штатные `start:api` и `start:worker` используют выделенные производственные точки входа. Их параметры не включают тестовый транспорт. Worker пишет в лог `disabled`, `openrouter-live` или `openrouter-replay` и SHA-256 скомпилированного harness. В режиме `disabled` ожидающие модельные задачи получают удержание. Replay требует действующего профиля OpenRouter и совпадения сохранённого вызова. Новая отправка блокируется шлюзом.
 
-Для `managed-test` нужны отдельные БД приложения с именем `test_*`, бакет и журнал. Тестовый запуск ставит постоянную метку `public.facade_managed_test_seal` в БД приложения. При наличии этой метки или старых маршрутов `managed` штатный API и worker отклоняют БД. Держите тестовый API в отдельном контейнере на внутренней сети. Для браузерного сценария с отдельным API запускайте `/app/test/fixtures/managed-test-api.mjs` вместо `start:api` на этой БД.
+Для `managed-test` нужны отдельные БД приложения с именем `test_*`, бакет и журнал `journal_*` или `test_*`. До запуска подготовьте обе БД по именам из записи испытателя. Команда сверяет эти имена с адресами и реальными подключениями и ставит метку `public.facade_managed_test_seal` с одним UUID и разной ролью БД. Сохраните UUID рядом с параметрами прогона и передайте `FACADE_MANAGED_TEST_RUN_ID` во все управляемые процессы.
+
+```sh
+export FACADE_MANAGED_TEST_RUN_ID="$(uuidgen | tr '[:upper:]' '[:lower:]')"
+node test/fixtures/provision-managed-test.mjs "$TEST_APP_NAME" "$TEST_JOURNAL_NAME" "$FACADE_MANAGED_TEST_RUN_ID"
+```
+
+При наличии метки или старых маршрутов `managed` штатные API и worker отклоняют БД. Управляемые программы сверяют метки до создания пользователей, настройки маршрутов и записи в журнал. Для браузерного сценария запускайте `/app/test/fixtures/managed-test-api.mjs` в отдельном контейнере на внутренней сети. Обычный `stand bootstrap` и relay используют действующую конфигурацию стенда.
 
 Соберите и закрепите образ по манифесту исходников. Для проверки обеих целей `core` и `reader` выполните для каждого ID образа следующие команды из корня checkout:
 

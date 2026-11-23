@@ -4,7 +4,9 @@ import { createServer } from 'node:http';
 import { appendFile, mkdir, readFile, readdir, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
-import { managedWorkerOptions } from '../fixtures/managed-worker-support.mjs';
+import { managedWorkerOptions, verifyManagedLauncherTargets } from '../fixtures/managed-worker-support.mjs';
+
+await verifyManagedLauncherTargets();
 
 const root = '/acceptance';
 const output = join(root, 'evidence', process.env.STEP15_RUN_ID);

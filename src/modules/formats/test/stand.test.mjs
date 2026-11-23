@@ -6,6 +6,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { test } from "node:test";
 import Fastify from "fastify";
 import pg from "pg";
+import { verifyManagedLauncherTargets } from "../../../../test/fixtures/managed-worker-support.mjs";
 
 const dist = process.env.FACADE_STEP11_DIST ?? resolve("dist");
 const fixtures = fileURLToPath(new URL("./fixtures/", import.meta.url));
@@ -18,6 +19,10 @@ test("same reader API and harness port reopen historical mixed-format observatio
 }, async (t) => {
   const { DATABASE_URL: databaseUrl, FACADE_DATA_DIR: dataDir } = process.env;
   assert.ok(databaseUrl && dataDir, "use a fresh step11 stand database");
+  const dwgWorker = process.env.FACADE_STEP11_WORKER_DWG === "1";
+  if (dwgWorker) await verifyManagedLauncherTargets({
+    loadBoundary: () => import(pathToFileURL(join(dist, "src/platform/runtime-boundary.js"))),
+  });
   const { bootstrapAdmin } = await load("access/bootstrap.js");
   const { register: access } = await load("access/index.js");
   const { register: intake } = await load("intake/index.js");
@@ -57,7 +62,6 @@ test("same reader API and harness port reopen historical mixed-format observatio
     assert.ok(reply.statusCode >= 200 && reply.statusCode < 300, `${url}: ${reply.statusCode} ${reply.json().code ?? ""}`);
     return reply.json();
   }
-  const dwgWorker = process.env.FACADE_STEP11_WORKER_DWG === "1";
   const requirements = dwgWorker ? [{
     key: "dwg-schedule", part: "Panel schedule", formats: ["dwg"], equivalents: [],
     applicability: "all", sourceRoles: ["design"], completenessCriterion: "Addressed assembly", addressee: "customer",

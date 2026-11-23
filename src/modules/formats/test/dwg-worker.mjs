@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { createHash, randomUUID } from "node:crypto";
 import { createServer } from "node:http";
 import { setTimeout as delay } from "node:timers/promises";
-import { managedWorkerOptions } from "../../../../test/fixtures/managed-worker-support.mjs";
+import { managedWorkerOptions, verifyManagedLauncherTargets } from "../../../../test/fixtures/managed-worker-support.mjs";
 
 const targetText = "AX-17 rev B | 2 x 35 mm | 70 mm";
 const neighborText = "AX-17 rev C | 5 x 14 mm | 70 mm";
@@ -20,6 +20,10 @@ export async function verifyOrdinaryDwg({
 }) {
   assert.ok(process.env.FACADE_CONVERTER_SOCKET, "connect the installed DWG converter");
   assert.notEqual(process.env.FACADE_GATEWAY_LIVE_MODE, "step-15", "use a managed synthetic gateway");
+  const loadBoundary = () => load("../platform/runtime-boundary.js");
+  await verifyManagedLauncherTargets({ loadBoundary });
+  const { verifyManagedTestTarget } = await loadBoundary();
+  await verifyManagedTestTarget(db, "app");
   const { createGateway, journalFromEnv } = await load("gateway/index.js");
   const { startWorker } = await load("harness/index.js");
   const journalConnection = journalFromEnv();

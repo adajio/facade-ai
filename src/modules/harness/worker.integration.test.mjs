@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { managedWorkerOptions } from '../../../test/fixtures/managed-worker-support.mjs';
+import { managedWorkerOptions, verifyManagedLauncherTargets } from '../../../test/fixtures/managed-worker-support.mjs';
 import { spawnSync } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
 import { mkdtemp, readFile, rm } from 'node:fs/promises';
@@ -72,6 +72,7 @@ async function until(read, valid, label) {
 test('ordinary upload runs two Mastra readers through PostgreSQL, the reader, questions and assessment', {
   skip: !run, timeout: 210_000,
 }, async (t) => {
+  await verifyManagedLauncherTargets({ loadBoundary: () => import(built('src/platform/runtime-boundary.js')) });
   const { createApi } = await import(built('src/platform/api.js'));
   const { readConfig } = await import(built('src/platform/config.js'));
   const { bootstrapAdmin } = await import(built('src/modules/access/bootstrap.js'));

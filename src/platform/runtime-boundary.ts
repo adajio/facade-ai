@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto'
 import { readFile } from 'node:fs/promises'
 import type { Pool, PoolClient } from 'pg'
 import { StartupError } from './config.js'
+import { openPool } from './db.js'
 
 function isManagedSlot(slot: unknown): boolean {
   if (slot === null || typeof slot !== 'object') return false
@@ -55,17 +56,40 @@ export async function openProductionDatabase(db: Pool): Promise<() => void> {
   }
 }
 
+export async function verifyManagedTestTarget(client: Pick<PoolClient, 'query'>, kind: 'app' | 'journal'): Promise<void> {
+  const runId = process.env.FACADE_MANAGED_TEST_RUN_ID;
+  if (!runId || !/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/.test(runId)) {
+    throw new StartupError('Managed model tests require a pinned test run ID');
+  }
+  const { rows: [target] } = await client.query<{ database: string; marked: boolean }>(`
+    SELECT current_database() AS database, to_regclass('public.facade_managed_test_seal') IS NOT NULL AS marked`);
+  const names = kind === 'app' ? /^test_[a-z0-9_]+$/ : /^(?:test|journal)_[a-z0-9_]+$/;
+  if (!names.test(target.database) || !target.marked) {
+    throw new StartupError(`Managed model tests require a marked ${kind} database`);
+  }
+  const { rows } = await client.query<{ runId: string; kind: string }>(`
+    SELECT to_jsonb(seal)->>'run_id' AS "runId", to_jsonb(seal)->>'kind' AS kind
+    FROM public.facade_managed_test_seal seal LIMIT 2`);
+  if (rows.length !== 1 || rows[0].runId !== runId || rows[0].kind !== kind) {
+    throw new StartupError(`Managed model test ${kind} database identity differs`);
+  }
+}
+
 export async function sealManagedTestDatabase(db: Pool): Promise<PoolClient> {
   const client = await db.connect()
   try {
-    const { rows: [target] } = await client.query<{ database: string }>('SELECT current_database() AS database')
-    if (!/^test_[a-z0-9_]+$/.test(target.database)) {
-      throw new StartupError('Managed model tests require a dedicated test_ database')
-    }
+    await verifyManagedTestTarget(client, 'app')
     const { rows: [boundary] } = await client.query<{ locked: boolean }>(`
       SELECT pg_try_advisory_lock(hashtextextended('facade/model-runtime',0)) AS locked`)
     if (!boundary.locked) throw new StartupError('Database already serves a runtime process')
-    await client.query('CREATE TABLE IF NOT EXISTS public.facade_managed_test_seal (created_at timestamptz NOT NULL DEFAULT now())')
+    const journalUrl = process.env.FACADE_GATEWAY_JOURNAL_URL;
+    if (!journalUrl) throw new StartupError('Managed model tests require a journal database URL');
+    const journal = openPool(journalUrl);
+    try {
+      await verifyManagedTestTarget(journal, 'journal');
+    } finally {
+      await journal.end();
+    }
     return client
   } catch (error) {
     client.release(true)

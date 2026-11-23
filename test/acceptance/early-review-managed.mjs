@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { managedWorkerOptions } from '../fixtures/managed-worker-support.mjs';
+import { managedWorkerOptions, verifyManagedLauncherTargets } from '../fixtures/managed-worker-support.mjs';
 import { createHash, randomUUID } from 'node:crypto';
 import { readFile, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:http';
@@ -16,6 +16,8 @@ import { advance } from '/app/dist/src/modules/harness/session.js';
 import { createIntakeStorage } from '/app/dist/src/modules/intake/blob.js';
 import { createRuntimePdfService } from '/app/dist/src/modules/pdf/index.js';
 import { acceptanceHttp } from './early-review-http.mjs';
+
+await verifyManagedLauncherTargets();
 
 const frozen = JSON.parse(await readFile('/frozen/machine-final-live.json', 'utf8')).main;
 const intake = JSON.parse(await readFile('/frozen/intake-verified.json', 'utf8'));
