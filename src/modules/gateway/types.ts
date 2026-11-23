@@ -93,7 +93,7 @@ export type CallInput = {
 export type CallResult =
   | { status: 'paid'; attemptId: string; receipt: Extract<Receipt, { state: 'paid' }>; output: unknown; replay: boolean }
   | { status: 'rejected'; attemptId: string; receipt: Extract<Receipt, { state: 'rejected' }> }
-  | { status: 'held'; code: string; nextAction: string; attemptId?: string };
+  | { status: 'held'; code: string; nextAction: string; attemptId?: string; retryAt?: Date };
 
 export type ModelAuthorization = QueueTarget & {
   jobId: string;

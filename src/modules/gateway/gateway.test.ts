@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
+import { setTimeout as delay } from 'node:timers/promises';
 import test, { type TestContext } from 'node:test';
 import Fastify from 'fastify';
 import pg from 'pg';
@@ -475,8 +476,11 @@ test('live primary, unfinished outcome, and open inventory gate review per gener
   await reached(entered, inFlight);
   const heldReview = isHeld(await s.gateway.call(call(review)), 'primary_barrier');
   assert.equal(await s.gateway.suspend(review, { reason: heldReview.code, nextAction: heldReview.nextAction }), true);
-  isHeld(await s.gateway.call(call(smallA)), 'route_busy');
-  assert.equal((await s.read()).provider.length, 2);
+  for (let check = 0; check < 3; check++) isHeld(await s.gateway.call(call(smallA)), 'route_busy');
+  const busy = await s.read();
+  assert.equal(busy.provider.length, 2);
+  assert.equal(busy.app.length, 2);
+  assert.equal(busy.external.length, 2);
   respond.release();
   assert.equal((await inFlight).status, 'paid');
 
@@ -728,7 +732,7 @@ test('known 429 permits one explicit retry and concurrent projects share the exa
   s.setBehavior(async () => { entered.release(); await respond.promise; return 'paid'; });
   const retry = s.gateway.call({ ...call(first), retryRejectedAttemptId: rejected.attemptId });
   await reached(entered, retry);
-  isHeld(await s.gateway.call(call(second)), 'budget_exhausted');
+  assert.ok(isHeld(await s.gateway.call(call(second)), 'budget_reserve_wait').retryAt);
   assert.equal((await s.read()).budget.reserveUsdNanos, BUDGET_USD_NANOS);
   respond.release();
   assert.equal((await retry).status, 'paid');
@@ -737,8 +741,60 @@ test('known 429 permits one explicit retry and concurrent projects share the exa
   assert.deepEqual(state.provider.map(row => row.state), ['rejected','paid']);
   assert.deepEqual(state.external.map(row => row.state), ['rejected','paid']);
   assert.equal(state.budget.spentUsdNanos, BUDGET_USD_NANOS);
-  t.diagnostic('one known 429 and one explicit retry; a concurrent project is denied at a $10 reserve and again at $10 spent');
+  t.diagnostic('one known 429 and one explicit retry; a concurrent project waits during a $10 reserve and is held at $10 spent');
   assert.equal(state.budget.reserveUsdNanos, 0);
+});
+
+test('an active reserve queues the same effect until settlement without a duplicate send', sqlCase, async t => {
+  const limit = 5_000_000_000;
+  const policy = { ...baseRoute, ceilingUsdNanos: 3_000_000_000 };
+  const waitingRoute = { ...policy, id: 'independent-route' };
+  const s = await setup(t, policy, limit);
+  await s.gateway.configureRoute(waitingRoute);
+  const one = project();
+  const two = project();
+  for (const [ref, route] of [[one, policy], [two, waitingRoute]] as const) {
+    await s.gateway.openGeneration(ref);
+    await s.gateway.sealGeneration(ref, manifest);
+    await grant(s.gateway, ref, true, route);
+  }
+  const first = await lease(s.gateway, one, 'running-reserve', obligationA);
+  const second = await lease(s.gateway, two, 'waiting-reserve', obligationA);
+  const input = call(second, waitingRoute.id);
+  const entered = gate();
+  const release = gate();
+  t.after(release.release);
+  s.setBehavior(async attempt => {
+    if (attempt.jobId === first.jobId) { entered.release(); await release.promise; }
+    return 'paid';
+  });
+  const inFlight = s.gateway.call(call(first));
+  await reached(entered, inFlight);
+  const blocked = isHeld(await s.gateway.call(input), 'budget_reserve_wait');
+  assert.ok(blocked.retryAt);
+  assert.ok(await s.gateway.suspend(second, { reason: blocked.code, nextAction: blocked.nextAction, retryAt: blocked.retryAt }));
+  const before = await s.read();
+  assert.equal(before.provider.length, 1);
+  assert.equal(before.external.length, 1);
+  assert.equal(before.budget.reserveUsdNanos, policy.ceilingUsdNanos);
+  const { rows: [queued] } = await s.db.query('SELECT state,reason FROM gateway_jobs WHERE id=$1', [second.jobId]);
+  assert.deepEqual(queued, { state: 'ready', reason: 'budget_reserve_wait' });
+
+  release.release();
+  assert.equal((await inFlight).status, 'paid');
+  await delay(Math.max(0, blocked.retryAt.getTime() - Date.now()) + 50);
+  const ready = await s.gateway.claim({ workerId: 'after-reserve', kinds: ['waiting-reserve'], leaseMs: 120_000 });
+  assert.equal(ready?.lease.jobId, second.jobId);
+  assert.ok(ready);
+  const resumed = await s.gateway.call({ ...input, lease: ready.lease });
+  assert.equal(resumed.status, 'paid');
+  const replay = await s.gateway.call({ ...input, lease: ready.lease });
+  assert.deepEqual(replay, { ...resumed, replay: true });
+  const after = await s.read();
+  assert.equal(after.provider.length, 2);
+  assert.equal(after.external.length, 2);
+  assert.equal(after.budget.reserveUsdNanos, 0);
+  assert.equal(after.budget.spentUsdNanos, 600_000_000);
 });
 
 test('a persisted $5 cap blocks dispatch and counts unknown effects after a gateway restart', sqlCase, async t => {
@@ -761,7 +817,7 @@ test('a persisted $5 cap blocks dispatch and counts unknown effects after a gate
   const mismatch = new PostgresIntentJournal(s.outside, s.journal.ledgerId, BUDGET_USD_NANOS);
   await assert.rejects(mismatch.balance(), /journal_limit_mismatch/);
   assert.equal(isHeld(await reopened.call(call(first)), 'unknown_charge').attemptId, unknown.attemptId);
-  isHeld(await reopened.call(call(second)), 'budget_exhausted');
+  assert.equal(isHeld(await reopened.call(call(second)), 'budget_exhausted').retryAt, undefined);
   await assert.rejects(s.outside.query(`INSERT INTO gateway_external_attempts
     (id,effect_key,project_id,generation_id,route_id,purpose,ceiling_usd_nanos,metadata,state)
     VALUES ($1,'old-gateway-attempt',$2,$3,$4,'primary_a',$5,'{}','prepared')`,

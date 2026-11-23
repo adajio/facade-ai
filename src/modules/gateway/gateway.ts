@@ -19,7 +19,8 @@ const actions: Record<string, string> = {
   primary_barrier: 'close_pending_primary_obligations',
   review_pair_stale: 'load_current_generation',
   effect_conflict: 'inspect_original_effect',
-  budget_exhausted: 'wait_for_reserve_settlement',
+  budget_reserve_wait: 'wait_for_reserve_settlement',
+  budget_exhausted: 'inspect_budget_and_unresolved_reserves',
   budget_frozen: 'operator_review_ledger',
   journal_unavailable: 'restore_external_journal',
   journal_identity_mismatch: 'restore_pinned_journal',
@@ -44,7 +45,8 @@ const actions: Record<string, string> = {
 };
 
 function held(code: string, attemptId?: string): CallResult {
-  return { status: 'held', code, nextAction: actions[code] ?? 'inspect_attempt_status', ...(attemptId ? { attemptId } : {}) };
+  return { status: 'held', code, nextAction: actions[code] ?? 'inspect_attempt_status', ...(attemptId ? { attemptId } : {}),
+    ...(code === 'budget_reserve_wait' ? { retryAt: new Date(Date.now() + 2_000) } : {}) };
 }
 
 type Gate = {
@@ -345,7 +347,12 @@ export class Gateway extends WorkQueue {
         return this.gate(tx, input, wire);
       });
       if (typeof first === 'string') return held(first);
-      const previous = await journal.head(first.effect);
+      const { previous, blocked } = await journal.probe(first.effect, first.dispatchBlock ? undefined : {
+        projectId: first.work.projectId, generationId: first.work.generationId, purpose: first.work.purpose,
+        jobId: first.work.lease.jobId, route: first.route, earlyReview: first.earlyReview,
+        ceilingUsdNanos: first.quote?.ceilingUsdNanos ?? first.route.ceilingUsdNanos,
+        retryRejectedAttemptId: input.retryRejectedAttemptId,
+      });
       if (previous) {
         attemptId = previous.attempt.id;
         if (previous.attempt.requestHash !== first.requestHash) return held('effect_conflict', attemptId);
@@ -360,6 +367,7 @@ export class Gateway extends WorkQueue {
         || (previous?.state === 'prepared' && previous.attempt.previousRejectedId !== (input.retryRejectedAttemptId ?? null))) {
         return held('effect_conflict', attemptId);
       }
+      if (blocked) return held(blocked, attemptId);
 
       const reserved = await transaction(this.db, async tx => {
         const current = await this.gate(tx, input, wire);
@@ -414,7 +422,7 @@ export class Gateway extends WorkQueue {
         if (['route_denied','route_data_unapproved','synthetic_retention_not_approved','route_training_policy_unverified',
           'route_parameters_unsupported','route_zdr_unavailable','route_endpoint_unverified','invalid_request',
           'route_bound_unavailable','primary_barrier','review_pair_stale','effect_conflict','route_busy','route_rate_limited',
-          'route_reconciliation','budget_frozen','budget_exhausted','analysis_replay_only','analysis_prior_effect',
+          'route_reconciliation','budget_frozen','budget_exhausted','budget_reserve_wait','analysis_replay_only','analysis_prior_effect',
           'analysis_target_changed','analysis_input_denied','analysis_legacy_replay_only'].includes(denied)) {
           // Cancellation is conditional in the journal because a concurrent caller may already own the attempt.
           await this.mirror(await journal.cancelPrepared(reserved.id), journal);

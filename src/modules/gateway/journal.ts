@@ -16,6 +16,13 @@ type JournalRow = JournalEntry & {
   createdOrder: string;
   startedAt: Date | null;
 };
+type DispatchTarget = Pick<Attempt, 'projectId' | 'generationId' | 'purpose' | 'jobId'>;
+type DispatchProbe = DispatchTarget & {
+  route: RoutePolicy;
+  ceilingUsdNanos: number;
+  earlyReview: boolean;
+  retryRejectedAttemptId?: string;
+};
 
 const columns = 'metadata AS attempt,state,receipt,created_order::text AS "createdOrder",started_at AS "startedAt"';
 const reserved = "state IN ('prepared','sending','unknown')";
@@ -81,10 +88,19 @@ export class PostgresIntentJournal {
     return Boolean(found.rowCount);
   }
 
-  async head(effectKey: string): Promise<JournalEntry | null> {
+  async probe(effectKey: string, candidate?: DispatchProbe): Promise<{ previous: JournalEntry | null; blocked?: string }> {
     return transaction(this.pool, async tx => {
-      await this.bound(tx);
-      return this.latest(tx, effectKey);
+      const { frozen, limitUsdNanos } = await this.bound(tx);
+      const previous = await this.latest(tx, effectKey);
+      if (!candidate || (previous && (previous.state !== 'rejected' || previous.attempt.id !== candidate.retryRejectedAttemptId
+        || await this.hasRouteIsolation(tx, previous.attempt.id)))) {
+        return { previous };
+      }
+      if (frozen) return { previous, blocked: 'budget_frozen' };
+      const routeBlock = await this.routeBlock(tx, candidate.route, candidate, candidate.earlyReview);
+      if (!routeBlock) return { previous };
+      const budgetBlock = await this.budgetBlock(tx, limitUsdNanos, candidate.ceilingUsdNanos);
+      return { previous, blocked: budgetBlock ?? routeBlock };
     });
   }
 
@@ -99,22 +115,34 @@ export class PostgresIntentJournal {
   }
 
   private async budget(tx: PoolClient) {
-    const result = await tx.query<{ reserveUsdNanos: string; spentUsdNanos: string }>(
+    const result = await tx.query<{ reserveUsdNanos: string; spentUsdNanos: string; activeReserveUsdNanos: string }>(
       `SELECT coalesce(sum(ceiling_usd_nanos) FILTER (WHERE ${reserved}),0) AS "reserveUsdNanos",
-              coalesce(sum(spent_usd_nanos),0) AS "spentUsdNanos" FROM gateway_external_attempts`,
+              coalesce(sum(spent_usd_nanos),0) AS "spentUsdNanos",
+              coalesce(sum(ceiling_usd_nanos) FILTER (WHERE state='prepared' OR
+                (state='sending' AND slot_until>statement_timestamp())),0) AS "activeReserveUsdNanos"
+       FROM gateway_external_attempts`,
     );
     return {
       reserveUsdNanos: Number(result.rows[0].reserveUsdNanos),
       spentUsdNanos: Number(result.rows[0].spentUsdNanos),
+      activeReserveUsdNanos: Number(result.rows[0].activeReserveUsdNanos),
     };
+  }
+
+  private async budgetBlock(tx: PoolClient, limit: number, additional: number, ownPreparedCeiling = 0) {
+    const { spentUsdNanos, reserveUsdNanos, activeReserveUsdNanos } = await this.budget(tx);
+    const committed = spentUsdNanos + reserveUsdNanos + additional;
+    if (committed <= limit) return undefined;
+    // Unknown receipts and expired sends remain reserved even in the retry calculation.
+    return committed - activeReserveUsdNanos + ownPreparedCeiling <= limit ? 'budget_reserve_wait' : 'budget_exhausted';
   }
 
   async balance() {
     return transaction(this.pool, async tx => {
       const { frozen, limitUsdNanos } = await this.bound(tx);
-      const budget = await this.budget(tx);
-      return { limitUsdNanos, frozen, ...budget,
-        remainingUsdNanos: Math.max(0, limitUsdNanos - budget.reserveUsdNanos - budget.spentUsdNanos) };
+      const { reserveUsdNanos, spentUsdNanos } = await this.budget(tx);
+      return { limitUsdNanos, frozen, reserveUsdNanos, spentUsdNanos,
+        remainingUsdNanos: Math.max(0, limitUsdNanos - reserveUsdNanos - spentUsdNanos) };
     });
   }
 
@@ -127,10 +155,8 @@ export class PostgresIntentJournal {
       if (current && (current.state !== 'rejected' || current.attempt.id !== attempt.previousRejectedId
         || await this.hasRouteIsolation(tx, current.attempt.id))) return current;
       if (frozen) return 'budget_frozen';
-      const budget = await this.budget(tx);
-      if (budget.spentUsdNanos + budget.reserveUsdNanos + attempt.ceilingUsdNanos > limitUsdNanos) {
-        return 'budget_exhausted';
-      }
+      const blocked = await this.budgetBlock(tx, limitUsdNanos, attempt.ceilingUsdNanos);
+      if (blocked) return blocked;
       const result = await tx.query<JournalRow>(
         `INSERT INTO gateway_external_attempts(id,effect_key,project_id,generation_id,route_id,purpose,
              ceiling_usd_nanos,metadata,state)
@@ -142,33 +168,35 @@ export class PostgresIntentJournal {
     });
   }
 
+  private async routeBlock(tx: PoolClient, route: RoutePolicy, work: DispatchTarget, earlyReview: boolean) {
+    const { rows: [gate] } = await tx.query<{ route_busy: boolean; unresolved: boolean; active_primary: boolean; rate_limited: boolean }>(
+      `SELECT
+         EXISTS (SELECT 1 FROM gateway_external_attempts WHERE route_id=$1 AND slot_until>clock_timestamp()
+           AND state IN ('sending','unknown')) AS route_busy,
+         EXISTS (SELECT 1 FROM gateway_external_attempts WHERE project_id=$2 AND route_id=$1
+           AND (state='sending' OR (state='unknown'
+             AND (coalesce(metadata->>'jobId',$5)=$5 OR receipt->>'providerId' IS NOT NULL OR NOT ${isolated})))) AS unresolved,
+         EXISTS (SELECT 1 FROM gateway_external_attempts WHERE generation_id=$3
+           AND purpose IN ('primary_a','primary_b') AND state IN ('sending','unknown')) AS active_primary,
+         EXISTS (SELECT 1 FROM gateway_external_attempts WHERE route_id=$1
+           AND started_at>clock_timestamp()-$4::int*interval '1 millisecond') AS rate_limited`,
+      [route.id, work.projectId, work.generationId, route.minIntervalMs ?? 0, work.jobId],
+    );
+    if (work.purpose === 'review' && !earlyReview && gate.active_primary) return 'primary_barrier';
+    if (gate.unresolved) return 'route_reconciliation';
+    if (gate.route_busy) return 'route_busy';
+    if (gate.rate_limited) return 'route_rate_limited';
+  }
+
   async claim(id: string, route: RoutePolicy, earlyReview = false): Promise<'claimed' | string> {
     return transaction(this.pool, async tx => {
       const { frozen, limitUsdNanos } = await this.bound(tx);
       const entry = await this.byId(tx, id);
       if (entry.state !== 'prepared') return 'effect_already_claimed';
       if (frozen) return 'budget_frozen';
-
-      const gates = await tx.query<{ route_busy: boolean; unresolved: boolean; active_primary: boolean; rate_limited: boolean }>(
-        `SELECT
-          EXISTS (SELECT 1 FROM gateway_external_attempts WHERE route_id=$1 AND slot_until>clock_timestamp()
-            AND state IN ('sending','unknown')) AS route_busy,
-          EXISTS (SELECT 1 FROM gateway_external_attempts WHERE project_id=$2 AND route_id=$1
-            AND (state='sending' OR (state='unknown'
-              AND (coalesce(metadata->>'jobId',$5)=$5 OR receipt->>'providerId' IS NOT NULL OR NOT ${isolated})))) AS unresolved,
-          EXISTS (SELECT 1 FROM gateway_external_attempts WHERE generation_id=$3
-            AND purpose IN ('primary_a','primary_b') AND state IN ('sending','unknown')) AS active_primary,
-          EXISTS (SELECT 1 FROM gateway_external_attempts WHERE route_id=$1
-            AND started_at>clock_timestamp()-$4::int*interval '1 millisecond') AS rate_limited`,
-        [route.id, entry.attempt.projectId, entry.attempt.generationId, route.minIntervalMs ?? 0, entry.attempt.jobId],
-      );
-      const gate = gates.rows[0];
-      if (entry.attempt.purpose === 'review' && !earlyReview && gate.active_primary) return 'primary_barrier';
-      if (gate.unresolved) return 'route_reconciliation';
-      if (gate.route_busy) return 'route_busy';
-      if (gate.rate_limited) return 'route_rate_limited';
-      const budget = await this.budget(tx);
-      if (budget.reserveUsdNanos + budget.spentUsdNanos > limitUsdNanos) return 'budget_exhausted';
+      const blocked = await this.routeBlock(tx, route, entry.attempt, earlyReview) ??
+        await this.budgetBlock(tx, limitUsdNanos, 0, entry.attempt.ceilingUsdNanos);
+      if (blocked) return blocked;
       await tx.query(
         `UPDATE gateway_external_attempts SET state='sending', started_at=clock_timestamp(),
          slot_until=clock_timestamp()+$2::int*interval '1 millisecond' WHERE id=$1`,
