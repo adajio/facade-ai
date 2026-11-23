@@ -15,6 +15,7 @@ import { conflict, IntakeError, invalid, notFound } from "./errors.js";
 import { appendIntakeEvent, closeEmptyHold, createHold, lockIntakeProject } from "./gate.js";
 import { checksum, parseMediaType, parsePath, parseScopeIds, parseSize, uuid } from "./inputs.js";
 import { lockReceipt } from "./receipts.js";
+import { acceptManifestInput } from "./manifest.js";
 import type { ReceiptContext } from "./receipts.js";
 
 type Queryable = Pool | PoolClient;
@@ -42,6 +43,7 @@ type UploadRow = {
 type Part = { number: number; offset: number; length: number; sha256: string };
 export type DeclareOriginalInput = ReceiptContext & {
   uploadId?: string;
+  manifestItemId?: string;
   relativePath: string;
   size: number;
   sha256: string;
@@ -127,6 +129,9 @@ export async function declareOriginal(tx: PoolClient, storage: IntakeStorage, in
   }
   if (!parentOccurrenceId && !declaration.importId && receipt.sealed_at) {
     conflict("receipt_sealed", "Receipt no longer accepts new inputs");
+  }
+  if (!parentOccurrenceId && !declaration.importId && receipt.manifest_mode && !input.manifestItemId) {
+    conflict("manifest_item_required", "Объявите файл в составе поступления.");
   }
   const importId = await checkProvenance(tx, declaration);
   if (!parentOccurrenceId) {
@@ -401,7 +406,7 @@ export async function prepareOriginal(
   });
 }
 
-async function lockUploadTransaction(tx: PoolClient, uploadId: string): Promise<void> {
+export async function lockUploadTransaction(tx: PoolClient, uploadId: string): Promise<void> {
   await tx.query(`SELECT pg_advisory_xact_lock(${uploadLock})`, [uuid(uploadId)]);
 }
 
@@ -465,6 +470,7 @@ export async function publishPreparedOriginal(tx: PoolClient, input: UploadConte
     originalId, documentId, versionId, jobId, mediaType: prepared.mediaType,
   };
   await appendIntakeEvent(tx, upload.project_id, upload.receipt_id, "intake.original_ready", result);
+  await acceptManifestInput(tx, { projectId: upload.project_id, receiptId: upload.receipt_id, uploadId: upload.id });
   return result;
 }
 
@@ -478,12 +484,18 @@ export async function finalizeOriginal(
   });
 }
 
-export async function retireUpload(tx: PoolClient, input: UploadContext, status: "cancelled" | "expired") {
+export async function retireUpload(
+  tx: PoolClient, input: UploadContext, status: "cancelled" | "expired", manifestExclusion = false,
+) {
   await lockUploadTransaction(tx, input.uploadId);
   await lockIntakeProject(tx, input.projectId);
   await lockProjectScopes(tx, input.projectId);
   const upload = await readUpload(tx, input);
   if (!upload) notFound();
+  if (status === "cancelled" && !manifestExclusion) {
+    const { rowCount } = await tx.query("SELECT 1 FROM intake_manifest_items WHERE upload_id=$1", [input.uploadId]);
+    if (rowCount) conflict("manifest_exclusion_reason_required", "Исключите вход из состава с указанием причины.");
+  }
   if (upload.state === "complete") conflict("upload_already_accepted", "An accepted original remains in the inventory");
   if (upload.state !== "uploading" || (status === "expired" && !upload.expired)) {
     return { uploadId: upload.id, status: upload.state };

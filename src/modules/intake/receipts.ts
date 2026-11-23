@@ -4,6 +4,8 @@ import { lockProjectScopes } from "../access/commands.js";
 import { conflict, invalid, notFound } from "./errors.js";
 import { appendIntakeEvent, closeEmptyHold, createHold, lockIntakeProject } from "./gate.js";
 import { parseScopeIds, uuid } from "./inputs.js";
+import { acceptManifestInput, closeDeclaredReceipt, manifestProjection } from "./manifest.js";
+import type { ManifestMode } from "./manifest.js";
 
 type Receipt = {
   id: string;
@@ -12,6 +14,8 @@ type Receipt = {
   source: "upload" | "import";
   created_at: Date;
   sealed_at: Date | null;
+  manifest_mode: ManifestMode | null;
+  manifest_version: number | null;
 };
 
 export type ReceiptContext = { projectId: string; receiptId: string };
@@ -26,22 +30,33 @@ export async function lockReceipt(tx: PoolClient, input: ReceiptContext): Promis
 }
 
 export async function createReceipt(tx: PoolClient, input: {
-  projectId: string; createdBy: string; source: Receipt["source"];
+  projectId: string; createdBy: string; source: Receipt["source"]; receiptId?: string; mode?: ManifestMode;
 }) {
-  const { projectId, createdBy, source } = input;
+  const { projectId, createdBy, source, receiptId, mode } = input;
   await lockIntakeProject(tx, projectId);
   const { rows: [receipt] } = await tx.query<Receipt>(
-    "INSERT INTO intake_receipts (project_id, created_by, source) VALUES ($1, $2, $3) RETURNING *",
-    [projectId, createdBy, source],
+    `INSERT INTO intake_receipts (id, project_id, created_by, source, manifest_mode, manifest_version)
+     VALUES (COALESCE($4,gen_random_uuid()), $1, $2, $3, $5, $6) ON CONFLICT (id) DO NOTHING RETURNING *`,
+    [projectId, createdBy, source, receiptId ?? null, mode ?? null, mode ? 1 : null],
   );
+  if (!receipt) conflict("receipt_id_in_use", "Идентификатор поступления уже занят.");
   const result = { receiptId: receipt.id, number: Number(receipt.number), source, sealed: false, inventoryOpen: true };
   await appendIntakeEvent(tx, projectId, receipt.id, "intake.receipt_created", result);
   return result;
 }
 
-export async function sealReceipt(tx: PoolClient, input: ReceiptContext) {
+export async function sealReceipt(tx: PoolClient, input: ReceiptContext & { manifestVersion?: number }) {
   await lockIntakeProject(tx, input.projectId);
   const receipt = await lockReceipt(tx, input);
+  if (receipt.manifest_mode) {
+    if (receipt.manifest_version !== input.manifestVersion) {
+      conflict("manifest_version_conflict", "Состав поступления изменился. Откройте актуальную опись.");
+    }
+    if (!receipt.sealed_at && !await closeDeclaredReceipt(tx, input, true)) {
+      conflict("manifest_inputs_pending", "Примите или исключите оставшиеся входы.");
+    }
+    return { receiptId: receipt.id, sealed: true };
+  }
   if (!receipt.sealed_at) {
     await tx.query("UPDATE intake_receipts SET sealed_at = now() WHERE id = $1", [receipt.id]);
     await appendIntakeEvent(tx, input.projectId, receipt.id, "intake.receipt_sealed", { receiptId: receipt.id });
@@ -49,7 +64,7 @@ export async function sealReceipt(tx: PoolClient, input: ReceiptContext) {
   return { receiptId: receipt.id, sealed: true };
 }
 
-export async function declareImport(tx: PoolClient, input: ReceiptContext & { importId?: string; scopeIds?: string[] }) {
+export async function declareImport(tx: PoolClient, input: ReceiptContext & { importId?: string; scopeIds?: string[]; manifestItemId?: string }) {
   const { projectId, receiptId } = input;
   const importId = input.importId ? uuid(input.importId) : randomUUID();
   const scopeIds = parseScopeIds(input.scopeIds);
@@ -71,6 +86,9 @@ export async function declareImport(tx: PoolClient, input: ReceiptContext & { im
     return { importId, receiptId, status: current.state, holdId: current.hold_id };
   }
   if (receipt.sealed_at) conflict("receipt_sealed", "Receipt no longer accepts new inputs");
+  if (receipt.manifest_mode && !input.manifestItemId) {
+    conflict("manifest_item_required", "Объявите ссылку в составе поступления.");
+  }
   const hold = await createHold(tx, { projectId, receiptId, source: "import", sourceId: importId, scopeIds });
   await tx.query(
     "INSERT INTO intake_imports (id, project_id, receipt_id, hold_id) VALUES ($1, $2, $3, $4)",
@@ -146,6 +164,7 @@ async function storeImportState(tx: PoolClient, input: ImportContext, status: Im
   );
   const result = { importId: input.importId, status, version };
   await appendIntakeEvent(tx, input.projectId, input.receiptId, "intake.import_updated", result);
+  if (status === "completed") await acceptManifestInput(tx, input);
   return result;
 }
 
@@ -188,6 +207,7 @@ export async function listReceipts(db: Pool, input: { projectId: string; uploadi
 export async function getInventory(db: Pool, input: ReceiptContext) {
   const { rows: [receipt] } = await db.query<{ number: string; sealed: boolean; inventoryOpen: boolean }>(
     `SELECT r.number, r.sealed_at IS NOT NULL AS sealed, ${inventoryOpen} AS "inventoryOpen",
+            r.project_id AS "projectId", ${manifestProjection} AS manifest,
             COALESCE((
                SELECT jsonb_agg(jsonb_build_object(
                  'uploadId', u.id, 'occurrenceId', u.occurrence_id, 'status', u.state,

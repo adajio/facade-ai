@@ -1,6 +1,6 @@
 import { Readable } from "node:stream";
 import type { FastifyInstance, FastifyRequest } from "fastify";
-import type { Pool } from "pg";
+import type { Pool, PoolClient } from "pg";
 import { requireAccess, requireMutationProtection } from "../access/auth.js";
 import type { AccessRequirement } from "../access/auth.js";
 import { executeCommand } from "../access/commands.js";
@@ -9,6 +9,8 @@ import type { IntakeStorage } from "./blob.js";
 import { getOriginal, parseRange } from "./content.js";
 import { IntakeError, invalid, notFound } from "./errors.js";
 import { checksum, parseMediaType, parsePath, parseScopeIds, parseSize, uuid } from "./inputs.js";
+import { parseExclusionReason, parseManifestItems, parseManifestMode, parseManifestVersion } from "./manifest.js";
+import { appendManifestItems, excludeManifestItem, retryManifestLink, startManifestUpload, storeManifestItems } from "./manifest-commands.js";
 import { createReceipt, getInventory, listReceipts, sealReceipt } from "./receipts.js";
 import { cleanIntakeUploads, declareOriginal, getUpload, prepareOriginal, publishPreparedOriginal, retireUpload, writePart } from "./uploads.js";
 
@@ -38,6 +40,14 @@ function engineer(projectId: string): AccessRequirement {
   return { projectId, action: "project:engineer" };
 }
 
+function checkItemScopes(tx: PoolClient, request: FastifyRequest, projectId: string) {
+  return async (scopeIds: string[] | null | undefined) => {
+    for (const scopeId of scopeIds ?? []) {
+      await requireAccess(tx, request, { projectId, scopeId, action: "project:engineer" });
+    }
+  };
+}
+
 async function relatedProject(
   db: Pool, table: "intake_receipts" | "intake_uploads" | "intake_document_versions", id: string, documentId?: string,
 ): Promise<string> {
@@ -47,6 +57,11 @@ async function relatedProject(
   );
   if (!row) notFound();
   return row.project_id;
+}
+
+async function relatedProjectWithSession(db: Pool, request: FastifyRequest, receiptId: string) {
+  await requireAccess(db, request, { action: "session" });
+  return await relatedProject(db, "intake_receipts", receiptId);
 }
 
 function integer(value: unknown, code: string): number {
@@ -81,14 +96,20 @@ async function registerRoutes(app: FastifyInstance, storage: () => IntakeStorage
     };
   });
 
-  app.post("/api/projects/:projectId/receipts", async (request, reply) => {
+  app.post("/api/projects/:projectId/receipts", { bodyLimit: 16 * 1024 * 1024 }, async (request, reply) => {
     const projectId = uuid(parameters(request).projectId);
-    const source = jsonBody(request).source ?? "upload";
+    const raw = jsonBody(request);
+    const mode = raw.mode === undefined && raw.items === undefined ? undefined : parseManifestMode(raw.mode);
+    const items = mode ? parseManifestItems(raw.items) : undefined;
+    const receiptId = mode && raw.receiptId != null ? uuid(raw.receiptId) : undefined;
+    const source = raw.source ?? (items?.every(item => item.kind === "link") ? "import" : "upload");
     if (source !== "upload" && source !== "import") invalid("invalid_receipt_source", "Unknown receipt source");
     const result = await executeCommand(db, request, {
-      operation: "intake.create_receipt", requirement: engineer(projectId), input: { source },
+      operation: "intake.create_receipt", requirement: engineer(projectId), input: { source, mode, receiptId },
     }, async (tx, actor) => {
-      const body = await createReceipt(tx, { projectId, source, createdBy: actor.userId });
+      const body = await createReceipt(tx, { projectId, source, createdBy: actor.userId, receiptId, mode });
+      if (items) await storeManifestItems(tx, { projectId, receiptId: body.receiptId, actorId: actor.userId },
+        1, items, checkItemScopes(tx, request, projectId));
       return { body, status: 201, audit: { objectId: body.receiptId } };
     });
     return reply.code(result.status).send(result.body);
@@ -114,10 +135,80 @@ async function registerRoutes(app: FastifyInstance, storage: () => IntakeStorage
     const receiptId = uuid(parameters(request).receiptId);
     await requireAccess(db, request, { action: "session" });
     const projectId = await relatedProject(db, "intake_receipts", receiptId);
-    emptyBody(request);
+    const raw = jsonBody(request);
+    if (Object.keys(raw).some(key => key !== "manifestVersion")) invalid("invalid_body", "Ожидается версия состава.");
+    const manifestVersion = raw.manifestVersion === undefined ? undefined : parseManifestVersion(raw.manifestVersion);
+    const input = { projectId, receiptId, manifestVersion };
     const result = await executeCommand(db, request, {
-      operation: "intake.seal", requirement: engineer(projectId), input: { receiptId },
-    }, async (tx) => ({ body: await sealReceipt(tx, { projectId, receiptId }), audit: { objectId: receiptId } }));
+      operation: "intake.seal", requirement: engineer(projectId), input: { receiptId, manifestVersion },
+    }, async (tx) => ({ body: await sealReceipt(tx, input), audit: { objectId: receiptId } }));
+    return reply.code(result.status).send(result.body);
+  });
+
+  app.post("/api/receipts/:receiptId/manifest", { bodyLimit: 16 * 1024 * 1024 }, async (request, reply) => {
+    const receiptId = uuid(parameters(request).receiptId);
+    const projectId = await relatedProjectWithSession(db, request, receiptId);
+    const raw = jsonBody(request);
+    const manifestVersion = parseManifestVersion(raw.manifestVersion);
+    const items = parseManifestItems(raw.items);
+    const result = await executeCommand(db, request, {
+      operation: "intake.manifest_append", requirement: engineer(projectId), input: { receiptId, manifestVersion },
+    }, async (tx, actor) => {
+      const body = await appendManifestItems(tx, { projectId, receiptId, manifestVersion, actorId: actor.userId },
+        items, checkItemScopes(tx, request, projectId));
+      return { body, audit: { objectId: receiptId, version: body.manifestVersion } };
+    });
+    return reply.code(result.status).send(result.body);
+  });
+
+  app.post("/api/receipts/:receiptId/manifest/:itemId/upload", async (request, reply) => {
+    const receiptId = uuid(parameters(request).receiptId);
+    const itemId = uuid(parameters(request).itemId);
+    const projectId = await relatedProjectWithSession(db, request, receiptId);
+    const raw = jsonBody(request);
+    const restartUploadId = raw.restartUploadId == null ? null : uuid(raw.restartUploadId);
+    const input = { projectId, receiptId, itemId, restartUploadId };
+    const result = await executeCommand(db, request, {
+      operation: "intake.manifest_upload", requirement: engineer(projectId), input,
+    }, async (tx) => {
+      const body = await startManifestUpload(tx, storage(), input, checkItemScopes(tx, request, projectId));
+      return { body, status: 201, audit: { objectId: body.uploadId } };
+    });
+    return reply.code(result.status).send(result.body);
+  });
+
+  app.post("/api/receipts/:receiptId/manifest/:itemId/exclude", async (request, reply) => {
+    const receiptId = uuid(parameters(request).receiptId);
+    const itemId = uuid(parameters(request).itemId);
+    const projectId = await relatedProjectWithSession(db, request, receiptId);
+    const raw = jsonBody(request);
+    const input = {
+      projectId, receiptId, itemId, manifestVersion: parseManifestVersion(raw.manifestVersion),
+      uploadId: raw.uploadId == null ? null : uuid(raw.uploadId),
+      importId: raw.importId == null ? null : uuid(raw.importId),
+      reason: parseExclusionReason(raw.reason),
+    };
+    const result = await executeCommand(db, request, {
+      operation: "intake.manifest_exclude", requirement: engineer(projectId), input,
+    }, async (tx, actor) => ({
+      body: await excludeManifestItem(tx, { ...input, actorId: actor.userId }, checkItemScopes(tx, request, projectId)),
+      audit: { objectId: itemId, version: input.manifestVersion },
+    }));
+    return reply.code(result.status).send(result.body);
+  });
+
+  app.post("/api/receipts/:receiptId/manifest/:itemId/retry", async (request, reply) => {
+    const receiptId = uuid(parameters(request).receiptId);
+    const itemId = uuid(parameters(request).itemId);
+    const projectId = await relatedProjectWithSession(db, request, receiptId);
+    const importId = uuid(jsonBody(request).importId);
+    const input = { projectId, receiptId, itemId, importId };
+    const result = await executeCommand(db, request, {
+      operation: "intake.manifest_retry_import", requirement: engineer(projectId), input,
+    }, async (tx) => ({
+      body: await retryManifestLink(tx, input, checkItemScopes(tx, request, projectId)),
+      audit: { objectId: itemId },
+    }));
     return reply.code(result.status).send(result.body);
   });
 

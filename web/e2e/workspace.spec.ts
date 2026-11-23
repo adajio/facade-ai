@@ -1,5 +1,5 @@
 import { expect, test } from '@playwright/test';
-import { account, admin, command, pdf, signIn, unique } from './synthetic';
+import { accepted, account, admin, command, pdf, signIn, unique } from './synthetic';
 
 test.describe('Рабочее место на штатном API', () => {
   test.skip(!admin.login || !admin.password, 'Задайте FACADE_E2E_ADMIN_LOGIN и FACADE_E2E_ADMIN_PASSWORD для отдельной синтетической БД');
@@ -17,7 +17,12 @@ test.describe('Рабочее место на штатном API', () => {
     const catalogName = unique('Каталог-web');
     await page.getByLabel('Код каталога').fill(unique('web'));
     await page.getByLabel('Название', { exact: true }).fill(catalogName);
-    await page.getByRole('button', { name: 'Опубликовать каталог' }).click();
+    const [published] = await Promise.all([
+      page.waitForResponse((result) => new URL(result.url()).pathname === '/api/catalogs' && result.request().method() === 'POST'),
+      page.getByRole('button', { name: 'Опубликовать каталог' }).click(),
+    ]);
+    expect(published.ok()).toBe(true);
+    const { id: catalogVersionId } = await published.json() as { id: string };
     await expect(page.getByText('Версия каталога опубликована.')).toBeVisible();
 
     const engineerContext = await browser.newContext({ baseURL });
@@ -31,15 +36,13 @@ test.describe('Рабочее место на штатном API', () => {
       const operator = await account(page.context(), operatorContext, origin, 'web-ops', true);
       const outsider = await account(page.context(), outsiderContext, origin, 'web-out');
 
-      await page.getByRole('navigation', { name: 'Основная навигация' }).getByRole('link', { name: 'Проекты' }).click();
-      await page.getByRole('button', { name: 'Создать проект' }).click();
       const project = unique('Фасад-web');
-      await page.getByLabel('Название проекта').fill(project);
-      await page.getByLabel('Версия каталога').selectOption({ label: catalogName + ' · 1' });
-      await page.getByRole('button', { name: 'Сохранить проект' }).click();
+      const { id: projectId } = await accepted<{ id: string }>(await command(
+        page.context(), origin, '/api/projects', 'POST', { name: project, catalogVersionId },
+      ), 'Проект прежнего формата');
+      const projectPath = '/projects/' + projectId;
+      await page.goto(projectPath + '/overview');
       await expect(page.getByRole('heading', { name: project })).toBeVisible();
-      const projectPath = new URL(page.url()).pathname.replace(/\/overview$/, '');
-      const projectId = projectPath.split('/').at(-1)!;
 
       await page.getByRole('button', { name: 'Добавить область' }).click();
       await page.getByLabel('Название области').fill('Фасад А');
@@ -58,7 +61,7 @@ test.describe('Рабочее место на штатном API', () => {
       await page.getByRole('button', { name: 'Сохранить участника' }).click();
       await expect(page.getByRole('cell', { name: viewer.login, exact: true })).toBeVisible();
 
-      const engineering = await engineerContext.newPage();
+      let engineering = await engineerContext.newPage();
       await signIn(engineering, engineer.login, engineer.password, projectPath + '/receipts');
       await expect(engineering.getByRole('heading', { name: 'Поступления', exact: true })).toBeVisible();
       await expect(engineering.getByRole('link', { name: 'Участники' })).toHaveCount(0);
@@ -68,44 +71,50 @@ test.describe('Рабочее место на штатном API', () => {
         scopeId, recipient: 'Синтетический адресат', items: [],
       })).status()).toBe(422);
       await expect(engineering.getByRole('link', { name: /^Письмо №/ })).toHaveCount(0);
-      await engineering.getByRole('link', { name: 'Поступления' }).click();
-      await engineering.getByRole('button', { name: 'Добавить поступление' }).click();
-      await engineering.getByLabel('Файлы или архивы').setInputFiles(pdf());
-      await engineering.route('**/api/uploads/*/parts/1', async (route) => {
-        const real = await route.fetch({ maxRetries: 0 });
-        expect(real.ok()).toBe(true);
-        await route.abort('connectionreset');
-      }, { times: 1 });
-      await engineering.getByRole('button', { name: 'Начать передачу' }).click();
-      await expect(engineering.getByText('Не удалось связаться с сервером.', { exact: false })).toBeVisible();
-      const list = await engineerContext.request.get('/api/projects/' + projectId + '/receipts?state=uploading');
-      expect(list.ok()).toBe(true);
-      const { receipts } = await list.json();
-      expect(receipts).toHaveLength(1);
-
-      const receiptId = receipts[0].receiptId as string;
-      await engineering.goto(projectPath + '/receipts/' + receiptId + '?scope=' + scopeId);
-      await engineering.getByRole('button', { name: 'Докачать файл' }).click();
-      await engineering.getByLabel('Исходный файл').setInputFiles(pdf());
+      await engineering.goto(projectPath + '/receipts?upload=1');
+      const later = { ...pdf(), name: 'второй-лист.pdf' };
+      await engineering.getByLabel('Файлы или архивы', { exact: true }).setInputFiles([pdf(), later]);
       await engineering.route('**/api/uploads/*/complete', async (route) => {
         const real = await route.fetch({ maxRetries: 0 });
         expect(real.ok()).toBe(true);
         await route.abort('connectionreset');
       }, { times: 1 });
-      await engineering.getByRole('button', { name: 'Продолжить передачу' }).click();
-      await expect(engineering.getByText('Не удалось связаться с сервером.', { exact: false })).toBeVisible();
-      await expect(engineering.getByRole('button', { name: 'Карточка документа' })).toHaveCount(1);
-      await engineering.getByRole('button', { name: 'Карточка документа' }).click();
+      await engineering.getByRole('button', { name: 'Начать передачу' }).click();
+      await expect(engineering.getByText('Осталось входов: 1')).toBeVisible();
+      const receiptPage = new URL(engineering.url()).pathname;
+      const receiptId = receiptPage.split('/').at(-1)!;
+      const list = await engineerContext.request.get('/api/projects/' + projectId + '/receipts?state=uploading');
+      expect(list.ok()).toBe(true);
+      expect((await list.json()).receipts.map((receipt: { receiptId: string }) => receipt.receiptId)).toEqual([receiptId]);
+
+      await engineering.close();
+      engineering = await engineerContext.newPage();
+      await engineering.goto(receiptPage);
+      await engineering.getByRole('button', { name: 'Продолжить передачу', exact: true }).click();
+      await engineering.getByLabel('Файлы или архивы', { exact: true }).setInputFiles(later);
+      await engineering.route('**/api/uploads/*/complete', async (route) => {
+        const real = await route.fetch({ maxRetries: 0 });
+        expect(real.ok()).toBe(true);
+        await route.abort('connectionreset');
+      }, { times: 1 });
+      await engineering.getByRole('form', { name: 'Передача исходных данных' })
+        .getByRole('button', { name: 'Продолжить передачу', exact: true }).click();
+      await expect(engineering.getByText('Опись зафиксирована', { exact: true })).toBeVisible();
+      await expect(engineering.getByRole('link', { name: 'Карточка документа' })).toHaveCount(2);
+      await engineering.getByRole('link', { name: 'Карточка документа' }).first().click();
+      await expect(engineering).toHaveURL(/document=[0-9a-f-]+&row=[0-9a-f-]+/);
+      await engineering.reload();
       await expect(engineering.getByRole('heading', { name: pdf().name })).toBeVisible();
-      await expect(engineering.getByText('Опись открыта')).toBeVisible();
+      const cardUrl = new URL(engineering.url());
       const original = (await engineering.getByRole('link', { name: 'Скачать оригинал' }).getAttribute('href'))!;
       const range = await engineerContext.request.get(original, { headers: { Range: 'bytes=0-7' } });
       expect(range.status()).toBe(206);
       expect(range.headers()['cache-control']).toBe('no-store');
       expect((await range.body()).toString()).toBe('%PDF-1.4');
-      await engineering.getByRole('button', { name: 'Завершить объявление входов' }).click();
-      await expect(engineering.getByText('Опись зафиксирована', { exact: true })).toBeVisible();
-      await engineering.getByRole('button', { name: 'Уточнить область' }).click();
+      await engineering.getByRole('link', { name: 'К описи' }).first().click();
+      await expect(engineering.locator('#occurrence-' + cardUrl.searchParams.get('row'))).toBeFocused();
+      await expect(engineering.getByRole('heading', { name: 'Опись', exact: true })).toBeVisible();
+      await engineering.getByRole('button', { name: 'Уточнить область' }).first().click();
       await engineering.getByRole('checkbox', { name: 'РД · Фасад А' }).check();
       await engineering.getByRole('button', { name: 'Сохранить применимость' }).click();
       await expect(engineering.getByText('Применимость поступления уточнена.')).toBeVisible();
@@ -118,9 +127,9 @@ test.describe('Рабочее место на штатном API', () => {
 
       const viewing = await viewerContext.newPage();
       await signIn(viewing, viewer.login, viewer.password, projectPath + '/receipts/' + receiptId);
-      await expect(viewing.getByRole('button', { name: 'Карточка документа' })).toBeVisible();
+      await expect(viewing.getByRole('link', { name: 'Карточка документа' })).toHaveCount(2);
       expect((await viewerContext.request.get(original, { headers: { Range: 'bytes=0-7' } })).status()).toBe(206);
-      await expect(viewing.getByRole('button', { name: 'Добавить поступление' })).toHaveCount(0);
+      await expect(viewing.getByRole('button', { name: 'Загрузить комплект' })).toHaveCount(0);
       expect((await command(viewerContext, origin, '/api/projects/' + projectId + '/receipts', 'POST', {})).status()).toBe(403);
 
       const operating = await operatorContext.newPage();
@@ -141,7 +150,7 @@ test.describe('Рабочее место на штатном API', () => {
       const blockedView = viewing.getByRole('heading', { name: 'Ресурс недоступен' });
       const loginView = viewing.getByRole('heading', { name: 'Вход', exact: true });
       await expect(blockedView.or(loginView)).toBeVisible({ timeout: 20_000 });
-      await expect(viewing.getByRole('button', { name: 'Карточка документа' })).toHaveCount(0);
+      await expect(viewing.getByRole('link', { name: 'Карточка документа' })).toHaveCount(0);
       expect([401, 403, 404]).toContain((await viewerContext.request.get(original, { headers: { Range: 'bytes=0-7' } })).status());
       if (await loginView.isVisible()) {
         await signIn(viewing, viewer.login, viewer.password, projectPath + '/receipts/' + receiptId);
@@ -152,5 +161,53 @@ test.describe('Рабочее место на штатном API', () => {
     } finally {
       await Promise.all(contexts.map((context) => context.close()));
     }
+  });
+
+  test('Пополняемый приём и карточка работают в проекте без области', async ({ page, baseURL }) => {
+    const origin = new URL(baseURL!).origin;
+    await signIn(page, admin.login!, admin.password!);
+    const catalog = await accepted<{ id: string }>(await command(page.context(), origin, '/api/catalogs', 'POST', {
+      key: unique('intake-open'), name: 'Синтетический каталог приёма', requirements: [],
+    }), 'Каталог');
+    const project = await accepted<{ id: string; scopes: { id: string }[] }>(
+      await command(page.context(), origin, '/api/projects', 'POST', {
+        name: unique('Приём без области'), catalogVersionId: catalog.id,
+      }), 'Проект',
+    );
+    expect(project.scopes).toEqual([]);
+    const path = '/projects/' + project.id + '/receipts';
+    await page.goto(path + '?upload=1');
+    await page.getByLabel('Оставить приём открытым').check();
+    await page.getByLabel('Файлы или архивы', { exact: true }).setInputFiles(pdf());
+    await page.route('**/api/projects/' + project.id + '/receipts', async (route) => {
+      expect(route.request().method()).toBe('POST');
+      const response = await route.fetch({ maxRetries: 0 });
+      expect(response.status()).toBe(201);
+      await route.abort('connectionreset');
+    }, { times: 1 });
+    await page.getByRole('button', { name: 'Начать передачу' }).click();
+    await expect(page.getByText('Приём оставлен открытым', { exact: false })).toBeVisible();
+    await expect(page.getByRole('link', { name: 'Карточка документа' })).toHaveCount(1);
+    await page.getByRole('link', { name: 'Карточка документа' }).click();
+    await expect(page.getByRole('heading', { name: pdf().name })).toBeVisible();
+    expect(new URL(page.url()).searchParams.has('scope')).toBe(false);
+    const badLink = new URL(page.url());
+    badLink.searchParams.set('row', '11111111-1111-4111-8111-111111111111');
+    await page.goto(badLink.href);
+    await expect(page.getByText('Документ недоступен.', { exact: true })).toBeVisible();
+    await expect(page.getByRole('link', { name: 'Скачать оригинал' })).toHaveCount(0);
+    await page.getByRole('link', { name: 'К описи' }).click();
+
+    await page.getByRole('button', { name: 'Добавить ещё' }).click();
+    await page.getByLabel('Файлы или архивы', { exact: true }).setInputFiles({
+      name: 'комплект.zip', mimeType: 'application/zip',
+      buffer: Buffer.from('504b0506' + '00'.repeat(18), 'hex'),
+    });
+    await page.getByRole('button', { name: 'Начать передачу' }).click();
+    await expect(page.getByRole('link', { name: 'Карточка документа' })).toHaveCount(2);
+    await page.getByRole('button', { name: 'Завершить приём', exact: true }).click();
+    await expect(page.getByText('Приём завершён', { exact: false })).toBeVisible();
+    await expect(page.getByText('Опись открыта', { exact: true })).toBeVisible();
+    await expect(page.getByText('Принят · раскрывается', { exact: true })).toBeVisible();
   });
 });

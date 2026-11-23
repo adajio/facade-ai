@@ -5,7 +5,8 @@ import { executeCommand } from "../access/commands.js";
 import { unauthenticated, unavailable } from "../access/errors.js";
 import { parseScopeIds, uuid } from "../intake/inputs.js";
 import { lockIntakeProject } from "../intake/gate.js";
-import { cancelImport, declareImport, updateImport } from "../intake/receipts.js";
+import { cancelImport, updateImport } from "../intake/receipts.js";
+import { queuePublicImport } from "./intake-source.js";
 import { ImportIssue, importLimits } from "./policy.js";
 import { findJob, jobView, setStatus, tryJobLock } from "./state.js";
 import type { Job } from "./state.js";
@@ -67,15 +68,8 @@ export async function register(app: FastifyInstance): Promise<void> {
       for (const scopeId of scopeIds ?? []) {
         await requireAccess(tx, request, { action: "project:engineer", projectId, scopeId });
       }
-      const declared = await declareImport(tx, { projectId, receiptId, scopeIds });
-      await tx.query(
-        "INSERT INTO import_jobs(id, project_id, receipt_id, actor_id, source_url) VALUES ($1,$2,$3,$4,$5)",
-        [declared.importId, projectId, receiptId, actor.userId, url],
-      );
-      return {
-        status: 202, body: { importId: declared.importId, receiptId, status: "queued" },
-        audit: { objectId: declared.importId },
-      };
+      const queued = await queuePublicImport(tx, { projectId, receiptId, actorId: actor.userId, url, scopeIds });
+      return { status: 202, body: queued, audit: { objectId: queued.importId } };
     });
     return reply.code(result.status).send(result.body);
   });
@@ -108,6 +102,8 @@ export async function register(app: FastifyInstance): Promise<void> {
       }
       const job = await findJob(tx, receiptId, importId);
       await lockIntakeProject(tx, projectId);
+      const { rowCount } = await tx.query("SELECT 1 FROM intake_manifest_items WHERE import_id=$1", [importId]);
+      if (rowCount) throw new ImportIssue("manifest_exclusion_reason_required", false, 409);
       const occupied = await tx.query(
         `SELECT 1 FROM intake_occurrences
            WHERE receipt_id=$1 AND (state='accepted' OR (import_id=$2 AND state='declared'))

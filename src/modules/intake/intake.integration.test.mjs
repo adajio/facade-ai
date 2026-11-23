@@ -58,13 +58,14 @@ test("durable intake, replay, project holds and private Range over HTTP", { time
   const connectionString = process.env.DATABASE_URL;
   assert.match(new URL(connectionString).pathname, /^\/test_step3[a-z0-9_]*$/, "Use a fresh isolated step3 database");
   assert.ok(process.env.FACADE_DATA_DIR && process.env.FACADE_S3_BUCKET);
-  const [{ register, createIntakeStorage }, uploads, gate, receipts, { csrfToken }, { transaction }] = await Promise.all([
+  const [{ register, createIntakeStorage }, uploads, gate, receipts, { csrfToken }, { transaction }, imports] = await Promise.all([
     compiled("src/modules/intake/index.js"),
     compiled("src/modules/intake/uploads.js"),
     compiled("src/modules/intake/gate.js"),
     compiled("src/modules/intake/receipts.js"),
     compiled("src/modules/access/auth.js"),
     compiled("src/modules/access/commands.js"),
+    compiled("src/modules/imports/index.js"),
   ]);
   const db = new pg.Pool({ connectionString });
   const storage = createIntakeStorage(process.env.FACADE_DATA_DIR);
@@ -73,6 +74,11 @@ test("durable intake, replay, project holds and private Range over HTTP", { time
     await db.query(await readFile(new URL(`db/migrations/${file}`, root), "utf8"));
   }
   const { project, scopeA, scopeB, owner, outsider } = await fixture(db);
+  const old = await db.query(
+    "INSERT INTO intake_receipts(project_id,created_by,source) VALUES ($1,$2,'upload') RETURNING id",
+    [project, owner.id],
+  );
+  await db.query(await readFile(new URL("db/migrations/03_intake_zz_manifest.sql", root), "utf8"));
   let origin;
   async function startApi() {
     const app = Fastify();
@@ -83,6 +89,7 @@ test("durable intake, replay, project holds and private Range over HTTP", { time
       return reply.code(status).send({ code: error.code, message: status >= 500 ? "Internal error" : error.message });
     });
     await app.register(register);
+    await app.register(imports.register);
     origin = await app.listen({ host: "127.0.0.1", port: 0 });
     t.after(() => app.close());
     return app;
@@ -105,6 +112,11 @@ test("durable intake, replay, project holds and private Range over HTTP", { time
     await gate.lockIntakeProject(tx, project);
     return gate.getIntakeGate(tx, project, scope);
   });
+
+  const legacy = await (await get(`/receipts/${old.rows[0].id}/inventory`)).json();
+  assert.equal(legacy.manifest, null);
+  assert.equal(legacy.sealed, false);
+  await postJson(`/receipts/${old.rows[0].id}/seal`);
 
   const key = randomUUID();
   const newReceipt = () => postJson(`/projects/${project}/receipts`, {}, 201);
@@ -262,6 +274,133 @@ test("durable intake, replay, project holds and private Range over HTTP", { time
   assert.deepEqual(Buffer.from(await historic.arrayBuffer()), pdf.subarray(4, 30));
 
   await expectResponse(await get(content, { range: "bytes=0-3" }, outsider), 404);
+
+
+  await t.test("batch manifest survives interruption, separates seal from inventory, and records exclusions", async () => {
+    const receiptId = randomUUID();
+    const projectReceipts = `/projects/${project}/receipts`;
+    const base = `/receipts/${receiptId}`;
+    const pdfItem = { ...data, scopeIds: undefined, kind: "file", itemId: randomUUID(), size: sourcePdf.length, sha256: sha(sourcePdf) };
+    const zip = Buffer.from("504b0506" + "00".repeat(18), "hex");
+    const archive = { kind: "file", itemId: randomUUID(), relativePath: "folder/source.zip", size: zip.length, sha256: sha(zip) };
+    const link = { kind: "link", itemId: randomUUID(), url: "https://disk.yandex.ru/d/synthetic-expired-share" };
+    const declaration = { receiptId, mode: "once", items: [pdfItem, archive, link] };
+    const first = await post(projectReceipts, declaration, receiptId);
+    await expectResponse(first, 201);
+    await first.body.cancel(); // A lost creation response after the transaction.
+    assert.equal((await postJson(projectReceipts, declaration, 201, receiptId)).receiptId, receiptId);
+
+    const inventory = async (path = base) => (await get(path + "/inventory")).json();
+    const itemUrl = (item, path = base) => path + "/manifest/" + item.itemId;
+    const part = (file, bytes) => fetch(origin + "/api/uploads/" + file.uploadId + "/parts/1", {
+      method: "PUT", headers: { ...mutationHeaders(), "content-type": "application/octet-stream", "x-part-sha256": sha(bytes) },
+      body: bytes,
+    });
+    const publish = async (item, bytes) => {
+      const upload = await postJson(itemUrl(item) + "/upload", {}, 201);
+      const response = await part(upload, bytes);
+      await expectResponse(response, 200);
+      await response.json();
+      return await postJson(`/uploads/${upload.uploadId}/complete`);
+    };
+
+    let view = await inventory();
+    assert.equal(view.manifest.version, 1);
+    assert.deepEqual(view.manifest.items.map(({ kind, status }) => [kind, status]),
+      [["file", "declared"], ["archive", "declared"], ["link", "queued"]]);
+    assert.equal(JSON.stringify(view).includes(link.url), false);
+    await expectResponse(await get(base + "/inventory", {}, outsider), 404);
+    await expectResponse(await post(base + "/uploads", pdfItem), 409);
+    await expectResponse(await post(base + "/imports", { url: link.url }), 409);
+    await expectResponse(await post(base + "/seal", { manifestVersion: 1 }), 409);
+
+    const publishedPdf = await publish(pdfItem, sourcePdf);
+    const archivePath = itemUrl(archive) + "/upload";
+    const originalAttempt = await postJson(archivePath, {}, 201);
+    const storedPart = await part(originalAttempt, zip);
+    await expectResponse(storedPart, 200);
+    await storedPart.body.cancel(); // Confirmed bytes recovered from GET.
+    view = await inventory();
+    assert.equal(view.sealed, false);
+    assert.equal(view.manifest.items[1].confirmedBytes, zip.length);
+    assert.equal(view.occurrences.find(item => item.versionId === publishedPdf.versionId).status, "accepted");
+
+    await db.query("UPDATE intake_uploads SET expires_at=now()-interval '1 second' WHERE id=$1", [originalAttempt.uploadId]);
+    view = await inventory();
+    assert.equal(view.manifest.items[1].status, "expired");
+    assert.equal(view.manifest.items[1].confirmedBytes, 0);
+    const restartKey = randomUUID();
+    const restart = { restartUploadId: originalAttempt.uploadId };
+    const renewed = await postJson(archivePath, restart, 201, restartKey);
+    assert.notEqual(renewed.uploadId, originalAttempt.uploadId);
+    assert.equal((await postJson(archivePath, restart, 201, restartKey)).uploadId, renewed.uploadId);
+    assert.equal((await postJson(archivePath, restart, 201)).uploadId, renewed.uploadId);
+    await expectResponse(await post(`/uploads/${renewed.uploadId}/cancel`), 409);
+    await expectResponse(await part(renewed, zip), 200);
+    const archived = await postJson(`/uploads/${renewed.uploadId}/complete`);
+
+    const importId = view.manifest.items[2].importId;
+    const coords = { projectId: project, receiptId, importId };
+    const failShare = () => transaction(db, async (tx) => {
+      await receipts.updateImport(tx, { ...coords, status: "failed", reason: "remote_not_found" });
+      await tx.query("UPDATE import_jobs SET status='failed',reason='remote_not_found' WHERE id=$1", [importId]);
+    });
+    await failShare();
+    assert.equal((await inventory()).manifest.items[2].canRetry, true);
+    assert.equal((await postJson(itemUrl(link) + "/retry", { importId })).status, "queued");
+    await failShare();
+    assert.equal((await inventory()).sealed, false);
+    await expectResponse(await post(itemUrl(link) + "/exclude", { importId, manifestVersion: 1 }), 422);
+    const exclusionKey = randomUUID();
+    const exclusion = { importId, manifestVersion: 1, reason: "Истёк срок действия синтетической ссылки" };
+    const response = await post(itemUrl(link) + "/exclude", exclusion, exclusionKey);
+    await expectResponse(response, 200);
+    await response.body.cancel(); // The automatic seal committed before the response was read.
+    view = await inventory();
+    assert.equal(view.sealed, true);
+    assert.equal(view.inventoryOpen, true);
+    assert.equal(view.manifest.items[2].status, "excluded");
+    assert.equal(view.manifest.items[2].reason, exclusion.reason);
+    assert.equal(view.occurrences.filter(item => item.status === "accepted").length, 2);
+    assert.equal((await postJson(itemUrl(link) + "/exclude", exclusion, 200, exclusionKey)).sealed, true);
+    assert.deepEqual(await postJson(base + "/seal", { manifestVersion: 1 }), { receiptId, sealed: true });
+    const sealEvents = await db.query("SELECT count(*)::int AS count FROM intake_events WHERE receipt_id=$1 AND type='intake.receipt_sealed'", [receiptId]);
+    assert.equal(sealEvents.rows[0].count, 1);
+    await transaction(db, (tx) => receipts.completeOccurrenceInventory(tx, {
+      projectId: project, receiptId, occurrenceId: archived.occurrenceId,
+    }));
+    assert.equal((await inventory()).inventoryOpen, false);
+
+    const open = await postJson(projectReceipts, { mode: "open", items: [pdfItem] }, 201);
+    const openPath = `/receipts/${open.receiptId}`;
+    const start = await postJson(itemUrl(pdfItem, openPath) + "/upload", {}, 201);
+    await expectResponse(await part(start, sourcePdf), 200);
+    await postJson(`/uploads/${start.uploadId}/complete`);
+    assert.equal((await inventory(openPath)).sealed, false);
+    const append = { manifestVersion: 1, items: [archive] };
+    const appendKey = randomUUID();
+    assert.equal((await postJson(openPath + "/manifest", append, 200, appendKey)).manifestVersion, 2);
+    assert.equal((await postJson(openPath + "/manifest", append, 200, appendKey)).manifestVersion, 2);
+    await expectResponse(await post(openPath + "/seal", { manifestVersion: 1 }), 409);
+    const dropped = { manifestVersion: 2, reason: "Проверка исключения входа до передачи" };
+    await postJson(itemUrl(archive, openPath) + "/exclude", dropped);
+    assert.equal((await inventory(openPath)).sealed, false);
+    assert.equal((await postJson(openPath + "/seal", { manifestVersion: 2 })).sealed, true);
+    assert.equal((await inventory(openPath)).inventoryOpen, false);
+
+    const source = await postJson(projectReceipts, { mode: "once", items: [link] }, 201);
+    const sourcePath = `/receipts/${source.receiptId}`;
+    const remoteId = (await inventory(sourcePath)).manifest.items[0].importId;
+    const sourceCoords = { projectId: project, receiptId: source.receiptId, importId: remoteId };
+    await transaction(db, async (tx) => {
+      await receipts.updateImport(tx, { ...sourceCoords, status: "running" });
+      await receipts.updateImport(tx, { ...sourceCoords, status: "completed" });
+    });
+    const remote = await inventory(sourcePath);
+    assert.equal(remote.sealed, true);
+    assert.equal(remote.manifest.items[0].status, "accepted");
+  });
+
   await db.query("DELETE FROM project_memberships WHERE user_id=$1 AND project_id=$2", [owner.id, project]);
   await expectResponse(await get(content, { range: "bytes=0-3" }), 404);
   await expectResponse(await post(u + "/complete", {}, completionKey), 404);
