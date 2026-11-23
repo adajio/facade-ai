@@ -202,4 +202,31 @@ test("an addressed mark without identity does not silently join or become a conf
   assert.equal(distinct.items[0].reasons[0], "facades_differ");
   assert.deepEqual(comparisonReview([a, { ...b, finding: { ...b.finding, applicability: "superseded" } }],
     [oa, ob], [], null, "P", [], [loose]).items, []);
+  const unknown = { ...b, membership: { kind: "unidentified" }, stage: null,
+    finding: { ...b.finding, sourceRole: "unknown" } };
+  const diagnostic = comparisonReview([a, unknown], [oa, ob], [], null, null, []);
+  assert.equal(diagnostic.items.length, 1);
+  assert.equal(diagnostic.items[0].facadeId, null);
+  for (const reason of ["facade_link_unproven", "variant_unproven", "project_stage_unconfirmed", "source_stage_unproven", "value_role_unproven"]) {
+    assert.ok(diagnostic.items[0].reasons.includes(reason), reason);
+  }
+  assert.deepEqual(diagnostic.items[0].sources.map(({ citation: { evidenceId, versionId } }) => [evidenceId, versionId]),
+    [["e-A", "v-A"], ["e-B", "v-B"]]);
+  assert.deepEqual(comparisonReview([a, { ...unknown, property: "Other spacing" }], [oa, ob], [], null, null, []).items, []);
+  assert.deepEqual(comparisonReview([a, { ...unknown, addressedValue: false }], [oa, ob], [], null, null, []).items, []);
+
+  const { facadeReview, requirementsFor } = await built("assessment/facade-model");
+  const { evaluate, pairProofVersion } = await built("assessment/domain");
+  const scope = { ...context, facadeId: id };
+  const [requirement] = requirementsFor([fixtureRow], scope, "P");
+  const complete = { complete: true, reason: null, basisIds: [] };
+  const coverage = { inventory: complete, map: complete, reading: complete, subject: complete };
+  const possible = { ...b, membership: { kind: "facades", facadeIds: ["other-facade"] }, variant: "V1" };
+  const attempted = [{ a: "a", b: "b", proof: { version: pairProofVersion, variant: "V1", scope: id,
+    revisionA: "RA", revisionB: "RB" } }];
+  for (const otherFact of [unknown, possible]) {
+    const review = facadeReview({ questionId: "q", context: scope, stage: "P", requirement,
+      facts: [a, otherFact], pairs: attempted, coverage, versionIds: ["v-A", "v-B"], supplementReceiptIds: [] });
+    assert.equal(evaluate(requirement, review).outcome, "needs_review");
+  }
 });

@@ -6,7 +6,7 @@ import { requirementsFor, type FacadeContext, type FacadeFact, type FacadeReadou
 
 export type ComparisonGap = "facade_link_unproven" | "facades_differ" | "variant_unproven" | "variants_differ" | "revisions_unproven" |
   "project_stage_unconfirmed" | "source_stage_unproven" | "source_stages_differ" | "source_role_unproven" |
-  "comparison_rule_unproven" | "units_not_comparable" | "pair_verification_required";
+  "value_role_unproven" | "comparison_rule_unproven" | "units_not_comparable" | "pair_verification_required";
 
 type ComparisonSource = { citation: Citation; binding: FacadeObservation["binding"]; variant: string | null;
   stage: string | null; revision: string | null; revisionStatus: FacadeObservation["revisionStatus"];
@@ -20,6 +20,30 @@ const maxBranchWitnesses = 12;
 const subjectKey = requirementSubjectKey;
 const sourceAddress = ({ versionId, address, value, unit }: Citation) => canonicalJson([versionId, address, value, unit]);
 const physicalPair = (a: Citation, b: Citation) => canonicalJson([sourceAddress(a), sourceAddress(b)].sort());
+type AddressedFact = { fact: FacadeFact; observation: FacadeObservation };
+
+function placed({ fact: { membership } }: AddressedFact) {
+  return membership.kind === "common" || membership.kind === "facades" && membership.facadeIds.length === 1;
+}
+
+function* comparisonGroups(groups: Iterable<Map<string, AddressedFact>>, plain: Iterable<Map<string, AddressedFact>>) {
+  const byBranch = (group: Map<string, AddressedFact>) => Object.groupBy(group.values(), ({ fact }) => fact.finding.citation.branch);
+  for (const group of groups) {
+    const { A = [], B = [] } = byBranch(group);
+    if (A.length && B.length) yield [A, B];
+  }
+  // An addressed property can be useful for review before its place has a facade.
+  // This pairing is exploratory and is never passed to assessment or letters.
+  const unidentified = ({ fact }: AddressedFact) => fact.membership.kind === "unidentified";
+  for (const group of plain) {
+    const { A = [], B = [] } = byBranch(group);
+    if (!A.length || !B.length) continue;
+    const left = A.filter(unidentified);
+    const right = B.filter(unidentified);
+    if (left.length) yield [left, B.filter(placed)];
+    if (right.length) yield [A.filter(placed), right];
+  }
+}
 
 export function comparisonReview(facts: FacadeFact[], observations: FacadeObservation[], contexts: FacadeContext[],
   catalog: Catalog | null, stage: string | null, verifiedPairs: FacadeReadout["pairs"],
@@ -46,7 +70,8 @@ export function comparisonReview(facts: FacadeFact[], observations: FacadeObserv
     return left?.property && right?.property ? [canonicalJson([canonicalSubject(left.property), proof.scope,
       physicalPair(left.finding.citation, right.finding.citation)])] : [];
   }));
-  const groups = new Map<string, Map<string, { fact: FacadeFact; observation: FacadeObservation }>>();
+  const groups = new Map<string, Map<string, AddressedFact>>();
+  const byProperty = new Map<string, Map<string, AddressedFact>>();
   const unresolvedByFact = Map.groupBy(unresolved, ({ factId }) => factId);
   let limited = false;
   for (const fact of facts) {
@@ -55,21 +80,26 @@ export function comparisonReview(facts: FacadeFact[], observations: FacadeObserv
     if (!observation || !fact.property || kind !== "value" || !fact.addressedValue || applicability === "superseded" ||
         fact.finding.sourceRole === "other") continue;
     const property = canonicalSubject(fact.property);
+    const address = canonicalJson([citation.branch, sourceAddress(citation)]);
+    const byAddress = byProperty.get(property) ?? new Map();
+    const entry = { fact, observation };
+    const prior = byAddress.get(address);
+    if (!prior || !placed(prior) && placed(entry)) byAddress.set(address, entry);
+    byProperty.set(property, byAddress);
     const hints = new Set(observation.binding.candidates.flatMap(({ id, label }) => [`id:${id}`, `label:${subjectKey(label)}`]));
     for (const { label } of unresolvedByFact.get(fact.finding.citation.observationId) ?? []) hints.add(`label:${subjectKey(label)}`);
     if (observation.binding.state === "common") hints.add("common");
     for (const hint of hints) {
       const groupKey = canonicalJson([property, hint]);
       const group = groups.get(groupKey) ?? new Map();
-      const address = canonicalJson([citation.branch, sourceAddress(citation)]);
-      if (!group.has(address)) group.set(address, { fact, observation });
+      if (!group.has(address)) group.set(address, entry);
       groups.set(groupKey, group);
     }
   }
   const items = new Map<string, ComparisonItem>();
-  for (const group of groups.values()) {
-    const { A = [], B = [] } = Object.groupBy(group.values(), ({ fact }) => fact.finding.citation.branch);
-    if (A.length && B.length && Math.max(A.length, B.length) > maxBranchWitnesses) limited = true;
+  for (const [A, B] of comparisonGroups(groups.values(), byProperty.values())) {
+    if (!A.length || !B.length) continue;
+    if (Math.max(A.length, B.length) > maxBranchWitnesses) limited = true;
     for (const left of A.slice(0, maxBranchWitnesses)) for (const right of B.slice(0, maxBranchWitnesses)) {
       const { fact: a, observation: oa } = left;
       const { fact: b, observation: ob } = right;
@@ -95,8 +125,8 @@ export function comparisonReview(facts: FacadeFact[], observations: FacadeObserv
       else if (subjectKey(a.variant) !== subjectKey(b.variant)) reasons.push("variants_differ");
       if ([oa, ob].some(({ revision, revisionStatus }) => !revision || revisionStatus !== "current")) reasons.push("revisions_unproven");
       if (!stage) reasons.push("project_stage_unconfirmed");
-      else if (!a.stage || !b.stage) reasons.push("source_stage_unproven");
-      else if ([a.stage, b.stage].some((value) => subjectKey(value) !== subjectKey(stage))) reasons.push("source_stages_differ");
+      if (!a.stage || !b.stage) reasons.push("source_stage_unproven");
+      else if (stage && [a.stage, b.stage].some((value) => subjectKey(value) !== subjectKey(stage))) reasons.push("source_stages_differ");
       if ([a, b].some(({ finding }) => finding.sourceRole === "unknown")) reasons.push("source_role_unproven");
       else if (requirements && catalog) {
         const allowed = requirements.some((requirement) =>
@@ -106,6 +136,7 @@ export function comparisonReview(facts: FacadeFact[], observations: FacadeObserv
           allowsCatalogPair(requirement.comparison, a.finding, b.finding));
         if (!allowed) reasons.push("comparison_rule_unproven");
       } else if (!catalog || a.finding.sourceRole !== b.finding.sourceRole) reasons.push("comparison_rule_unproven");
+      if (a.finding.sourceRole !== b.finding.sourceRole && (!a.finding.valueRole || !b.finding.valueRole)) reasons.push("value_role_unproven");
       if (values === "unknown") reasons.push("units_not_comparable");
       if (!reasons.length) {
         if (knownPairs.has(comparisonKey)) continue;
