@@ -1,7 +1,7 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import { Commands } from '../lib/commands';
-  import { conflictMessage } from '../lib/conflict';
+  import { conflictMessage, conflictVersion } from '../lib/conflict';
   import { type Catalog, type Project } from '../lib/contracts';
   import { describe, id, query, type Api } from '../lib/http';
   import { date, label } from '../lib/format';
@@ -10,11 +10,21 @@
 
   type Member = { userId: string; login: string; role: string; expiresAt?: string; scopeId?: string; reason?: string };
   type Page = { members: Member[]; version: number; nextCursor?: string | null };
+  type CatalogPage = { catalogs: Catalog[]; reason: string; nextCursor: string | null; version: number };
+  const catalogReasons: Record<string, string> = {
+    stage_unknown: 'Подтвердите стадию проекта.',
+    facades_unconfirmed: 'Ожидается подтверждение типов фасадов.',
+    no_approved_profile: 'Для установленной стадии и типов фасадов пока нет утверждённого профиля.',
+    multiple_profiles: 'Подходит несколько утверждённых версий. Уточните исходные сведения или выберите версию.',
+  };
   let { api, project, refresh }: { api: Api; project: Project; refresh: () => Promise<void> } = $props();
   const commands = new Commands(() => api);
   let base = $derived(projectApi(project.id));
   let members = $state<Member[]>([]);
   let catalogs = $state<Catalog[]>([]);
+  let catalogReason = $state('');
+  let catalogCursor = $state<string | null>(null);
+  let catalogVersion = $state<number>();
   let version = $state<number>();
   let cursor = $state<string | null>(null);
   let userId = $state('');
@@ -23,6 +33,8 @@
   let temporaryScope = $state('');
   let reason = $state('');
   let catalogVersionId = $state('');
+  let stage = $state('');
+  let stageReason = $state('');
   let busy = $state(false);
   let error = $state('');
   let status = $state('');
@@ -43,25 +55,44 @@
     }
   }
 
+  async function loadCatalogOptions(next?: string) {
+    try {
+      const page = await api.json<CatalogPage>(query(base + '/catalog-options', { cursor: next }));
+      if (next && page.version !== catalogVersion) return await loadCatalogOptions();
+      catalogs = next ? [...catalogs, ...page.catalogs] : page.catalogs;
+      if (!next) {
+        catalogReason = page.reason;
+        catalogVersion = page.version;
+        catalogVersionId = '';
+      }
+      catalogCursor = page.nextCursor;
+    } catch (problem) {
+      error = describe(problem);
+    }
+  }
+
+  async function reload() {
+    await Promise.all([load(), loadCatalogOptions()]);
+  }
+
   onMount(() => {
-    catalogVersionId = project.catalogVersionId ?? '';
-    void load();
-    void api.json<{ catalogs: Catalog[] }>('/api/catalogs').then((data) => catalogs = data.catalogs)
-      .catch((problem) => error = describe(problem));
+    stage = project.stage ?? '';
+    void reload();
   });
 
-  async function modify(path: string, method: string, body: unknown, message: string) {
-    if (busy || version == null) return;
-    const expected = version;
+  async function modify(path: string, method: string, body: unknown, message: string, expected = version) {
+    if (busy || expected == null) return;
     error = '';
     status = '';
     busy = true;
     try {
       await commands.send(base + path, method, body, expected);
       status = message;
-      await Promise.all([refresh(), load()]);
+      await Promise.all([refresh(), reload()]);
+      if (path === '/stage') stageReason = '';
     } catch (problem) {
       error = conflictMessage(problem, expected);
+      if (conflictVersion(problem, expected)) await Promise.all([refresh(), reload()]);
     } finally {
       busy = false;
     }
@@ -69,7 +100,7 @@
 </script>
 
 <section class="card table-card">
-  <div class="card-header"><h2>Доступ к проекту</h2><button type="button" onclick={() => load()} disabled={busy}>Обновить назначения</button></div>
+  <div class="card-header"><h2>Доступ к проекту</h2><button type="button" onclick={() => reload()} disabled={busy}>Обновить назначения</button></div>
   {#if members.length}
     <div class="table-wrap">
       <table>
@@ -112,19 +143,47 @@
     </form>
   </section>
   <section class="card">
-    <h2>Закреплённый каталог</h2>
-    {#if project.catalog}<p>{project.catalog.name} · версия {project.catalog.revision}</p>{/if}
+    <h2>Рабочий каталог</h2>
+    {#if project.catalog}
+      <p>{project.catalog.name} · версия {project.catalog.revision}</p>
+      {#if project.catalogState === 'legacy_empty'}<p>В исторической версии нет требований.</p>{/if}
+    {:else}
+      <p>Нет рабочего каталога.</p>
+    {/if}
+    {#if catalogReasons[catalogReason]}<p>{catalogReasons[catalogReason]}</p>{/if}
+    {#if catalogs.length}
+      <form onsubmit={(event) => {
+        event.preventDefault();
+        void modify('/catalog', 'PUT', { catalogVersionId }, 'Версия каталога закреплена.', catalogVersion);
+      }}>
+        <label>Версия каталога
+          <select required bind:value={catalogVersionId}>
+            <option value="">Выберите каталог</option>
+            {#each catalogs as catalog (catalog.id)}<option value={catalog.id}>{catalog.name} · {catalog.revision}</option>{/each}
+          </select>
+        </label>
+        {#if catalogCursor}<button type="button" disabled={busy} onclick={() => loadCatalogOptions(catalogCursor ?? undefined)}>Ещё версии</button>{/if}
+        <div class="actions"><button class="primary" disabled={busy || catalogVersion == null || !catalogVersionId}>Назначить рабочий каталог</button></div>
+      </form>
+    {/if}
+  </section>
+  <section class="card">
+    <h2>Стадия проекта</h2>
+    {#if project.stage}
+      <p>Подтверждённая стадия: {project.stage}</p>
+    {:else if project.stageStatus === 'legacy_unconfirmed'}
+      <p>Стадия проекта не подтверждена. Исторические стадии указаны в областях.</p>
+    {:else}
+      <p>Стадия проекта не установлена.</p>
+    {/if}
+    {#if project.confirmedFacadeKinds?.length}<p>Подтверждённые типы фасадов: {project.confirmedFacadeKinds.join(', ')}</p>{/if}
     <form onsubmit={(event) => {
       event.preventDefault();
-      void modify('/catalog', 'PUT', { catalogVersionId }, 'Версия каталога закреплена.');
+      void modify('/stage', 'PUT', { stage, reason: stageReason }, 'Стадия проекта сохранена.');
     }}>
-      <label>Версия каталога
-        <select required bind:value={catalogVersionId}>
-          <option value="">Выберите каталог</option>
-          {#each catalogs as catalog (catalog.id)}<option value={catalog.id}>{catalog.name} · {catalog.revision}</option>{/each}
-        </select>
-      </label>
-      <div class="actions"><button class="primary" disabled={busy || version == null}>Закрепить каталог</button></div>
+      <label>Код стадии<input required maxlength="200" bind:value={stage} /></label>
+      <label>Основание подтверждения<input required maxlength="500" bind:value={stageReason} /></label>
+      <div class="actions"><button class="primary" disabled={busy || version == null || !stage.trim() || !stageReason.trim()}>Подтвердить стадию проекта</button></div>
     </form>
   </section>
 </div>

@@ -28,6 +28,7 @@ export interface CatalogRequirement {
   formats: string[];
   equivalents: string[];
   applicability: string;
+  level?: 'facade' | 'common';
   sourceRoles: string[];
   completenessCriterion: string;
   addressee: string;
@@ -40,6 +41,8 @@ export function requirements(value: unknown): CatalogRequirement[] {
     const row = object(entry);
     const key = text(row.key, 'key', 100);
     if (keys.has(key)) throw invalid('duplicate_requirement');
+    const { level } = row;
+    if (level !== undefined && level !== 'facade' && level !== 'common') throw invalid('invalid_requirement_level');
     keys.add(key);
     return {
       key,
@@ -47,6 +50,7 @@ export function requirements(value: unknown): CatalogRequirement[] {
       formats: list(row.formats, 'formats', 1),
       equivalents: list(row.equivalents, 'equivalents'),
       applicability: text(row.applicability, 'applicability', 2000),
+      ...(level === undefined ? {} : { level }),
       sourceRoles: list(row.sourceRoles, 'sourceRoles', 1),
       completenessCriterion: text(row.completenessCriterion, 'completenessCriterion', 2000),
       addressee: text(row.addressee, 'addressee'),

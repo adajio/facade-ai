@@ -19,6 +19,11 @@
   let name = $state('');
   let key = $state('');
   let requirements = $state<Requirement[]>([]);
+  let publishDefault = $state(false);
+  let profileStage = $state('');
+  let profileFacades = $state('');
+  let approvalReference = $state('');
+  let facadeKinds = $derived(profileFacades.split(',').map((kind) => kind.trim()).filter(Boolean));
   let editing = $state<User>();
   let link = $state('');
   let status = $state('');
@@ -82,11 +87,19 @@
       <h2>Новая версия каталога</h2>
       <form onsubmit={(event) => {
         event.preventDefault();
-        void modify('/api/catalogs', 'POST', { name, key, requirements }, 'Версия каталога опубликована.');
+        const defaultProfile = publishDefault ? { stage: profileStage, facadeKinds, approvalReference } : undefined;
+        void modify('/api/catalogs', 'POST', { name, key, requirements, defaultProfile }, 'Версия каталога опубликована.');
       }}>
         <div class="form-row"><label>Код каталога<input bind:value={key} required /></label><label>Название<input bind:value={name} required /></label></div>
         <CatalogFields bind:requirements />
-        <div class="actions"><button class="primary" disabled={busy}>Опубликовать каталог</button></div>
+        <label><input type="checkbox" bind:checked={publishDefault} /> Опубликовать утверждённый рабочий профиль</label>
+        {#if publishDefault}
+          <label>Код стадии<input required maxlength="200" bind:value={profileStage} /></label>
+          <label>Коды подтверждённых типов фасадов через запятую<input required bind:value={profileFacades} /></label>
+          <label>Ссылка или номер решения об утверждении<input required maxlength="500" bind:value={approvalReference} /></label>
+          {#if !requirements.length}<p>Добавьте утверждённые требования для рабочего профиля.</p>{/if}
+        {/if}
+        <div class="actions"><button class="primary" disabled={busy || (publishDefault && (!requirements.length || !facadeKinds.length))}>Опубликовать каталог</button></div>
       </form>
     </section>
   </div>

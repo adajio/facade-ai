@@ -2,16 +2,14 @@
   import { onMount } from 'svelte';
   import { describe, query, type Api } from '../lib/http';
   import { Commands } from '../lib/commands';
-  import { collection, type Catalog, type Project, type Session } from '../lib/contracts';
+  import { type Project, type Session } from '../lib/contracts';
   import { projectUrl } from '../lib/routes';
   import { date, label } from '../lib/format';
   import Notice from '../lib/Notice.svelte';
 
   let { api, session, refresh }: { api: Api; session: Session; refresh: () => Promise<void> } = $props();
   const commands = new Commands(() => api);
-  let catalogs = $state<Catalog[]>([]);
   let name = $state('');
-  let catalogVersionId = $state('');
   let filter = $state('');
   let extra = $state<Project[]>([]);
   let next = $state<string | null>();
@@ -41,18 +39,13 @@
     }
   }
 
-  async function show() {
+  function show() {
     creating = true;
     error = '';
-    try {
-      catalogs = collection(await api.json<Catalog[] | { catalogs: Catalog[] }>('/api/catalogs'), 'catalogs');
-    } catch (problem) {
-      error = describe(problem);
-    }
   }
 
   onMount(() => {
-    if (canCreate && !session.projects.length) void show();
+    if (canCreate && !session.projects.length) show();
   });
 
   async function submit(event: SubmitEvent) {
@@ -62,7 +55,7 @@
     error = '';
     try {
       const result = await commands.send<Project | { project: Project }>('/api/projects', 'POST', {
-        name: name.trim(), catalogVersionId,
+        name: name.trim(), mode: 'intake',
       });
       const project = 'project' in result ? result.project : result;
       window.location.assign(projectUrl(project.id));
@@ -85,18 +78,11 @@
       <h2>Новый проект</h2>
       <form onsubmit={submit}>
         <div class="form-row">
-          <label>Название проекта <input name="project-name" required bind:value={name} /></label>
-          <label>Версия каталога
-            <select required bind:value={catalogVersionId}>
-              <option value="">Выберите каталог</option>
-              {#each catalogs as catalog (catalog.id)}<option value={catalog.id}>{catalog.name} · {catalog.revision}</option>{/each}
-            </select>
-          </label>
+          <label>Название проекта <input name="project-name" maxlength="200" required bind:value={name} /></label>
         </div>
         <Notice kind="error" message={error} />
-        {#if !catalogs.length && !error}<p class="muted">В организации пока нет доступных версий каталога.</p>{/if}
         <div class="actions">
-          <button class="primary" disabled={pending || !catalogVersionId}>Сохранить проект</button>
+          <button class="primary" disabled={pending || !name.trim()}>Сохранить проект</button>
           <button type="button" class="quiet" onclick={() => creating = false}>Отмена</button>
         </div>
       </form>
@@ -119,7 +105,7 @@
               <tr>
                 <td><a class="row-link" href={projectUrl(project.id)}>{project.name}</a></td>
                 <td>{label(project.role)}</td>
-                <td>{project.catalog ? project.catalog.name + ' · ' + project.catalog.revision : '—'}</td>
+                <td>{project.catalog ? project.catalog.name + ' · ' + project.catalog.revision : project.scopeId ? '—' : 'Нет рабочего каталога'}</td>
                 <td>{date(project.updatedAt)}</td>
               </tr>
             {/each}

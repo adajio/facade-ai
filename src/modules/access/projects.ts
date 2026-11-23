@@ -1,7 +1,5 @@
 import type { FastifyInstance, FastifyRequest } from 'fastify';
 import type { Pool, PoolClient } from 'pg';
-import { refreshScopeAssessment } from '../assessment/index.js';
-import { lockIntakeProject } from '../intake/index.js';
 import {
   authorize, csrfToken, organizationActions, projectActions, readCookie, readSession, requireAccess,
   revokeSessions, touchSession, uuid,
@@ -12,24 +10,14 @@ import type { ProjectScope } from './commands.js';
 import { AccessError, forbidden, invalid, unavailable } from './errors.js';
 import { object, requirements, text } from './input.js';
 import type { CatalogRequirement } from './input.js';
+import {
+  assertApplicableCatalog, assignCatalog, catalogColumns, catalogOptions, catalogProfileColumn, catalogState, defaultProfile,
+  getCatalog, getProject, lockProjectApplicability, projectColumns, resolvePublishedProfile, stageStatus, versionHref,
+} from './project-state.js';
+import type { Catalog, Project } from './project-state.js';
+import { registerStages } from './stages.js';
 import { publicAccount } from './sessions.js';
 import { getAccount } from './users.js';
-
-interface Project {
-  id: string;
-  organizationId: string;
-  name: string;
-  catalogVersionId: string;
-  version: number;
-}
-
-interface Catalog {
-  id: string;
-  key: string;
-  name: string;
-  revision: number;
-  requirements: CatalogRequirement[];
-}
 
 interface ProjectMember {
   userId: string;
@@ -42,29 +30,6 @@ interface ProjectMember {
 type ProjectParams = { projectId: string };
 type ScopeParams = ProjectParams & { scopeId: string };
 type MemberParams = ProjectParams & { userId: string };
-
-const projectColumns = 'id, organization_id AS "organizationId", name, catalog_version_id AS "catalogVersionId", version';
-const catalogColumns = 'id, catalog_key AS key, name, revision, requirements';
-
-function versionHref(projectId: string) { return `/api/projects/${projectId}`; }
-
-async function getProject(db: Pool | PoolClient, id: string, lock = false) {
-  const { rows: [row] } = await db.query<Project>(
-    `SELECT ${projectColumns} FROM projects WHERE id = $1${lock ? ' FOR UPDATE' : ''}`,
-    [id],
-  );
-  if (!row) throw unavailable();
-  return row;
-}
-
-async function getCatalog(db: Pool | PoolClient, organizationId: string, id: string) {
-  const { rows: [row] } = await db.query<Catalog>(
-    `SELECT ${catalogColumns} FROM catalog_versions WHERE organization_id = $1 AND id = $2`,
-    [organizationId, id],
-  );
-  if (!row) throw unavailable();
-  return row;
-}
 
 async function projectVersion(tx: PoolClient, projectId: string) {
   const project = await getProject(tx, projectId, true);
@@ -226,8 +191,12 @@ async function listProjects(db: Pool, request: FastifyRequest) {
   const { rows } = await db.query<{
     id: string; name: string; version: number; role: ProjectRole; scopeId: string | null;
   }>(
-    `SELECT p.id, p.name, p.version, m.role, m.scope_id AS "scopeId"
+    `SELECT p.id, p.name, p.version, m.role, m.scope_id AS "scopeId",
+       CASE WHEN m.scope_id IS NULL THEN p.catalog_version_id END AS "catalogVersionId",
+       CASE WHEN m.scope_id IS NULL AND c.id IS NOT NULL THEN
+         jsonb_build_object('id', c.id, 'name', c.name, 'revision', c.revision) END AS catalog
      FROM project_memberships m JOIN projects p ON p.id = m.project_id
+     LEFT JOIN catalog_versions c ON c.organization_id = p.organization_id AND c.id = p.catalog_version_id
      WHERE m.organization_id = $1 AND m.user_id = $2
        AND (m.expires_at IS NULL OR m.expires_at > statement_timestamp())
        AND ($3::uuid IS NULL OR p.id > $3) ORDER BY p.id LIMIT 101`,
@@ -256,7 +225,8 @@ function registerCatalogs(app: FastifyInstance, db: Pool) {
     }
     await touchSession(db, session);
     const { rows } = await db.query<Catalog>(
-      `SELECT ${catalogColumns} FROM catalog_versions WHERE organization_id = $1
+      `SELECT ${catalogColumns}, ${catalogProfileColumn}
+       FROM catalog_versions WHERE organization_id = $1
        AND ($2::uuid IS NULL OR id > $2) ORDER BY id LIMIT 101`,
       [session.organizationId, query.cursor == null ? null : uuid(query.cursor)],
     );
@@ -269,19 +239,30 @@ function registerCatalogs(app: FastifyInstance, db: Pool) {
       key: text(payload.key, 'key', 100),
       name: text(payload.name, 'name'),
       requirements: requirements(payload.requirements),
+      ...(payload.defaultProfile === undefined ? {} : { defaultProfile: defaultProfile(payload.defaultProfile) }),
     };
     const result = await executeCommand(db, request, {
       requirement: { action: 'organization:admin' },
       operation: 'catalog.publish', input, authorizationWrite: true,
     }, async (tx, actor) => {
+      const profile = input.defaultProfile;
+      if (profile && !input.requirements.length) {
+        throw invalid('empty_default_profile', 'Для рабочего профиля требуется хотя бы одно утверждённое требование.');
+      }
       const { rows: [body] } = await tx.query<Catalog>(
-        `INSERT INTO catalog_versions (organization_id, catalog_key, revision, name, requirements, created_by)
-         SELECT $1, $2, COALESCE(MAX(revision), 0) + 1, $3, $4, $5
+        `INSERT INTO catalog_versions (organization_id, catalog_key, revision, name, requirements, created_by,
+             default_stage, default_facade_kinds, approval_reference)
+         SELECT $1, $2, COALESCE(MAX(revision), 0) + 1, $3, $4, $5, $6, $7, $8
          FROM catalog_versions WHERE organization_id = $1 AND catalog_key = $2
          RETURNING ${catalogColumns}`,
-        [actor.organizationId, input.key, input.name, JSON.stringify(input.requirements), actor.userId],
+        [actor.organizationId, input.key, input.name, JSON.stringify(input.requirements), actor.userId,
+          profile?.stage ?? null, profile?.facadeKinds ?? null, profile?.approvalReference ?? null],
       );
-      return { status: 201, body, audit: { objectId: body.id, version: body.revision } };
+      if (profile) {
+        await resolvePublishedProfile(tx, profile, actor);
+        body.defaultProfile = profile;
+      }
+      return { status: 201, body, audit: { objectId: body.id, version: body.revision, details: profile && { ...profile } } };
     });
     return reply.code(result.status).send(result.body);
   });
@@ -313,11 +294,11 @@ function registerScopes(app: FastifyInstance, db: Pool) {
     const projectId = uuid(request.params.projectId);
     const scopeId = uuid(request.params.scopeId);
     const actor = await requireAccess(db, request, { action: 'project:read', projectId, scopeId });
-    const { rows: [body] } = await db.query<ProjectScope & { requirements: CatalogRequirement[]; catalogVersionId: string }>(
+    const { rows: [body] } = await db.query<ProjectScope & { requirements: CatalogRequirement[]; catalogVersionId: string | null }>(
       `SELECT s.id, p.id AS "projectId", s.stage, s.name, s.version, c.id AS "catalogVersionId",
-              COALESCE(r.requirements, c.requirements) AS requirements
+              COALESCE(r.requirements, c.requirements, '[]'::jsonb) AS requirements
        FROM project_scopes s JOIN projects p ON p.id = s.project_id
-       JOIN catalog_versions c ON c.id = p.catalog_version_id
+       LEFT JOIN catalog_versions c ON c.organization_id = p.organization_id AND c.id = p.catalog_version_id
        LEFT JOIN scope_requirements r ON r.scope_id = s.id AND r.version = s.version AND r.catalog_version_id = c.id
        WHERE p.id = $1 AND s.id = $2`,
       [projectId, scopeId],
@@ -342,6 +323,7 @@ function registerScopes(app: FastifyInstance, db: Pool) {
       },
     }, async (tx, actor) => {
       const project = await getProject(tx, projectId);
+      if (project.catalogVersionId === null) throw invalid('catalog_required', 'Нет рабочего каталога.');
       const { rows: [{ version }] } = await tx.query<{ version: number }>(
         'UPDATE project_scopes SET version = version + 1 WHERE id = $1 AND project_id = $2 RETURNING version',
         [scopeId, projectId],
@@ -362,37 +344,51 @@ export function registerProjects(app: FastifyInstance, db: Pool) {
 
   app.post('/api/projects', async (request, reply) => {
     const payload = object(request.body);
-    const input = {
-      name: text(payload.name, 'name'),
+    const name = text(payload.name, 'name');
+    if (payload.mode !== undefined && payload.mode !== 'intake') throw invalid('invalid_project_mode');
+    if (payload.mode === 'intake' &&
+        ['catalogVersionId', 'stage', 'scopeName'].some((field) => payload[field] != null)) {
+      throw invalid('invalid_intake_project', 'Для первичного приёма укажите название проекта.');
+    }
+    const input = payload.mode === 'intake' ? { name, mode: 'intake' as const } : {
+      name,
       catalogVersionId: uuid(payload.catalogVersionId),
       stage: payload.stage === undefined ? 'design' : text(payload.stage, 'stage'),
       scopeName: payload.scopeName === undefined ? 'Общая область' : text(payload.scopeName, 'scopeName'),
     };
     const result = await executeCommand(db, request, {
       requirement: { action: 'organization:create-project' }, operation: 'project.create', input,
-      authorizeReplay: async (tx, _actor, body: Project) => {
+      authorizeReplay: async (tx, _actor, body: { id: string; version: number }) => {
         const session = await readSession(tx, request);
         await authorize(tx, session, { action: 'project:read', projectId: body.id });
       },
     }, async (tx, actor) => {
-      await getCatalog(tx, actor.organizationId, input.catalogVersionId);
+      const legacy = 'catalogVersionId' in input ? input : undefined;
+      if (legacy?.catalogVersionId) await getCatalog(tx, actor.organizationId, legacy.catalogVersionId);
       const { rows: [project] } = await tx.query<Project>(
-        `INSERT INTO projects (organization_id, name, catalog_version_id)
-         VALUES ($1, $2, $3) RETURNING ${projectColumns}`,
-        [actor.organizationId, input.name, input.catalogVersionId],
+        `INSERT INTO projects (organization_id, name, catalog_version_id, intake_mode)
+         VALUES ($1, $2, $3, $4) RETURNING ${projectColumns.join(', ')}`,
+        [actor.organizationId, input.name, legacy?.catalogVersionId ?? null, !legacy],
       );
       await tx.query(
         `INSERT INTO project_memberships (organization_id, project_id, user_id, role)
          VALUES ($1, $2, $3, 'project_manager')`,
         [actor.organizationId, project.id, actor.userId],
       );
+      if (!legacy) {
+        return {
+          status: 201, body: { ...project, catalog: null, catalogState: 'unassigned', stageStatus: 'unknown', scopes: [] },
+          audit: { projectId: project.id, objectId: project.id, version: project.version },
+        };
+      }
       const { rows: [scope] } = await tx.query<ProjectScope>(
         `INSERT INTO project_scopes (project_id, stage, name) VALUES ($1, $2, $3)
          RETURNING id, project_id AS "projectId", stage, name, version`,
-        [project.id, input.stage, input.scopeName],
+        [project.id, legacy.stage, legacy.scopeName],
       );
+      const { id, name, organizationId, catalogVersionId, version } = project;
       return {
-        status: 201, body: { ...project, scopes: [scope] },
+        status: 201, body: { id, name, organizationId, catalogVersionId, version, scopes: [scope] },
         audit: { projectId: project.id, objectId: project.id, version: project.version },
       };
     });
@@ -403,11 +399,10 @@ export function registerProjects(app: FastifyInstance, db: Pool) {
     const projectId = uuid(request.params.projectId);
     const actor = await requireAccess(db, request, { action: 'project:read', projectId });
     const query = request.query as { cursor?: string };
-    const { rows: [snapshot] } = await db.query<Project & { catalog: Catalog; scopes: ProjectScope[] }>(
-      `SELECT p.id, p.organization_id AS "organizationId", p.name, p.version,
-              p.catalog_version_id AS "catalogVersionId",
-              jsonb_build_object('id', c.id, 'key', c.catalog_key, 'name', c.name,
-                'revision', c.revision, 'requirements', c.requirements) AS catalog,
+    const { rows: [snapshot] } = await db.query<Project & { catalog: Catalog | null; scopes: ProjectScope[] }>(
+      `SELECT ${projectColumns.map((column) => 'p.' + column).join(', ')},
+              CASE WHEN c.id IS NOT NULL THEN jsonb_build_object('id', c.id, 'key', c.catalog_key, 'name', c.name,
+                'revision', c.revision, 'requirements', c.requirements) END AS catalog,
               COALESCE((
                 SELECT jsonb_agg(to_jsonb(scope) ORDER BY scope.id) FROM (
                   SELECT s.id, s.project_id AS "projectId", s.stage, s.name, s.version
@@ -415,46 +410,52 @@ export function registerProjects(app: FastifyInstance, db: Pool) {
                   ORDER BY s.id LIMIT 101
                 ) scope
               ), '[]'::jsonb) AS scopes
-       FROM projects p JOIN catalog_versions c ON c.id = p.catalog_version_id WHERE p.id = $1`,
+       FROM projects p LEFT JOIN catalog_versions c ON c.organization_id = p.organization_id AND c.id = p.catalog_version_id
+       WHERE p.id = $1`,
       [projectId, query.cursor == null ? null : uuid(query.cursor)],
     );
     if (!snapshot) throw unavailable();
     const role = actor.role as ProjectRole;
     return reply.header('ETag', `"${snapshot.version}"`).send({
       ...snapshot,
+      stageStatus: stageStatus(snapshot),
+      catalogState: catalogState(snapshot.catalog),
       scopes: snapshot.scopes.slice(0, 100),
       nextCursor: snapshot.scopes.length > 100 ? snapshot.scopes[99].id : null,
       role, actions: projectActions(role),
     });
   });
 
+  app.get<{ Params: ProjectParams; Querystring: { cursor?: string } }>(
+    '/api/projects/:projectId/catalog-options', async (request) => {
+      const projectId = uuid(request.params.projectId);
+      await requireAccess(db, request, { action: 'project:manage', projectId });
+      const project = await getProject(db, projectId);
+      const options = await catalogOptions(db, project, request.query.cursor == null ? null : uuid(request.query.cursor));
+      return { ...options, version: project.version };
+    },
+  );
+
   app.put<{ Params: ProjectParams }>('/api/projects/:projectId/catalog', async (request, reply) => {
     const projectId = uuid(request.params.projectId);
     const catalogVersionId = uuid(object(request.body).catalogVersionId);
-    let scopes: ProjectScope[];
+    let locked: Awaited<ReturnType<typeof lockProjectApplicability>>;
     const result = await executeCommand(db, request, {
       requirement: { action: 'project:manage', projectId }, operation: 'project.catalog.pin', input: { catalogVersionId },
       version: async (tx) => {
-        await lockIntakeProject(tx, projectId);
-        scopes = await lockProjectScopes(tx, projectId);
-        return projectVersion(tx, projectId);
+        locked = await lockProjectApplicability(tx, projectId);
+        return { current: locked.project.version, href: versionHref(projectId) };
       },
-    }, async (tx, actor) => {
-      await getCatalog(tx, actor.organizationId, catalogVersionId);
-      const current = await getProject(tx, projectId);
+    }, async (tx) => {
+      const { project: current, scopes } = locked;
       if (current.catalogVersionId === catalogVersionId) {
         return { body: current, audit: { objectId: projectId, version: current.version, details: { catalogVersionId } } };
       }
-      // Capture the previous revision even for a scope whose assessment was never read.
-      for (const scope of scopes) await refreshScopeAssessment(tx, projectId, scope.id);
-      const { rows: [body] } = await tx.query<Project>(
-        `UPDATE projects SET catalog_version_id = $2, version = version + 1
-         WHERE id = $1 RETURNING ${projectColumns}`,
-        [projectId, catalogVersionId],
-      );
-      await tx.query('UPDATE project_scopes SET version = version + 1 WHERE project_id = $1', [projectId]);
-      for (const scope of scopes) await refreshScopeAssessment(tx, projectId, scope.id);
-      return { body, audit: { objectId: projectId, version: body.version, details: { catalogVersionId } } };
+      await assertApplicableCatalog(tx, current, catalogVersionId);
+      const body = await assignCatalog(tx, current, scopes, catalogVersionId);
+      return { body, audit: { objectId: projectId, version: body.version, details: {
+        previous: current.catalogVersionId, catalogVersionId, stage: current.stage, facadeKinds: current.confirmedFacadeKinds,
+      } } };
     });
     return reply.code(result.status).header('ETag', `"${result.body.version}"`).send(result.body);
   });
@@ -462,4 +463,5 @@ export function registerProjects(app: FastifyInstance, db: Pool) {
   registerMembers(app, db);
   registerCatalogs(app, db);
   registerScopes(app, db);
+  registerStages(app, db);
 }

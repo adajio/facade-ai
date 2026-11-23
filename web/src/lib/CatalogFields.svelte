@@ -1,7 +1,8 @@
 <script lang="ts" module>
   export type Requirement = {
     key: string; part: string; formats: string[]; equivalents: string[];
-    applicability: string; sourceRoles: string[]; completenessCriterion: string; addressee: string;
+    applicability: string; level?: 'facade' | 'common';
+    sourceRoles: string[]; completenessCriterion: string; addressee: string;
   };
   export function blank(): Requirement {
     return { key: '', part: '', formats: [], equivalents: [], applicability: 'all', sourceRoles: [], completenessCriterion: '', addressee: '' };
@@ -23,6 +24,13 @@
       <label>Наименование<input required bind:value={requirement.part} /></label>
       <label>Область действия<input required bind:value={requirement.applicability} /></label>
     </div>
+    <label>Уровень требования
+      <select bind:value={requirement.level}>
+        <option value={undefined}>По правилу области</option>
+        <option value="facade">Для каждого фасада</option>
+        <option value="common">Для проекта в целом</option>
+      </select>
+    </label>
     <div class="form-row">
       <label>Форматы<input required value={requirement.formats.join(', ')} onchange={(e) => requirement.formats = parse(e.currentTarget.value)} /></label>
       <label>Эквиваленты<input value={requirement.equivalents.join(', ')} onchange={(e) => requirement.equivalents = parse(e.currentTarget.value)} /></label>

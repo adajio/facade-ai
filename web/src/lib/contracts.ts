@@ -31,8 +31,13 @@ export type Project = {
   scopeId?: string | null;
   actions?: string[];
   scopes: Scope[];
-  catalog?: Catalog;
-  catalogVersionId?: string;
+  catalog?: Catalog | null;
+  catalogVersionId?: string | null;
+  catalogState?: 'unassigned' | 'legacy_empty' | 'assigned';
+  intakeMode?: boolean;
+  stage?: string | null;
+  stageStatus?: 'unknown' | 'legacy_unconfirmed' | 'confirmed';
+  confirmedFacadeKinds?: string[];
   updatedAt?: string;
 };
 
@@ -44,7 +49,7 @@ export type Session = {
   nextCursor?: string | null;
 };
 
-export type ProjectRead = Project | { project: Project; actions?: string[]; scopes?: Scope[]; role?: string; catalog?: Catalog };
+export type ProjectRead = Project | { project: Project; actions?: string[]; scopes?: Scope[]; role?: string; catalog?: Catalog | null };
 
 export function projectOf(body: ProjectRead): Project {
   if ('project' in body) {
@@ -53,7 +58,7 @@ export function projectOf(body: ProjectRead): Project {
       actions: body.actions ?? body.project.actions,
       role: body.role ?? body.project.role,
       scopes: body.scopes ?? body.project.scopes ?? [],
-      catalog: body.catalog ?? body.project.catalog,
+      catalog: body.catalog === undefined ? body.project.catalog : body.catalog,
     };
   }
   return { ...body, scopes: body.scopes ?? [] };

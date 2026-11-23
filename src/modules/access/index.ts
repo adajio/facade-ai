@@ -10,6 +10,7 @@ export type { AccessActor, AccessRequirement, ProjectAction, ProjectRole } from 
 export { executeCommand, lockProjectScopes, transaction, writeAudit } from './commands.js';
 export type { AuditEvent, ProjectScope } from './commands.js';
 export { AccessError, sendAccessError } from './errors.js';
+export { updateConfirmedFacadeKinds } from './project-state.js';
 
 const publicMutations = new Set([
   '/api/sessions', '/api/invitations/complete', '/api/password-resets/complete',

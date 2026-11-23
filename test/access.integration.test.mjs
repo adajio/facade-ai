@@ -23,7 +23,8 @@ test('access v1.1 on Fastify and PostgreSQL', { skip: !enabled, timeout: 240_000
   assert.ok(process.env.DATABASE_URL, 'use an isolated migrated test database');
   const { createApi } = await import(new URL('src/platform/api.js', build));
   const { bootstrapAdmin } = await import(new URL('src/modules/access/bootstrap.js', build));
-  const { lockProjectScopes, transaction } = await import(new URL('src/modules/access/index.js', build));
+  const { lockProjectScopes, transaction, updateConfirmedFacadeKinds } = await import(new URL('src/modules/access/index.js', build));
+  const { lockOrganization } = await import(new URL('src/modules/access/commands.js', build));
   process.env.FACADE_LOGIN_ACCOUNT_LIMIT = '8';
   process.env.FACADE_LOGIN_SOURCE_LIMIT = '80';
   const password = randomUUID();
@@ -113,6 +114,160 @@ test('access v1.1 on Fastify and PostgreSQL', { skip: !enabled, timeout: 240_000
   for (const [name, flags] of [['operator', { technicalOperator: true }], ['admin', { orgAdmin: true }]]) {
     await request(`/users/${ids[name]}`, { auth: owner, method: 'PATCH', version: 2, key: `role:${name}`, body: flags });
   }
+
+  await t.test('first intake project and approved catalog resolution', async () => {
+    const creatorId = await invite('intake-creator');
+    await request(`/users/${creatorId}`, {
+      auth: owner, method: 'PATCH', version: 2, key: 'intake-creator:right',
+      body: { canCreateProject: true },
+    });
+    const creator = await login('intake-creator');
+    const initialEngineer = await login('engineer');
+    assert.equal((await db.query('SELECT id FROM catalog_versions')).rowCount, 0);
+    const create = (auth, name, status = 201) => request('/projects', {
+      auth, method: 'POST', key: name, body: { mode: 'intake', name }, status,
+    });
+    await create(initialEngineer, 'no-create-permission', 403);
+    const first = (await create(creator, 'first-intake')).value;
+    assert.deepEqual((await create(creator, 'first-intake')).value, first);
+    const path = `/projects/${first.id}`;
+    const read = (auth = creator) => request(path, { auth });
+    const { value: created } = await read();
+    assert.equal(created.role, 'project_manager');
+    assert.equal(created.catalogVersionId, null);
+    assert.equal(created.catalog, null);
+    assert.equal(created.catalogState, 'unassigned');
+    assert.equal(created.stage, null);
+    assert.equal(created.stageStatus, 'unknown');
+    assert.deepEqual(created.scopes, []);
+    assert.deepEqual((await request('/me', { auth: creator })).value.projects.map(({ id, role }) => [id, role]),
+      [[first.id, 'project_manager']]);
+    await request(path, { auth: owner, status: 404 });
+    const { value: membership } = await request(`${path}/members/${ids.engineer}`, {
+      auth: creator, method: 'PUT', key: 'intake-engineer', version: created.version, body: { role: 'engineer' },
+    });
+    const engineer = await login('engineer');
+    assert.equal((await read(engineer)).value.role, 'engineer');
+    await request(path + '/catalog-options', { auth: engineer, status: 403 });
+    const confirm = (path, auth, key, version, status = 200, stage = 'RD') => request(path + '/stage', {
+      auth, method: 'PUT', key, version, body: { stage, reason: 'Синтетическое решение' }, status,
+    });
+    await confirm(path, engineer, 'engineer-project-stage', membership.version, 403);
+    const staged = (await confirm(path, creator, 'project-stage', membership.version)).value;
+    assert.equal(staged.stageStatus, 'confirmed');
+    const stale = await confirm(path, creator, 'stale-stage', membership.version, 412, 'P');
+    assert.equal(stale.value.currentVersion, staged.version);
+
+    const publish = (auth, key, requirements, defaultProfile, status = 201) => request('/catalogs', {
+      auth, method: 'POST', key, body: { key, name: key, requirements, defaultProfile }, status,
+    });
+    const profile = { stage: 'RD', facadeKinds: ['synthetic-kind'], approvalReference: 'synthetic-reference' };
+    await publish(creator, 'unauthorized-profile', [catalogRule], profile, 403);
+    const empty = (await publish(owner, 'empty-profile', [], profile, 422)).value;
+    assert.equal(empty.code, 'empty_default_profile');
+    const legacyCatalog = (await publish(owner, 'legacy-empty', [])).value;
+    const { value: legacy } = await request('/projects', {
+      auth: owner, method: 'POST', key: 'old-client', body: { name: 'old-client', catalogVersionId: legacyCatalog.id }, status: 201,
+    });
+    const historical = (await request(`/projects/${legacy.id}`, { auth: owner })).value;
+    assert.equal(historical.stageStatus, 'legacy_unconfirmed');
+    assert.equal(historical.stage, null);
+    assert.equal(historical.scopes[0].stage, 'design');
+    assert.equal(historical.catalogState, 'legacy_empty');
+
+    const setKinds = (projectId, expectedVersion, facadeKinds, userId = ids.engineer) => transaction(db, async (tx) => {
+      await lockOrganization(tx, created.organizationId, false);
+      return updateConfirmedFacadeKinds(tx, {
+        projectId, expectedVersion, facadeKinds, actor: {
+          organizationId: created.organizationId, userId, role: userId === creatorId ? 'project_manager' : 'engineer',
+        },
+      });
+    });
+    const resolvedKinds = await setKinds(first.id, staged.version, ['synthetic-kind', 'synthetic-kind']);
+    assert.deepEqual(resolvedKinds.confirmedFacadeKinds, ['synthetic-kind']);
+    assert.equal(resolvedKinds.catalogVersionId, null);
+    const options = (path) => request(path + '/catalog-options', { auth: creator });
+    assert.equal((await options(path)).value.reason, 'no_approved_profile');
+    const invalidLevel = await publish(owner, 'working-invalid-level', [{ ...catalogRule, level: 'document' }], profile, 422);
+    assert.equal(invalidLevel.value.code, 'invalid_requirement_level');
+    const approved = (await publish(owner, 'working-a', [{ ...catalogRule, level: 'facade' }], profile)).value;
+    assert.equal(approved.requirements[0].level, 'facade');
+    assert.equal((await read()).value.catalogVersionId, approved.id);
+    const second = (await create(creator, 'second-intake')).value;
+    const secondPath = `/projects/${second.id}`;
+    const secondStage = (await confirm(secondPath, creator, 'second-stage', second.version)).value;
+    assert.equal((await setKinds(second.id, secondStage.version, profile.facadeKinds, creatorId)).catalogVersionId, approved.id);
+    const racing = (await create(creator, 'racing-intake')).value;
+    const racingPath = `/projects/${racing.id}`;
+    const waiting = await setKinds(racing.id, racing.version, profile.facadeKinds, creatorId);
+    const [, attemptedPin] = await Promise.all([
+      confirm(racingPath, creator, 'racing-stage', waiting.version),
+      fetch(`${origin}/api${racingPath}/catalog`, {
+        method: 'PUT',
+        headers: {
+          Origin: origin, Cookie: creator.cookie, 'X-CSRF-Token': creator.csrf,
+          'Idempotency-Key': 'racing-pin', 'If-Match': `"${waiting.version}"`, 'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ catalogVersionId: approved.id }),
+      }),
+    ]);
+    assert.ok([412, 422].includes(attemptedPin.status));
+    assert.equal((await request(racingPath, { auth: creator })).value.catalogVersionId, approved.id);
+    const otherProfile = (await publish(owner, 'working-b', [{ ...catalogRule, level: 'common' }], profile)).value;
+    assert.equal(otherProfile.requirements[0].level, 'common');
+    const third = (await create(creator, 'third-intake')).value;
+    const thirdPath = `/projects/${third.id}`;
+    const thirdStage = (await confirm(thirdPath, creator, 'third-stage', third.version)).value;
+    await setKinds(third.id, thirdStage.version, profile.facadeKinds, creatorId);
+    const choices = (await options(thirdPath)).value;
+    assert.equal(choices.reason, 'multiple_profiles');
+    assert.deepEqual(choices.catalogs.map(({ id }) => id).sort(), [approved.id, otherProfile.id].sort());
+    const pin = (id, version, status, key) => request(thirdPath + '/catalog', {
+      auth: creator, method: 'PUT', key, version, body: { catalogVersionId: id }, status,
+    });
+    assert.equal((await pin(legacyCatalog.id, choices.version, 422, 'empty-cannot-pin')).value.code, 'catalog_not_applicable');
+    assert.equal((await pin(otherProfile.id, thirdStage.version, 412, 'stale-pin')).value.code, 'version_conflict');
+    assert.equal((await pin(otherProfile.id, choices.version, 200, 'manual-pin')).value.catalogVersionId, otherProfile.id);
+    const afterStageChange = (await confirm(path, creator, 'changed-stage', (await read()).value.version, 200, 'P')).value;
+    assert.equal(afterStageChange.catalogVersionId, approved.id);
+    assert.equal((await db.query('SELECT id FROM project_scopes WHERE project_id = $1', [first.id])).rowCount, 0);
+    assert.equal((await db.query("SELECT id FROM access_audit WHERE project_id = $1 AND action = 'project.catalog.auto_assign'", [first.id])).rowCount, 1);
+
+    const originalId = randomUUID();
+    const sha = '1'.repeat(64);
+    await db.query('INSERT INTO intake_originals (id, project_id, object_key, size, sha256) VALUES ($1,$2,$3,1,$4)',
+      [originalId, first.id, originalId, sha]);
+    const { rows: [document] } = await db.query('INSERT INTO intake_documents (project_id) VALUES ($1) RETURNING id', [first.id]);
+    const { rows: [receipt] } = await db.query("INSERT INTO intake_receipts (project_id, source, created_by) VALUES ($1,'upload',$2) RETURNING id",
+      [first.id, creatorId]);
+    const versions = [];
+    for (const page of ['P', 'RD']) {
+      const { rows: [{ id: versionId }] } = await db.query(
+        "INSERT INTO intake_document_versions (project_id, document_id, original_id, media_type) VALUES ($1,$2,$3,'application/pdf') RETURNING id",
+        [first.id, document.id, originalId]);
+      await db.query(`INSERT INTO reader_maps (project_id, document_id, version_id, reader_version, receipt_id, original_sha256, format, units)
+         VALUES ($1,$2,$3,'fixture',$4,$5,'pdf','[]')`, [first.id, document.id, versionId, receipt.id, sha]);
+      const evidenceId = randomUUID();
+      const address = { unitId: page };
+      await db.query(`INSERT INTO reader_evidence (id, project_id, version_id, reader_version, run_id, branch, operation_key, request_sha256, payload)
+        VALUES ($1,$2,$3,'fixture',$4,'A','title',$5,$6)`, [evidenceId, first.id, versionId, randomUUID(), sha, { address }]);
+      versions.push({ versionId, evidenceId, address, stage: page });
+    }
+    for (const [index, basis] of versions.entries()) {
+      const url = `${path}/versions/${basis.versionId}/stage`;
+      const body = { stage: basis.stage, reason: 'Синтетический титул', evidenceId: basis.evidenceId, target: index ? 'place' : 'document' };
+      const saved = await request(url, { auth: engineer, method: 'PUT', key: `version-stage-${index}`, version: 1, body });
+      assert.equal(saved.value.version, 2);
+      const current = await request(url + (index ? `?evidenceId=${basis.evidenceId}` : ''), { auth: creator });
+      assert.equal(current.value.stage, basis.stage);
+      assert.deepEqual(current.value.address, index ? basis.address : null);
+      await request(url, { auth: engineer, method: 'PUT', key: `version-stale-${index}`, version: 1, body, status: 412 });
+      await request(url, { auth: engineer, method: 'PUT', key: `version-wrong-basis-${index}`, version: 2,
+        body: { ...body, evidenceId: versions[1 - index].evidenceId }, status: 404 });
+    }
+    assert.equal((await read()).value.version, afterStageChange.version);
+  });
+
   const catalogInput = { key: 'fasteners', name: 'Крепёж', requirements: [catalogRule] };
   const { value: catalog } = await request('/catalogs', {
     auth: owner, method: 'POST', body: catalogInput, key: 'catalog-1', status: 201,
@@ -148,7 +303,7 @@ test('access v1.1 on Fastify and PostgreSQL', { skip: !enabled, timeout: 240_000
     const conflict = await createProject({ ...projectInput, name: 'Другое назначение' }, 409);
     assert.equal(conflict.value.code, 'idempotency_conflict');
     await createProject({ ...projectInput, extra: true }, 409);
-    assert.equal((await db.query('SELECT id FROM projects')).rowCount, 1);
+    assert.equal((await db.query('SELECT id FROM projects WHERE name = $1', [projectInput.name])).rowCount, 1);
     const { value } = await request(`/projects/${project.id}/scopes`, {
       auth: owner, method: 'POST', key: 'scope-b', body: { name: 'Б', stage: 'stage-2' }, status: 201,
     });
