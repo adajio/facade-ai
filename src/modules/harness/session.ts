@@ -539,7 +539,7 @@ async function executeTool(
       const stored = await reader.record(tx, context, { evidence: prior.evidence!, quote: anchor.quote,
         lineId: anchor.lineId, value: anchor.literal, unit: components.find(({ role }) => role === 'unit')?.literal,
         sourceRole, components, package:metadata });
-      return { reply: { body: { ok: true, observationId: stored.observationId, qualified: true },
+      return { reply: { body: { ok: true, ...stored, qualified: true },
         observation: { id: stored.observationId, qualified: true } } };
     }
     case 'save_observation': {
@@ -585,7 +585,7 @@ async function executeTool(
       const stored = await reader.record(tx, context, { ...input, evidence: prior.evidence });
       const qualified = !input.limitation && !input.alternatives;
       return { reply: {
-        body: { ok: true, observationId: stored.observationId, qualified },
+        body: { ok: true, ...stored, qualified },
         observation: { id: stored.observationId, qualified },
       } };
     }

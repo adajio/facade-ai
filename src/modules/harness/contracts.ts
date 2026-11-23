@@ -2,7 +2,7 @@ import type { PoolClient } from 'pg';
 import type { VerifiedPairEvidence } from '../assessment/domain.js';
 import type { DeliveryStatement, ReaderComponentInput } from '../pdf/types.js';
 import { z } from 'zod';
-import type { PackageDetails } from './package-observation.js';
+import type { PackageDetails, PackageMetadataReceipt } from './package-observation.js';
 
 export const branchSchema = z.enum(['A', 'B']);
 export type Branch = z.infer<typeof branchSchema>;
@@ -217,7 +217,7 @@ export interface ReaderPort {
   read(context: ReaderContext, request: ReadRequest): Promise<Representation>;
   record(
     tx: PoolClient, context: ReaderContext, observation: ObservationInput
-  ): Promise<{ observationId: string }>;
+  ): Promise<{ observationId: string; packageMetadata?: PackageMetadataReceipt }>;
 }
 
 export class ReaderRefusal extends Error {

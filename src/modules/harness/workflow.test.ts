@@ -528,6 +528,44 @@ test('delivery statements require a literal quote and preserve the legacy tool w
   }).success, true);
 });
 
+test('both package save tools give field-specific feedback on the next model turn', async () => {
+  const { task, ports, textId, observationId, recorded } = setup();
+  if (task.job.mode !== 'primary') assert.fail();
+  task.scopeId = null;
+  task.job.packageWindow = { id: randomUUID(), readerVersion: 'test', routeRevision: 'known', walkProtocol: 1 };
+  task.job.observationProtocol = 2;
+  const packageMetadata = {
+    confirmed: [{ field: 'stage', evidenceId: textId, lineId: 'fixture-stage' }],
+    rejected: [{ field: 'revision', code: 'reference_required', nextAction: 'Укажите package.references.revision.' }],
+  } as const;
+  const record = ports.reader.record;
+  ports.reader.record = async (...args) => ({ ...await record(...args),
+    packageMetadata: { confirmed: [...packageMetadata.confirmed], rejected: [...packageMetadata.rejected] } });
+  const feedback = (messages: ReturnType<typeof initialMessages>) => messages.flatMap((message) =>
+    message.role === 'tool' ? [JSON.parse(message.content)] : []);
+  let turn = 0;
+  ports.call = async ({ request }) => {
+    switch (++turn) {
+      case 1: return receipt('survey', {});
+      case 2: return receipt('extract', {});
+      case 3: return receipt('save_observation', { evidenceId: textId, quote: 'Толщина 2 мм', value: '2', unit: 'мм' });
+      case 4:
+        assert.deepEqual(feedback(request.messages).at(-1), { ok: true, observationId, qualified: true, packageMetadata });
+        return receipt('save_compound_observation', { components: [
+          { role: 'value', evidenceId: textId, lineId: 'fixture-value', quote: '2', literal: '2', link: { kind: 'anchor' } },
+          { role: 'unit', evidenceId: textId, lineId: 'fixture-value', quote: 'мм', literal: 'мм', link: { kind: 'source_context', to: 0 } },
+        ] });
+      case 5:
+        assert.deepEqual(feedback(request.messages).at(-1), { ok: true, observationId, qualified: true, packageMetadata });
+        return receipt('finish_reading', { status: 'covered', explanation: 'Подтверждено исходное значение.' });
+      default: return assert.fail('Unexpected model turn');
+    }
+  };
+  const result = await runResearchWorkflow(task, ports, new AbortController().signal);
+  assert.deepEqual(result, { status: 'done', outcome: { kind: 'covered', observationIds: [observationId] } });
+  assert.equal(recorded.length, 2);
+});
+
 test('package turn exhaustion records the last request and permits exactly one bounded continuation', async () => {
   const {task,ports,events}=setup();
   assert.equal(task.job.mode,'primary');

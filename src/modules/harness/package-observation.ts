@@ -5,6 +5,7 @@ import { deliveredLines } from '../questions/attribute-aliases.js';
 import type { Observation } from '../pdf/types.js';
 import { type ObservationInput, type ReaderContext } from './contracts.js';
 import { packageRoles, type PackageBinding, type PackageSourceRole } from './package-analysis.js';
+import { hasPrintedRevision } from './pair-evidence.js';
 
 const literal = z.string().trim().min(1).max(500).refine((value) => !value.includes('\0'));
 const label = z.string().trim().min(1).max(160).refine((value) => !value.includes('\0'));
@@ -30,6 +31,25 @@ export const packageDetails = z.strictObject({
 });
 
 export type PackageDetails = z.infer<typeof packageDetails>;
+
+const referenceFields = ['attribute', 'role', 'stage', 'revision', 'binding', 'valueRole'] as const;
+type ReferenceField = typeof referenceFields[number];
+type MetadataField = ReferenceField | 'sourceRole' | 'revisionStatus' | 'materials' | 'subjectRegister' | 'subjectRegister.commonQuote';
+type MetadataRefusal = 'reference_required' | 'reference_invalid' | 'quote_not_supported' | 'field_not_grounded';
+
+export interface PackageMetadataReceipt {
+  confirmed: { field: MetadataField; evidenceId: string; lineId?: string; box?: Observation['address']['box']; componentIndex?: number; itemIndex?: number }[];
+  rejected: { field: MetadataField; code: MetadataRefusal; nextAction: string; itemIndex?: number }[];
+}
+
+const fieldGuidance: Record<ReferenceField, string> = {
+  attribute: 'Укажите название поля в дословной строке значения, строке этого ряда или заголовке его столбца.',
+  role: 'Откройте строку с видом документа. Укажите package.role с дословной цитатой. Для отдельной строки укажите её компонент в package.references.role.',
+  stage: 'Процитируйте дословное обозначение стадии.',
+  revision: 'Процитируйте обозначение вместе с печатной подписью поля редакции.',
+  binding: 'Процитируйте напечатанную принадлежность и все заявленные обозначения. Если область неясна, оставьте unclear.',
+  valueRole: 'Процитируйте, что это проектное или исполнительное значение либо предел.',
+};
 
 export function packageNonDeliveryGrounded(input: Omit<ObservationInput, 'evidence'>, image: boolean, fullLine?: string) {
   if (input.deliveryStatement?.status !== 'not_delivered') return true;
@@ -144,7 +164,7 @@ export async function publishPackageObservation(
   const { quote, grounding, deliveryStatement } = observation;
   const text = grounding === 'text' ? quote : undefined;
   const references=details.references??{};
-  const fields=['attribute','role','stage','revision','binding','valueRole'] as const;
+  const fields=referenceFields;
   const supportIds=[...new Set([observation.evidenceId,...(observation.components??[]).map(({evidenceId})=>evidenceId)])];
   const {rows:issued}=grounding==='text'&&(details.role||details.binding||Object.keys(references).length)
     ? await tx.query<{ id:string;content:string|null }>(
@@ -175,7 +195,7 @@ export async function publishPackageObservation(
   const stage = details.stage && citations.stage?.quote?.includes(details.stage.quote) && hasLiteral(details.stage.quote, details.stage.value)
     ? details.stage : undefined;
   const revision = details.revision && citations.revision?.quote?.includes(details.revision.quote) &&
-    hasLiteral(details.revision.quote, details.revision.value) && /(?:\brev(?:ision)?\.?\s|редакция|ревизия|ред\.\s)/iu.test(details.revision.quote)
+    hasPrintedRevision(details.revision.quote, details.revision.value)
     ? details.revision : undefined;
   const revisionStatus = revision?.status === 'current' && current.test(revision.quote) && !inactive.test(revision.quote)
     ? 'current' : revision?.status === 'superseded' && inactive.test(revision.quote) ? 'superseded' : 'unknown';
@@ -190,18 +210,20 @@ export async function publishPackageObservation(
     ? { quote: proposal.quote, commonChecked: Boolean(proposal.commonQuote && text.includes(proposal.commonQuote) && commonRegister.test(proposal.commonQuote) && !exclusion.test(proposal.commonQuote)) }
     : null;
   const attributeQuote=citations.attribute?.quote;
-  const attribute = details.attribute && attributeQuote && hasLiteral(attributeQuote.toLocaleLowerCase('ru'), details.attribute.toLocaleLowerCase('ru'))
-    ? details.attribute : deliveryStatement?.item ?? null;
-  const materials = details.materials?.filter((material) => quote?.includes(material.quote) &&
-    hasLiteral(material.quote, material.label)).map((material) => ({ ...material,
-      id: packageCandidateId(observation, material.label) })) ?? [];
+  const attributeGrounded = Boolean(details.attribute && attributeQuote &&
+    hasLiteral(attributeQuote.toLocaleLowerCase('ru'), details.attribute.toLocaleLowerCase('ru')));
+  const attribute = (attributeGrounded ? details.attribute : deliveryStatement?.item) ?? null;
+  const materialGrounded = details.materials?.map((material) => Boolean(quote?.includes(material.quote) && hasLiteral(material.quote, material.label))) ?? [];
+  const materials = details.materials?.flatMap((material, index) => materialGrounded[index]
+    ? [{ ...material, id: packageCandidateId(observation, material.label) }] : []) ?? [];
   const functionalRoles={design:/(?:design value|nominal value|проектн\p{L}* значен|номинальн\p{L}* значен)/iu,
     as_built:/(?:as[- ]built|actual value|фактическ\p{L}* значен|исполнительн\p{L}* размер)/iu,
     limit:/(?:limit|maximum|minimum|предел|предельн\p{L}* значен|не более|не менее)/iu};
   const proposedRole=details.valueRole;
   const valueRole=proposedRole&&citations.valueRole?.quote?.includes(proposedRole.quote)&&
     functionalRoles[proposedRole.kind].test(proposedRole.quote)?proposedRole:undefined;
-  const qualified={attribute,role:confirmedRole,stage,revision,binding:binding.quote,valueRole};
+  const scopedBinding = binding.quote && (binding.state === 'identified' || binding.state === 'common');
+  const qualified={attribute:attributeGrounded,role:confirmedRole,stage,revision,binding:scopedBinding,valueRole};
   const parts=Object.fromEntries(fields.flatMap((name)=>{
     const part=citations[name];
     return qualified[name]&&references[name]!==undefined&&part?.lineId&&part.quote?
@@ -209,13 +231,66 @@ export async function publishPackageObservation(
   }));
   const basis = { role: confirmedRole?.quote, stage: stage?.quote, revision: revision?.quote,
     valueRole,...(Object.keys(parts).length?{parts}:{}) };
-  await tx.query(
+  const saved = await tx.query(
     `INSERT INTO harness_package_facts(id,project_id,window_id,job_id,attribute,source_role,design_stage,revision,revision_status,basis,subject_register,materials)
-     VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) ON CONFLICT(id) DO NOTHING`,
+     VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) ON CONFLICT(id) DO NOTHING RETURNING id`,
     [observation.id, task.projectId, task.job.packageWindow.id, task.jobId, attribute,
      confirmedRole?.value ?? 'unknown', stage?.value ?? null, revision?.value ?? null, revisionStatus, basis, register, JSON.stringify(materials)]);
+  if (!saved.rowCount) return;
   await tx.query(
     `INSERT INTO harness_package_bindings(fact_id,version,state,candidates,quote,reason)
      VALUES($1,1,$2,$3,$4,$5) ON CONFLICT DO NOTHING`,
     [observation.id, binding.state, JSON.stringify(binding.candidates), binding.quote, binding.reason]);
+  if (task.job.packageWindow.walkProtocol !== 1) return;
+
+  const receipt: PackageMetadataReceipt = { confirmed: [], rejected: [] };
+  function confirm(field: MetadataField, ref: typeof anchor, componentIndex?: number, itemIndex?: number) {
+    receipt.confirmed.push({ field, evidenceId: ref.evidenceId,
+      ...(ref.lineId ? { lineId: ref.lineId } : ref.address.box ? { box: ref.address.box } : {}),
+      ...(componentIndex !== undefined ? { componentIndex } : {}), ...(itemIndex !== undefined ? { itemIndex } : {}) });
+  }
+  function reject(field: MetadataField, code: MetadataRefusal, nextAction: string, itemIndex?: number) {
+    receipt.rejected.push({ field, code, nextAction, ...(itemIndex !== undefined ? { itemIndex } : {}) });
+  }
+  for (const field of fields) {
+    if (field === 'role' && !details.role && input.sourceRole) {
+      reject(field, 'reference_required', fieldGuidance.role);
+      continue;
+    }
+    if (!details[field] || (field === 'binding' && ['unclear', 'unidentified'].includes(details.binding!.state))) continue;
+    const ref = citations[field];
+    const componentIndex = references[field];
+    if (qualified[field] && ref) {
+      confirm(field, ref, componentIndex);
+      continue;
+    }
+    const proposedQuote = field === 'attribute' ? undefined : details[field]?.quote;
+    const supported = field === 'attribute' ? attributeGrounded : Boolean(proposedQuote && ref?.quote?.includes(proposedQuote));
+    const code = componentIndex !== undefined && !ref ? 'reference_invalid' : supported ? 'field_not_grounded'
+      : componentIndex === undefined ? 'reference_required' : 'quote_not_supported';
+    const nextAction = code === 'field_not_grounded' ? fieldGuidance[field]
+      : code === 'quote_not_supported' ? 'Используйте точную цитату из указанного компонента.'
+      : `Откройте нужную строку и укажите индекс адресного компонента в package.references.${field} при save_compound_observation. В повторном сохранении сохраните подтверждённые поля. ${fieldGuidance[field]}`;
+    reject(field, code, nextAction);
+  }
+  if (input.sourceRole && details.role && input.sourceRole !== confirmedRole?.value) {
+    reject('sourceRole', 'field_not_grounded', fieldGuidance.role);
+  }
+  if (revision && revision.status !== 'unknown') {
+    if (revisionStatus === revision.status) confirm('revisionStatus', citations.revision!, references.revision);
+    else reject('revisionStatus', 'field_not_grounded', 'Процитируйте прямое указание статуса этой редакции или укажите unknown.');
+  }
+  materialGrounded.forEach((grounded, index) => {
+    if (grounded) confirm('materials', anchor, undefined, index);
+    else reject('materials', 'quote_not_supported', 'Процитируйте название материала в исходной строке.', index);
+  });
+  if (proposal) {
+    if (register) confirm('subjectRegister', anchor);
+    else reject('subjectRegister', 'field_not_grounded', 'Процитируйте полный перечень фасадов из действующей описи или ведомости и подтвердите все её обозначения.');
+    if (proposal.commonQuote) {
+      if (register?.commonChecked) confirm('subjectRegister.commonQuote', anchor);
+      else reject('subjectRegister.commonQuote', 'field_not_grounded', 'В опоре на перечень нужна дословная отметка о полноте или отсутствии общих материалов.');
+    }
+  }
+  return receipt;
 }

@@ -38,6 +38,10 @@ export function printedPairVariant(line: string): string | null {
   return marks.size === 1 ? marks.values().next().value! : null;
 }
 
+export function hasPrintedRevision(quote: string, label: string): boolean {
+  return [...quote.matchAll(revision)].some((match) => match[1] === label);
+}
+
 export function hasPrintedPairScope(line: string, label: string): boolean {
   const labels = scopes(line);
   return labels.length > 0 && labels.every((item) => item === normalized(label));

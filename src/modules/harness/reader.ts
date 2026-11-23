@@ -1,4 +1,5 @@
 import type { Pool, PoolClient } from 'pg';
+import type { PackageMetadataReceipt } from './package-observation.js';
 import { occurrenceScope, occurrenceScopeJoin } from './occurrence-scope.js';
 import { packageStructure, savePackageBlocks, saveSemanticCheck } from './package-walk.js';
 import { authorizedPackageReview } from './package-review.js';
@@ -31,7 +32,7 @@ function executionScope(context: ReaderContext) {
 
 export function connectReader(
   db: Pool, service: ReaderService,
-  publish: (tx: PoolClient, context: ReaderContext, input: ObservationInput, observation: Observation) => Promise<void>,
+  publish: (tx: PoolClient, context: ReaderContext, input: ObservationInput, observation: Observation) => Promise<void | PackageMetadataReceipt>,
 ): ReaderPort {
   async function checkPackage(context: ReaderContext, connection: Pool | PoolClient = db, support?: 'A' | 'B') {
     const { task, branch } = context;
@@ -225,8 +226,8 @@ export function connectReader(
         const pinned = await service.pin(evidence.place.source, executionScope(context), {
           ...observation, scope: context.task.scopeId, evidenceId: evidence.evidenceId, ...(limitation ? { limitation } : {}),
         }, tx, components);
-        await publish(tx, context, input, pinned);
-        return { observationId: pinned.id };
+        const packageMetadata = await publish(tx, context, input, pinned);
+        return { observationId: pinned.id, ...(packageMetadata ? { packageMetadata } : {}) };
       } catch (error) {
         return refusal(error);
       }
