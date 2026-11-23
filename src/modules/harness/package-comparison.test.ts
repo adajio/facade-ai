@@ -51,6 +51,33 @@ test('verbatim duplicate title text requires the evidence lineId to identify one
   assert.deepEqual(locatePairQuote([first, second], text, 'unseen'), []);
 });
 
+test('an addressed difference with a missing facade is eligible for independent clarification only', () => {
+  const a = measurement('A', 'Gap', '30', 'mm');
+  const b = measurement('B', 'Gap', '40', 'mm');
+  a.observation.lineId = 'page:10';
+  b.observation.lineId = 'table:3';
+  a.binding = { ...a.binding, state: 'unidentified', candidates: [] };
+  a.sourceRole = 'unknown';
+  a.basis = {};
+  b.sourceRole = 'schedule';
+  b.designStage = 'RD';
+  const result = comparePackageFacts([a, b]);
+  assert.deepEqual(result.reviewCandidates, []);
+  assert.deepEqual(result.comparisonFollowups, [a.id]);
+  assert.deepEqual(comparePackageFacts([a, { ...b, binding: a.binding }]).comparisonFollowups, []);
+  const other = { id: randomUUID(), label: 'Other facade' };
+  assert.deepEqual(comparePackageFacts([{ ...a, binding: { ...b.binding, candidates: [other] } }, b]).comparisonFollowups, []);
+  assert.deepEqual(comparePackageFacts([a, { ...b, revisionStatus: 'superseded' }]).comparisonFollowups, []);
+  assert.deepEqual(comparePackageFacts([a, { ...b, observation: { ...b.observation, unit: 'kg' } }]).comparisonFollowups, []);
+  assert.deepEqual(comparePackageFacts([a, { ...b, observation: { ...b.observation, value: '30' } }]).comparisonFollowups, []);
+  assert.deepEqual(comparePackageFacts([a, { ...b, attribute: 'Height' }]).comparisonFollowups, []);
+  assert.deepEqual(comparePackageFacts([a, { ...b, observation: { ...b.observation,
+    source: { ...b.observation.source, projectId: randomUUID() } } }]).comparisonFollowups, []);
+  const limit = { ...b, basis: { ...b.basis, valueRole: { kind: 'limit' as const, quote: 'limit' } } };
+  const actual = { ...a, basis: { valueRole: { kind: 'as_built' as const, quote: 'actual value' } } };
+  assert.deepEqual(comparePackageFacts([actual, limit]).comparisonFollowups, []);
+});
+
 test('typed catalogue comparisons require the confirmed type of the addressed facade', () => {
   const a = measurement('A', 'Gap', '30', 'mm');
   const b = measurement('B', 'Gap', '40', 'mm');

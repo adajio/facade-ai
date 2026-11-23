@@ -50,7 +50,8 @@ export type FacadeAssessment = {
   comparisonReview?: { limited: boolean; items: {
     id: string; property: string; facadeId: string | null; reasons: string[];
     sources: { citation: Citation; binding: FacadeObservation['binding']; variant: string | null;
-      stage: string | null; revision: string | null; revisionStatus: string; sourceRole: string }[];
+      stage: string | null; revision: string | null; revisionStatus: string; sourceRole: string;
+      clarification?: { branch: 'A' | 'B'; state: 'ready' | 'leased' | 'held' | 'done' }[] }[];
   }[] };
   unresolvedMentions?: { items: MentionSource[]; limited: boolean };
   stage: string | null;
@@ -62,6 +63,10 @@ export type FacadeAssessment = {
   contexts: FacadeContext[];
   limitations: string[];
   outcome: string;
+};
+
+export const clarificationLabels = {
+  ready: 'ожидает выполнения', leased: 'выполняется', held: 'на удержании', done: 'завершено',
 };
 
 export const coverageLabels = {

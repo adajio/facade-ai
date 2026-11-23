@@ -3,7 +3,7 @@
   import { conflictMessage } from '../lib/conflict';
   import { date, label } from '../lib/format';
   import { describe, id, interrupted, type Api } from '../lib/http';
-  import { assessmentReasons, coverageLabels, observationLabels, type Binding, type FacadeAssessment, type FacadeContext } from '../lib/facade-assessment';
+  import { assessmentReasons, clarificationLabels, coverageLabels, observationLabels, type Binding, type FacadeAssessment, type FacadeContext } from '../lib/facade-assessment';
   import { projectV1, scopedUrl, V1, type AssessmentQuestion, type OpenEvidence, type WorkspaceProps } from '../lib/workspace';
   import EvidenceButtons from '../lib/EvidenceButtons.svelte';
   import Notice from '../lib/Notice.svelte';
@@ -211,6 +211,9 @@
                 {#if source.revision} · редакция {source.revision}{/if}
                 {#if source.stage} · стадия {source.stage}{/if}
                 {#if source.revisionStatus !== 'current'} · действующая редакция требует сверки{/if}
+                {#each source.clarification ?? [] as read (read.branch)}
+                  <div>Адресное дочитывание {read.branch} · {clarificationLabels[read.state]}</div>
+                {/each}
                 {#if source.citation.quote}<blockquote>{source.citation.quote}</blockquote>{/if}
               </li>
             {/each}

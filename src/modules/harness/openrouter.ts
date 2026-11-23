@@ -281,12 +281,14 @@ export function initialMessages(job: ResearchJob): Message[] {
       instructions.push(plan&&'kind' in plan&&plan.candidateBlocks?'Перед завершением отметьте фактически проверенные блоки через record_blocks.':'Если оснований нет, зафиксируйте проверку или ограничение.');
     }
     else if(job.packageWindow.followup?.discovery) instructions.push('Проверьте указанную марку в назначенном оригинале. Сохраните отдельные дословные опоры обозначения, проектного идентификатора, корпуса, осей, типа, стадии, редакции и исполнения, если они напечатаны. Для составной опоры укажите индексы адресов. При неоднозначности сохраните ограничение.');
+    if (job.packageWindow.followup?.comparison) instructions.push('Уточните принадлежность и смысл значения на указанной строке. Проверьте, как именно с ним связаны атрибут, фасад, роль значения и документа, стадия, исполнение и действующая редакция. При необходимости откройте соседний фрагмент того же оригинала через context_inventory и open_context. Для двух нативных фрагментов одной строки укажите их исходные evidenceId и lineId с source_context. Сохраните подтверждённые части дословно. Если связь не установлена, завершите с указанием причины.');
     instructions[1] = 'Сохраняйте несколько независимых наблюдений, где у каждого есть точный адрес и буквальная цитата. Помечайте материал как общий только при прямом указании, а спорные трактовки и отсутствие обозначения сохраняйте отдельно.';
   }
   const assignment = job.mode === 'primary'
     ? { mode: job.mode, place: job.place, question: job.question, ...(job.packageWindow ? { objective: job.packageWindow.followup?'package_followup':'package_primary',
       ...(!job.packageWindow.followup&&job.packageWindow.profileInspection?.lineIds.length?{profileInspectionLines:job.packageWindow.profileInspection.lineIds}:{}),
       ...(job.packageWindow.followup?{ blocks:job.packageWindow.followup.blocks,
+        ...(job.packageWindow.followup.comparison ? { comparison: job.packageWindow.followup.comparison } : {}),
         ...(job.packageWindow.followup.discovery?{discovery:profileScan(job)?{kind:'profile_scan'}:job.packageWindow.followup.discovery}:{}),
         ...(job.packageWindow.followup.semantic?{semantic:job.packageWindow.followup.semantic}:{}) }:{}) } : {}) }
     : { mode: job.mode, dispute: job.dispute, ...(job.mode === 'verify' ? { proposal: job.proposal } : {}) };

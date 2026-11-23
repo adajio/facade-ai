@@ -4,7 +4,7 @@ import { getCatalog, getProject, matchesDefaultProfile } from '../access/project
 import type { CatalogRequirement } from '../access/input.js';
 import type { Branch, PackageBlock, PackageSemanticCheck, Place } from './contracts.js';
 import type { Observation } from '../pdf/types.js';
-import type { VerifiedPairEvidence } from '../assessment/domain.js';
+import { compareCitationValues, type VerifiedPairEvidence } from '../assessment/domain.js';
 import { printedPairVariant } from './pair-evidence.js';
 import { currentFacadeScopes } from './package-walk.js';
 import { buildFacadeProfiles, facadeDiscoveryVersion, type FacadeMention, type FacadeProfile } from './facade-discovery.js';
@@ -93,6 +93,7 @@ export interface PackageAnalysis {
   windows: PackageWindow[];
   comparisons: PackageComparison[];
   reviewCandidates: { a: string; b: string; property: string; scope: { id: string; label: string };catalogVersionId?:string;stage?:string }[];
+  comparisonFollowups: string[];
   verifiedPairs: { a: string; b: string; proof: VerifiedPairEvidence;
     titles: { A: ReviewTitle | null; B: ReviewTitle | null } }[];
   coverage: {
@@ -178,6 +179,33 @@ function bindingScope(a: PackageFact, b: PackageFact) {
   return ids.length === 1 ? ids[0] : undefined;
 }
 
+function hasKnownFacade({ binding }: PackageFact) {
+  return binding.state === 'identified' && binding.candidates.length === 1;
+}
+
+function comparisonFollowup(a: PackageFact, b: PackageFact, scope: ReturnType<typeof bindingScope>) {
+  const left = a.observation;
+  const right = b.observation;
+  if ([a, b].some(({ observation, sourceRole, revisionStatus }) => observation.grounding !== 'text' ||
+    !observation.quote || !observation.lineId || !observation.unit || revisionStatus === 'superseded' ||
+    ['other', 'inventory', 'correspondence'].includes(sourceRole)) ||
+    left.source.projectId !== right.source.projectId || left.source.documentId === right.source.documentId ||
+    left.source.sha256 === right.source.sha256 ||
+    a.variant && b.variant && a.variant !== b.variant ||
+    a.designStage && b.designStage && normalizeAttribute(a.designStage) !== normalizeAttribute(b.designStage) ||
+    a.basis.valueRole && b.basis.valueRole && a.basis.valueRole.kind !== b.basis.valueRole.kind ||
+    compareCitationValues({ value: left.value ?? null, unit: left.unit ?? null },
+      { value: right.value ?? null, unit: right.unit ?? null }) !== 'different') return [];
+  if (!scope) {
+    const unbound = (fact: PackageFact) => ['unidentified', 'unclear'].includes(fact.binding.state) && !fact.binding.candidates.length;
+    if (hasKnownFacade(a) && unbound(b)) return [b];
+    if (hasKnownFacade(b) && unbound(a)) return [a];
+    return [];
+  }
+  return [a, b].filter((fact) => (fact.binding.state !== 'common' && !hasKnownFacade(fact)) ||
+    !fact.basis.role || fact.sourceRole === 'unknown' || !fact.designStage || fact.revisionStatus === 'unknown' || !fact.variant);
+}
+
 type ComparisonCatalog={versionId:string;stage:string|null;requirements:CatalogRequirement[];facadeKinds?:ReadonlyMap<string,string>};
 
 function pairCandidate(a: PackageFact, b: PackageFact, scope: { id: string; label: string } | undefined,
@@ -261,6 +289,7 @@ function possibleDisagreement(left: Observation, right: Observation) {
 export function comparePackageFacts(facts: PackageFact[], aliases: ReadonlyMap<string, string> = new Map(), catalog?:ComparisonCatalog) {
   const comparisons: PackageComparison[] = [];
   const reviewCandidates: PackageAnalysis['reviewCandidates'] = [];
+  const comparisonFollowups = new Set<string>();
   const grouped = new Map<string, { A: PackageFact[]; B: PackageFact[]; property: string }>();
   for (const fact of facts) {
     if (!fact.attribute || fact.observation.grounding === 'limited' || fact.observation.limitation) continue;
@@ -278,10 +307,11 @@ export function comparePackageFacts(facts: PackageFact[], aliases: ReadonlyMap<s
       const sameLocation = left.source.versionId === right.source.versionId &&
         left.address.unitId === right.address.unitId && left.lineId && left.lineId === right.lineId;
       const scope = bindingScope(a, b);
-      if (!sameLocation && !scope) continue;
       const different = possibleDisagreement(left, right);
       const proposal = different ? pairCandidate(a, b, scope,property,catalog) : undefined;
       if (proposal) reviewCandidates.push({ ...proposal, property });
+      else if (different) for (const target of comparisonFollowup(a, b, scope)) comparisonFollowups.add(target.id);
+      if (!sameLocation && !scope) continue;
       if (comparisons.length >= 200) continue;
       const comparable = sameLocation && left.unit === right.unit && a.variant === b.variant;
       const equal = !different && (left.value === undefined) === (right.value === undefined) &&
@@ -290,7 +320,57 @@ export function comparePackageFacts(facts: PackageFact[], aliases: ReadonlyMap<s
         : 'applicability_unclear' });
     }
   }
-  return { comparisons, reviewCandidates };
+  return { comparisons, reviewCandidates, comparisonFollowups: [...comparisonFollowups] };
+}
+
+async function packageFactRows(db: Pool | PoolClient, projectId: string) {
+  return (await db.query<FactRow>(
+    `WITH accepted AS (${accepted})
+     SELECT f.id,o.branch,f.window_id AS "windowId",o.payload AS observation,f.attribute,f.source_role AS "sourceRole",
+       f.design_stage AS "designStage",f.revision,f.revision_status AS "revisionStatus",f.basis,f.materials,f.subject_register AS register,d.mentions,
+       jsonb_build_object('state',CASE WHEN b.state IN ('identified','unclear') AND (stale.yes OR b.actor_id IS NULL AND NOT coalesce(d.resolved,false))
+         THEN 'unclear' ELSE b.state END,'quote',b.quote,'reason',CASE WHEN stale.yes THEN 'Зависимая опора заменена.' ELSE b.reason END,
+         'candidates',CASE WHEN NOT stale.yes AND (b.actor_id IS NOT NULL OR d.resolved) THEN b.candidates ELSE '[]'::jsonb END,
+         'version',b.version,'actorId',b.actor_id) AS binding
+     FROM harness_package_facts f JOIN reader_observations o ON o.id=f.id
+     JOIN accepted a ON a.version_id=o.version_id
+     LEFT JOIN harness_package_followups followup ON followup.job_id=f.job_id
+     JOIN harness_package_branches active ON active.job_id=coalesce(followup.root_job_id,f.job_id) AND active.active
+     JOIN harness_package_windows w ON w.id=f.window_id
+     JOIN harness_package_maps m ON m.version_id=w.version_id AND m.fingerprint=w.map_fingerprint AND m.active
+     LEFT JOIN harness_facade_discovery d ON d.fact_id=f.id AND d.discovery_version=${facadeDiscoveryVersion}
+     JOIN LATERAL (SELECT * FROM harness_package_bindings h WHERE h.fact_id=f.id ORDER BY version DESC LIMIT 1) b ON true
+     CROSS JOIN LATERAL (SELECT EXISTS(SELECT 1 FROM harness_stale_facade_profiles stale
+       CROSS JOIN LATERAL jsonb_array_elements(b.candidates) candidate
+       WHERE b.actor_id IS NULL AND stale.project_id=f.project_id AND stale.facade_id::text=candidate->>'id') AS yes) stale
+     WHERE f.project_id=$1 ORDER BY o.created_at,f.id`, [projectId])).rows;
+}
+
+function packageFact(row: FactRow): PackageFact {
+  const { register, mentions, ...fact } = row;
+  return {
+    ...fact, evidenceHref: `/api/v1/evidence/${fact.observation.evidenceId}`,
+    variant: (fact.observation.grounding === 'text' && fact.observation.quote ?
+      printedPairVariant(fact.observation.quote) : null) ?? fact.observation.components?.find(({ role }) => role === 'variant')?.literal ?? null,
+  };
+}
+
+async function compareCurrentPackageFacts(db: Pool | PoolClient, projectId: string, facts: PackageFact[]) {
+  const catalog=facts.length?await approvedComparisonCatalog(db,projectId):undefined;
+  if(catalog?.stage&&catalog.requirements.some(({facadeKinds})=>facadeKinds?.length)) {
+    const {rows:kinds}=await db.query<{id:string;kind:string}>(
+      `SELECT DISTINCT id,kind FROM (${currentFacadeScopes('$1','$2::text')}) facade WHERE kind IS NOT NULL`,
+      [projectId,catalog.stage]);
+    catalog.facadeKinds=new Map(kinds.map(({id,kind})=>[id,kind]));
+  }
+  return comparePackageFacts(facts,catalog&&packageCatalogAliases(catalog.requirements),catalog);
+}
+
+export async function readComparisonTargets(db: PoolClient, projectId: string) {
+  const facts = (await packageFactRows(db, projectId)).map(packageFact);
+  const { comparisonFollowups } = await compareCurrentPackageFacts(db, projectId, facts);
+  const eligible = new Set(comparisonFollowups);
+  return facts.filter(({ id }) => eligible.has(id));
 }
 
 export async function readPackageAnalysis(db: Pool | PoolClient, projectId: string): Promise<PackageAnalysis> {
@@ -318,26 +398,7 @@ export async function readPackageAnalysis(db: Pool | PoolClient, projectId: stri
        ORDER BY CASE WHEN a.state IN ('sending','unknown') THEN 0 WHEN a.state='paid' THEN 1 ELSE 2 END, a.created_at LIMIT 1
      ) prior ON true
      ORDER BY w.version_id,w.ordinal,b.branch`, args);
-  const { rows } = await db.query<FactRow>(
-    `WITH accepted AS (${accepted})
-     SELECT f.id,o.branch,f.window_id AS "windowId",o.payload AS observation,f.attribute,f.source_role AS "sourceRole",
-       f.design_stage AS "designStage",f.revision,f.revision_status AS "revisionStatus",f.basis,f.materials,f.subject_register AS register,d.mentions,
-       jsonb_build_object('state',CASE WHEN b.state IN ('identified','unclear') AND (stale.yes OR b.actor_id IS NULL AND NOT coalesce(d.resolved,false))
-         THEN 'unclear' ELSE b.state END,'quote',b.quote,'reason',CASE WHEN stale.yes THEN 'Зависимая опора заменена.' ELSE b.reason END,
-         'candidates',CASE WHEN NOT stale.yes AND (b.actor_id IS NOT NULL OR d.resolved) THEN b.candidates ELSE '[]'::jsonb END,
-         'version',b.version,'actorId',b.actor_id) AS binding
-     FROM harness_package_facts f JOIN reader_observations o ON o.id=f.id
-     JOIN accepted a ON a.version_id=o.version_id
-     LEFT JOIN harness_package_followups followup ON followup.job_id=f.job_id
-     JOIN harness_package_branches active ON active.job_id=coalesce(followup.root_job_id,f.job_id) AND active.active
-     JOIN harness_package_windows w ON w.id=f.window_id
-     JOIN harness_package_maps m ON m.version_id=w.version_id AND m.fingerprint=w.map_fingerprint AND m.active
-     LEFT JOIN harness_facade_discovery d ON d.fact_id=f.id AND d.discovery_version=${facadeDiscoveryVersion}
-     JOIN LATERAL (SELECT * FROM harness_package_bindings h WHERE h.fact_id=f.id ORDER BY version DESC LIMIT 1) b ON true
-     CROSS JOIN LATERAL (SELECT EXISTS(SELECT 1 FROM harness_stale_facade_profiles stale
-       CROSS JOIN LATERAL jsonb_array_elements(b.candidates) candidate
-       WHERE b.actor_id IS NULL AND stale.project_id=f.project_id AND stale.facade_id::text=candidate->>'id') AS yes) stale
-     WHERE f.project_id=$1 ORDER BY o.created_at,f.id`, args);
+  const rows = await packageFactRows(db, projectId);
   const { rows: [inventory] } = await db.query<{ closed: boolean }>(
     `SELECT EXISTS(SELECT 1 FROM intake_receipts WHERE project_id=$1) AND NOT EXISTS (
        SELECT 1 FROM intake_receipts r WHERE r.project_id=$1 AND (r.sealed_at IS NULL OR EXISTS (
@@ -427,11 +488,7 @@ export async function readPackageAnalysis(db: Pool | PoolClient, projectId: stri
          (current.state<>'identified' OR NOT EXISTS(SELECT 1 FROM jsonb_array_elements(current.candidates) c WHERE c->>'id'=s.facade_id::text)))
      ) ORDER BY s.window_id,s.branch,s.position_id`,[walkIds,projectId]):{rows:[]};
 
-  const facts = rows.map(({ register, mentions, ...fact }) => ({
-    ...fact, evidenceHref: `/api/v1/evidence/${fact.observation.evidenceId}`,
-    variant: (fact.observation.grounding === 'text' && fact.observation.quote ?
-      printedPairVariant(fact.observation.quote) : null) ?? fact.observation.components?.find(({ role }) => role === 'variant')?.literal ?? null,
-  }));
+  const facts = rows.map(packageFact);
   const candidates = [...new Map(facts.flatMap(({ binding }) => binding.candidates)
     .map((candidate) => [candidate.id, candidate])).values()];
   const facadeMentions=rows.flatMap(({mentions})=>mentions??[]);
@@ -460,14 +517,7 @@ export async function readPackageAnalysis(db: Pool | PoolClient, projectId: stri
       (binding.state === 'unidentified' && (attribute || observation.value !== undefined || materials.length)))
     ? { versionIds, basisIds: [a.id, b.id], facadeIds, commonChecked: true } : null;
   const mappedVersions = new Set(windows.map(({ place }) => place.source.versionId)).size;
-  const catalog=facts.length?await approvedComparisonCatalog(db,projectId):undefined;
-  if(catalog?.stage&&catalog.requirements.some(({facadeKinds})=>facadeKinds?.length)) {
-    const {rows:kinds}=await db.query<{id:string;kind:string}>(
-      `SELECT DISTINCT id,kind FROM (${currentFacadeScopes('$1','$2::text')}) facade WHERE kind IS NOT NULL`,
-      [projectId,catalog.stage]);
-    catalog.facadeKinds=new Map(kinds.map(({id,kind})=>[id,kind]));
-  }
-  const comparison=comparePackageFacts(facts,catalog&&packageCatalogAliases(catalog.requirements),catalog);
+  const comparison = await compareCurrentPackageFacts(db, projectId, facts);
   const reviewed = await db.query<PackageAnalysis['verifiedPairs'][number]>(
     `SELECT p.a_fact_id AS a,p.b_fact_id AS b,p.proof,
        jsonb_build_object('A',a_title.title,'B',b_title.title) AS titles

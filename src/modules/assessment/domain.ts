@@ -172,7 +172,7 @@ function numericValue(value: string, unit: string | null): Value | null {
   };
 }
 
-export function compareCitationValues(a: Citation, b: Citation): "equal" | "different" | "unknown" {
+export function compareCitationValues(a: Pick<Citation, "value" | "unit">, b: Pick<Citation, "value" | "unit">): "equal" | "different" | "unknown" {
   if (a.value === null || b.value === null) return "unknown";
   const left = numericValue(a.value, a.unit);
   const right = numericValue(b.value, b.unit);

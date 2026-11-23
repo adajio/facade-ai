@@ -1,7 +1,7 @@
 import { allowsCatalogPair } from "../access/catalog-comparison.js";
 import type { Catalog } from "../access/project-state.js";
 import { canonicalJson, compareCitationValues, requirementSubjectKey, type Citation } from "./domain.js";
-import type { FacadeObservation } from "./facade-input.js";
+import type { ComparisonRead, FacadeObservation } from "./facade-input.js";
 import { requirementsFor, type FacadeContext, type FacadeFact, type FacadeReadout } from "./facade-model.js";
 
 export type ComparisonGap = "facade_link_unproven" | "facades_differ" | "variant_unproven" | "variants_differ" | "revisions_unproven" |
@@ -10,7 +10,7 @@ export type ComparisonGap = "facade_link_unproven" | "facades_differ" | "variant
 
 type ComparisonSource = { citation: Citation; binding: FacadeObservation["binding"]; variant: string | null;
   stage: string | null; revision: string | null; revisionStatus: FacadeObservation["revisionStatus"];
-  sourceRole: string; valueRole: FacadeFact["finding"]["valueRole"] };
+  sourceRole: string; valueRole: FacadeFact["finding"]["valueRole"]; clarification?: ComparisonRead[] };
 type ComparisonItem = { id: string; property: string; facadeId: string | null; reasons: ComparisonGap[];
   sources: [ComparisonSource, ComparisonSource] };
 export type ComparisonReview = { items: ComparisonItem[]; limited: boolean };
@@ -47,7 +47,8 @@ function* comparisonGroups(groups: Iterable<Map<string, AddressedFact>>, plain: 
 
 export function comparisonReview(facts: FacadeFact[], observations: FacadeObservation[], contexts: FacadeContext[],
   catalog: Catalog | null, stage: string | null, verifiedPairs: FacadeReadout["pairs"],
-  unresolved: { factId: string; label: string }[] = []): ComparisonReview {
+  unresolved: { factId: string; label: string }[] = [],
+  reads: ReadonlyMap<string, ComparisonRead[]> = new Map()): ComparisonReview {
   const byObservation = new Map(observations.map((observation) => [observation.id, observation]));
   const byFact = new Map(facts.map((fact) => [fact.finding.citation.observationId, fact]));
   const requirementsByFacade = new Map(contexts.map((context) =>
@@ -147,6 +148,7 @@ export function comparisonReview(facts: FacadeFact[], observations: FacadeObserv
         citation: fact.finding.citation, binding: observation.binding, variant: fact.variant, stage: fact.stage,
         revision: observation.revision, revisionStatus: observation.revisionStatus, sourceRole: fact.finding.sourceRole,
         valueRole: fact.finding.valueRole,
+        ...(reads.has(observation.id) ? { clarification: reads.get(observation.id) } : {}),
       });
       items.set(comparisonKey, { id, property: a.property!, facadeId, reasons, sources: [source(a, oa), source(b, ob)] });
     }

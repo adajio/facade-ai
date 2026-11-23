@@ -3,6 +3,7 @@ import type { Pool, PoolClient } from 'pg';
 import { type LeasedJob, WorkQueue } from '../gateway/queue.js';
 import { GatewayError, transaction, type CallInput, type CallResult, type PrimaryResult } from '../gateway/types.js';
 import { lockIntakeProject } from '../intake/gate.js';
+import { publishProjectEvent } from '../supplements/events.js';
 import {
   jobSchema, settingsSchema, type ReaderPort, type ResearchOutcome, type ResearchSettings,
   type ResearchSuspension, type ResearchTask, type ScheduledResearchTask,
@@ -58,10 +59,12 @@ function primaryResult(task: ScheduledResearchTask, outcome: ResearchOutcome): P
 export async function resumeInterruptedResearch(
   db: Pool, queue: Pick<WorkQueue, 'resume'>, signal: AbortSignal, allowProfileScans=false,
 ): Promise<void> {
-  const { rows } = await db.query<{ id: string; reason: string }>(
-    `SELECT j.id,j.reason FROM gateway_jobs j JOIN gateway_generations g USING(generation_id)
+  const { rows } = await db.query<{ id: string; reason: string; projectId: string; comparison: boolean }>(
+    `SELECT j.id,j.reason,j.project_id AS "projectId",j.payload#>'{packageWindow,followup,comparison}' IS NOT NULL AS comparison
+     FROM gateway_jobs j JOIN gateway_generations g USING(generation_id)
      LEFT JOIN harness_route_bindings b ON b.job_id=j.id
-     WHERE g.current AND (j.kind=$1 OR $2::boolean AND j.payload#>>'{packageWindow,followup,discovery,kind}'='profile_scan')
+     WHERE g.current AND (j.kind=$1 OR $2::boolean AND (j.payload#>>'{packageWindow,followup,discovery,kind}'='profile_scan'
+       OR j.payload#>'{packageWindow,followup,comparison}' IS NOT NULL))
        AND j.state='held'
        AND (j.reason IN ('analysis_replay_only','journal_unavailable','research_profile_unavailable','research_route_not_approved',
                          'research_gateway_unconfigured','synthetic_input_not_approved','research_profile_changed')
@@ -72,9 +75,12 @@ export async function resumeInterruptedResearch(
            AND (NOT a.route_isolated OR a.job_id=j.id OR a.receipt->>'providerId' IS NOT NULL)
        )
      ORDER BY j.created_at,j.id`, [researchKind,allowProfileScans]);
-  for (const { id, reason } of rows) {
+  for (const { id, reason, projectId, comparison } of rows) {
     if (signal.aborted) return;
-    await queue.resume(id, [reason]);
+    if (!comparison) await queue.resume(id, [reason]);
+    else await transaction(db, async (tx) => {
+      if (await queue.resume(id, [reason], tx)) await publishProjectEvent(tx, projectId, { type: 'package-analysis.changed', payload: {} });
+    });
   }
 }
 
@@ -200,6 +206,11 @@ export async function executeResearch(
   const task = taskFromWork(work);
   const { db, gateway } = services;
   const { lease } = work;
+  const comparison = task.job.mode === 'primary' && Boolean(task.job.packageWindow?.followup?.comparison);
+  const notify = (tx: PoolClient) => publishProjectEvent(tx, task.projectId, { type: 'package-analysis.changed', payload: {} });
+  const suspend = async (hold: ResearchSuspension & { retryAt?: Date }) => {
+    if (await gateway.suspend(lease, hold) && comparison) await transaction(db, notify);
+  };
   const local = new AbortController();
   const active = AbortSignal.any([signal, local.signal]);
   let heartbeatFailure: unknown;
@@ -215,9 +226,10 @@ export async function executeResearch(
     }
   });
   try {
+    if (comparison) await transaction(db, notify);
     const unresolved = await services.unsettledPrior?.(task);
     if (unresolved) {
-      await gateway.suspend(lease, {
+      await suspend({
         reason: 'prior_attempt_unsettled', nextAction: `Сверить попытку ${unresolved} перед продолжением места.`,
       });
       return;
@@ -234,13 +246,14 @@ export async function executeResearch(
           await lockIntakeProject(tx, task.projectId);
           if (!await gateway.finish(lease, state.outcome, primaryResult(task, state.outcome), tx)) return;
           await services.publishOutcome(tx, task, state.outcome);
+          if (comparison) await notify(tx);
         });
         break;
       case 'suspended':
-        await gateway.suspend(lease, state.hold);
+        await suspend(state.hold);
         break;
       case 'continue':
-        await gateway.suspend(lease, {
+        await suspend({
           reason: 'yield', nextAction: 'Продолжить с сохранённого хода.', retryAt: new Date(),
         });
         break;

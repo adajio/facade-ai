@@ -27,6 +27,9 @@ test('addressed PDF and XLSX facts share a stable facade; the branch worker cons
   const {reconcileNextFacadeDiscovery}=await import(built('src/modules/harness/facade-discovery.js'));
   const {dispatchPackageFollowup,packageFollowupKind}=await import(built('src/modules/harness/package-walk.js'));
   const {readPackageAnalysis}=await import(built('src/modules/harness/package-analysis.js'));
+  const {initialMessages}=await import(built('src/modules/harness/openrouter.js'));
+  const {resumeInterruptedResearch}=await import(built('src/modules/harness/runner.js'));
+  const {readFacadeSnapshot,synchronizeFacadeAssessment}=await import(built('src/modules/assessment/facade-store.js'));
   const queue=new WorkQueue(db);
   const {rows:[owner]}=await db.query(`WITH org AS (INSERT INTO organizations(name) VALUES('Fixture') RETURNING id),
     actor AS (INSERT INTO users(organization_id,login) SELECT id,'fixture-identity' FROM org RETURNING id),
@@ -112,7 +115,7 @@ test('addressed PDF and XLSX facts share a stable facade; the branch worker cons
         VALUES($1,$2,'native:1',$3,true,'Fixture raw line') ON CONFLICT DO NOTHING`,[packageWindow.id,job.lease.jobId,evidenceId]);
       await client.query('COMMIT');
     }catch(error){await client.query('ROLLBACK');throw error;}finally{client.release();}
-    return {id,evidenceId};
+    return {id,evidenceId,lineId};
   }
   const text=(value,identity='Facade',context='Building: Forge | Axes: 6-8',kind='')=>
     `Specification | Depth ${value} mm | ${identity}: ${mark} | ${context} | Stage: RD | Revision: Q-9 current | Variant: V2${kind}`;
@@ -220,6 +223,55 @@ test('addressed PDF and XLSX facts share a stable facade; the branch worker cons
     await settle();
   }
   assert.equal(await dispatchPackageFollowup(db,queue),false,'a revisit is never repeated with the same root and subject');
+  const pdfRoot=leased.get(pdf.version_id+'A');
+  const open=await publish(pdfRoot,pdf,'Depth 12 mm','12',{package:{attribute:'Depth'}});
+  await db.query(`UPDATE harness_package_structures SET blocks=jsonb_set(blocks,'{0,lineIds}',blocks#>'{0,lineIds}'||to_jsonb($2::text))
+    WHERE window_id=$1`,[pdfRoot.payload.packageWindow.id,open.lineId]);
+  await settle();
+  const unqualified=await state();
+  assert.ok(unqualified.comparisonFollowups.includes(open.id));
+  assert.ok(!unqualified.reviewCandidates.some(({a,b})=>a===open.id||b===open.id));
+  const snapshot=async(version)=>{
+    const tx=await db.connect();
+    try{
+      await tx.query('BEGIN');
+      const result=version===undefined?await synchronizeFacadeAssessment(tx,projectId):await readFacadeSnapshot(tx,projectId,version);
+      await tx.query('COMMIT');
+      return result;
+    }catch(error){await tx.query('ROLLBACK');throw error;}finally{tx.release();}
+  };
+  const openSource=(summary)=>{
+    const item=summary.payload.comparisonReview.items.find(({sources})=>sources.some(({citation})=>citation.observationId===open.id));
+    assert.ok(item?.reasons.includes('facade_link_unproven'));
+    return item.sources.find(({citation})=>citation.observationId===open.id);
+  };
+  const historical=await snapshot();
+  assert.equal(openSource(historical).clarification,undefined);
+  assert.deepEqual((await Promise.all([dispatchPackageFollowup(db,queue,false),dispatchPackageFollowup(db,queue,false)])).sort(),[false,true]);
+  assert.deepEqual(openSource(await snapshot()).clarification,[{branch:'A',state:'ready'}]);
+  const claim=()=>queue.claim({workerId:'fixture',kinds:[packageFollowupKind],leaseMs:30_000});
+  const clarification=await claim();
+  assert.deepEqual(openSource(await snapshot()).clarification,[{branch:'A',state:'leased'}]);
+  assert.equal(clarification.payload.branch,'A');
+  assert.deepEqual(clarification.payload.place,pdfRoot.payload.place);
+  const wire=JSON.parse(initialMessages(clarification.payload)[1].content);
+  assert.deepEqual(wire.comparison,{lineId:open.lineId,property:'Depth'});
+  assert.deepEqual(wire.blocks,['native:1']);
+  assert.ok(!JSON.stringify(wire).includes(xlsx.version_id));
+  assert.ok(!JSON.stringify(wire).includes(tableFact.id));
+  assert.equal(await queue.suspend(clarification.lease,{reason:'analysis_replay_only',nextAction:'fixture'}),true);
+  assert.deepEqual(openSource(await snapshot()).clarification,[{branch:'A',state:'held'}]);
+  assert.equal(await dispatchPackageFollowup(db,queue,false),false,'held clarification retains the same identity');
+  await resumeInterruptedResearch(db,queue,AbortSignal.timeout(10_000),true);
+  const resumed=await claim();
+  assert.equal(resumed.lease.jobId,clarification.lease.jobId);
+  assert.equal(await queue.finish(resumed.lease,{kind:'reviewed_no_match'},{state:'completed',evidenceRef:open.evidenceId}),true);
+  assert.deepEqual(openSource(await snapshot()).clarification,[{branch:'A',state:'done'}]);
+  assert.equal(openSource(await snapshot(historical.version)).clarification,undefined);
+  assert.equal(await dispatchPackageFollowup(db,queue,false),false,'unchanged anchor never enqueues twice');
+  const {rows:[effects]}=await db.query(`SELECT (SELECT count(*)::int FROM gateway_attempts) AS attempts,
+    (SELECT count(*)::int FROM harness_package_review_pairs) AS pairs,(SELECT count(*)::int FROM letters) AS letters`);
+  assert.deepEqual(effects,{attempts:0,pairs:0,letters:0});
   const priorEpoch=await epoch();
   const last=checked.facts.find(({id})=>id===tableFact.id).binding.version;
   const lastReplaced=checked.facts.find(({id})=>id===pdfFact.id).binding.version;
@@ -232,6 +284,7 @@ test('addressed PDF and XLSX facts share a stable facade; the branch worker cons
   assert.deepEqual(immediately.candidates.map(({id})=>id),[facadeId]);
   assert.equal(immediately.facadeProfiles[0].identity,'engineer');
   assert.equal(immediately.facts.find(({id})=>id===pdfFact.id),undefined);
+  assert.ok(!immediately.comparisonFollowups.includes(open.id));
   assert.equal(immediately.facts.find(({id})=>id===tableFact.id).binding.state,'identified');
   assert.ok(references.every(({id})=>immediately.facts.find((f)=>f.id===id).binding.state==='unclear'));
   assert.equal(immediately.facts.find(({id})=>id===tableFact.id).binding.actorId,owner.actor);
