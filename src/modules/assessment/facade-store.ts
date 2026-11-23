@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import type { PoolClient } from "pg";
 import { getCatalog, getProject, matchesDefaultProfile } from "../access/project-state.js";
 import { lockIntakeProject } from "../intake/gate.js";
@@ -215,7 +216,11 @@ export async function synchronizeFacadeAssessment(tx: PoolClient, projectId: str
   const unresolved = limitations.length > 0 || questions.some(({ machine }) => machine.outcome === "needs_review");
   const known = questions.some(({ machine }) => machine.outcome === "covered");
   const problem = questions.some(({ machine }) => machine.outcome === "confirmed_missing" || machine.outcome === "confirmed_conflict");
-  const observations = input.observations.map((fact) => ({ ref: `${fact.id}:${fact.binding.version}`, id: fact.id, payload: fact }));
+  const observations = input.observations.map((fact) => ({
+    ref: `${fact.id}:${createHash("sha256").update(canonicalJson(fact)).digest("hex")}`,
+    id: fact.id,
+    payload: fact,
+  }));
   const counts = { identified: 0, common: 0, unclear: 0, unidentified: 0 };
   const proposalCounts = { stage: 0, facadeKind: 0 };
   for (const observation of input.observations) {

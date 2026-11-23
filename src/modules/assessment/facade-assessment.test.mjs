@@ -287,8 +287,10 @@ test("ordinary intake publishes a local conflict, then keeps sent history after 
           anchors: { A: [quotes[0].quote], B: [quotes[1].quote] }, scopeName: job.packageReview.scopeLabel,
           confirmVariant: true, confirmRevision: true, confirmApplicability: true });
         assert.ok(proof);
+        const revision = { status: "confirmed", reason: "Reopened the original revision lines",
+          sources: quotes.map(({ evidenceId, quote }) => ({ evidenceId, quote })) };
         const outcome = job.mode === "lead" ? { kind: "proposal", aObservationId: job.dispute.a.observationId,
-          bObservationId: job.dispute.b.observationId, explanation: "Synthetic verified comparison", verifiedPair: proof } :
+          bObservationId: job.dispute.b.observationId, explanation: "Synthetic verified comparison", verifiedPair: proof, checks: { revision } } :
           { kind: "verification", verdict: "supported", verifiedPair: proof };
         await transaction(db, async (tx) => {
           assert.equal(await gateway.finish(lease, outcome, undefined, tx), true);
@@ -317,7 +319,10 @@ test("ordinary intake publishes a local conflict, then keeps sent history after 
     facadeKinds: ["panel"], reason: "Synthetic original",
   }, { version: project.version })).json();
   await request("PUT", `/api/projects/${projectId}/stage`, { stage: "P", reason: "Synthetic title" }, { version: kinds.version });
-  assert.equal((await assessment()).contexts.find(({ name }) => name === "F1").counts.confirmed_conflict, 0);
+  const beforeVerification = await assessment();
+  assert.equal(beforeVerification.contexts.find(({ name }) => name === "F1").counts.confirmed_conflict, 0);
+  const oldObservations = (await request("GET", beforeVerification.observations.href)).json().items;
+  assert.ok(oldObservations.every(({ basis }) => basis.revisionEvidence === undefined));
   await verifyConflicts();
   const early = await assessment();
   assert.equal(early.catalogVersionId, catalog.id);
@@ -327,6 +332,12 @@ test("ordinary intake publishes a local conflict, then keeps sent history after 
   assert.equal(early.contexts.find(({ kind }) => kind === "common").counts.covered, 1);
   assert.equal(early.contexts.find(({ name }) => name === "F2").counts.needs_review, 2);
   assert.equal(early.contexts.find(({ name }) => name === "F1").counts.confirmed_conflict, 1);
+  const newObservations = (await request("GET", early.observations.href)).json().items;
+  const titled = newObservations.find(({ basis }) => basis.revisionEvidence);
+  assert.ok(titled);
+  const historicalObservations = (await request("GET", beforeVerification.observations.href)).json().items;
+  assert.deepEqual(historicalObservations, oldObservations);
+  assert.equal(historicalObservations.find(({ id }) => id === titled.id).binding.version, titled.binding.version);
   const context = (summary) => summary.contexts.find(({ name }) => name === "F1");
   const question = (summary, key) => context(summary).questions.find(({ requirement }) => requirement.positionId === key);
   const decision = async (q, requestExternal = false) => (await request("POST", `/api/v1/questions/${q.id}/decisions`, {
