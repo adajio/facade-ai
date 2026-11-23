@@ -1,27 +1,22 @@
 <script lang="ts">
+  import { tick } from 'svelte';
   import { Commands } from '../lib/commands';
-  import { conflictMessage } from '../lib/conflict';
-  import { count, date, label } from '../lib/format';
-  import { ApiError, describe, id, interrupted, query, type Api } from '../lib/http';
+  import { label } from '../lib/format';
+  import { ApiError, denied, describe, id, interrupted, type Api } from '../lib/http';
   import type { Occurrence } from '../lib/intake';
-  import { V1, type Citation, type OpenEvidence, type WorkspaceProps } from '../lib/workspace';
-  import EvidenceButtons from '../lib/EvidenceButtons.svelte';
+  import { V1, type OpenEvidence, type WorkspaceProps } from '../lib/workspace';
   import Notice from '../lib/Notice.svelte';
+  import WorkJob, { type Job } from './DocumentJob.svelte';
 
   type Unit = { id: string; label?: string; locator?: Record<string, string | number> };
-  type Job = {
-    id: string; documentId: string; cursor: string; version?: number; status?: string; state?: string;
-    reason?: string; nextAction?: string; priority?: number; leaseUntil?: string; owner?: string;
-    branch?: 'A' | 'B'; evidence?: Citation[];
-  };
+  type ReaderMap = { source: { documentId: string; versionId: string; sha256: string }; units: Unit[] };
   type Work = {
-    jobs: Job[];
-    observations?: Citation[];
-    branches?: { branch: string; completed: number; total: number; outcome?: string }[];
-    review?: string; application?: string; previous?: string;
+    jobs: Job[]; jobCount: number;
+    branches: { branch: string; completed: number; total: number; outcome: string }[];
+    mappingReason?: string; mapReady: boolean; mapped: boolean; catalogAssigned: boolean;
   };
 
-  let { api, context, occurrence, open, renew }: {
+  let { api, context, occurrence, renew }: {
     api: Api; context: WorkspaceProps;
     occurrence: Occurrence & { documentId: string; versionId: string };
     open: OpenEvidence; renew: () => void;
@@ -31,103 +26,227 @@
   let work = $state<Work>();
   let readerError = $state('');
   let workError = $state('');
-  let operationError = $state('');
-  let status = $state('');
-  let saving = $state(false);
-  let priority = $state(0);
+  let originalError = $state('');
+  let ready = $state(false);
+  let showing = $state(false);
+  let page = $state(1);
+  let heading: HTMLHeadingElement;
+  let viewer = $state<HTMLHeadingElement>();
+  let refreshWork = $state(0);
 
-  let path = $derived('/api/documents/' + id(occurrence.documentId));
-  let original = $derived(path + '/versions/' + id(occurrence.versionId) + '/content');
+  const path = $derived('/api/documents/' + id(occurrence.documentId) + '/versions/' + id(occurrence.versionId));
+  const original = $derived(path + '/content');
+  const isPdf = $derived(occurrence.mediaType === 'application/pdf');
+  const pages = $derived(units.flatMap(({ locator }) => typeof locator?.page === 'number' ? [locator.page] : []));
+  const pdfUrl = $derived(original + '#page=' + page);
 
   $effect(() => {
-    const read = V1 + path.slice(4) + '/versions/' + id(occurrence.versionId) + '/reader/units';
-    const workPath = query(path + '/work', { versionId: occurrence.versionId });
-    void context.refreshKey;
-    const job = new AbortController();
-    const signal = job.signal;
-    readerError = '';
-    workError = '';
-    api.json<{ units: Unit[] }>(read, { signal }).then((value) => units = value.units ?? [])
-      .catch((error) => {
-        if (!interrupted(error)) readerError = error instanceof ApiError && error.status === 404
-          ? 'Карта физических единиц ещё недоступна.' : describe(error);
-      });
-    api.json<Work>(workPath, { signal }).then((value) => work = value)
-      .catch((error) => { if (!interrupted(error)) workError = describe(error); });
-    return () => job.abort();
+    const raw = context.params.get('page');
+    const saved = raw && /^[1-9]\d{0,6}$/u.test(raw) ? Number(raw) : 1;
+    page = saved;
+    showing = Boolean(raw) && isPdf;
+    if (context.params.get('document')) void tick().then(() => heading?.focus());
   });
 
-  async function change(job: Job, action: 'priority' | 'resume') {
-    if (saving) return;
-    saving = true;
-    operationError = '';
-    status = '';
+  $effect(() => {
+    if (pages.length && !pages.includes(page)) page = pages[0];
+  });
+
+  $effect(() => {
+    const url = original;
+    const expectedHash = occurrence.sha256;
+    const expectedPdf = isPdf;
+    const controller = new AbortController();
+    const { signal } = controller;
+    ready = false;
+    originalError = '';
+    void api.response(url, { method: 'HEAD', signal }).then((response) => {
+      if (expectedHash && response.headers.get('ETag') !== '"sha256-' + expectedHash + '"') {
+        originalError = 'Полученная версия не совпадает с SHA-256 в описи.';
+      } else if (expectedPdf && response.headers.get('Content-Type')?.split(';')[0] !== 'application/pdf') {
+        originalError = 'Сервер не подтвердил формат PDF принятого оригинала.';
+      } else {
+        ready = true;
+      }
+    }).catch((error) => { if (!signal.aborted) originalError = describe(error); });
+    return () => controller.abort();
+  });
+
+  $effect(() => {
+    const url = V1 + path.slice(4) + '/reader/units';
+    const { documentId, versionId, sha256 } = occurrence;
+    void context.refreshKey;
+    void work?.mapReady;
+    const controller = new AbortController();
+    readerError = '';
+    void api.json<ReaderMap>(url, { signal: controller.signal }).then((value) => {
+      if (value.source.documentId !== documentId || value.source.versionId !== versionId ||
+          sha256 && value.source.sha256 !== sha256) {
+        units = [];
+        readerError = 'Карта относится к другой версии оригинала.';
+        return;
+      }
+      units = value.units;
+    }).catch((error) => {
+      if (controller.signal.aborted || interrupted(error)) return;
+      units = [];
+      readerError = error instanceof ApiError && error.code === 'reader_map_unavailable'
+        ? 'Карта физических единиц ещё недоступна.' : describe(error);
+    });
+    return () => controller.abort();
+  });
+
+  $effect(() => {
+    const url = path + '/work';
+    void context.refreshKey;
+    void refreshWork;
+    const controller = new AbortController();
+    const { signal } = controller;
+    let timer: ReturnType<typeof setTimeout>;
+
+    async function load() {
+      try {
+        work = await api.json<Work>(url, { signal: AbortSignal.any([signal, AbortSignal.timeout(8000)]) });
+        workError = '';
+      } catch (error) {
+        if (signal.aborted) return;
+        work = undefined;
+        workError = describe(error);
+        if (denied(error)) {
+          ready = false;
+          return;
+        }
+      } finally {
+        if (!signal.aborted) timer = setTimeout(load, 5000);
+      }
+    }
+    void load();
+    return () => { controller.abort(); clearTimeout(timer); };
+  });
+
+  function setPage(next: number, focus = false) {
+    if (!ready || !Number.isSafeInteger(next) || next < 1 || (pages.length && !pages.includes(next))) return;
+    page = next;
+    showing = true;
+    const url = new URL(window.location.href);
+    url.searchParams.set('page', String(next));
+    history.replaceState(history.state, '', url);
+    if (focus) void tick().then(() => viewer?.focus());
+  }
+
+  function closeOriginal() {
+    showing = false;
+    const url = new URL(window.location.href);
+    url.searchParams.delete('page');
+    history.replaceState(history.state, '', url);
+    void tick().then(() => document.getElementById('document-open-original')?.focus());
+  }
+
+  async function change(job: Job, action: 'priority' | 'resume', priority?: number) {
     try {
-      await commands.send(path + '/' + action, action === 'priority' ? 'PATCH' : 'POST', {
-        jobId: job.id, cursor: job.cursor, ...(action === 'priority' ? { priority } : {}),
-      }, job.version);
-      status = action === 'priority' ? 'Приоритет сохранён.' : 'Продолжение поставлено в очередь.';
-    } catch (error) {
-      operationError = conflictMessage(error, job.version);
+      if (action === 'priority' && job.actions.priority.version !== undefined) {
+        await commands.send(path + '/work/' + id(job.id) + '/priority', 'PATCH', { priority }, job.actions.priority.version);
+      } else if (action === 'resume' && job.actions.resume.href && job.actions.resume.version !== undefined) {
+        await commands.send(job.actions.resume.href, 'POST', {}, job.actions.resume.version);
+      }
     } finally {
-      saving = false;
+      refreshWork += 1;
       renew();
     }
   }
 </script>
 
 <section class="card" aria-labelledby="document-heading">
-  <div class="card-header"><h2 id="document-heading">{occurrence.relativePath}</h2>
-    <a class="button" href={original} target="_blank" rel="noopener">Скачать оригинал</a>
+  <div class="card-header">
+    <h2 id="document-heading" bind:this={heading} tabindex="-1">{occurrence.relativePath}</h2>
+    {#if ready}
+      <div class="actions">
+        {#if isPdf}
+          <button id="document-open-original" class="primary" type="button"
+            onclick={() => setPage(pages.includes(page) || !pages.length ? page : pages[0], true)}>Открыть оригинал</button>
+        {/if}
+        <a class="button" href={original} download={occurrence.relativePath.split('/').at(-1)}>Скачать оригинал</a>
+      </div>
+    {/if}
   </div>
+  <Notice kind="error" message={originalError} />
+  {#if !ready && !originalError && !workError}<p role="status">Проверяем доступ к оригиналу…</p>{/if}
+  {#if showing && ready && isPdf}
+    <section class="original" aria-labelledby="document-viewer">
+      <div class="card-header">
+        <h3 id="document-viewer" tabindex="-1" bind:this={viewer}>Оригинал PDF</h3>
+        <button type="button" onclick={closeOriginal}>Закрыть просмотр</button>
+      </div>
+      <div class="actions">
+        <button type="button" disabled={page === 1} onclick={() => setPage(page - 1)}>Предыдущая страница</button>
+        <span aria-live="polite">Страница {page}{pages.length ? ' из ' + pages.length : ''}</span>
+        <button type="button" disabled={!pages.length || page >= pages.at(-1)!} onclick={() => setPage(page + 1)}>Следующая страница</button>
+        <a href={pdfUrl} target="_blank" rel="noopener">Открыть PDF в новой вкладке</a>
+      </div>
+      {#key pdfUrl}
+        <iframe title={'Оригинал PDF, страница ' + page} src={pdfUrl}></iframe>
+      {/key}
+    </section>
+  {/if}
   <dl class="details">
-    <dt>Редакция</dt><dd>{occurrence.versionId}</dd>
+    <dt>Версия оригинала</dt><dd>{occurrence.versionId}</dd>
     <dt>SHA-256</dt><dd>{occurrence.sha256 ?? '—'}</dd>
     <dt>Фактический тип</dt><dd>{occurrence.mediaType ?? '—'}</dd>
-    <dt>Верификация</dt><dd>{label(work?.review)}</dd>
-    <dt>Применение</dt><dd>{label(work?.application)}</dd>
-    {#if work?.previous}<dt>Предыдущий результат</dt><dd>{label(work.previous)}</dd>{/if}
+    {#if occurrence.restriction}<dt>Ограничение</dt><dd>{label(occurrence.restriction)}</dd>{/if}
   </dl>
   <h3>Физические единицы</h3>
   <Notice message={readerError} />
   {#if units.length}
-    <ul class="plain-list">{#each units as unit (unit.id)}
-      <li>{unit.label ?? (unit.locator?.page ? 'Страница ' + unit.locator.page : unit.id)}</li>
-    {/each}</ul>
-  {/if}
-  <Notice message={workError && 'Состояние чтения · ' + workError} />
-  {#if work?.branches?.length}
-    <h3>Охват чтения</h3>
-    <ul class="plain-list">{#each work.branches as branch (branch.branch)}
-      <li>Ветвь {branch.branch} · {count(branch.completed)} из {count(branch.total)} · {label(branch.outcome)}</li>
-    {/each}</ul>
-  {/if}
-  <EvidenceButtons citations={work?.observations} {open} />
-  <Notice kind="error" message={operationError} />
-  <Notice kind="success" message={status} />
-  {#each work?.jobs ?? [] as job (job.id)}
-    <section class="card">
-      <h3>Работа {job.branch ?? ''}</h3>
-      <dl class="details">
-        <dt>Состояние</dt><dd>{label(job.status ?? job.state)}</dd>
-        <dt>Адрес продолжения</dt><dd>{job.cursor || '—'}</dd>
-        <dt>Приоритет</dt><dd>{job.priority ?? '—'}</dd>
-        {#if job.reason}<dt>Причина</dt><dd>{label(job.reason)}</dd>{/if}
-        {#if job.owner}<dt>Ответственный</dt><dd>{job.owner}</dd>{/if}
-        {#if job.leaseUntil}<dt>До</dt><dd>{date(job.leaseUntil)}</dd>{/if}
-      </dl>
-      <EvidenceButtons citations={job.evidence} {open} />
-      {#if context.canEdit}
-        <div class="actions">
-          <label>Новый приоритет<input type="number" bind:value={priority} /></label>
-          <button type="button" disabled={saving || !Number.isInteger(priority)} onclick={() => change(job, 'priority')}>Изменить приоритет</button>
-          {#if job.nextAction === 'resume'}
-            <button type="button" disabled={saving} onclick={() => change(job, 'resume')}>Продолжить</button>
-          {:else if job.nextAction}
-            <span class="meta">{label(job.nextAction)}</span>
+    <ul class="plain-list unit-list">
+      {#each units as unit (unit.id)}
+        {@const number = unit.locator?.page}
+        <li>
+          {#if isPdf && typeof number === 'number' && ready}
+            <button type="button" onclick={() => setPage(number, true)}>{unit.label ?? 'Страница ' + number}</button>
+          {:else}
+            {unit.label ?? unit.id}
+            {#if unit.locator?.coverage} · {label(unit.locator.coverage)}{/if}
+            {#if unit.locator?.limitations} · {String(unit.locator.limitations).split(',').map((value) => label(value)).join(' · ')}{/if}
           {/if}
-        </div>
-      {/if}
-    </section>
-  {/each}
+        </li>
+      {/each}
+    </ul>
+  {/if}
+
+  <h3>Состояние чтения</h3>
+  <Notice message={workError} />
+  {#if work}
+    {#if work.mappingReason}
+      <p>Подготовка карты приостановлена · {label(work.mappingReason)}</p>
+    {:else if !work.mapped}
+      <p>Подготовка карты оригинала ожидает обработки.</p>
+    {:else if !work.mapReady}
+      <p>Оригинал принят. Представление для чтения недоступно.</p>
+    {:else if !work.jobCount}
+      <p>Карта готова. Задания чтения пока отсутствуют.</p>
+    {/if}
+    {#if work.branches.some(({ outcome }) => outcome === 'held')}<p>Чтение остановлено. Причины указаны в заданиях.</p>{/if}
+    {#if !work.catalogAssigned}<p>Нет рабочего каталога. Оценка комплектности ожидает назначения.</p>{/if}
+    {#if work.branches.length}
+      <ul class="plain-list">
+        {#each work.branches as branch (branch.branch)}
+          <li>Ветвь {branch.branch} · завершено заданий {branch.completed} из {branch.total} · {label(branch.outcome)}</li>
+        {/each}
+      </ul>
+    {/if}
+    {#if work.jobCount > work.jobs.length}
+      <p class="meta">Показано {work.jobs.length} из {work.jobCount} заданий. Сначала остановленные и активные.</p>
+    {/if}
+    {#each work.jobs as job (job.id)}
+      <WorkJob {job} {change} />
+    {/each}
+  {:else if !workError}
+    <p role="status">Проверяем очередь чтения…</p>
+  {/if}
 </section>
+
+<style>
+  .original { margin-block: 1rem; }
+  iframe { width: 100%; height: max(24rem, 64dvh); border: 1px solid var(--line); margin-top: .6rem; }
+  .unit-list { display: flex; flex-wrap: wrap; align-items: center; gap: .4rem .7rem; }
+</style>

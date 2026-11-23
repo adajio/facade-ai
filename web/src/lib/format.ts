@@ -2,6 +2,20 @@ const ruNumber = new Intl.NumberFormat('ru', { maximumFractionDigits: 2 });
 const ruDate = new Intl.DateTimeFormat('ru', { dateStyle: 'medium', timeStyle: 'short' });
 const labels: Record<string, string> = {
   queued: 'В очереди',
+  leased: 'В работе',
+  done: 'Завершено',
+  waiting_route: 'Ожидается маршрут',
+  job_not_waiting: 'Доступен только для ожидающей работы',
+  no_resumable_stop: 'Для этой остановки ручное продолжение недоступно',
+  continuation_requested: 'Запрос уже принят',
+  operator_reconcile_attempt: 'Техническому оператору нужно сверить журнал отправок',
+  operator_reconcile_route: 'Техническому оператору нужно сверить журнал маршрута',
+  research_profile_unavailable: 'Ожидается доступный профиль чтения',
+  research_route_not_approved: 'Ожидается разрешённый маршрут',
+  research_gateway_unconfigured: 'Ожидается настройка маршрута чтения',
+  route_denied: 'Ожидается разрешение на маршрут',
+  original_only: 'Доступен оригинал',
+
   pending: 'Ожидает',
   running: 'В работе',
   uploading: 'Передача',
@@ -59,6 +73,7 @@ const labels: Record<string, string> = {
   input_size_limit: 'Превышен размер входа',
   effect_conflict: 'Сохранённый запрос требует сверки',
   route_bound_unavailable: 'Предел расходов требует сверки',
+  analysis_prior_effect: 'Техническому оператору нужно сверить прежнюю отправку по этому месту',
   unknown_charge: 'Исход отправки требует сверки',
   route_receipt_mismatch: 'Квитанция не совпала с маршрутом',
   http_429: 'Маршрут ограничил запросы',

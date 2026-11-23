@@ -1,6 +1,6 @@
 <script lang="ts">
   import { tick } from 'svelte';
-  import { denied, describe, endpoint, id, interrupted, type Api, type RecordData } from './http';
+  import { denied, describe, id, interrupted, type Api, type RecordData } from './http';
   import { V1, type Citation } from './workspace';
   import Notice from './Notice.svelte';
 
@@ -8,20 +8,19 @@
   type Transform = { width: number; height: number; pixelsPerPoint: number; pixelOriginX: number; pixelOriginY: number };
   type Evidence = {
     id: string;
-    source: { documentId: string; versionId: string; sha256: string; name?: string; relativePath?: string };
+    source: { projectId: string; documentId: string; versionId: string; sha256: string; name?: string; relativePath?: string };
     readerVersion?: string;
     branch?: string;
     address: { unitId?: string; page?: number; box?: Box; locator?: Record<string, string | number> };
     transform?: Transform;
     limitations?: string[];
     mediaType?: string;
-    contentUrl?: string;
-    inputImage?: { transform: Transform; url?: string };
+    inputImage?: { transform: Transform };
   };
   type Observation = Citation & { scope?: string; box?: Box; limitation?: string; address?: Evidence['address'] };
 
-  let { api, refs, index, componentIndex, select, selectComponent, close, verify }: {
-    api: Api; refs: Citation[]; index: number; select: (i: number) => void; close: () => void; verify: () => void;
+  let { api, projectId, refs, index, componentIndex, select, selectComponent, close, verify }: {
+    api: Api; projectId: string; refs: Citation[]; index: number; select: (i: number) => void; close: () => void; verify: () => void;
     componentIndex?: number; selectComponent: (index?: number) => void;
   } = $props();
 
@@ -48,13 +47,18 @@
   let transform = $state<Transform>();
   let error = $state('');
   let previewError = $state('');
+  let fullOriginal = $state('');
   let pending = $state(true);
   let zoom = $state(100);
   let full = $state(false);
   let viewport = $state<HTMLDivElement>();
   let selectedAddress = $derived(citation?.address as Evidence['address'] | undefined);
   let locator = $derived({ ...evidence?.address.locator, ...selectedAddress?.locator, ...observation?.address?.locator });
-  let box = $derived(observation?.box ?? observation?.address?.box ?? selectedAddress?.box ?? evidence?.address?.box);
+  let box = $derived.by(() => {
+    const placed = observation?.box ?? observation?.address?.box ?? selectedAddress?.box ?? evidence?.address?.box;
+    return placed && [placed.x, placed.y, placed.width, placed.height].every(Number.isFinite) &&
+      placed.width > 0 && placed.height > 0 ? placed : undefined;
+  });
 
   $effect(() => {
     const ref = parent;
@@ -80,6 +84,7 @@
     image = '';
     error = '';
     previewError = '';
+    fullOriginal = '';
     zoom = 100;
     pending = true;
     const stop = new AbortController();
@@ -89,12 +94,23 @@
       const path = V1 + '/evidence/' + id(ref.evidenceId);
       try {
         const meta = await api.json<Evidence>(path, { signal });
-        if (ref.versionId && meta.source.versionId !== ref.versionId || ref.sha256 && meta.source.sha256 !== ref.sha256) {
-          throw new Error('Открытое место не совпадает с закреплённой версией оригинала.');
+        if (meta.id !== ref.evidenceId || meta.source.projectId !== projectId ||
+            ref.documentId && meta.source.documentId !== ref.documentId ||
+            ref.versionId && meta.source.versionId !== ref.versionId || ref.sha256 && meta.source.sha256 !== ref.sha256) {
+          error = 'Открытое место не совпадает с закреплённой версией оригинала.';
+          return;
         }
         evidence = meta;
-        const response = await api.response(meta.contentUrl ?? path + '/content', { signal });
-        if (response.headers.get('Content-Type')?.startsWith('image/')) {
+        const original = '/api/documents/' + id(meta.source.documentId) + '/versions/' + id(meta.source.versionId) + '/content';
+        void api.response(original, { method: 'HEAD', signal }).then((response) => {
+          if (!signal.aborted && response.headers.get('ETag') === '"sha256-' + meta.source.sha256 + '"') {
+            const page = meta.address.locator?.page ?? meta.address.page;
+            fullOriginal = original + (typeof page === 'number' && Number.isSafeInteger(page) && page > 0 &&
+              response.headers.get('Content-Type')?.startsWith('application/pdf') ? '#page=' + page : '');
+          }
+        }).catch(() => { /* Full-source access is independent of the addressed fragment. */ });
+        const response = await api.response(path + '/content', { signal });
+        if (/^image\/(png|jpeg|webp)(?:;|$)/u.test(response.headers.get('Content-Type') ?? '')) {
           const body = await response.blob();
           signal.throwIfAborted();
           imageUrl = URL.createObjectURL(body);
@@ -104,8 +120,8 @@
           const result = await response.json() as RecordData;
           signal.throwIfAborted();
           rows = Array.isArray(result) ? result : Array.isArray(result.lines) ? result.lines : [];
-          if (meta.inputImage?.url) {
-            const raster = await api.response(meta.inputImage.url, { signal }).then((res) => res.blob());
+          if (meta.inputImage) {
+            const raster = await api.response(path + '/ocr-input', { signal }).then((res) => res.blob());
             signal.throwIfAborted();
             imageUrl = URL.createObjectURL(raster);
             image = imageUrl;
@@ -233,7 +249,7 @@
         {/if}
       </p>
     {/if}
-    <a class="button" target="_blank" rel="noopener" href={endpoint('/api/documents/' + id(evidence.source.documentId) + '/versions/' + id(evidence.source.versionId) + '/content')}>Открыть оригинал</a>
+    {#if fullOriginal}<a class="button" target="_blank" rel="noopener" href={fullOriginal}>Открыть оригинал</a>{/if}
     <Notice message={observation?.limitation ?? evidence.limitations?.join(' · ') ?? ''} />
     <Notice kind="error" message={previewError} />
     {#if image}

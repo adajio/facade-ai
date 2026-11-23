@@ -10,6 +10,7 @@
   import Overview from './Overview.svelte';
   import Receipts from './Receipts.svelte';
   import Completeness from './Completeness.svelte';
+  import FacadeAssessment from './FacadeAssessment.svelte';
   import Questions from './Questions.svelte';
   import Letters from './Letters.svelte';
   import Members from './Members.svelte';
@@ -226,7 +227,7 @@
             </select>
           </label>
         {/if}
-        {#if available(project, 'project:manage')}
+        {#if available(project, 'project:manage') && (!project.intakeMode || scopes.length)}
           <button type="button" onclick={() => scopeForm = !scopeForm}>Добавить область</button>
         {/if}
         {#if projection}<span class="meta">Срез {projection.projectionVersion}</span>{/if}
@@ -243,18 +244,23 @@
       {/if}
       {#if subscriptionError}<Notice message={'Синхронизация проекта · ' + subscriptionError} />{/if}
       {#if pinnedSlice && projection && pinnedSlice !== projection.sliceId}
-        <p class="notice">Появился новый срез. <a href={scopedUrl(project.id, section, { scope: scopeId, filter }, route.objectId)}>Открыть актуальный</a></p>
+        {@const currentQuery = Object.fromEntries([...route.params].filter(([key]) => key !== 'slice'))}
+        <p class="notice">Появился новый срез. <a href={scopedUrl(project.id, section, currentQuery, route.objectId)}>Открыть актуальный</a></p>
       {/if}
     {/if}
     <div class:with-evidence={refs.length > 0} class="project-content">
       <div class="section-content">
         {#key section + '/' + scopeId}
           {#if section === 'overview'}
-            <Overview {api} {context} {projection} />
+            <Overview {api} {context} {projection} {renew} open={openEvidence} />
           {:else if section === 'receipts'}
             <Receipts {api} {context} {projection} {renew} open={openEvidence} />
           {:else if section === 'completeness'}
-            <Completeness {api} {context} {renew} open={openEvidence} />
+            {#if project.intakeMode && (!scopeId || route.params.has('context')) && !project.scopeId}
+              <FacadeAssessment {api} {context} {renew} open={openEvidence} />
+            {:else}
+              <Completeness {api} {context} {renew} open={openEvidence} />
+            {/if}
           {:else if section === 'questions' || section === 'facts'}
             <Questions {api} {context} mode={section} {renew} open={openEvidence} />
           {:else if section === 'letters'}
@@ -267,7 +273,7 @@
         {/key}
       </div>
       {#if refs.length}
-        <EvidenceViewer {api} {refs} index={selected} {componentIndex} close={closeEvidence} verify={() => refresh(true)}
+        <EvidenceViewer {api} projectId={project.id} {refs} index={selected} {componentIndex} close={closeEvidence} verify={() => refresh(true)}
           select={(index) => { selected = index; componentIndex = undefined; address(index); }}
           selectComponent={(index) => { componentIndex = index; address(selected); }} />
       {/if}

@@ -21,7 +21,7 @@
     id: string; editedWording?: string | null; wordingSha256?: string;
     wordingApproval?: WordingReview & { basisSha256: string };
   };
-  type Summary = { id: string; number: number; scopeId: string; version: number; revisionId: string; status: string; recipient: string; createdAt: string };
+  type Summary = { id: string; number: number; scopeId?: string | null; assessmentContextId?: string | null; version: number; revisionId: string; status: string; recipient: string; createdAt: string };
   type RevisionRow = { id: string; version: number; status: string; createdAt: string };
   type Revision = RevisionRow & { items: Item[]; text: string; recipient: string; layout: 'formal' | 'brief' };
   type Export = { id: string; format: 'txt' | 'docx'; url: string; historicalUrl: string; revisionId: string };
@@ -74,6 +74,9 @@
   let historical = $derived(Boolean(context.revision || sentId || activeResponse));
   let activeId = $derived(context.objectId ?? '');
   let base = $derived(projectV1(context.project.id) + '/letters');
+  let assessmentContextId = $derived(context.params.get('context') ||
+    (letter?.id === activeId ? letter?.assessmentContextId : undefined) || undefined);
+  let target = $derived(assessmentContextId ? { assessmentContextId } : { scopeId: context.scopeId || undefined });
   let current = $derived(letter?.id === activeId ? letter : undefined);
   let currentRevision = $derived(revision && current && revision.id === (context.revision ?? current.revisionId) ? revision : undefined);
   let choices = $derived((eligible?.items ?? []).filter((item) => !recipient || item.recipient === recipient));
@@ -89,7 +92,16 @@
     return V1 + '/letters/' + id(letterId);
   }
   function url(letterId?: string, params: Record<string, unknown> = {}) {
-    return scopedUrl(context.project.id, 'letters', { scope: context.scopeId, ...params }, letterId);
+    return scopedUrl(context.project.id, 'letters', {
+      scope: assessmentContextId ? undefined : context.scopeId, context: assessmentContextId,
+      ...params,
+    }, letterId);
+  }
+  function assessmentUrl(letter?: Summary, questionId?: string) {
+    return scopedUrl(context.project.id, 'completeness', {
+      scope: letter?.scopeId ?? (assessmentContextId ? undefined : context.scopeId),
+      context: letter?.assessmentContextId ?? assessmentContextId,
+    }, questionId);
   }
   function asSelection(item: Ground): Selection {
     return { questionId: item.questionId, questionVersion: item.questionVersion, decisionId: item.decisionId };
@@ -128,21 +140,23 @@
 
   $effect(() => {
     const scopeId = context.scopeId;
+    const selection = target;
     const listPath = base;
     void context.refreshKey;
     const stop = new AbortController();
     listError = '';
-    api.json<Page<Summary>>(query(listPath, { scopeId }), { signal: stop.signal }).then((page) => {
+    api.json<Page<Summary>>(query(listPath, selection), { signal: stop.signal }).then((page) => {
       letters = page.items;
       cursor = page.nextCursor ?? null;
     }).catch((error) => { if (!interrupted(error)) listError = describe(error); });
-    if (scopeId) {
+    eligible = undefined;
+    if (selection.scopeId || selection.assessmentContextId) {
       eligibleError = '';
-      api.json<Eligible>(query(listPath + '/eligible', { scopeId }), { signal: stop.signal })
+      api.json<Eligible>(query(listPath + '/eligible', selection), { signal: stop.signal })
         .then(async (result) => {
           eligible = result;
           assessmentOutcome = '';
-          if (result.items.length || result.holds.length) return;
+          if (result.items.length || result.holds.length || selection.assessmentContextId) return;
           const outcome = await api.json<Assessment>(query(listPath.replace(/\/letters$/, '/assessments/current'), { scopeId }), {
             signal: stop.signal,
           }).catch(() => undefined);
@@ -240,7 +254,7 @@
     const observed = context.refreshKey;
     paging = true;
     try {
-      const page = await api.json<Page<Summary>>(query(base, { scopeId: context.scopeId, cursor }));
+      const page = await api.json<Page<Summary>>(query(base, { ...target, cursor }));
       if (observed !== context.refreshKey) return;
       const known = new Set(letters.map((item) => item.id));
       letters = [...letters, ...page.items.filter((item) => !known.has(item.id))];
@@ -279,7 +293,7 @@
     if (!selected.length) return;
     void run(async () => {
       const result = await commands.send<Summary>(base, 'POST', {
-        scopeId: context.scopeId, recipient, items: selected.map(asSelection),
+        ...target, recipient, items: selected.map(asSelection),
       });
       window.location.assign(url(result.id));
     });
@@ -402,7 +416,7 @@
 <Notice kind="error" message={listError} />
 <Notice kind="error" message={problem} />
 <Notice kind="success" message={status} />
-{#if context.scopeId && !activeId}
+{#if (context.scopeId || assessmentContextId) && !activeId}
   <section class="card">
     <h2>Пункты к запросу</h2>
     <Notice kind="error" message={eligibleError} />
@@ -412,7 +426,7 @@
       <p>{assessmentOutcome === 'sufficient'
         ? 'Письмо не требуется. Комплект достаточен для выбранной области.'
         : 'Внешних оснований пока нет. Для письма нужны подтверждённые нехватка или противоречие.'}</p>
-      <a href={scopedUrl(context.project.id, 'completeness', { scope: context.scopeId })}>Проверить комплектность</a>
+      <a href={assessmentUrl()}>Проверить комплектность</a>
     {:else if eligible?.items.length}
       {#if context.canEdit}
         <form onsubmit={create}>
@@ -474,7 +488,7 @@
             <ul class="plain-list">{#each sentSnapshot.items as item (item.id)}
               <li>{item.subject}<EvidenceButtons citations={supports(item)} {open} />
                 {#if context.canEdit}
-                  <a href={scopedUrl(context.project.id, 'receipts', { scope: context.scopeId, letter: current.id, sent: sentId, item: item.id })}>Добавить досылку по пункту</a>
+                  <a href={scopedUrl(context.project.id, 'receipts', { scope: context.scopeId, letter: current.id, sent: sentId, item: item.id, upload: 1 })}>Добавить досылку по пункту</a>
                 {/if}
               </li>
             {/each}</ul>
@@ -517,7 +531,7 @@
             <h3>Основания</h3>
             <ul class="plain-list">{#each currentRevision.items as item (item.id)}
               <li>
-                <a href={scopedUrl(context.project.id, 'completeness', { scope: current.scopeId }, item.questionId)}>{item.subject}</a>
+                <a href={assessmentUrl(current, item.questionId)}>{item.subject}</a>
                 <EvidenceButtons citations={supports(item)} {open} />
               </li>
             {/each}</ul>
@@ -552,7 +566,7 @@
               <h2>Допуск сохранённой редакции</h2>
               {#if currentRevision.items.some((item) => !currentGround(item))}
                 <p class="notice">Для части пунктов изменились основания или получатель.</p>
-                <a href={scopedUrl(context.project.id, 'completeness', { scope: current.scopeId })}>Сверить комплектность</a>
+                <a href={assessmentUrl(current)}>Сверить комплектность</a>
               {/if}
               {#each reviewItems as { item, ground } (reviewKey(item, ground))}
                 {#if item.wordingSha256 && item.editedWording}
