@@ -9,8 +9,8 @@
   import Notice from '../lib/Notice.svelte';
   import FacadeObservations from './FacadeObservations.svelte';
 
-  let { api, context, open, renew, overview = false }: {
-    api: Api; context: WorkspaceProps; open: OpenEvidence; renew: () => void; overview?: boolean;
+  let { api, context, open, renew, overview = false, overviewVersion }: {
+    api: Api; context: WorkspaceProps; open: OpenEvidence; renew: () => void; overview?: boolean; overviewVersion?: number;
   } = $props();
   const commands = new Commands(() => api);
   let summary = $state<FacadeAssessment>();
@@ -33,8 +33,9 @@
 
   $effect(() => {
     const projectId = context.project.id;
-    const path = projectV1(projectId) + '/facade-assessment' + (historicalVersion ? '/' + id(historicalVersion) : '');
-    void context.refreshKey;
+    const version = historicalVersion || overviewVersion;
+    const path = projectV1(projectId) + '/facade-assessment' + (version ? '/' + id(version) : '');
+    if (!overviewVersion) void context.refreshKey;
     const controller = new AbortController();
     problem = '';
     void api.json<FacadeAssessment>(path, {
@@ -66,7 +67,7 @@
 
   function url(ctx?: FacadeContext, question?: AssessmentQuestion, filter?: string) {
     return scopedUrl(context.project.id, 'completeness', {
-      context: ctx?.assessmentContextId, filter, revision: historicalVersion, slice: context.params.get('slice'),
+      context: ctx?.assessmentContextId, filter, revision: historicalVersion || (ctx ? overviewVersion : undefined), slice: context.params.get('slice'),
     }, question?.id);
   }
 
