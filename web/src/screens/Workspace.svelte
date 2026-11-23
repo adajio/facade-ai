@@ -15,18 +15,23 @@
   import Letters from './Letters.svelte';
   import Members from './Members.svelte';
 
-  let { api, project, route, masked, refresh, onDenied }: {
+  let { api, project, route, masked, refresh, onDenied, setDocumentPage }: {
     api: Api; project: Project; route: Route; masked: boolean; refresh: (foreground?: boolean) => Promise<void>;
-    onDenied: () => void;
+    onDenied: () => void; setDocumentPage: (page?: number) => void;
   } = $props();
 
   let section = $derived(route.section ?? 'overview');
+  let projectId = $derived(project.id);
   let scopes = $derived(project.scopes ?? []);
   let requestedScope = $derived(route.params.get('scope') ?? '');
   let scopeId = $derived(scopes.some((scope) => scope.id === requestedScope) ? requestedScope : (scopes[0]?.id ?? ''));
   let filter = $derived(route.params.get('filter') ?? '');
   let pinnedSlice = $derived(route.params.get('slice') ?? undefined);
   let revision = $derived(route.params.get('revision') ?? undefined);
+  let objectId = $derived(route.objectId);
+  let evidenceId = $derived(route.params.get('evidence'));
+  let observationId = $derived(route.params.get('observation') ?? undefined);
+  let evidenceComponent = $derived(route.params.get('component'));
   let projection = $state<Projection>();
   let subscriptionError = $state('');
   let refreshKey = $state(0);
@@ -56,7 +61,7 @@
   }
 
   $effect(() => {
-    const base = projectApi(project.id);
+    const base = projectApi(projectId);
     const activeScope = scopeId;
     if (masked) return;
     void loopRevision;
@@ -123,11 +128,12 @@
   $effect(() => {
     void section;
     void scopeId;
-    void route.objectId;
-    const evidence = route.params.get('evidence');
-    const component = route.params.get('component');
+    void objectId;
+    const evidence = evidenceId;
+    const observation = observationId;
+    const component = evidenceComponent;
     untrack(() => {
-      refs = evidence ? [{ evidenceId: evidence, observationId: route.params.get('observation') ?? undefined }] : [];
+      refs = evidence ? [{ evidenceId: evidence, observationId: observation }] : [];
       selected = 0;
       componentIndex = component && /^\d{1,2}$/u.test(component) ? Number(component) : undefined;
       trigger = undefined;
@@ -194,7 +200,7 @@
 
   let context = $derived({
     project, scopeId, sliceId: pinnedSlice ?? projection?.sliceId, filter, revision,
-    params: route.params, cursor: projection?.cursor, objectId: route.objectId, canEdit: isEngineer(project), refreshKey,
+    params: route.params, cursor: projection?.cursor, objectId, canEdit: isEngineer(project), refreshKey, setDocumentPage,
   });
 </script>
 

@@ -42,6 +42,18 @@
     route = readRoute(window.location);
   }
 
+  function setDocumentPage(page?: number) {
+    const url = new URL(window.location.href);
+    const params = new URLSearchParams(route.params);
+    for (const query of [url.searchParams, params]) {
+      if (page === undefined) query.delete('page');
+      else query.set('page', String(page));
+    }
+    history.replaceState(history.state, '', url);
+    activeLocation = url.pathname + url.search;
+    route = { ...route, params };
+  }
+
   function expired() {
     const next = window.location.pathname + window.location.search;
     clear();
@@ -258,7 +270,7 @@
           <Projects {api} {session} refresh={verify} />
         {:else if route.page === 'project' && project}
           {#key project.id}
-            <Workspace {api} {project} {route} {masked} refresh={verify}
+            <Workspace {api} {project} {route} {masked} {setDocumentPage} refresh={verify}
               onDenied={() => lockScreen('denied')} />
           {/key}
         {:else if route.page === 'admin' && session.actions?.includes('organization:admin')}

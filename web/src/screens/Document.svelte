@@ -28,33 +28,35 @@
   let workError = $state('');
   let originalError = $state('');
   let ready = $state(false);
-  let showing = $state(false);
-  let page = $state(1);
   let heading: HTMLHeadingElement;
   let viewer = $state<HTMLHeadingElement>();
   let refreshWork = $state(0);
 
-  const path = $derived('/api/documents/' + id(occurrence.documentId) + '/versions/' + id(occurrence.versionId));
+  const documentId = $derived(occurrence.documentId);
+  const versionId = $derived(occurrence.versionId);
+  const originalHash = $derived(occurrence.sha256);
+  const snapshotRevision = $derived(context.refreshKey);
+  const mapReady = $derived(work?.mapReady);
+  const path = $derived('/api/documents/' + id(documentId) + '/versions/' + id(versionId));
   const original = $derived(path + '/content');
   const isPdf = $derived(occurrence.mediaType === 'application/pdf');
   const pages = $derived(units.flatMap(({ locator }) => typeof locator?.page === 'number' ? [locator.page] : []));
+  const selectedPage = $derived.by(() => {
+    const raw = context.params.get('page');
+    return raw && /^[1-9]\d{0,6}$/u.test(raw) ? Number(raw) : undefined;
+  });
+  const page = $derived(selectedPage !== undefined && (!pages.length || pages.includes(selectedPage))
+    ? selectedPage : pages[0] ?? 1);
   const pdfUrl = $derived(original + '#page=' + page);
 
   $effect(() => {
-    const raw = context.params.get('page');
-    const saved = raw && /^[1-9]\d{0,6}$/u.test(raw) ? Number(raw) : 1;
-    page = saved;
-    showing = Boolean(raw) && isPdf;
-    if (context.params.get('document')) void tick().then(() => heading?.focus());
-  });
-
-  $effect(() => {
-    if (pages.length && !pages.includes(page)) page = pages[0];
+    void versionId;
+    void tick().then(() => heading?.focus());
   });
 
   $effect(() => {
     const url = original;
-    const expectedHash = occurrence.sha256;
+    const expectedHash = originalHash;
     const expectedPdf = isPdf;
     const controller = new AbortController();
     const { signal } = controller;
@@ -74,14 +76,14 @@
 
   $effect(() => {
     const url = V1 + path.slice(4) + '/reader/units';
-    const { documentId, versionId, sha256 } = occurrence;
-    void context.refreshKey;
-    void work?.mapReady;
+    const expected = { documentId, versionId, sha256: originalHash };
+    void snapshotRevision;
+    void mapReady;
     const controller = new AbortController();
     readerError = '';
     void api.json<ReaderMap>(url, { signal: controller.signal }).then((value) => {
-      if (value.source.documentId !== documentId || value.source.versionId !== versionId ||
-          sha256 && value.source.sha256 !== sha256) {
+      if (value.source.documentId !== expected.documentId || value.source.versionId !== expected.versionId ||
+          expected.sha256 && value.source.sha256 !== expected.sha256) {
         units = [];
         readerError = 'Карта относится к другой версии оригинала.';
         return;
@@ -98,7 +100,7 @@
 
   $effect(() => {
     const url = path + '/work';
-    void context.refreshKey;
+    void snapshotRevision;
     void refreshWork;
     const controller = new AbortController();
     const { signal } = controller;
@@ -126,19 +128,12 @@
 
   function setPage(next: number, focus = false) {
     if (!ready || !Number.isSafeInteger(next) || next < 1 || (pages.length && !pages.includes(next))) return;
-    page = next;
-    showing = true;
-    const url = new URL(window.location.href);
-    url.searchParams.set('page', String(next));
-    history.replaceState(history.state, '', url);
+    context.setDocumentPage(next);
     if (focus) void tick().then(() => viewer?.focus());
   }
 
   function closeOriginal() {
-    showing = false;
-    const url = new URL(window.location.href);
-    url.searchParams.delete('page');
-    history.replaceState(history.state, '', url);
+    context.setDocumentPage();
     void tick().then(() => document.getElementById('document-open-original')?.focus());
   }
 
@@ -171,7 +166,7 @@
   </div>
   <Notice kind="error" message={originalError} />
   {#if !ready && !originalError && !workError}<p role="status">Проверяем доступ к оригиналу…</p>{/if}
-  {#if showing && ready && isPdf}
+  {#if selectedPage !== undefined && ready && isPdf}
     <section class="original" aria-labelledby="document-viewer">
       <div class="card-header">
         <h3 id="document-viewer" tabindex="-1" bind:this={viewer}>Оригинал PDF</h3>

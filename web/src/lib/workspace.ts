@@ -121,6 +121,7 @@ export type WorkspaceProps = {
   revision?: string;
   canEdit: boolean;
   refreshKey: number;
+  setDocumentPage: (page?: number) => void;
   params: URLSearchParams;
 };
 
