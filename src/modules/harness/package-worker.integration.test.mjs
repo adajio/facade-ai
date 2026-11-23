@@ -426,8 +426,8 @@ test('ordinary intake publishes independent package evidence before questions an
     }
     const incoming=(await command('POST',`/api/projects/${walked.id}/receipts`,{source:'upload'})).json();
     const target=`/api/receipts/${incoming.receiptId}`;
-    const bytes=pdf([...Array.from({length:40},(_,row)=>'Record '+(row+1)),'Material Graphite | project facade ID: K-88'],
-      {size:5,leading:5,top:250});
+    const bytes=pdf([...Array.from({length:72},(_,row)=>'Record '+(row+1)),'Material Graphite | project facade ID: K-88'],
+      {size:3,leading:3.1,top:250});
     walkOriginal=sha(bytes);
     run();
     try {
@@ -438,15 +438,15 @@ test('ordinary intake publishes independent package evidence before questions an
       assert.deepEqual(result.facts.map(({branch,attribute,observation})=>[branch,attribute,observation.value]).sort(),
         [['A','Material','Graphite'],['B','Material','Graphite']]);
       const structure=result.windows[0].structure;
-      assert.equal(structure.blocks.flatMap(({lineIds})=>lineIds??[]).length,41);
+      assert.equal(structure.blocks.flatMap(({lineIds})=>lineIds??[]).length,73);
       assert.deepEqual(result.candidates.map(({label})=>label),['K-88']);
       for(const [branch,purpose] of [['A','primary_a'],['B','primary_b']]){
-        assert.equal(structure.branches[branch].reviewed.length,3);
-        assert.equal(walkthrough.filter((check)=>check.branch===purpose&&check.child).length,2);
+        assert.equal(structure.branches[branch].reviewed.length,4);
+        assert.equal(walkthrough.filter((check)=>check.branch===purpose&&check.child).length,3);
       }
       const count=await app.db.query(`SELECT count(*)::int AS count FROM harness_package_followups f
         JOIN gateway_jobs j ON j.id=f.job_id WHERE j.project_id=$1`,[walked.id]);
-      assert.equal(count.rows[0].count,4);
+      assert.equal(count.rows[0].count,6);
       await command('GET',`/api/v1/projects/${walked.id}/facade-assessment`,undefined);
       const catalog=(await command('POST','/api/catalogs',{key:'walk-rd',name:'Walk RD',
         defaultProfile:{stage:'RD',facadeKinds:['universal'],approvalReference:'synthetic fixture'},
