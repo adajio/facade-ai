@@ -54,7 +54,8 @@ function tool(name, args) {
 }
 
 const primaryDrawing = 'Drawing | current revision R1 | variant V9 | scope: K-47 | project facade ID: K-47 | Gap 30 mm';
-const opposingDrawing = 'Drawing | current revision R2 | variant V9 | scope: K-47 | project facade ID: K-47 | Gap 41 mm';
+const opposingDrawing = 'Drawing | project facade ID: K-47 | Gap 4.1 cm';
+const opposingTitle = 'Drawing | current revision R2 | variant V9 | scope: K-47 | project facade ID: K-47';
 const register = 'Schedule | current revision R1 | Complete list of facades | project facade ID: K-47 | project facade ID: M-18 | all common materials listed';
 const notDelivered = 'Transmittal | current revision R1 | project facade ID: M-18 | thermal report not delivered';
 const common = 'Specification | applies to all facades | current revision R1 | System vent';
@@ -68,7 +69,7 @@ function observation(line) {
         : lower.includes('schedule') ? { value: 'schedule', quote: 'Schedule' } : undefined;
   const attribute = lower.includes('gap') ? 'Gap' : lower.includes('thermal report') ? 'thermal report' :
     lower.includes('system vent') ? 'System vent' : lower.includes('mar?') ? 'Material identifier' : 'Facade register';
-  const value = /Gap (\d+) mm/.exec(line.text)?.[1];
+  const measurement = /Gap ([\d.,]+) (mm|cm)/.exec(line.text);
   const binding = ids.length ? {
     state: 'identified', labels: ids.map((item) => item[1]), projectIdentifiers: ids.map((item) => ({ label: item[1], quote: item[0] })),
     quote: line.text, reason: 'Printed project facade identifier.',
@@ -76,7 +77,7 @@ function observation(line) {
     state: 'common', labels: [], quote: 'applies to all facades', reason: 'The specification expressly applies to every facade.',
   } : { state: 'unclear', labels: [], quote: line.text, reason: 'Incomplete material identifier.' };
   return {
-    quote: line.text, lineId: line.id, ...(value ? { value, unit: 'mm' } : {}),
+    quote: line.text, lineId: line.id, ...(measurement ? { value: measurement[1], unit: measurement[2] } : {}),
     ...(lower.includes('not delivered') ? { sourceRole: 'inventory',
       deliveryStatement: { status: 'not_delivered', item: 'thermal report' } } : {}),
     package: { attribute, role, binding,
@@ -124,14 +125,26 @@ test('ordinary intake publishes independent package evidence before questions an
         if (!texts.length) output = tool('extract', { support: 'A' });
         else if (texts.length === 1) output = tool('extract', { support: 'B' });
         else {
-          const sources = texts.map((reply) => ({ evidenceId: reply.evidence.evidenceId, quote: JSON.parse(reply.content).lines[0].text }));
-          const check = { status: 'confirmed', reason: 'Both sources print this scope, variant and effective revision.', sources };
-          const proof = { explanation: 'Checked the two addressed drawing lines.',
-            evidenceIds: sources.map(({ evidenceId }) => evidenceId),
-            checks: { variant: check, revision: check, applicability: check, comparability: check } };
-          output = assignment.mode === 'lead'
-            ? tool('propose_resolution', { aObservationId: a.observationId, bObservationId: b.observationId, ...proof })
-            : tool('verify_resolution', { verdict: 'supported', ...proof });
+          const direct = texts.slice(0, 2);
+          const titleIndex = direct.findIndex((reply) => !JSON.parse(reply.content).lines.some(({ text }) => text.includes('current revision')));
+          const inventory = replies.find(({ items }) => items);
+          if (titleIndex >= 0 && !inventory) output = tool('context_inventory', {});
+          else if (titleIndex >= 0 && texts.length === 2) {
+            const support = titleIndex === 0 ? 'A' : 'B';
+            output = tool('open_context', { contextId: inventory.items.find((item) => item.support === support).id });
+          } else {
+            const citation = (reply, predicate) => ({ evidenceId: reply.evidence.evidenceId, quote: JSON.parse(reply.content).lines.find(predicate).text });
+            const measurement = direct.map((reply) => citation(reply, ({ text }) => text.includes('Gap')));
+            const metadata = direct.map((reply, index) => citation(index === titleIndex ? texts[2] : reply,
+              ({ text }) => text.includes('current revision')));
+            const check = (sources) => ({ status: 'confirmed', reason: 'Verified the printed context and anchored quantities.', sources });
+            const proof = { explanation: 'Checked the two addressed values and title contexts.',
+              evidenceIds: measurement.map(({ evidenceId }) => evidenceId),
+              checks: { variant: check(metadata), revision: check(metadata), applicability: check(metadata), comparability: check(measurement) } };
+            output = assignment.mode === 'lead'
+              ? tool('propose_resolution', { aObservationId: a.observationId, bObservationId: b.observationId, ...proof })
+              : tool('verify_resolution', { verdict: 'supported', ...proof });
+          }
         }
         res.setHeader('content-type', 'application/json');
         res.end(JSON.stringify({ receipt: { state: 'paid', costUsdNanos: 0, providerId: attempt.id, evidenceRef: 'synthetic:pair' }, output }));
@@ -229,18 +242,22 @@ test('ordinary intake publishes independent package evidence before questions an
   delete process.env.FACADE_HARNESS_REPLAY_ONLY;
   process.env.FACADE_HARNESS_PACKAGE_EFFECTS = 'enabled';
   run();
-  await upload('second.pdf', pdf([opposingDrawing]));
+  await upload('second.pdf', pdf([opposingDrawing, opposingTitle]));
   await command('POST', receiptUrl + '/seal', {});
   const complete = await until(analyze, ({ coverage }) => coverage.completedWindows === 2, 'completed package');
   assert.equal(complete.coverage.physicalProof.versionIds.length, 2);
   assert.equal(complete.coverage.subjectProof.facadeIds.length, 2);
   assert.deepEqual(complete.candidates.map(({ label }) => label).sort(), ['K-47', 'M-18']);
-  assert.equal(complete.facts.length, 10);
+  assert.equal(complete.facts.length, 12);
   assert.equal(complete.facts.filter(({ binding }) => binding.state === 'common').length, 2);
   assert.equal(complete.facts.filter(({ observation }) => observation.deliveryStatement?.status === 'not_delivered').length, 2);
   const reviewed = await until(analyze, ({ verifiedPairs }) => verifiedPairs.length > 0, 'fresh pair review');
   assert.ok(reviewed.verifiedPairs.some(({ proof }) =>
-    [proof.revisionA, proof.revisionB].sort().join('/') === 'R1/R2'));
+    [proof.revisionA, proof.revisionB].map((value) => value.toUpperCase()).sort().join('/') === 'R1/R2'));
+  const contextual = reviewed.facts.find(({ observation, basis }) => observation.value === '4.1' && basis.revisionEvidence);
+  assert.equal(contextual.revision.toUpperCase(), 'R2');
+  assert.equal(contextual.variant, 'v9');
+  await command('GET', contextual.basis.revisionEvidence.href, undefined);
   assert.ok(complete.windows.every(({ branches }) => branches.A.jobId !== branches.B.jobId));
   const fact = complete.facts[0];
   await command('GET', fact.evidenceHref, undefined);
@@ -345,6 +362,16 @@ test('ordinary intake publishes independent package evidence before questions an
       WHERE project_id=$1 ORDER BY state`, [existing.id])).rows, before);
     assert.equal((await legacyGateway.call(seen[0].call)).replay, true);
     assert.equal((await legacyGateway.call(seen[1].call)).code, 'unknown_charge');
+    const stopId = randomUUID();
+    const unknownJob = seen[1].call.lease.jobId;
+    await app.db.query("INSERT INTO harness_research_events(job_id,sequence,event) VALUES($1,1,'{}')", [unknownJob]);
+    await app.db.query('INSERT INTO harness_research_stops(id,job_id,sequence) VALUES($1,$2,1)', [stopId, unknownJob]);
+    const resumeUrl = `/api/projects/${existing.id}/research-stops/${stopId}/resume`;
+    await command('POST', resumeUrl, {}, { 'if-match': '"2"' }, 412);
+    const blocked = await command('POST', resumeUrl, {}, { 'if-match': '"1"' }, 409);
+    assert.equal(blocked.json().code, 'research_attempt_unsettled');
+    assert.equal((await app.db.query('SELECT resume_requested_at FROM harness_research_stops WHERE id=$1', [stopId]))
+      .rows[0].resume_requested_at, null);
     assert.equal(sends, 2);
   });
 });

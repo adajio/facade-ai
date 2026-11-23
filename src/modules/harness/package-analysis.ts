@@ -29,7 +29,8 @@ export interface PackageFact {
   revision: string | null;
   variant: string | null;
   revisionStatus: 'current' | 'superseded' | 'unknown';
-  basis: { role?: string; stage?: string; revision?: string };
+  basis: { role?: string; stage?: string; revision?: string;
+    revisionEvidence?: { evidenceId: string; quote: string; href: string } };
   binding: PackageBinding;
   materials: { id: string; label: string; quote: string }[];
 }
@@ -59,7 +60,8 @@ export interface PackageAnalysis {
   windows: PackageWindow[];
   comparisons: PackageComparison[];
   reviewCandidates: { a: string; b: string; scope: { id: string; label: string } }[];
-  verifiedPairs: { a: string; b: string; proof: VerifiedPairEvidence }[];
+  verifiedPairs: { a: string; b: string; proof: VerifiedPairEvidence;
+    titles: { A: ReviewTitle | null; B: ReviewTitle | null } }[];
   coverage: {
     inventory: 'open' | 'closed';
     acceptedVersions: number;
@@ -74,6 +76,8 @@ export interface PackageAnalysis {
     subjectProof: (PackageCoverageProof & { facadeIds: string[]; commonChecked: boolean }) | null;
   };
 }
+
+type ReviewTitle = { evidenceId: string; quote: string };
 
 interface PackageCoverageProof {
   versionIds: string[];
@@ -265,11 +269,24 @@ export async function readPackageAnalysis(db: Pool | PoolClient, projectId: stri
     ? { versionIds, basisIds: [a.id, b.id], facadeIds, commonChecked: true } : null;
   const mappedVersions = new Set(windows.map(({ place }) => place.source.versionId)).size;
   const comparison = compare(facts);
-  const reviewed = await db.query<{ a: string; b: string; proof: VerifiedPairEvidence }>(
-    `SELECT p.a_fact_id AS a,p.b_fact_id AS b,p.proof FROM harness_package_review_pairs p
+  const reviewed = await db.query<PackageAnalysis['verifiedPairs'][number]>(
+    `SELECT p.a_fact_id AS a,p.b_fact_id AS b,p.proof,
+       jsonb_build_object('A',a_title.title,'B',b_title.title) AS titles
+     FROM harness_package_review_pairs p
      JOIN gateway_jobs lead ON lead.id=p.lead_job_id AND lead.state='done'
      JOIN gateway_jobs a ON a.id=p.a_job_id AND a.state='done'
      JOIN gateway_jobs b ON b.id=p.b_job_id AND b.state='done'
+     JOIN reader_observations oa ON oa.id=p.a_fact_id JOIN reader_observations ob ON ob.id=p.b_fact_id
+     LEFT JOIN LATERAL (
+       SELECT source AS title FROM jsonb_array_elements(lead.result#>'{checks,revision,sources}') AS asks(source)
+       JOIN reader_evidence e ON e.id::text=source->>'evidenceId' AND e.run_id=lead.id AND e.version_id=oa.version_id
+       ORDER BY e.created_at,e.id LIMIT 1
+     ) a_title ON true
+     LEFT JOIN LATERAL (
+       SELECT source AS title FROM jsonb_array_elements(lead.result#>'{checks,revision,sources}') AS asks(source)
+       JOIN reader_evidence e ON e.id::text=source->>'evidenceId' AND e.run_id=lead.id AND e.version_id=ob.version_id
+       ORDER BY e.created_at,e.id LIMIT 1
+     ) b_title ON true
      WHERE p.project_id=$1
        AND lead.result->>'kind'='proposal' AND a.result->>'verdict'='supported' AND b.result->>'verdict'='supported'
        AND p.proof IS NOT NULL AND (lead.result->'verifiedPair')=p.wire_proof AND (a.result->'verifiedPair')=p.wire_proof AND (b.result->'verifiedPair')=p.wire_proof
@@ -277,7 +294,28 @@ export async function readPackageAnalysis(db: Pool | PoolClient, projectId: stri
        AND NOT EXISTS (SELECT 1 FROM harness_package_bindings x WHERE x.fact_id=p.b_fact_id AND x.version>p.b_binding_version)`, args);
   const current = new Map(comparison.reviewCandidates.map((pair) => [pair.a + '/' + pair.b, pair]));
   const verifiedPairs = reviewed.rows.filter((pair) => current.get(pair.a + '/' + pair.b)?.scope.id === pair.proof.scope);
-  return { facts, candidates, windows, ...comparison, verifiedPairs, coverage: {
+  const titleByFact = new Map<string, { variant: string; revision: string; evidence: ReviewTitle }[]>();
+  for (const { a, b, proof, titles } of verifiedPairs) {
+    for (const [id, revision, evidence] of [[a, proof.revisionA, titles.A], [b, proof.revisionB, titles.B]] as const) {
+      if (!evidence) continue;
+      const records = titleByFact.get(id) ?? [];
+      records.push({ variant: proof.variant, revision, evidence });
+      titleByFact.set(id, records);
+    }
+  }
+  const published = facts.map((fact) => {
+    const titles = titleByFact.get(fact.id);
+    if (!titles?.length) return fact;
+    const [first] = titles;
+    if (titles.some(({ variant, revision }) => variant !== first.variant || revision.toLowerCase() !== first.revision.toLowerCase())) return fact;
+    return { ...fact, variant: fact.variant ?? first.variant, revision: fact.revision ?? first.revision,
+      revisionStatus: 'current' as const,
+      basis: { ...fact.basis, revision: fact.basis.revision ?? first.evidence.quote, revisionEvidence: {
+        ...first.evidence, href: `/api/v1/evidence/${first.evidence.evidenceId}`,
+      } },
+    };
+  });
+  return { facts: published, candidates, windows, ...comparison, verifiedPairs, coverage: {
     inventory: inventory.closed ? 'closed' : 'open', acceptedVersions: versionIds.length, mappedVersions,
     refusedVersions: versions.rows.filter(({ refusal }) => refusal !== null).length,
     pendingVersions: versionIds.length - mappedVersions, completedWindows,
