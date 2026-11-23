@@ -331,7 +331,8 @@ async function putFollowup(tx:PoolClient,queue:WorkQueue,row:FollowupTarget,plan
 
 async function dispatchFacadeFollowup(tx:PoolClient,queue:WorkQueue) {
   const {rows}=await tx.query<FollowupTarget&{label:string;key:string}>(`WITH demand AS (
-      SELECT DISTINCT fact.project_id,w.version_id,translate(lower(trim(mark->>'label')),'‐‑‒–—','-----') AS key,mark->>'label' AS label,
+      SELECT DISTINCT fact.project_id,w.version_id,coalesce(mark->>'lookupToken',translate(lower(trim(mark->>'label')),'‐‑‒–—','-----')) AS key,
+        mark->>'lookupToken' AS direction,mark->>'label' AS label,
         mark->>'branch' AS branch,mark->>'kind' AS mention_kind
       FROM ${activeFacts} JOIN harness_facade_discovery d ON d.fact_id=fact.id
       CROSS JOIN LATERAL jsonb_array_elements(d.mentions) mark
@@ -355,14 +356,17 @@ async function dispatchFacadeFollowup(tx:PoolClient,queue:WorkQueue) {
         CROSS JOIN LATERAL regexp_split_to_table(l.folded,'[|;·]') field
         WHERE l.block_id=mb.id AND (
           translate(trim(substring(trim(field) FROM '^(?:project facade (?:identifier|id)|идентификатор фасада проекта|код фасада проекта)\\s*[:№=]\\s*(.+)$')),'‐‑‒–—','-----')=demand.key
+            AND (demand.mention_kind='reference' OR l.folded~'(facade (type|kind)|тип фасада|building|корпус|axes|grid|оси|осях|осям)')
           OR demand.mention_kind<>'reference' AND (
             translate(trim(substring(trim(field) FROM '^(?:facade(?: mark| designation| id)?|фасад|марка фасада|обозначение фасада)\\s*[:№=]\\s*(.+)$')),'‐‑‒–—','-----')=demand.key
-            OR substring(translate(trim(field),'‐‑‒–—','-----') FROM '^(?:facade|фасад)\\s+([[:alnum:]_.\\/-]+)\\s+(?:в|по|in|at|axes|grid|корпус|building|block)')=demand.key)
+            OR substring(translate(trim(field),'‐‑‒–—','-----') FROM '^(?:facade|фасад)\\s+([[:alnum:]_.\\/-]+)\\s+(?:в|по|in|at|axes|grid|корпус|building|block)')=demand.key
+            OR demand.direction IS NOT NULL AND field~'(^|[^[:alpha:]])(facade|фасад(а|у|ом|е)?)($|[^[:alpha:]])'
+              AND field~('(^|[^[:alpha:]])'||demand.direction||'(ern|ый|ого|ому|ым|ом)?($|[^[:alpha:]])'))
           AND l.folded~'(facade (type|kind)|тип фасада|building|корпус|axes|grid|оси|осях|осям)'))
       AND NOT EXISTS(SELECT 1 FROM harness_package_facts f LEFT JOIN harness_package_followups step ON step.job_id=f.job_id
         JOIN harness_facade_discovery proof ON proof.fact_id=f.id CROSS JOIN LATERAL jsonb_array_elements(proof.mentions) item
         WHERE coalesce(step.root_job_id,f.job_id)=j.id AND f.revision_status<>'superseded'
-          AND item->>'kind' IN ('registry','context') AND translate(lower(trim(item->>'label')),'‐‑‒–—','-----')=demand.key
+          AND item->>'kind' IN ('registry','context') AND coalesce(item->>'lookupToken',translate(lower(trim(item->>'label')),'‐‑‒–—','-----'))=demand.key
           AND lower(trim(coalesce((SELECT o.payload->>'quote' FROM reader_observations o WHERE o.id=f.id),'')))
             ~'(facade (type|kind)|тип фасада)\\s*[:№=]')
       AND NOT EXISTS(SELECT 1 FROM harness_package_followups f WHERE f.root_job_id=j.id AND f.plan_key='facade:'||md5(demand.key))

@@ -14,7 +14,9 @@ export type FacadeEvidence = {
 export type FacadeMention = FacadeEvidence & {
   label: string; kind: 'registry' | 'reference' | 'context' | 'designation' | 'unresolved';
   context?: { building: string; axes: string };
+  partialContext?: { building?: string; axes?: string; conflicting?: true };
   contextQuote?: string;
+  lookupToken?: string;
   qualifier?: { evidenceId: string; lineId: string; quote: string; address: ReaderAddress };
 };
 
@@ -40,6 +42,24 @@ const inlineAxes = /(?<!\p{L})(?:в\s+осях|по\s+осям|axes|grid)\s*[:�
 const normalize = (value: string) => value.normalize('NFC').trim();
 const foldedLabel = (value: string) => normalize(value).toLowerCase().replace(/[‐‑‒–—]/gu,'-').replace(/\s+/gu, ' ');
 const printedMark = /^(?=[\p{L}\p{N}_.\/‐‑‒–—-]*\p{N})[\p{L}\p{N}_.\/‐‑‒–—-]+$/u;
+const direction = /\b(?:north(?:east|west)?|south(?:east|west)?|east|west)(?:ern)?\b|(?<!\p{L})(?:северо-восточн|северо-западн|юго-восточн|юго-западн|северн|южн|восточн|западн)(?:ый|ого|ому|ым|ом)(?!\p{L})/iu;
+const directionSubject = /(?<!\p{L})(?:facade|фасад(?:а|у|ом|е)?)(?!\p{L})/iu;
+
+function directionalMark(line: string) {
+  // A direction must name the facade in the heading, even when the words are reversed or inflected.
+  const subject=directionSubject.exec(line);
+  const marker=direction.exec(line);
+  if(!subject||!marker||line.slice(Math.min(subject.index+subject[0].length,marker.index+marker[0].length),
+    Math.max(subject.index,marker.index)).trim().replace(/^[:№=]$/u,'').trim())return;
+  const token=foldedLabel(marker[0]).replace(/(?:ern|ый|ого|ому|ым|ом)$/u,'');
+  return {label:`${marker[0]} ${subject[0]}`,token,heading:!line.slice(0,Math.min(subject.index,marker.index)).trim()};
+}
+
+function localFacadeFields(line: string) {
+  const marks=[...fields(line,designation),...fields(line,inlineDesignation)].filter((label)=>printedMark.test(label));
+  const orientations=line.split(clauses).map((part)=>directionalMark(part.trim())).filter((item)=>item!==undefined);
+  return [...marks.map((label)=>({label,token:undefined,heading:true})),...orientations];
+}
 
 function fields(line: string, pattern: RegExp) {
   return new Set(line.split(clauses).flatMap((part) => {
@@ -75,19 +95,33 @@ function facadeColumn(lines: ReaderLine[], cell: ReaderLine) {
 
 function addressedContext(line: string, mark: string) {
   const anchors=[...line.matchAll(/[^|;·\r\n]+/gu)].flatMap((part)=>{
-    const label=uniqueField(part[0],registered)??uniqueField(part[0],referred)??uniqueField(part[0],designation)??uniqueField(part[0],inlineDesignation);
-    return label?[{label:foldedLabel(label),at:part.index}]:[];
+    const candidate=localFacadeFields(part[0]).find(({heading})=>heading);
+    const label=uniqueField(part[0],registered)??uniqueField(part[0],referred);
+    const key=label?foldedLabel(label):candidate?.token??foldedLabel(candidate?.label??uniqueField(part[0],designation)??'');
+    return key?[{label:key,at:part.index}]:[];
   });
   const distinct=new Set(anchors.map(({label})=>label));
   const segments=distinct.size<=1?[line]:anchors.flatMap(({label,at},index)=>
     label===mark?[line.slice(at,anchors[index+1]?.at??line.length).replace(/[|;·\s]+$/u,'').trimStart()]:[]);
-  const qualified=segments.flatMap((contextQuote)=>{
-    const building=uniqueField(contextQuote,buildingField)??uniqueField(contextQuote,inlineBuilding);
-    const axes=uniqueField(contextQuote,axesField)??uniqueField(contextQuote,inlineAxes);
-    return building&&axes?[{context:{building,axes},contextQuote}]:[];
+  const qualifiers=(quote:string,field:RegExp,inline:RegExp)=>new Map(quote.split(clauses).flatMap((clause)=>{
+    const explicit=fields(clause,field);
+    return [...(explicit.size?explicit:fields(clause,inline))].map((value)=>[foldedLabel(value),value] as const);
+  }));
+  const qualified=segments.map((contextQuote)=>{
+    const buildings=qualifiers(contextQuote,buildingField,inlineBuilding);
+    const grids=qualifiers(contextQuote,axesField,inlineAxes);
+    return {buildings,grids,contextQuote};
   });
-  const identities=new Set(qualified.map(({context})=>JSON.stringify([foldedLabel(context.building),foldedLabel(context.axes)])));
-  return identities.size===1?qualified[0]:undefined;
+  const buildings=new Map(qualified.flatMap(({buildings})=>[...buildings]));
+  const grids=new Map(qualified.flatMap(({grids})=>[...grids]));
+  const building=buildings.size===1?[...buildings.values()][0]:undefined;
+  const axes=grids.size===1?[...grids.values()][0]:undefined;
+  const conflicting=buildings.size>1||grids.size>1;
+  const complete=qualified.find(({buildings,grids})=>buildings.size===1&&grids.size===1);
+  if(!building&&!axes&&!conflicting)return;
+  const contextQuote=complete?.contextQuote??qualified.find(({buildings,grids})=>buildings.size||grids.size)?.contextQuote;
+  const context=building&&axes&&complete&&!conflicting?{building,axes}:undefined;
+  return {context,contextQuote,partialContext:{building,axes,...(conflicting?{conflicting:true as const}:{})}};
 }
 
 export function collectFacadeMentions(observation: Observation, initial: Pick<PackageBinding,'quote'|'candidates'>,
@@ -100,19 +134,20 @@ export function collectFacadeMentions(observation: Observation, initial: Pick<Pa
   }
   const projectMarks = fields(quote, registered);
   const referenceMarks = fields(quote, referred);
-  const localMarks = new Set([...fields(quote,designation),...fields(quote,inlineDesignation)]);
+  const localMarks = localFacadeFields(quote);
   const column = facadeColumn(lines, line);
-  for(const label of [...projectMarks,...referenceMarks,...localMarks])possible.add(label);
+  for(const label of [...projectMarks,...referenceMarks,...localMarks.map(({label})=>label)])possible.add(label);
   if (column && quote === line.text && quote.length <= 160) possible.add(normalize(quote));
   return [...possible].map((label) => {
     const mark = foldedLabel(label);
     const isRegistry = [...projectMarks].some((label)=>foldedLabel(label)===mark);
     const isReference = [...referenceMarks].some((label)=>foldedLabel(label)===mark);
-    const isLocal = [...localMarks].some((label)=>foldedLabel(label)===mark);
+    const orientation=directionalMark(label);
+    const local=localMarks.find(({label,token})=>foldedLabel(label)===mark||token&&token===orientation?.token);
     const isCell = column && foldedLabel(line.text) === mark;
-    const scope=isRegistry||isReference||isLocal ? addressedContext(line.text,mark):undefined;
-    const kind = isRegistry ? 'registry' : isReference ? 'reference' : isLocal && scope ? 'context' : isLocal || isCell ? 'designation' : 'unresolved';
-    return { ...reference, label, kind, ...scope,
+    const scope=isRegistry||isReference||local?.heading ? addressedContext(line.text,local?.token??mark):undefined;
+    const kind = isRegistry ? 'registry' : isReference ? 'reference' : local?.heading && scope?.context ? 'context' : local || isCell ? 'designation' : 'unresolved';
+    return { ...reference, label, kind, ...scope, ...(local?.token?{lookupToken:local.token}:{}),
       ...(isCell && column ? { qualifier: { evidenceId:evidenceByLine.get(column.id)??reference.evidenceId, lineId: column.id, quote: column.text,
         address: { ...reference.address, locator: column.locator, box: column.box } } } : {}) };
   });
@@ -125,19 +160,21 @@ function facadeId(projectId: string, identity: string, label: string) {
 
 function identityKey(mention: FacadeMention) {
   if(mention.kind!=='context'&&mention.kind!=='registry')return;
-  return JSON.stringify([mention.kind,foldedLabel(mention.label),mention.context&&
+  return JSON.stringify([mention.kind,mention.lookupToken??foldedLabel(mention.label),mention.context&&
     [foldedLabel(mention.context.building),foldedLabel(mention.context.axes)]]);
 }
 
 export function resolveFacadeMentions(projectId: string, mentions: FacadeMention[],
   established: ReadonlyMap<FacadeMention,{id:string;label:string}> = new Map()) {
-  const groups = Map.groupBy(mentions, ({ label }) => foldedLabel(label));
+  const groups = Map.groupBy(mentions, ({ label,lookupToken }) => lookupToken??foldedLabel(label));
   const resolved = new Map<FacadeMention,{ id: string; label: string }>();
   for (const group of groups.values()) {
     const registries=group.filter(({kind})=>kind==='registry');
-    const registerContexts=new Set(registries.flatMap(({context})=>context?
-      [JSON.stringify([foldedLabel(context.building),foldedLabel(context.axes)])]:[]));
-    const registry = registerContexts.size<=1 ? registries.find(({context})=>context)??registries[0] : undefined;
+    const registryClaims=registries.map((item)=>item.partialContext??item.context);
+    const claims=(field:'building'|'axes')=>new Set(registryClaims.flatMap((claim)=>claim?.[field]?[foldedLabel(claim[field])]:[]));
+    const buildings=claims('building'),axes=claims('axes');
+    const registry = buildings.size<=1&&axes.size<=1&&!registries.some(({partialContext})=>partialContext?.conflicting)
+      ? registries.find(({context})=>context)??registries[0] : undefined;
     const registerId = registry && facadeId(projectId, 'printed-project-facade-id', registry.label);
     const contexts = new Map(group.flatMap(({ context }) => context ?
       [[JSON.stringify([foldedLabel(context.building),foldedLabel(context.axes)]),context] as const] : []));
@@ -147,13 +184,16 @@ export function resolveFacadeMentions(projectId: string, mentions: FacadeMention
       const sameBranch=registries.filter(({branch})=>branch===item.branch);
       const sameLine=sameBranch.some((entry)=>entry.versionId===item.versionId&&entry.address.unitId===item.address.unitId&&
         entry.lineId===item.lineId);
+      const partial=item.partialContext??item.context;
+      const compatible=!(item.partialContext?.conflicting || partial?.building&&buildings.size&&!buildings.has(foldedLabel(partial.building)) ||
+        partial?.axes&&axes.size&&!axes.has(foldedLabel(partial.axes)));
       if (registerId && (item.kind==='registry' || item.kind==='context' && contextKey===registryContext
-        || item.kind==='reference' && sameBranch.length>0 && (!contextKey || !registryContext || contextKey===registryContext)
-        || item.kind==='designation' && sameLine)) {
+        || item.kind==='reference' && sameBranch.length>0 && compatible
+        || item.kind==='designation' && sameLine && compatible)) {
         resolved.set(item,{id:registerId,label:registry!.label});
       } else if ((item.kind==='context'||item.kind==='registry') && contextKey) {
         const context = contexts.get(contextKey)!;
-        const label = group.find((other) => (other.kind==='context'||other.kind==='registry') && foldedLabel(other.label)===foldedLabel(item.label)
+        const label = group.find((other) => (other.kind==='context'||other.kind==='registry')
           && other.context && foldedLabel(other.context.building)===foldedLabel(context.building)
           && foldedLabel(other.context.axes)===foldedLabel(context.axes))!.label;
         resolved.set(item,{id:facadeId(projectId,JSON.stringify(['building-axes',context.building,context.axes]),label),label});
@@ -333,8 +373,10 @@ export function buildFacadeProfiles(facts: PackageFact[], mentions: FacadeMentio
   const byFact=Map.groupBy(mentions,({factId})=>factId);
   return candidates.map(({id,label})=>{
     const relevant=facts.filter((f)=>f.binding.state==='identified'&&f.binding.candidates.some((c)=>c.id===id));
+    const localDirection=directionalMark(label)?.token;
     const addressed=relevant.flatMap((f)=>(byFact.get(f.id)??[])
-      .filter((mention)=>mention.kind!=='unresolved'&&foldedLabel(mention.label)===foldedLabel(label)));
+      .filter((mention)=>mention.kind!=='unresolved'&&(foldedLabel(mention.label)===foldedLabel(label)||
+        localDirection&&mention.lookupToken===localDirection)));
     const branches=new Set(addressed.map(({branch})=>branch));
     const attributes: FacadeProfile['attributes']={};
     function attach(field:keyof typeof attributes,value:string|undefined|null,evidence:FacadeEvidence,status?:string) {
@@ -348,8 +390,8 @@ export function buildFacadeProfiles(facts: PackageFact[], mentions: FacadeMentio
     }
     for(const m of addressed) {
       const context={...m,quote:m.contextQuote??m.quote};
-      attach('building',m.context?.building,context);
-      attach('axes',m.context?.axes,context);
+      attach('building',m.context?.building??m.partialContext?.building,context);
+      attach('axes',m.context?.axes??m.partialContext?.axes,context);
     }
     for(const fact of relevant) {
       if(fact.binding.candidates.length!==1)continue;

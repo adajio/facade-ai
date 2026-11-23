@@ -113,6 +113,8 @@ test('addressed PDF and XLSX facts share a stable facade; the branch worker cons
   await publish(leased.get(pdf.version_id+'B'),pdf,text('11','Project facade ID'),'11');
   await publish(leased.get(xlsx.version_id+'A'),xlsx,text('19'),'19');
   const tableFact=await publish(leased.get(xlsx.version_id+'B'),xlsx,text('19'),'19');
+  await publish(leased.get(pdf.version_id+'A'),pdf,'Схема восточного фасада','11');
+  await publish(leased.get(pdf.version_id+'B'),pdf,'Схема восточного фасада','11');
   const referenceText=text('19','Project facade ref','Physical schedule');
   const references=[await publish(leased.get(xlsx.version_id+'A'),xlsx,referenceText,'19'),
     await publish(leased.get(xlsx.version_id+'B'),xlsx,referenceText,'19')];
@@ -167,6 +169,18 @@ test('addressed PDF and XLSX facts share a stable facade; the branch worker cons
   assert.deepEqual(checked.facadeProfiles[0].attributes.facadeKind.map(({value})=>value),['cassette']);
   assert.equal(new Set(checked.facadeProfiles[0].attributes.facadeKind[0].evidence.map(({branch})=>branch)).size,2);
   assert.ok(await epoch()>initialEpoch);
+  const oriented='Фасад восточный | Корпус: Forge | Оси: А–Б';
+  await db.query(`INSERT INTO project_memory_lines(block_id,ordinal,line_id,literal,folded,address)
+    VALUES($1,1,'orient',$2,lower($2),'{"unitId":"1"}')`,[blockId,oriented]);
+  for(let i=0;i<2;i++) {
+    assert.equal(await dispatchPackageFollowup(db,queue),true,'memory locates the same direction with changed word order and case');
+    const child=await queue.claim({workerId:'fixture',kinds:[packageFollowupKind],leaseMs:30_000});
+    assert.match(child.payload.packageWindow.followup.discovery.label,/^Восточного фасада$/iu);
+    await publish(child,pdf,oriented,'11');
+    assert.equal(await queue.finish(child.lease,{kind:'covered'},{state:'completed',evidenceRef:'fixture'}),true);
+    await settle();
+  }
+  assert.equal(await dispatchPackageFollowup(db,queue),false,'a revisit is never repeated with the same root and subject');
   const priorEpoch=await epoch();
   const last=checked.facts.find(({id})=>id===tableFact.id).binding.version;
   const lastReplaced=checked.facts.find(({id})=>id===pdfFact.id).binding.version;
