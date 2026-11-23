@@ -3,7 +3,7 @@ import { randomUUID } from 'node:crypto';
 import { test } from 'node:test';
 import type { Branch, ResearchSettings, ResearchTask } from './contracts.js';
 import { validateLivePolicy, type LiveRoute } from './live-policy.js';
-import { loadResearchProfile } from './profile.js';
+import { loadResearchProfile, profileHold } from './profile.js';
 
 const projectId = randomUUID();
 const scopeId = randomUUID();
@@ -91,8 +91,30 @@ test('policy, envelope and configuration failures are isolated to the affected b
     ...liveEnv, FACADE_HARNESS_PROFILE: JSON.stringify({ A: { routeId: 'broken' }, B: profile.B }),
   });
   assert.deepEqual(half, { A: null, B: profile.B, lead: null });
-  assert.deepEqual(loadResearchProfile(liveEnv), { A: null, B: null, lead: null });
+  assert.deepEqual(loadResearchProfile({ ...liveEnv, FACADE_HARNESS_PROFILE: '{}' }), { A: null, B: null, lead: null });
   assert.equal(validateLivePolicy(half, [qwen], env).hold(task('A'))?.reason, 'research_profile_unavailable');
   const duplicate = loadResearchProfile({ ...liveEnv, FACADE_HARNESS_PROFILE: JSON.stringify({ A: profile.B, B: profile.B }) });
   assert.deepEqual(duplicate, { A: null, B: null, lead: null });
+});
+
+test('the new defaults require independent approvals and leave saved pilot assignments and lead explicit', () => {
+  const defaults = loadResearchProfile({});
+  assert.deepEqual([defaults.A?.model, defaults.B?.model, defaults.lead], ['gpt-6.1-terra', 'qwen/qwen3.8-max-0902', null]);
+  assert.deepEqual(loadResearchProfile({ FACADE_HARNESS_PROFILE: JSON.stringify(profile) }), profile);
+  assert.equal(profileHold(defaults, task('A'))?.reason, 'research_profile_changed');
+  assert.equal(profileHold(defaults, task('B'))?.reason, 'research_profile_changed');
+  assert.ok(defaults.A && defaults.B);
+  const direct: LiveRoute = { transport: 'cheaperinference', routeId: defaults.A.routeId, model: 'gpt-6.1-terra',
+    mode: 'strict-zdr', zdrEvidenceRef: 'fixture', syntheticScopes: [testedScope] };
+  const pinned = { ...qwen, routeId: defaults.B.routeId, model: defaults.B.model };
+  const synthetic = validateLivePolicy(defaults, [direct, pinned], env);
+  assert.equal(synthetic.hold(task('A', defaults.A)), null);
+  assert.equal(synthetic.hold(task('B', defaults.B)), null);
+  const withPilot = validateLivePolicy(defaults, [direct, pinned, kimi], env);
+  assert.equal(withPilot.hold(task('A'))?.reason, 'research_profile_changed');
+  assert.equal(withPilot.hold(task('A'), true), null);
+  assert.equal(synthetic.hold(task('A'), true)?.reason, 'research_profile_changed');
+  assert.deepEqual(validateLivePolicy(defaults, [direct, pinned], {}).approvals, [direct]);
+  assert.deepEqual(validateLivePolicy(defaults, [direct, { ...pinned, provider: 'alibaba/us-east-1' }], env).approvals, [direct]);
+  assert.deepEqual(validateLivePolicy({ A: null, B: null, lead: defaults.A }, [direct], env).approvals, []);
 });

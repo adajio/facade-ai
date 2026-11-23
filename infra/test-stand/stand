@@ -313,9 +313,10 @@ TOML
           exit 2
         fi
         FACADE_STAND_STEP15_CONFIG_REVISION="$(stat -f '%i-%m-%z' "$FACADE_STAND_STEP15_ENV")"
-        export FACADE_STAND_STEP15_CONFIG_REVISION
+        FACADE_STAND_MODEL_EGRESS=$(node "$here/step15-config.mjs" "$FACADE_STAND_STEP15_ENV")
+        export FACADE_STAND_STEP15_CONFIG_REVISION FACADE_STAND_MODEL_EGRESS
         compose -f "$here/compose.egress.yaml" --profile public-import stop import-egress
-        compose -f "$here/compose.egress.yaml" --profile openrouter up -d --no-recreate openrouter-egress
+        compose -f "$here/compose.egress.yaml" --profile openrouter up -d openrouter-egress
         compose "${app_compose[@]}" -f "$here/compose.egress.yaml" \
           -f "$here/compose.openrouter.yaml" --profile openrouter up -d --wait --no-deps api worker
         printf '%s\n%s\n%s\n' "$image" "$db_env" "${FACADE_STAND_WITH_BROKER:-0}" > "$FACADE_STAND_DIR/current-runtime"

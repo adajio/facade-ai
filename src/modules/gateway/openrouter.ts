@@ -1,17 +1,6 @@
+import { pngBase64Length, record, syntheticScope, validSyntheticScopes, verifySyntheticInputs, type SyntheticScope } from './admission.js';
 import { verifyCopilotInputs } from '../copilot/admission.js';
 import { BUDGET_USD_NANOS, GatewayError, hash, positiveInteger, type ModelTransport, type RoutePolicy, type RouterDiagnostic } from './types.js';
-
-type SyntheticScope = {
-  projectId: string;
-  scopeId: string | null;
-  approvalRef: string;
-  originalSha256s: readonly string[];
-  retentionApproval?: {
-    approvalRef: string;
-    noTrainingEvidenceRef: string;
-    validUntil: string;
-  };
-};
 
 type OpenRouterPricingQualification = {
   maxImageWidth: number;
@@ -74,12 +63,9 @@ const requestFields = new Set(['model','messages','tools','tool_choice','paralle
 const messageFields = new Set(['role','name','content','tool_call_id','tool_calls','reasoning','reasoning_details']);
 const functionFields = new Set(['name','description','parameters','strict']);
 const endpoints = ['https://openrouter.ai','https://eu.openrouter.ai','https://us.openrouter.ai'];
+export const qwen38Max = 'qwen/qwen3.8-max-0902';
 const allowedModel = /^[a-z0-9._-]+\/[a-z0-9._-]+$/;
 const allowedProvider = /^[a-z0-9._-]+(?:\/[a-z0-9._-]+)*$/;
-const imageUrl = /^data:image\/png;base64,([A-Za-z0-9+/]+={0,2})$/;
-const uuid = /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/;
-const sha256 = /^[a-f0-9]{64}$/;
-const signature = Buffer.from('89504e470d0a1a0a', 'hex');
 const tracePlaceholder = '00000000-0000-0000-0000-000000000000';
 const disabledPlugins = ['web', 'file-parser', 'response-healing', 'auto-router', 'pareto-router', 'armor']
   .map(id => ({ id, enabled: false }));
@@ -93,10 +79,6 @@ export type OpenRouterCostBound = {
   additional: number;
   ceilingUsdNanos: number;
 };
-
-function record(value: unknown): Record<string, unknown> | null {
-  return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : null;
-}
 
 const errorTypes = new Set([
   'context_length_exceeded','max_tokens_exceeded','token_limit_exceeded','string_too_long',
@@ -175,36 +157,12 @@ function tokenCount(value: unknown): number | undefined {
   return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0 ? value : undefined;
 }
 
-function pngBase64Length(url: unknown, profile: QualifiedOpenRouterProfile): number | null {
-  if (typeof url !== 'string') return null;
-  const match = imageUrl.exec(url);
-  if (!match || match[1].length > Math.ceil(profile.maxImageBytes / 3) * 4) return null;
-  const png = Buffer.from(match[1], 'base64');
-  if (png.length < 33 || png.length > profile.maxImageBytes || png.toString('base64') !== match[1]
-    || !png.subarray(0,8).equals(signature) || png.readUInt32BE(8) !== 13
-    || png.toString('ascii',12,16) !== 'IHDR') return null;
-  const width = png.readUInt32BE(16);
-  const height = png.readUInt32BE(20);
-  if (!positiveInteger(width, profile.maxImageWidth) || !positiveInteger(height, profile.maxImageHeight)
-    || width * height > profile.maxImagePixels) return null;
-
-  let pixels = false;
-  for (let offset = 33; offset + 12 <= png.length;) {
-    const size = png.readUInt32BE(offset);
-    const type = png.toString('ascii', offset + 4, offset + 8);
-    offset += 12 + size;
-    if (offset > png.length || ['acTL','fcTL','fdAT','IHDR'].includes(type)) return null;
-    if (type === 'IDAT') pixels = true;
-    if (type === 'IEND') return pixels && size === 0 && offset === png.length ? match[1].length : null;
-  }
-  return null;
-}
-
 function requireZdr(profile: OpenRouterProfile): boolean {
   return profile.mode === 'strict-zdr' || profile.model.startsWith('moonshotai/kimi-');
 }
 
 function approvedProfile(profile: OpenRouterProfile): boolean {
+  if (profile.model === qwen38Max && !isAlibabaQwenMax(profile)) return false;
   const kimi = profile.model.startsWith('moonshotai/kimi-');
   const qwen = profile.model.startsWith('qwen/');
   if ((kimi && !matchesKimiEndpoint(profile.model, profile.provider, profile.mode))
@@ -213,14 +171,11 @@ function approvedProfile(profile: OpenRouterProfile): boolean {
   if (profile.mode !== 'synthetic-research' || (!kimi && !qwen)
     || (qwen && !/^alibaba(?:\/|$)/.test(profile.provider))
     || !Array.isArray(profile.syntheticScopes) || !profile.syntheticScopes.length) return false;
-  return profile.syntheticScopes.every(scope => uuid.test(scope.projectId) && (scope.scopeId === null || uuid.test(scope.scopeId))
-    && typeof scope.approvalRef === 'string' && Boolean(scope.approvalRef.trim())
-    && Array.isArray(scope.originalSha256s) && scope.originalSha256s.length > 0
-    && scope.originalSha256s.every((digest: unknown) => typeof digest === 'string' && sha256.test(digest)));
+  return validSyntheticScopes(profile.syntheticScopes);
 }
 
-function isAlibabaQwen4Max(profile: OpenRouterProfile): boolean {
-  return profile.model === 'qwen/qwen4-max' && profile.provider === 'alibaba';
+function isAlibabaQwenMax(profile: OpenRouterProfile): boolean {
+  return (profile.model === 'qwen/qwen4-max' || profile.model === qwen38Max) && profile.provider === 'alibaba';
 }
 
 function isWaferKimiK31Pro(profile: OpenRouterProfile): boolean {
@@ -236,10 +191,6 @@ export function matchesKimiEndpoint(model: string, provider: string, mode: OpenR
     || (mode === 'synthetic-research' && isDecartKimiK31Pro(model, provider)));
 }
 
-function syntheticScope(profile: OpenRouterProfile, projectId: string, scopeId: string | null): SyntheticScope | undefined {
-  return profile.syntheticScopes?.find(item => item.projectId === projectId && item.scopeId === scopeId);
-}
-
 function retentionBlock(scope: SyntheticScope): string | null {
   const approval = scope.retentionApproval;
   if (!approval || typeof approval.approvalRef !== 'string' || !approval.approvalRef.trim()
@@ -253,7 +204,7 @@ function retentionBlock(scope: SyntheticScope): string | null {
 }
 
 function endpointBlock(profile: QualifiedOpenRouterProfile, request: unknown, endpoint: Step15Approval['endpoint']): string | null {
-  const alibaba = isAlibabaQwen4Max(profile);
+  const alibaba = isAlibabaQwenMax(profile);
   const decart = isDecartKimiK31Pro(profile.model, profile.provider);
   if (!alibaba && !decart && !isWaferKimiK31Pro(profile)) return null;
   if (alibaba && requireZdr(profile)) return 'route_zdr_unavailable';
@@ -274,7 +225,7 @@ function endpointBlock(profile: QualifiedOpenRouterProfile, request: unknown, en
 function validInputEnvelope(profile: OpenRouterProfile): boolean {
   const envelope = profile.inputEnvelope;
   if (envelope === undefined) return true;
-  return Boolean(envelope && (isAlibabaQwen4Max(profile) || isWaferKimiK31Pro(profile) || isDecartKimiK31Pro(profile.model, profile.provider))
+  return Boolean(envelope && (isAlibabaQwenMax(profile) || isWaferKimiK31Pro(profile) || isDecartKimiK31Pro(profile.model, profile.provider))
     && typeof envelope.evidenceRef === 'string' && envelope.evidenceRef.trim()
     && positiveInteger(envelope.maxWireBytes, 32 * 1024 * 1024)
     && positiveInteger(envelope.maxMessages, 1024)
@@ -298,14 +249,6 @@ function boundedInput(profile: OpenRouterProfile, wireBytes: number, pngBase64By
     + images * (envelope.maxTokensPerImage ?? 0);
   return { wireBytes, ...(maxTextWireBytes === undefined ? {} : { textWireBytes }), messages, tools, images,
     inputTokens: Math.min(inputs, profile.inputTokenUpperBound) };
-}
-
-function assignedSources(payload: unknown): Record<string, unknown>[] {
-  const job = record(payload);
-  const dispute = record(job?.dispute);
-  const places = job?.mode === 'primary' ? [job.place]
-    : job?.mode === 'lead' || job?.mode === 'verify' ? [record(dispute?.a)?.place, record(dispute?.b)?.place] : [];
-  return places.map(place => record(record(place)?.source) ?? {});
 }
 
 function localFunction(value: unknown): boolean {
@@ -357,7 +300,7 @@ function requestBody(profile: QualifiedOpenRouterProfile, value: unknown, route:
     ? Math.max(profile.completionNanosPerToken, profile.reasoningNanosPerToken)
     : profile.completionNanosPerToken + profile.reasoningNanosPerToken;
   const { max_tokens: _legacy, max_completion_tokens: _completion, parallel_tool_calls: parallelTools, ...approved } = body;
-  const alibaba = isAlibabaQwen4Max(profile);
+  const alibaba = isAlibabaQwenMax(profile);
   const wafer = isWaferKimiK31Pro(profile);
   const decart = isDecartKimiK31Pro(profile.model, profile.provider);
   const wire = {
@@ -425,7 +368,8 @@ export function estimateOpenRouterRequest(profile: OpenRouterProfile, route: Rou
 }
 
 export function openRouterTransport(approval: Step15Approval): ModelTransport {
-  if (approval.qualification !== 'step-15' || !approval.apiKey.trim() || !endpoints.includes(approval.endpoint)) {
+  if (approval.qualification !== 'step-15' || !approval.apiKey.trim()
+    || approval.apiKey.trim().startsWith('ci_live_') || !endpoints.includes(approval.endpoint)) {
     throw new GatewayError('step15_approval_required');
   }
   const profiles = new Map<string, { profile: QualifiedOpenRouterProfile; fingerprint: string }>();
@@ -461,43 +405,16 @@ export function openRouterTransport(approval: Step15Approval): ModelTransport {
       const profile = profileFor(route)?.profile;
       if (!profile) return false;
       if (profile.mode === 'strict-zdr') return true;
-      const scope = syntheticScope(profile, context.projectId, context.scopeId);
+      const scope = syntheticScope(profile.syntheticScopes, context.projectId, context.scopeId);
       if (context.dataClass !== 'synthetic' || !scope) return false;
       if (record(context.payload)?.mode === 'copilot') {
-        if (isAlibabaQwen4Max(profile)) {
+        if (isAlibabaQwenMax(profile)) {
           const block = retentionBlock(scope);
           if (block) return block;
         }
         return verifyCopilotInputs(tx, context, scope.originalSha256s);
       }
-      const sources = assignedSources(context.payload);
-      if (!sources.length || sources.some(source => source.projectId !== context.projectId
-        || typeof source.versionId !== 'string' || !uuid.test(source.versionId)
-        || typeof source.documentId !== 'string' || !uuid.test(source.documentId)
-        || typeof source.sha256 !== 'string' || !scope.originalSha256s.includes(source.sha256))
-        || context.inputRefs.some(id => !uuid.test(id))) return false;
-
-      if (isAlibabaQwen4Max(profile)) {
-        const block = retentionBlock(scope);
-        if (block) return block;
-      }
-
-      const expected = sources.map(source => ({ version_id: source.versionId, document_id: source.documentId, sha256: source.sha256 }));
-      const evidenceIds = [...new Set(context.inputRefs)];
-      const result = await tx.query<{ authorized: boolean }>(
-        `SELECT
-          NOT EXISTS (SELECT 1 FROM intake_originals WHERE project_id=$1 AND sha256<>ALL($2::text[]))
-          AND (SELECT count(*) FROM jsonb_to_recordset($3::jsonb) src(version_id uuid,document_id uuid,sha256 text)
-            JOIN intake_document_versions v ON v.project_id=$1 AND v.id=src.version_id AND v.document_id=src.document_id
-            JOIN intake_originals o ON o.project_id=v.project_id AND o.id=v.original_id AND o.sha256=src.sha256)=$4
-          AND (SELECT count(*) FROM reader_evidence e
-            JOIN reader_maps m USING(project_id,version_id,reader_version)
-            WHERE e.project_id=$1 AND e.run_id=$5 AND e.id=ANY($6::uuid[])
-              AND m.original_sha256=ANY($2::text[]))=$7 AS authorized`,
-        [context.projectId, scope.originalSha256s, JSON.stringify(expected), expected.length,
-         context.jobId, evidenceIds, evidenceIds.length],
-      );
-      return result.rows[0].authorized;
+      return verifySyntheticInputs(tx, context, scope, isAlibabaQwenMax(profile) ? retentionBlock : undefined);
     },
     async send(attempt, route, request, signal) {
       const selected = profileFor(route);
@@ -507,9 +424,9 @@ export function openRouterTransport(approval: Step15Approval): ModelTransport {
         || selected.fingerprint !== attempt.pricingFingerprint || body.cost.ceilingUsdNanos !== attempt.ceilingUsdNanos) {
         return { receipt: { state: 'rejected', code: 'invalid_request', evidenceRef: 'gateway:no-network' } };
       }
-      const alibaba = isAlibabaQwen4Max(profile);
+      const alibaba = isAlibabaQwenMax(profile);
       if (alibaba || isDecartKimiK31Pro(profile.model, profile.provider)) {
-        const scope = syntheticScope(profile, attempt.projectId, attempt.scopeId);
+        const scope = syntheticScope(profile.syntheticScopes, attempt.projectId, attempt.scopeId);
         const block = attempt.dataClass === 'synthetic' && scope
           ? (alibaba ? retentionBlock(scope) : null) : 'route_data_unapproved';
         if (block) return { receipt: { state: 'rejected', code: block, evidenceRef: 'gateway:no-network' } };

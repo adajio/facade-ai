@@ -18,6 +18,7 @@ test('production invocation rejects managed environment and arguments before ope
     for (const profile of [
       { FACADE_HARNESS_PROFILE: JSON.stringify({ lead: { model: 'managed/lead' } }) },
       { FACADE_COPILOT_PROFILE: JSON.stringify({ model: 'managed/copilot' }) },
+      { FACADE_GATEWAY_CHEAPERINFERENCE_PROFILES: JSON.stringify([{ model: 'managed/reader' }]) },
     ]) {
       const profiles = spawnSync(process.execPath, [main], { env: { PATH: process.env.PATH, ...profile }, encoding: 'utf8' });
       assert.equal(profiles.status, 1);
@@ -32,7 +33,7 @@ test('production invocation rejects managed environment and arguments before ope
     assert.equal(insecure.status, 1);
     assert.match(insecure.stderr, /Runtime requires TLS certificate verification/);
   }
-  assert.deepEqual(loadResearchProfile({}), { A: null, B: null, lead: null });
+  assert.deepEqual(loadResearchProfile({ FACADE_HARNESS_PROFILE: '{}' }), { A: null, B: null, lead: null });
 });
 
 test('OpenRouter accepts exact official origins and refuses endpoint overrides without a network call', () => {
@@ -50,6 +51,8 @@ test('OpenRouter accepts exact official origins and refuses endpoint overrides w
   for (const endpoint of ['https://openrouter.ai', 'https://eu.openrouter.ai', 'https://us.openrouter.ai']) {
     assert.equal(openRouterTransport({ ...approval, endpoint }).kind, 'openrouter');
   }
+  assert.throws(() => openRouterTransport({ ...approval, endpoint: 'https://openrouter.ai',
+    apiKey: 'ci_' + 'live_' + 'fixture' }), /step15_approval_required/);
   for (const endpoint of ['http://127.0.0.1:1', 'https://openrouter.ai.evil.test', 'https://openrouter.ai/',
     'https://openrouter.ai:443', 'https://openrouter.ai@127.0.0.1']) {
     assert.throws(() => openRouterTransport({ ...approval, endpoint }), /step15_approval_required/);

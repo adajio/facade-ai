@@ -160,10 +160,6 @@ export async function dispatchPackagePair(db: Pool, queue: WorkQueue, profile: R
       const projectId = outdated.rows[0].project_id;
       await lockIntakeProject(tx, projectId);
       await tx.query('UPDATE harness_package_projects SET profile_hash=$2 WHERE project_id=$1', [projectId, profileHash]);
-      await tx.query(
-        `UPDATE harness_package_branches b SET active=false FROM harness_package_windows w
-         WHERE w.id=b.window_id AND w.project_id=$1 AND b.active AND b.profile_hash<>ALL($2::text[])`,
-        [projectId, pinned.map((entry) => entry.profileHash)]);
       return true;
     }
     const { rows: [{ count }] } = await tx.query<{ count: number }>(
@@ -224,11 +220,23 @@ export async function dispatchPackagePair(db: Pool, queue: WorkQueue, profile: R
     const { rows: [{ walkPinned }] } = await tx.query<{ walkPinned: boolean | null }>(
       `SELECT bool_and(coalesce(j.payload#>>'{packageWindow,walkProtocol}'='1',false)) AS "walkPinned"
        FROM harness_package_branches b JOIN gateway_jobs j ON j.id=b.job_id
-       WHERE b.window_id=$1 AND b.profile_hash=ANY($2::text[])`,
-      [next.windowId, pinned.map(({ profileHash }) => profileHash)]);
+       WHERE b.window_id=$1 AND b.active`,
+      [next.windowId]);
     const walk = walkPinned ?? walkOverride ?? next.walkDefault;
     const ref = { projectId: next.projectId, scopeId: null, generationId: next.generationId };
     for (const { branch, revision, profileHash: branchHash, settings } of pinned) {
+      // An assigned branch belongs to this window even when the default has since changed.
+      const { rows: [active] } = await tx.query<{ profile_hash: string; occupied: boolean }>(
+        `SELECT b.profile_hash,(b.job_id IS NOT NULL OR EXISTS (
+           SELECT 1 FROM gateway_attempts a WHERE a.job_id=b.blocker_job_id
+             AND a.state IN ('reserved','prepared','sending','unknown','paid')
+         )) AS occupied FROM harness_package_branches b WHERE b.window_id=$1 AND b.branch=$2 AND b.active`,
+        [next.windowId, branch]);
+      if (active?.occupied) continue;
+      if (active && active.profile_hash !== branchHash) {
+        await tx.query(`UPDATE harness_package_branches SET active=false
+          WHERE window_id=$1 AND branch=$2 AND profile_hash=$3 AND job_id IS NULL`, [next.windowId, branch, active.profile_hash]);
+      }
       const { rows: [previous] } = await tx.query<{ job_id: string | null }>(
         'SELECT job_id FROM harness_package_branches WHERE window_id=$1 AND branch=$2 AND profile_hash=$3',
         [next.windowId, branch, branchHash]);

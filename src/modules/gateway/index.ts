@@ -2,13 +2,15 @@ import pg, { type Pool } from 'pg';
 import type { FastifyInstance } from 'fastify';
 import { Gateway, type ReviewAdmission, type ResearchAdmission } from './gateway.js';
 import { PostgresIntentJournal } from './journal.js';
+import { cheaperInferenceTransport, type CheaperInferenceProfile } from './cheaperinference.js';
 import { openRouterTransport, type Step15Approval } from './openrouter.js';
 import { BUDGET_USD_NANOS, GatewayError, positiveInteger, type ModelTransport } from './types.js';
 import { registerOperatorRoutes } from './operator.js';
 
 export { Gateway } from './gateway.js';
 export { PostgresIntentJournal, type ReconciliationInput, type OperatorAuthorization } from './journal.js';
-export { estimateOpenRouterRequest, matchesKimiEndpoint, type OpenRouterCostBound, type OpenRouterInputEnvelope, type OpenRouterProfile, type QualifiedOpenRouterProfile, type Step15Approval } from './openrouter.js';
+export { terraModel, type CheaperInferenceProfile } from './cheaperinference.js';
+export { qwen38Max, estimateOpenRouterRequest, matchesKimiEndpoint, type OpenRouterCostBound, type OpenRouterInputEnvelope, type OpenRouterProfile, type QualifiedOpenRouterProfile, type Step15Approval } from './openrouter.js';
 export { type LeasedJob } from './queue.js';
 export * from './types.js';
 
@@ -29,8 +31,20 @@ export function createGateway(
 export function createStep15Gateway(
   db: Pool, journal: PostgresIntentJournal, approval: Step15Approval, reviewAdmission?: ReviewAdmission, policy?: ResearchGatewayPolicy,
 ): Gateway {
+  return createLiveGateway(db, journal, { openRouter: approval }, reviewAdmission, policy);
+}
+
+export function createLiveGateway(
+  db: Pool, journal: PostgresIntentJournal, approvals: {
+    openRouter?: Step15Approval; cheaperInference?: { apiKey: string; profiles: readonly CheaperInferenceProfile[] };
+  }, reviewAdmission?: ReviewAdmission, policy?: ResearchGatewayPolicy,
+): Gateway {
   if (process.env.FACADE_GATEWAY_LIVE_MODE !== 'step-15') throw new GatewayError('step15_approval_required');
-  return new Gateway(db, journal, openRouterTransport(approval), reviewAdmission, policy?.researchAdmission, policy?.replayOnly);
+  const transports: ModelTransport[] = [];
+  if (approvals.openRouter) transports.push(openRouterTransport(approvals.openRouter));
+  if (approvals.cheaperInference) transports.push(cheaperInferenceTransport(approvals.cheaperInference));
+  if (!transports.length) throw new GatewayError('step15_profile_required');
+  return new Gateway(db, journal, transports, reviewAdmission, policy?.researchAdmission, policy?.replayOnly);
 }
 
 export function journalFromEnv(env: NodeJS.ProcessEnv = process.env): { journal: PostgresIntentJournal; close: () => Promise<void> } | null {

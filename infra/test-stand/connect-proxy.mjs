@@ -5,8 +5,12 @@ import { networkInterfaces } from 'node:os';
 import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-const allowlists = {
-  openrouter: ['openrouter.ai', 'eu.openrouter.ai', 'us.openrouter.ai'],
+const openrouter = ['openrouter.ai', 'eu.openrouter.ai', 'us.openrouter.ai'];
+const cheaperinference = ['api.cheaperinference.com'];
+export const allowlists = {
+  openrouter,
+  cheaperinference,
+  mixed: [...openrouter, ...cheaperinference],
   import: ['cloud-api.yandex.net', 'downloader.disk.yandex.ru', 'downloader.disk.yandex.net'],
 };
 const blocked = new BlockList();

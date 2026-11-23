@@ -52,6 +52,7 @@ function held(code: string, attemptId?: string): CallResult {
 type Gate = {
   work: LeasedJob & { purpose: ModelPurpose };
   route: RoutePolicy;
+  transport: ModelTransport;
   effect: string;
   requestHash: string;
   quote: RequestQuote | null;
@@ -103,11 +104,16 @@ function durableReceipt(receipt: Receipt): Receipt {
 export class Gateway extends WorkQueue {
   private recovered = false;
   private pendingRecovery?: Promise<unknown>;
+  private readonly transports = new Map<RoutePolicy['transport'], ModelTransport>();
 
-  constructor(db: Pool, private readonly journal?: PostgresIntentJournal, private readonly transport?: ModelTransport,
+  constructor(db: Pool, private readonly journal?: PostgresIntentJournal, transport?: ModelTransport | ModelTransport[],
     private readonly reviewAdmission?: ReviewAdmission, private readonly researchAdmission?: ResearchAdmission,
     private readonly replayOnly = false) {
     super(db);
+    for (const configured of Array.isArray(transport) ? transport : transport ? [transport] : []) {
+      if (this.transports.has(configured.kind)) throw new GatewayError('duplicate_transport');
+      this.transports.set(configured.kind, configured);
+    }
   }
 
   async configureRoute(policy: RoutePolicy): Promise<void> {
@@ -172,16 +178,17 @@ export class Gateway extends WorkQueue {
       [input.routeId, work.projectId, input.dataClass, work.purpose],
     );
     const route = routeResult.rows[0];
-    if (!route || route.transport !== this.transport?.kind) return 'route_denied';
+    const transport = route && this.transports.get(route.transport);
+    if (!transport) return 'route_denied';
     if (Buffer.byteLength(wire) > route.maxRequestBytes) return 'invalid_request';
-    const requestBlock = this.transport.requestBlock?.(route, input.request);
+    const requestBlock = transport.requestBlock?.(route, input.request);
     if (requestBlock) return requestBlock;
-    const quote = this.transport.quote?.(route, input.request) ?? null;
-    if (this.transport.quote && (!quote || !positiveInteger(quote.ceilingUsdNanos, route.ceilingUsdNanos))) {
+    const quote = transport.quote?.(route, input.request) ?? null;
+    if (transport.quote && (!quote || !positiveInteger(quote.ceilingUsdNanos, route.ceilingUsdNanos))) {
       return 'route_bound_unavailable';
     }
-    if (!this.transport.quote && this.transport.validate?.(route, input.request) === false) return 'invalid_request';
-    const authorization = await this.transport.authorize?.(tx, route, {
+    if (!transport.quote && transport.validate?.(route, input.request) === false) return 'invalid_request';
+    const authorization = await transport.authorize?.(tx, route, {
       projectId: work.projectId, scopeId: work.scopeId, generationId: work.generationId,
       jobId: work.lease.jobId, payload: work.payload, dataClass: input.dataClass, inputRefs: input.inputRefs,
     });
@@ -202,7 +209,7 @@ export class Gateway extends WorkQueue {
       if (!barrier.rowCount) return 'primary_barrier';
     }
     return {
-      work: { ...work, purpose: work.purpose }, route, quote, earlyReview: review === 'early',
+      work: { ...work, purpose: work.purpose }, route, transport, quote, earlyReview: review === 'early',
       dispatchBlock: this.replayOnly ? 'analysis_replay_only' : research?.dispatchBlock,
       effect: hash([work.projectId, work.scopeId, work.generationId, work.key, input.effectKey]),
       requestHash: hash([route.id, route.revision, input.dataClass, input.inputRefs, wire, ...(quote ? [quote] : [])]),
@@ -281,6 +288,13 @@ export class Gateway extends WorkQueue {
     return saved.rows[0];
   }
 
+  private async savedOutcome(attempt: Attempt): Promise<ProviderOutcome | null> {
+    const { rows: [stored] } = await this.db.query<{ receipt: Receipt; output: unknown }>(
+      `SELECT response_receipt AS receipt,response AS output FROM gateway_attempts
+         WHERE id=$1 AND request_hash=$2 AND response IS NOT NULL`, [attempt.id, attempt.requestHash]);
+    return stored?.receipt?.state === 'paid' && validReceipt(stored.receipt) ? stored : null;
+  }
+
   private async saveOutput(attemptId: string, outcome: ProviderOutcome): Promise<void> {
     if (outcome.receipt.state !== 'paid') {
       if (outcome.receipt.routerDiagnostic) {
@@ -325,9 +339,9 @@ export class Gateway extends WorkQueue {
 
   async call(source: CallInput): Promise<CallResult> {
     const journal = this.journal;
-    const transport = this.transport;
-    if (!journal || !transport) return held('journal_unavailable');
-    if ((transport.kind === 'openrouter' || this.researchAdmission) && !this.recovered) {
+    if (!journal || !this.transports.size) return held('journal_unavailable');
+    const live = this.transports.has('openrouter') || this.transports.has('cheaperinference');
+    if ((live || this.researchAdmission) && !this.recovered) {
       try {
         this.pendingRecovery ??= this.recover().finally(() => { this.pendingRecovery = undefined; });
         await this.pendingRecovery;
@@ -411,7 +425,7 @@ export class Gateway extends WorkQueue {
             started = Promise.resolve({ receipt: { state: 'rejected', code: 'not_dispatched', evidenceRef: 'gateway:no-network' } });
             return 'dispatch_not_started';
           }
-          started = this.dispatch(transport, reserved, current.route, input.request);
+          started = this.dispatch(current.transport, reserved, current.route, input.request);
           await tx.query("UPDATE gateway_attempts SET state='sending' WHERE id=$1 AND state='prepared'", [reserved.id]);
           return 'sent';
         });
@@ -448,6 +462,7 @@ export class Gateway extends WorkQueue {
   async recover() {
     const journal = this.requireJournal();
     await transaction(this.db, tx => this.bind(tx, journal));
+    const lookups = [...this.transports.values()].filter(transport => transport.lookup);
     let cursor = '0';
     let recovered = 0;
     let unresolved = 0;
@@ -459,10 +474,16 @@ export class Gateway extends WorkQueue {
         await this.mirror(entry, journal);
         const unsettled = entry.state === 'sending' || entry.state === 'unknown';
         const paid = entry.receipt?.state === 'paid' ? entry.receipt : null;
-        const missing = !this.replayOnly && this.transport?.lookup && paid && paid.routeVerified !== false
-          && !await this.response(this.db, entry.attempt.id, paid);
+        let transport: ModelTransport | undefined;
+        if (!this.replayOnly && lookups.length && (unsettled || (paid && paid.routeVerified !== false))) {
+          const { rows: [route] } = await this.db.query<Pick<RoutePolicy, 'transport'>>(
+            'SELECT transport FROM gateway_routes WHERE id=$1 AND revision=$2', [entry.attempt.routeId, entry.attempt.revision]);
+          transport = route && this.transports.get(route.transport);
+        }
+        const missing = transport?.lookup && paid && paid.routeVerified !== false && !await this.response(this.db, entry.attempt.id, paid);
         if (unsettled || missing) {
-          const outcome = this.replayOnly ? null : await this.transport?.lookup?.(entry.attempt).catch(() => null);
+          const outcome = (unsettled ? await this.savedOutcome(entry.attempt) : null)
+            ?? await transport?.lookup?.(entry.attempt).catch(() => null);
           if (outcome && validReceipt(outcome.receipt) && outcome.receipt.state !== 'unknown') {
             const receipt = durableReceipt(outcome.receipt);
             final = await journal.settle(entry.attempt.id, receipt);

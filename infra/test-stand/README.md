@@ -116,16 +116,19 @@ API и worker получат существующий Unix-сокет броке
 роль, база и том журнала используют тот же внешний SSD. Этот профиль позволяет проверить границу подключения и устойчивость
 отдельного процесса. Приёмка внешнего журнала требует независимого сервера и носителя.
 
-`stand run` оставляет worker в закрытом режиме. Для прежних испытаний общим стендом предусмотрена команда
+`stand run` оставляет worker в закрытом режиме. Для отдельно разрешённого модельного прогона предусмотрена команда
 `infra/test-stand/stand run-step15 "$image" "$db_env" "$step15_env"`. Она требует reader-сборку, отдельный журнал и файл
-`step15.env` с правами `0600` в каталоге прогона на SSD. Оператор передаёт в файл
-`FACADE_GATEWAY_OPENROUTER_KEY`, `FACADE_GATEWAY_STEP15_PROFILES`, `FACADE_HARNESS_PROFILE` и при необходимости
-`FACADE_GATEWAY_OPENROUTER_ENDPOINT`. Профили маршрутов и лимиты проверяет сам шлюз.
+`step15.env` с правами `0600` в каталоге прогона на SSD. Для OpenRouter укажите `FACADE_GATEWAY_OPENROUTER_KEY`,
+`FACADE_GATEWAY_STEP15_PROFILES` и при необходимости `FACADE_GATEWAY_OPENROUTER_ENDPOINT`. Для CheaperInference
+укажите отдельные `FACADE_GATEWAY_CHEAPERINFERENCE_KEY` и `FACADE_GATEWAY_CHEAPERINFERENCE_PROFILES`.
+Без `FACADE_HARNESS_PROFILE` используются новые назначения из [профиля worker](../../src/modules/harness/README.md).
+Профили маршрутов и лимиты проверяет сам шлюз.
 
-Только worker получает отдельную сеть до прокси OpenRouter. Прокси разрешает HTTPS CONNECT на порт 443 для
-`openrouter.ai`, `eu.openrouter.ai`, `us.openrouter.ai`. TLS остаётся между worker и провайдером. У API, PostgreSQL,
-S3 и worker сохраняются внутренние сети без внешнего маршрута. Утилиты Poppler и Tesseract запускаются с очищенным окружением,
-ограничением CPU и запретом сокетов.
+Только worker получает отдельную сеть до модельного прокси. В него попадают адреса явно настроенных транспортов.
+Для OpenRouter разрешены `openrouter.ai`, `eu.openrouter.ai`, `us.openrouter.ai`, для CheaperInference —
+`api.cheaperinference.com`. Прокси разрешает HTTPS CONNECT на порт 443. TLS остаётся между worker и провайдером.
+У API, PostgreSQL, S3 и worker сохраняются внутренние сети без прямого внешнего маршрута.
+Утилиты Poppler и Tesseract запускаются с очищенным окружением, ограничением CPU и запретом сокетов.
 
 Для разрешённого публичного импорта выполните `infra/test-stand/stand run-public-import "$image" "$db_env"`.
 Worker получает `FACADE_IMPORT_HTTPS_PROXY` и собственную сеть до этого прокси. Разрешены только `cloud-api.yandex.net`,

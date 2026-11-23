@@ -508,6 +508,31 @@ test('live primary, unfinished outcome, and open inventory gate review per gener
   t.diagnostic('large review: 0 sends until B publishes; small project completes earlier; 6 receipts match across all ledgers');
 });
 
+test('recovery settles a locally saved reply without resending or looking up the effect', sqlCase, async t => {
+  const s = await setup(t);
+  const ref = project();
+  await s.gateway.openGeneration(ref);
+  await s.gateway.sealGeneration(ref, manifest);
+  await grant(s.gateway, ref);
+  const work = await lease(s.gateway, ref, 'saved-output', obligationA);
+  const suppress = t.mock.method(s.journal, 'settle', async () => { throw new Error('fixture journal disruption'); });
+  const interrupted = isHeld(await s.gateway.call(call(work)), 'journal_unavailable');
+  assert.ok(interrupted.attemptId);
+  assert.equal((await s.journal.balance()).reserveUsdNanos, baseRoute.ceilingUsdNanos);
+  suppress.mock.restore();
+
+  const restarted = new Gateway(s.db, s.journal, { kind: 'managed', async send() { assert.fail('duplicate send'); } });
+  const recovered = await restarted.recover();
+  assert.equal(recovered.unresolved, 0);
+  assert.equal(recovered.reserveUsdNanos, 0);
+  assert.equal(recovered.spentUsdNanos, 300_000_000);
+  const replay = await restarted.call(call(work));
+  assert.equal(replay.status, 'paid');
+  assert.equal(replay.status === 'paid' && replay.replay, true);
+  assert.equal(replay.attemptId, interrupted.attemptId);
+  assert.equal((await s.read()).provider.length, 1);
+});
+
 test('restored database reconciles the original charge and repeats the operator receipt after restart', sqlCase, async t => {
   const s = await setup(t);
   const damaged = project();

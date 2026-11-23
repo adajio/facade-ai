@@ -1,3 +1,4 @@
+import { qwen38Max, terraModel } from '../gateway/index.js';
 import { settingsSchema, type ResearchSettings, type ResearchSuspension, type ResearchTask, type ScheduledResearchJob } from './contracts.js';
 
 export const researchSlots = ['A', 'B', 'lead'] as const;
@@ -8,11 +9,21 @@ export function researchSlot(job: ScheduledResearchJob): ResearchSlot {
   return job.mode === 'lead' ? 'lead' : job.branch;
 }
 
+function defaultResearchProfile(): ResearchProfile {
+  const reader = { dataClass: 'synthetic', maxTokens: 2_048, maxTurns: 32, maxKnownRejections: 1 };
+  return {
+    A: { ...reader, routeId: 'cheaperinference-terra-reader', model: terraModel },
+    B: { ...reader, routeId: 'openrouter-alibaba-qwen38-max-reader', model: qwen38Max },
+    lead: null,
+  };
+}
+
 export function loadResearchProfile(env = process.env): ResearchProfile {
+  if (env.FACADE_HARNESS_PROFILE === undefined) return defaultResearchProfile();
   const profile: ResearchProfile = { A: null, B: null, lead: null };
   let input: unknown;
   try {
-    input = JSON.parse(env.FACADE_HARNESS_PROFILE ?? '{}');
+    input = JSON.parse(env.FACADE_HARNESS_PROFILE);
   } catch {
     return profile;
   }

@@ -42,15 +42,20 @@ remove() {
 }
 
 egress_up() {
+  local route=${1:-openrouter}
   ensure_net "$or_net" true
   ensure_net "$uplink" false
-  if ! "${d[@]}" container inspect facade-ai-step15-openrouter >/dev/null 2>&1; then
+  local current
+  current=$("${d[@]}" inspect -f '{{index .Config.Labels "io.facade.step15.egress-mode"}}' facade-ai-step15-openrouter 2>/dev/null || true)
+  if [[ "$current" != "$route" ]]; then
+    remove facade-ai-step15-openrouter
     "${d[@]}" run -d --name facade-ai-step15-openrouter --pull=never --read-only --cap-drop ALL \
       --security-opt no-new-privileges --memory 128m --user node \
+      --label "io.facade.step15.egress-mode=$route" \
       --network "name=$or_net,alias=step15-openrouter,driver-opt=com.docker.network.endpoint.ifname=priv0" \
       --network "name=$uplink,gw-priority=1" \
       --mount "type=bind,source=$here/connect-proxy.mjs,target=/proxy.mjs,readonly" \
-      "$helper_image" node /proxy.mjs openrouter >/dev/null
+      "$helper_image" node /proxy.mjs "$route" >/dev/null
   fi
   "${d[@]}" exec -i facade-ai-step15-openrouter node --input-type=module - < "$here/proxy-ready.mjs" || {
     echo 'CONNECT-прокси шага 15 не принимает TCP на приватном интерфейсе.' >&2
@@ -103,7 +108,9 @@ EOF
 # Fill locally as the step 15 operator. Keep this file mode 0600.
 FACADE_GATEWAY_OPENROUTER_KEY=
 FACADE_GATEWAY_STEP15_PROFILES=
-FACADE_HARNESS_PROFILE=
+FACADE_GATEWAY_CHEAPERINFERENCE_KEY=
+FACADE_GATEWAY_CHEAPERINFERENCE_PROFILES=
+# FACADE_HARNESS_PROFILE={}
 FACADE_GATEWAY_OPENROUTER_ENDPOINT=https://openrouter.ai
 # FACADE_HARNESS_LIVE_POLICY=synthetic-research
 ENV
@@ -127,7 +134,7 @@ ENV
       [[ -f "$root/$secret" && ! -L "$root/$secret" && "$(stat -f '%Lp' "$root/$secret")" == 600 ]]
     done
     if [[ "$1" == start ]]; then
-      node "$here/step15-config.mjs" "$root/step15.env"
+      egress_route=$(node "$here/step15-config.mjs" "$root/step15.env")
     fi
     native_up
     ensure_net "$journal_net" true
@@ -192,7 +199,7 @@ PY
     fi
     live=(-e FACADE_GATEWAY_LIVE_MODE=)
     if [[ "$1" == start ]]; then
-      egress_up
+      egress_up "$egress_route"
       live=(--network "$or_net" -e FACADE_GATEWAY_LIVE_MODE=step-15 -e NODE_USE_ENV_PROXY=1
         -e HTTPS_PROXY=http://step15-openrouter:3128 -e NO_PROXY=postgres,step15-journal,objects,localhost,127.0.0.1
         --mount "type=bind,source=$root/step15.env,target=/run/facade/step15.env,readonly")

@@ -2,10 +2,9 @@ import assert from 'node:assert/strict';
 import { once } from 'node:events';
 import { createConnection, createServer, Socket } from 'node:net';
 import { test } from 'node:test';
-import { createConnectProxy } from './connect-proxy.mjs';
+import { allowlists, createConnectProxy } from './connect-proxy.mjs';
 
 const hostname = 'openrouter.ai';
-const header = `CONNECT ${hostname}:443 HTTP/1.1\r\nHost: ${hostname}:443\r\n\r\n`;
 const tunnelData = 'synthetic-test-data';
 const publicAnswer = (...hosts) => hosts.map((address) => ({ address, family: 4 }));
 
@@ -24,13 +23,13 @@ async function listen(t, server) {
   return server.address().port;
 }
 
-async function connect(port) {
+async function connect(port, target = hostname + ':443') {
   const client = createConnection({ host: '127.0.0.1', port });
   const closed = once(client, 'close');
   let response = '';
   client.setEncoding('utf8').on('data', (chunk) => { response += chunk; });
   await once(client, 'connect');
-  client.write(header + tunnelData);
+  client.write(`CONNECT ${target} HTTP/1.1\r\nHost: ${target}\r\n\r\n` + tunnelData);
   await closed;
   return response;
 }
@@ -100,4 +99,22 @@ test('exhausting checked addresses returns 502 without opening a tunnel', { time
   }));
   assert.equal(await connect(proxy), 'HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\n\r\n');
   assert.deepEqual(addresses, ['1.1.1.1', '8.8.8.8']);
+});
+
+test('CheaperInference is allowed only on its exact authority in explicitly selected model modes', async t => {
+  const upstream = await listen(t, createServer(socket => socket.once('data', () => socket.end('fixture'))));
+  for (const [mode, allowed] of [['openrouter', false], ['cheaperinference', true], ['mixed', true], ['import', false]]) {
+    const lookups = [];
+    const proxy = await listen(t, createConnectProxy({
+      hosts: allowlists[mode],
+      lookupAddresses: async host => { lookups.push(host); return publicAnswer('1.1.1.1'); },
+      dial: () => createConnection({ host: '127.0.0.1', port: upstream }),
+    }));
+    const response = await connect(proxy, 'api.cheaperinference.com:443');
+    assert.match(response, allowed ? /^HTTP\/1\.1 200/ : /^HTTP\/1\.1 403/);
+    for (const target of ['cheaperinference.com:443', 'api.cheaperinference.com:444', 'api.cheaperinference.com.example:443']) {
+      assert.match(await connect(proxy, target), /^HTTP\/1\.1 403/);
+    }
+    assert.deepEqual(lookups, allowed ? ['api.cheaperinference.com'] : []);
+  }
 });

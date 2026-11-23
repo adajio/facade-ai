@@ -14,7 +14,7 @@ services:
   openrouter-egress:
     <<: *proxy
     profiles: [openrouter]
-    command: ["openrouter"]
+    command: ["${FACADE_STAND_MODEL_EGRESS:-openrouter}"]
     networks:
       openrouter-private:
         interface_name: priv0

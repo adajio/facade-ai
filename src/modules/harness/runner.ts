@@ -26,7 +26,7 @@ export interface RunnerPorts {
   gateway: ResearchGateway;
   reader: ReaderPort;
   configured?(slot: ResearchSlot): ResearchSettings | null;
-  admit?(task: ResearchTask): ResearchSuspension | null;
+  admit?(task: ResearchTask, pinned: boolean): ResearchSuspension | null;
   localLimits?(task: ResearchTask): Pick<ResearchSettings, 'maxTurns' | 'maxKnownRejections'>;
   publishOutcome(tx: PoolClient, task: ScheduledResearchTask, outcome: ResearchOutcome): Promise<void>;
   loadPriorOutcome?(task: ScheduledResearchTask): Promise<ResearchOutcome | null>;
@@ -64,7 +64,7 @@ export async function resumeInterruptedResearch(
      WHERE g.current AND (j.kind=$1 OR $2::boolean AND j.payload#>>'{packageWindow,followup,discovery,kind}'='profile_scan')
        AND j.state='held'
        AND (j.reason IN ('analysis_replay_only','journal_unavailable','research_profile_unavailable','research_route_not_approved',
-                         'research_gateway_unconfigured','synthetic_input_not_approved')
+                         'research_gateway_unconfigured','synthetic_input_not_approved','research_profile_changed')
          OR (j.reason='route_reconciliation' AND j.next_action='operator_reconcile_route'))
        AND NOT EXISTS (
          SELECT 1 FROM gateway_attempts a WHERE a.project_id=j.project_id
@@ -119,7 +119,7 @@ function sessionPorts(
     },
     call: async (input) => {
       active.throwIfAborted();
-      const hold = services.admit?.(task);
+      const hold = services.admit?.(task, true);
       if (hold) return { status: 'held', code: hold.reason, nextAction: hold.nextAction };
       const result = await gateway.call({
         ...input, lease, routeId: task.job.settings.routeId, dataClass: task.job.settings.dataClass,
@@ -175,7 +175,7 @@ async function runAssignment(
   };
   let task: ResearchTask = { ...scheduled, job: { ...scheduled.job, settings },
     ...(review === 'early' ? { earlyPair: true, pairScopeName: scopeName } : {}) };
-  const hold = services.admit?.(task);
+  const hold = services.admit?.(task, Boolean(scheduled.job.settings || binding));
   if (hold) return { status: 'suspended', hold };
   if (!scheduled.job.settings && !binding) {
     const bound = await transaction(db, async (tx) => {

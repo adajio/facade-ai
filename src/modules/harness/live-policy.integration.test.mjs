@@ -9,6 +9,9 @@ const optIn = process.env.FACADE_HARNESS_LIVE_STUB_TEST === '1';
 const checksum = (bytes) => createHash('sha256').update(bytes).digest('hex');
 const origin = 'http://127.0.0.1:3000';
 const endpoint = 'https://openrouter.ai/api/v1/chat/completions';
+const directEndpoint = 'https://api.cheaperinference.com/v1/chat/completions';
+const directKey = 'ci_' + 'live_' + 'local_fixture';
+const retentionApproval = { approvalRef: 'test-retention', noTrainingEvidenceRef: 'test-no-training', validUntil: '2099-01-01T00:00:00Z' };
 const fixture = {
   A: { routeId: 'fixture-kimi', model: 'moonshotai/kimi-fixture', provider: 'wafer/us', responseProvider: 'Wafer' },
   B: { routeId: 'fixture-qwen', model: 'qwen/qwen-fixture', provider: 'alibaba', responseProvider: 'Alibaba' },
@@ -65,7 +68,7 @@ test('partial live configuration uses only independently admitted routes with th
   const { createApi } = await import('../../../dist/src/platform/api.js');
   const { readConfig } = await import('../../../dist/src/platform/config.js');
   const { bootstrapAdmin } = await import('../../../dist/src/modules/access/bootstrap.js');
-  const { createGateway } = await import('../../../dist/src/modules/gateway/index.js');
+  const { createGateway, Gateway, PostgresIntentJournal } = await import('../../../dist/src/modules/gateway/index.js');
   const { startWorker } = await import('../../../dist/src/modules/harness/index.js');
   await ledgerPool.query(await readFile(new URL('../gateway/journal.sql', import.meta.url), 'utf8'));
   await ledgerPool.query('INSERT INTO gateway_external_ledger(ledger_id) VALUES($1)', [process.env.FACADE_GATEWAY_LEDGER_ID]);
@@ -97,9 +100,20 @@ test('partial live configuration uses only independently admitted routes with th
       maxRequestBytes: 2 * 1024 * 1024, ceilingUsdNanos: 1, timeoutMs: 8000,
     });
   }
+  const { loadResearchProfile } = await import('../../../dist/src/modules/harness/profile.js');
+  const defaults = loadResearchProfile({});
+  const terra = { ...defaults.A, direct: true };
+  const qwen38 = { ...fixture.B, ...defaults.B };
+  for (const [cfg, transport, ceilingUsdNanos] of [[terra, 'cheaperinference', 3_000_000_000], [qwen38, 'openrouter', 1]]) {
+    await gateway.configureRoute({
+      id: cfg.routeId, revision: 'local-test', transport, enabled: true,
+      maxRequestBytes: 2 * 1024 * 1024, ceilingUsdNanos, timeoutMs: 8000,
+    });
+  }
   let selectedA = fixture.A;
+  let selectedB = fixture.B;
   async function grant(projectId, branch, allowed) {
-    await gateway.grantRoute({ projectId, routeId: (branch === 'A' ? selectedA : fixture.B).routeId, revision: 'local-test',
+    await gateway.grantRoute({ projectId, routeId: (branch === 'A' ? selectedA : selectedB).routeId, revision: 'local-test',
       dataClass: 'synthetic', purpose: branch === 'A' ? 'primary_a' : 'primary_b', allowed });
   }
 
@@ -113,17 +127,28 @@ test('partial live configuration uses only independently admitted routes with th
   let revoke;
   globalThis.fetch = async (url, options) => {
     try {
-      assert.equal(String(url), endpoint);
       const input = JSON.parse(options.body);
-      const branch = input.model === fixture.B.model ? 'B' : 'A';
-      const selected = branch === 'A' ? selectedA : fixture.B;
+      const branch = input.model === selectedB.model ? 'B' : 'A';
+      const selected = branch === 'A' ? selectedA : selectedB;
       assert.equal(input.model, selected.model);
-      assert.deepEqual(input.provider.only, [selected.provider]);
-      assert.deepEqual(input.provider.order, [selected.provider]);
-      assert.equal(input.provider.allow_fallbacks, false);
-      assert.equal(input.provider.require_parameters, true);
-      assert.equal(input.provider.data_collection, 'deny');
-      assert.equal(input.provider.zdr, branch === 'A');
+      assert.equal(options.redirect, 'error');
+      if (selected.direct) {
+        assert.equal(String(url), directEndpoint);
+        assert.equal(options.headers.authorization, 'Bearer ' + directKey);
+        assert.equal(options.headers['x-ci-model-lock'], '1');
+        assert.equal(input.zdr, true);
+        assert.equal(input.max_tokens, defaults.A.maxTokens);
+        assert.equal(input.provider, undefined);
+      } else {
+        assert.equal(String(url), endpoint);
+        assert.equal(options.headers.authorization, 'Bearer local-fixture-key');
+        assert.deepEqual(input.provider.only, [selected.provider]);
+        assert.deepEqual(input.provider.order, [selected.provider]);
+        assert.equal(input.provider.allow_fallbacks, false);
+        assert.equal(input.provider.require_parameters, true);
+        assert.equal(input.provider.data_collection, selected === qwen38 ? 'allow' : 'deny');
+        assert.equal(input.provider.zdr, branch === 'A');
+      }
       assert.equal(input.tool_choice, selected.toolChoice ?? 'required');
       const assignment = JSON.parse(input.messages[1].content);
       const projectId = assignment.place.source.projectId;
@@ -132,7 +157,11 @@ test('partial live configuration uses only independently admitted routes with th
       if (revoke?.projectId === projectId && revoke.branch === branch && outputs.length === 0) {
         await grant(projectId, branch, false);
       }
-      const receipt = { id: `gen-${randomUUID()}`, model: selected.model, provider: selected.responseProvider, usage: { cost: 0 } };
+      const receipt = selected.direct ? {
+        request_id: randomUUID(), model: selected.model,
+        usage: { prompt_tokens: 1024, completion_tokens: 128 },
+        billing: { status: 'settled', currency: 'USD', billed_cost_usd: '0.000000' },
+      } : { id: `gen-${randomUUID()}`, model: selected.model, provider: selected.responseProvider, usage: { cost: 0 } };
       if (selected.toolChoice === 'auto' && input.messages.length === 2) {
         return Response.json({ ...receipt, choices: [{ finish_reason: 'stop',
           message: { role: 'assistant', content: unsolicitedClaim } }] });
@@ -211,19 +240,40 @@ test('partial live configuration uses only independently admitted routes with th
   delete process.env.FACADE_GATEWAY_OPENROUTER_ENDPOINT;
 
   async function runCase(testCase) {
-    selectedA = testCase.comparison ?? fixture.A;
-    const sources = { A: selectedA, B: fixture.B };
+    selectedA = testCase.mixed ? terra : testCase.comparison ?? fixture.A;
+    selectedB = testCase.mixed ? qwen38 : fixture.B;
+    const sources = { A: selectedA, B: selectedB };
     const project = await post('/api/projects', { name: testCase.name, catalogVersionId: catalog.id, scopeName: 'F-A', stage: 'P' });
     const scopeId = project.scopes[0].id;
     const files = testCase.compound ? compoundTexts : testCase.dispute ? ['Thickness 2 mm', 'Thickness 3 mm'] : ['Thickness 2 mm'];
     if (testCase.compound) compoundProject = project.id;
     const authorized = { projectId: project.id, scopeId, originalSha256s: files.map(checksum) };
-    const approvals = testCase.approvals.map((branch) => formatProfile(sources[branch], authorized));
-    for (const branch of ['A', 'B']) await grant(project.id, branch, true);
-    process.env.FACADE_HARNESS_PROFILE = JSON.stringify({
-      A: settings(sources.A), B: settings(sources.B),
-      ...(testCase.settings ?? {}),
+    const approvals = testCase.approvals.filter(branch => !sources[branch].direct).map(branch => {
+      const source = sources[branch];
+      const profile = formatProfile(source, {
+        ...authorized, ...(source === qwen38 && { retentionApproval }),
+      });
+      return source === qwen38 ? { ...profile, outputTokenLimit: defaults.B.maxTokens } : profile;
     });
+    for (const branch of ['A', 'B']) await grant(project.id, branch, true);
+    if (testCase.mixed) {
+      delete process.env.FACADE_HARNESS_PROFILE;
+      process.env.FACADE_GATEWAY_CHEAPERINFERENCE_KEY = directKey;
+      process.env.FACADE_GATEWAY_CHEAPERINFERENCE_PROFILES = JSON.stringify([{
+        transport: 'cheaperinference', routeId: terra.routeId, model: terra.model,
+        revision: 'local-test', mode: 'strict-zdr', zdrEvidenceRef: 'fixture-zdr',
+        boundEvidenceRef: 'fixture-rates', validUntil: '2099-01-01T00:00:00Z',
+        syntheticScopes: [{...authorized, approvalRef: 'fixture'}],
+        inputNanosPerToken: 2500, outputNanosPerToken: 7500, outputTokenLimit: defaults.A.maxTokens,
+        maxImages: 0, maxImageWidth: 1, maxImageHeight: 1, maxImagePixels: 1, maxImageBytes: 1,
+      }]);
+    } else {
+      delete process.env.FACADE_GATEWAY_CHEAPERINFERENCE_KEY;
+      delete process.env.FACADE_GATEWAY_CHEAPERINFERENCE_PROFILES;
+      process.env.FACADE_HARNESS_PROFILE = JSON.stringify({
+        A: settings(sources.A), B: settings(sources.B), ...(testCase.settings ?? {}),
+      });
+    }
     process.env.FACADE_GATEWAY_STEP15_PROFILES = JSON.stringify([
       ...approvals,
       ...(testCase.malformed ? [{ ...formatProfile(fixture[testCase.malformed], authorized), promptNanosPerToken: 'broken' }] : []),
@@ -257,6 +307,20 @@ test('partial live configuration uses only independently admitted routes with th
       .filter(([purpose]) => purpose !== 'review')
       .map(([purpose, state]) => [purpose.endsWith('_a') ? 'A' : 'B', state === 'done' ? 'completed' : 'pending']));
     assert.deepEqual(calls.filter(({ projectId }) => project.id === projectId).map(({ branch }) => branch).sort(), testCase.calls);
+    if (testCase.mixed) {
+      const { rows: bindings } = await app.db.query(
+        `SELECT j.purpose, coalesce(nullif(j.payload->'settings','null'::jsonb),b.settings) AS settings
+         FROM gateway_jobs j LEFT JOIN harness_route_bindings b ON b.job_id=j.id
+         WHERE j.project_id=$1 ORDER BY j.purpose`, [project.id]);
+      assert.deepEqual(bindings, [{ purpose: 'primary_a', settings: defaults.A }, { purpose: 'primary_b', settings: defaults.B }]);
+      const { rows: receipts } = await app.db.query(
+        `SELECT DISTINCT purpose, receipt->>'provider' AS provider, receipt->>'model' AS model
+         FROM gateway_attempts WHERE project_id=$1 AND state='paid' ORDER BY purpose`, [project.id]);
+      assert.deepEqual(receipts, [
+        { purpose: 'primary_a', model: terra.model, provider: 'CheaperInference' },
+        { purpose: 'primary_b', model: qwen38.model, provider: 'Alibaba' },
+      ]);
+    }
     if (testCase.comparison) {
       const { rows: trail } = await app.db.query(
         `SELECT e.event FROM harness_research_events e JOIN gateway_jobs j ON j.id=e.job_id
@@ -280,7 +344,7 @@ test('partial live configuration uses only independently admitted routes with th
       assert.ok(evidence.lines.some(({ text }) => text === claim.quote));
     }
     const response = (await http('GET', `/api/projects/${project.id}/assessments/current?scopeId=${scopeId}`)).json();
-    assert.equal(response.questions[0].machine.outcome, 'needs_review');
+    assert.equal(response.questions[0].machine.outcome, testCase.mixed ? 'covered' : 'needs_review');
     if (testCase.dispute) {
       const [question] = response.questions;
       assert.ok(question.machine.limitations.includes('dispute_pending'));
@@ -361,6 +425,8 @@ test('partial live configuration uses only independently admitted routes with th
   const done = (branch) => [`primary_${branch}`, 'done', null];
   const held = (branch, reason) => [`primary_${branch}`, 'held', reason];
   if (process.env.FACADE_HARNESS_COMPOUND_ONLY !== '1') {
+    await runCase({ name: 'Default Terra and Qwen3.8 Max', mixed: true, approvals: ['A', 'B'],
+      calls: ['A', 'A', 'A', 'B', 'B', 'B'], expected: [done('a'), done('b')] });
     await runCase({ name: 'Only A', approvals: ['A'], malformed: 'B', calls: ['A', 'A', 'A'],
       expected: [done('a'), held('b', 'research_route_not_approved')] });
     await runCase({ name: 'Only B', approvals: ['B'], recoverA: true, settings: { A: { routeId: 'broken' } }, calls: ['B', 'B', 'B'],
@@ -384,6 +450,78 @@ test('partial live configuration uses only independently admitted routes with th
     `SELECT count(*) FILTER(WHERE state IN ('prepared','sending','unknown'))::int AS open,
             coalesce(sum(spent_usd_nanos),0)::text AS spent FROM gateway_external_attempts`);
   assert.deepEqual(ledger, { open: 0, spent: '0' });
+  if (process.env.FACADE_HARNESS_COMPOUND_ONLY !== '1') await t.test('profile switch preserves ready and unknown window assignments', async () => {
+    const { activatePackageProjects, authorizedPackageWindow, dispatchPackagePair, preparePackageMap } =
+      await import('../../../dist/src/modules/harness/package-dispatch.js');
+    const project = await post('/api/projects', { name: 'Pinned package', catalogVersionId: catalog.id, scopeName: 'F-1', stage: 'P' });
+    const projectId = project.id;
+    const bytes = Buffer.from('Thickness 2 mm\nThickness 3 mm');
+    const receipt = await post(`/api/projects/${projectId}/receipts`, {});
+    const upload = await post(`/api/receipts/${receipt.receiptId}/uploads`, {
+      relativePath: 'map.txt', size: bytes.length, sha256: checksum(bytes), mediaType: 'text/plain', scopeIds: [project.scopes[0].id],
+    });
+    await http('PUT', `/api/uploads/${upload.uploadId}/parts/1`, bytes, {
+      'content-type': 'application/octet-stream', 'x-part-sha256': checksum(bytes), 'content-length': String(bytes.length),
+    });
+    await post(`/api/uploads/${upload.uploadId}/complete`, {});
+    await post(`/api/receipts/${receipt.receiptId}/seal`, {});
+    const readerVersion = 'fixture-window-map';
+    await activatePackageProjects(app.db, gateway, [projectId]);
+    assert.equal(await preparePackageMap(app.db, gateway, {
+      formatFor: () => 'txt', readerVersion: async () => readerVersion,
+      map: async source => ({ source, format: 'txt', readerVersion, units: [{ id: 'first' }, { id: 'second' }] }),
+    }, [projectId]), true);
+    const prior = { A: settings(fixture.A), B: settings(fixture.B), lead: null };
+    for (const profile of [prior, defaults]) {
+      for (const [slot, purpose] of [['A', 'primary_a'], ['B', 'primary_b']]) {
+        await gateway.grantRoute({ projectId, routeId: profile[slot].routeId, revision: 'local-test', dataClass: 'synthetic',
+          purpose, allowed: true });
+      }
+    }
+    assert.equal(await dispatchPackagePair(app.db, gateway, prior), true);
+    assert.equal(await dispatchPackagePair(app.db, gateway, prior), true);
+    const journal = new PostgresIntentJournal(ledgerPool, process.env.FACADE_GATEWAY_LEDGER_ID);
+    let sends = 0;
+    const fixtureGateway = new Gateway(app.db, journal, { kind: 'openrouter', async send() {
+      sends++;
+      return { receipt: { state: 'unknown', code: 'fixture_unknown_charge' } };
+    } });
+    const work = await fixtureGateway.claim({ workerId: 'fixture-profile-switch', kinds: ['harness_research'], leaseMs: 60_000 });
+    assert.equal(work.projectId, projectId);
+    const savedSettings = work.payload.settings;
+    const call = { lease: work.lease, effectKey: 'fixture-first-step', routeId: savedSettings.routeId,
+      dataClass: savedSettings.dataClass, inputRefs: [], request: { text: 'synthetic' } };
+    const lost = await fixtureGateway.call(call);
+    assert.equal(lost.code, 'unknown_charge');
+    await fixtureGateway.checkpoint(work.lease, { researchSequence: 1 });
+    await app.db.query('INSERT INTO harness_research_events(job_id,sequence,event) VALUES($1,1,$2)',
+      [work.lease.jobId, { kind: 'fixture-marker' }]);
+    await fixtureGateway.suspend(work.lease, { reason: lost.code, nextAction: lost.nextAction });
+    const assignments = () => app.db.query(
+      `SELECT w.ordinal,b.active,b.branch,b.profile_hash,b.job_id,j.payload,j.state,j.cursor,j.generation_id
+       FROM harness_package_branches b JOIN harness_package_windows w ON w.id=b.window_id
+       JOIN gateway_jobs j ON j.id=b.job_id WHERE w.project_id=$1 ORDER BY w.ordinal,b.branch`, [projectId]);
+    const before = (await assignments()).rows;
+    assert.equal(before.length, 2);
+    assert.deepEqual(before.map(({ state }) => state).sort(), ['held', 'ready']);
+    const balance = await journal.balance();
+    assert.equal(balance.reserveUsdNanos, 1);
+    assert.equal(await dispatchPackagePair(app.db, gateway, defaults), true);
+    assert.equal(await dispatchPackagePair(app.db, gateway, defaults), true);
+    const after = (await assignments()).rows;
+    assert.deepEqual(after.slice(0, 2), before);
+    assert.deepEqual(after.slice(2).map(({ active, payload }) => [active, payload.settings]), [[true, defaults.A], [true, defaults.B]]);
+    for (const { job_id, generation_id, branch, payload } of before) {
+      assert.equal(await authorizedPackageWindow(app.db, { id: job_id, projectId, generationId: generation_id, branch,
+        place: payload.place, windowId: payload.packageWindow.id, readerVersion }), true);
+    }
+    assert.deepEqual((await app.db.query('SELECT event FROM harness_research_events WHERE job_id=$1', [work.lease.jobId])).rows,
+      [{ event: { kind: 'fixture-marker' } }]);
+    assert.deepEqual((await app.db.query('SELECT state,route_id FROM gateway_attempts WHERE id=$1', [lost.attemptId])).rows,
+      [{ state: 'unknown', route_id: savedSettings.routeId }]);
+    assert.deepEqual(await journal.balance(), balance);
+    assert.equal(sends, 1);
+  });
   assert.deepEqual(errors, []);
   assert.deepEqual(warnings, []);
 });

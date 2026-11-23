@@ -8,7 +8,7 @@ import type { Pool } from 'pg';
 import type { WorkerContext } from '../../platform/worker-context.js';
 import { sealManagedTestDatabase, toolHash } from '../../platform/runtime-boundary.js';
 import { createFormatAdapters } from '../formats/index.js';
-import { createGateway, createStep15Gateway, journalFromEnv, type OpenRouterProfile, type Step15Approval } from '../gateway/index.js';
+import { createGateway, createLiveGateway, journalFromEnv, type CheaperInferenceProfile, type OpenRouterProfile, type Step15Approval } from '../gateway/index.js';
 import type { ModelTransport } from '../gateway/types.js';
 import { startImports } from '../imports/index.js';
 import { createIntakeStorage } from '../intake/blob.js';
@@ -32,13 +32,22 @@ import { reconcileNextFacadeDiscovery } from './facade-discovery.js';
 export { register } from './stops.js';
 export { readPackageAnalysis, type PackageAnalysis } from './package-analysis.js';
 
-function configuredApprovals(): OpenRouterProfile[] {
-  try {
-    const input: unknown = JSON.parse(process.env.FACADE_GATEWAY_STEP15_PROFILES ?? '[]');
-    return Array.isArray(input) ? input.filter((item) => item && typeof item === 'object') : [];
-  } catch {
-    return [];
-  }
+type RouterApproval = OpenRouterProfile & { transport?: 'openrouter' };
+type LiveApproval = RouterApproval | CheaperInferenceProfile;
+
+function configuredApprovals(): LiveApproval[] {
+  const read = (input: string | undefined): LiveApproval[] => {
+    try {
+      const parsed: unknown = JSON.parse(input ?? '[]');
+      return Array.isArray(parsed) ? parsed.filter(item => item && typeof item === 'object') : [];
+    } catch {
+      return [];
+    }
+  };
+  return [
+    ...read(process.env.FACADE_GATEWAY_STEP15_PROFILES).filter(item => item.transport === undefined || item.transport === 'openrouter'),
+    ...read(process.env.FACADE_GATEWAY_CHEAPERINFERENCE_PROFILES).filter(item => item.transport === 'cheaperinference'),
+  ];
 }
 
 interface ManagedTestOptions {
@@ -68,7 +77,8 @@ function modelGateway(context: WorkerContext, external: ReturnType<typeof journa
   };
   const localGateway = () => createGateway(context.db, { journal: external?.journal, reviewAdmission, ...policyOptions });
   if (test) {
-    if (!external || process.env.FACADE_GATEWAY_LIVE_MODE || process.env.FACADE_GATEWAY_OPENROUTER_KEY) {
+    if (!external || process.env.FACADE_GATEWAY_LIVE_MODE || process.env.FACADE_GATEWAY_OPENROUTER_KEY
+      || process.env.FACADE_GATEWAY_CHEAPERINFERENCE_KEY) {
       throw new Error('Managed model tests require an isolated journal and disabled live gateway');
     }
     const gateway = createGateway(context.db, {
@@ -77,41 +87,52 @@ function modelGateway(context: WorkerContext, external: ReturnType<typeof journa
     return { gateway, hasTransport: true, mode: 'managed-test', admit: (task: ResearchTask) => profileHold(profile, task) };
   }
   if (process.env.FACADE_GATEWAY_LIVE_MODE === 'step-15') {
-    const apiKey = process.env.FACADE_GATEWAY_OPENROUTER_KEY;
-    if (!external || !apiKey?.trim()) return {
+    const routerKey = process.env.FACADE_GATEWAY_OPENROUTER_KEY;
+    const directKey = process.env.FACADE_GATEWAY_CHEAPERINFERENCE_KEY;
+    if (!external || (!routerKey?.trim() && !directKey?.trim())) return {
       gateway: localGateway(), hasTransport: false, mode: 'disabled',
       admit: (task: ResearchTask) => ({
         reason: 'research_gateway_unconfigured',
         nextAction: `Проверить настройки шлюза для ${researchSlot(task.job)}.`,
       }),
     };
-    const approval: Omit<Step15Approval, 'profiles'> = {
-      qualification: 'step-15', apiKey,
-      endpoint: (process.env.FACADE_GATEWAY_OPENROUTER_ENDPOINT ?? 'https://openrouter.ai') as Step15Approval['endpoint'],
-    };
     const approvals = configuredApprovals();
-    const usable=(route:OpenRouterProfile)=>{
+    function enabledFor(profiles: readonly LiveApproval[]): Parameters<typeof createLiveGateway>[2] {
+      const openRouter = profiles.filter((route): route is RouterApproval => route.transport !== 'cheaperinference');
+      const cheaperInference = profiles.filter((route): route is CheaperInferenceProfile => route.transport === 'cheaperinference');
+      return {
+        ...(openRouter.length && { openRouter: {
+          qualification: 'step-15', apiKey: routerKey ?? '', profiles: openRouter,
+          endpoint: (process.env.FACADE_GATEWAY_OPENROUTER_ENDPOINT ?? 'https://openrouter.ai') as Step15Approval['endpoint'],
+        } }),
+        ...(cheaperInference.length && { cheaperInference: { apiKey: directKey ?? '', profiles: cheaperInference } }),
+      };
+    }
+    const usable = (route: LiveApproval) => {
       if (!(Date.parse(route.validUntil) > Date.now()) ||
         approvals.filter(({ routeId, revision }) => routeId === route.routeId && revision === route.revision).length !== 1) {
         return false;
       }
       try {
-        // Construction validates credentials and the route envelope without accessing the network or journal.
-        createStep15Gateway(context.db, external.journal, { ...approval, profiles: [route] });
+        createLiveGateway(context.db, external.journal, enabledFor([route]));
         return true;
       } catch {
         return false;
       }
     };
-    const policy=validateLivePolicy(profile,approvals,process.env,usable);
-    const copilot=configuredCopilot();
-    const copilotPolicy=copilot?validateLivePolicy({A:null,B:null,lead:{...copilot,maxTurns:8,maxKnownRejections:1}},
-      approvals,process.env,usable):null;
-    const profiles=[...new Set([...policy.approvals,...copilotPolicy?.approvals??[]])];
-    const gateway=profiles.length?createStep15Gateway(context.db,external.journal,{...approval,profiles},reviewAdmission,policyOptions):localGateway();
-    const hasTransport=profiles.length>0;
-    return {gateway,admit:policy.hold,hasTransport,copilotRoute:copilotPolicy?.approvals.length?copilot:null,
-      mode:hasTransport?policyOptions.replayOnly?'openrouter-replay':'openrouter-live':'disabled'};
+    const qualified = approvals.filter(usable);
+    const policy = validateLivePolicy(profile, qualified);
+    const copilot = configuredCopilot();
+    const copilotPolicy = copilot ? validateLivePolicy({ A: null, B: null, lead: { ...copilot, maxTurns: 8, maxKnownRejections: 1 } },
+      qualified) : null;
+    // Retain the transports for existing assignments authorized by a still-qualified approval.
+    const enabled = enabledFor(qualified);
+    const hasTransport = qualified.length > 0;
+    const gateway = hasTransport
+      ? createLiveGateway(context.db, external.journal, enabled, reviewAdmission, policyOptions) : localGateway();
+    const provider = enabled.cheaperInference ? enabled.openRouter ? 'mixed' : 'cheaperinference' : 'openrouter';
+    return { gateway, admit: policy.hold, hasTransport, copilotRoute: copilotPolicy?.approvals.length ? copilot : null,
+      mode: hasTransport ? provider + (policyOptions.replayOnly ? '-replay' : '-live') : 'disabled' };
   }
   return {
     gateway: localGateway(), hasTransport: false, mode: 'disabled',
@@ -253,10 +274,11 @@ export async function startWorker(context: WorkerContext, test?: ManagedTestOpti
         await executeResearch(work, {
           db, gateway, reader, admit, configured: (slot) => profile[slot],
           publishOutcome: publish.outcome, loadPriorOutcome: publish.loadPriorOutcome, unsettledPrior: publish.unsettledPrior,
-          localLimits: ({ job }) => {
+          localLimits: (task) => {
+            const { job } = task;
+            if ((job.mode === 'primary' && job.packageWindow) || profileHold(profile, task)) return job.settings;
             const configured = profile[researchSlot(job)] ?? job.settings;
-            return job.mode === 'primary' && job.packageWindow ? job.settings :
-              { maxTurns: configured.maxTurns, maxKnownRejections: configured.maxKnownRejections };
+            return { maxTurns: configured.maxTurns, maxKnownRejections: configured.maxKnownRejections };
           },
         }, signal);
         return true;
