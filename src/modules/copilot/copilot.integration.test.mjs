@@ -209,6 +209,37 @@ test('engineer question reopens originals through the gateway and restricted sea
           output,
           receipt: { state: 'paid', costUsdNanos: 0, providerId: 'fixture-' + attempt.id, evidenceRef: 'fixture:' + attempt.id },
         });
+        if (question === 'READ_JOURNAL') {
+          const turn = sent.filter((item) => item.request.messages[1].content === question).length;
+          const last = toolReplies.at(-1);
+          if (turn === 1) return paid(responseTools(attempt, ['A', 'B', 'C', 'D', 'E']
+            .map((group) => ['search_sources', { query: 'JOURNAL-GROUP-' + group }])));
+          if (turn <= 19) {
+            const number = Math.floor((turn - 2) / 2) + 1;
+            return turn % 2 === 0
+              ? paid(responseTool(attempt, 'search_sources', { query: 'JOURNAL-ITEM-' + String(number).padStart(2, '0') }))
+              : paid(responseTool(attempt, 'open_source', { sourceId: last.sources[0].sourceId }));
+          }
+          if (turn === 20) {
+            assert.equal(toolReplies.some(({ source }) => source?.text.includes('JOURNAL-ITEM-01')), false);
+            return paid(responseTool(attempt, 'search_sources', { query: 'JOURNAL-ITEM-01' }));
+          }
+          assert.equal(turn, 21);
+          return paid(responseTool(attempt, 'submit_answer', {
+            claims: [{ text: 'Ссылка на первую прочитанную строку.', sources: [last.sources[0].sourceId] }], limitations: [],
+          }));
+        }
+        if (question === 'PARTIAL_JOURNAL') {
+          const turn = sent.filter((item) => item.request.messages[1].content === question).length;
+          const last = toolReplies.at(-1);
+          if (turn === 1 || turn === 3 || turn === 5) {
+            const query = ({ 1: 'JOURNAL-GROUP-A', 3: 'JOURNAL-GROUP-B', 5: 'JOURNAL-ITEM-99' })[turn];
+            return paid(responseTool(attempt, 'search_sources', { query }));
+          }
+          assert.ok(turn === 2 || turn === 4);
+          assert.equal(last.sources.length, 4);
+          return paid(responseTools(attempt, last.sources.map(({ sourceId }) => ['open_source', { sourceId }])));
+        }
         if (question === 'MULTIPLE_OPENS') {
           if (!toolReplies.length) return paid(responseTool(attempt, 'search_sources', { query: 'QUANTUM' }));
           if (toolReplies.length === 1) {
@@ -484,6 +515,60 @@ test('engineer question reopens originals through the gateway and restricted sea
   assert.equal((await db.query('SELECT count(*)::int AS value FROM gateway_attempts WHERE job_id=$1', [multiJob])).rows[0].value, 3);
   console.info('Copilot fixture: three read calls in one model turn returned three citations with no duplicate send');
 
+  const journalLines = Array.from({ length: 20 }, (_, index) =>
+    'JOURNAL-ITEM-' + String(index + 1).padStart(2, '0') + ' JOURNAL-GROUP-' + 'ABCDE'[Math.floor(index / 4)]);
+  const journalOriginal = await accept('read-journal.txt', Buffer.from([...journalLines, 'JOURNAL-ITEM-99 unopened'].join('\n')), 'text/plain');
+  for (let operation = 0; ; operation++) {
+    assert.ok(operation < 60);
+    if (!await indexNextProjectMemory(db, reader)) break;
+  }
+  const readsId = (await ask('READ_JOURNAL')).json().id;
+  assert.equal(await next({ route }), true);
+  const { rows: [{ job_id: readsJob }] } = await db.query('SELECT job_id FROM copilot_questions WHERE id=$1', [readsId]);
+  assert.equal(await next({ route }), true); // First quantum.
+  const interruptedJournal = new Proxy(gateway, { get(target, property) {
+    if (property === 'checkpoint') return async (lease, cursor, tx) => {
+      if (cursor.opened.length === 7) throw new Error('fixture stops after the seventh unique read');
+      return target.checkpoint(lease, cursor, tx);
+    };
+    const member = target[property];
+    return typeof member === 'function' ? member.bind(target) : member;
+  }});
+  await assert.rejects(next({ route, gateway: interruptedJournal }), /fixture stops after the seventh unique read/);
+  await db.query("UPDATE gateway_jobs SET lease_until=clock_timestamp()-interval '1 second' WHERE id=$1 AND state='leased'", [readsJob]);
+  assert.equal(await next({ route, workerId: id() }), true);
+  const readsAnswer = await get(base + '/questions/' + readsId);
+  assert.equal(readsAnswer.state, 'answered');
+  assert.equal(readsAnswer.citations[0].text, journalLines[0]);
+  const { rows: [{ cursor: readsCursor }] } = await db.query('SELECT cursor FROM gateway_jobs WHERE id=$1', [readsJob]);
+  assert.equal(readsCursor.opened.length, 9);
+  assert.ok(readsCursor.found.length > 20);
+  assert.equal(sent.filter(({ attempt }) => attempt.jobId === readsJob).length, 21);
+  assert.equal((await db.query('SELECT count(*)::int AS value FROM gateway_attempts WHERE job_id=$1', [readsJob])).rows[0].value, 21);
+
+  const partialId = (await ask('PARTIAL_JOURNAL')).json().id;
+  const partialPath = base + '/questions/' + partialId;
+  assert.equal(await next({ route }), true);
+  const stopAfterRead = new Proxy(gateway, { get(target, property) {
+    if (property === 'call') return (input) => input.effectKey === 'copilot/turn/5'
+      ? Promise.resolve({ status: 'held', code: 'budget_exhausted', nextAction: 'Inspect budget' }) : target.call(input);
+    const member = target[property];
+    return typeof member === 'function' ? member.bind(target) : member;
+  }});
+  assert.equal(await next({ route, gateway: stopAfterRead }), true);
+  const partialAnswer = await get(partialPath);
+  assert.equal(partialAnswer.state, 'held');
+  assert.equal(partialAnswer.reason, 'budget_exhausted');
+  assert.equal(partialAnswer.claims, undefined);
+  assert.equal(partialAnswer.citations, undefined);
+  assert.equal(partialAnswer.partialSources.length, 8);
+  assert.ok(partialAnswer.partialSources.every((source) => source.label === 'read-journal.txt' && !source.text));
+  assert.equal((await inject(partialPath, limited)).statusCode, 404);
+  assert.equal((await get(base + '/sources?id=' + partialAnswer.partialSources[0].id)).source.text, journalLines[0]);
+  await accept('read-journal-new.txt', Buffer.from('Later journal edition'), 'text/plain', { replaces: journalOriginal });
+  assert.equal((await get(partialPath)).partialSources, undefined);
+  console.info('Copilot fixture: ninth read, older citation, replay, partial addresses and superseded partial suppression checked');
+
   const unknownKey = id();
   const unknownId = (await ask('UNKNOWN', unknownKey)).json().id;
   assert.equal(await next({ route }), true);
@@ -539,6 +624,9 @@ test('engineer question reopens originals through the gateway and restricted sea
 
   await accept('unrelated-addendum.txt', Buffer.from('Independent text'), 'text/plain');
   await gateway.openGeneration({ ...generation, generationId: id() });
+  const stalePartial = await get(partialPath);
+  assert.equal(stalePartial.reason, 'inputs_changed');
+  assert.equal(stalePartial.partialSources, undefined);
   const intact = await get(questionPath);
   assert.equal(intact.state, 'answered');
   assert.equal(intact.asOf, answer.asOf);

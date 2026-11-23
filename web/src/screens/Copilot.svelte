@@ -218,6 +218,14 @@
           <h4>Открытые источники</h4>
           {@render sources(question.citations)}
         {/if}
+        {#if question.partialSources?.length}
+          <h4>Места, открытые до остановки</h4>
+          <ul class="plain-list">
+            {#each question.partialSources as source (source.id)}
+              <li><a href={projectLink(source.id)}>{source.label} · {renderAddress(source.address)}</a> · {representations[source.representation]}</li>
+            {/each}
+          </ul>
+        {/if}
         {#if question.limitations?.length}
           <h4>Границы ответа</h4>
           {@render limits(question.limitations)}

@@ -1,5 +1,6 @@
 import { z } from 'zod';
 import { decodeCompletion, type FunctionCall } from '../harness/openrouter.js';
+import { copilotReadBatchLimit, type MemorySource } from './contracts.js';
 
 const text = z.string().trim().min(1).refine((value) => !value.includes('\0'));
 const sourceId = text.max(360);
@@ -65,13 +66,12 @@ export type Action = { [Name in keyof typeof tools]: {
   name: Name; args: z.infer<typeof tools[Name]['args']>;
 } }[keyof typeof tools];
 
-const maxReadBatch = 6;
 const readTools = new Set<string>(['search_sources', 'open_source']);
 
 export function decodeTurn(output: unknown) {
   const result = decodeCompletion(output);
   const calls = result?.message.tool_calls;
-  if (result?.finishReason !== 'tool_calls' || !calls?.length || calls.length > maxReadBatch) return null;
+  if (result?.finishReason !== 'tool_calls' || !calls?.length || calls.length > copilotReadBatchLimit) return null;
   if (calls.length > 1 && calls.some((call) => !readTools.has(call.function.name))) return null;
 
   const actions: { action: Action; callId: string }[] = [];
@@ -90,4 +90,20 @@ export function decodeTurn(output: unknown) {
   // Replay the entire provider turn with exactly one reply for each tool ID.
   const message: Message = { role: 'assistant', content: null, tool_calls: toolCalls };
   return { actions, message };
+}
+
+export function recordedReadAddresses(messages: Message[], opened: ReadonlySet<string>) {
+  const reads = new Map<string, Pick<MemorySource, 'address' | 'representation'>>();
+  for (const message of messages) {
+    if (message.role !== 'tool') continue;
+    // Tool replies are assembled by the worker from an authorized source read.
+    const payload = JSON.parse(message.content) as { source?: {
+      sourceId: string; text: string; address: MemorySource['address']; representation: MemorySource['representation'];
+    } };
+    const source = payload.source;
+    if (source?.text && opened.has(source.sourceId)) {
+      reads.set(source.sourceId, { address: source.address, representation: source.representation });
+    }
+  }
+  return reads;
 }

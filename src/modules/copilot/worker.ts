@@ -5,18 +5,17 @@ import { lockOrganization, lockSession } from '../access/commands.js';
 import { GatewayError, type Gateway, type LeasedJob } from '../gateway/index.js';
 import { hash } from '../gateway/types.js';
 import type { ResearchAdmission } from '../gateway/gateway.js';
-import type { CopilotMemory, MemorySource, SourceIdentity, StoredAnswer } from './contracts.js';
-import { copilotKind, maxCopilotInputRefs, verifyCopilotInputs } from './admission.js';
+import {
+  copilotJournalLimit, copilotOcrLimit, copilotSearchResultLimit, copilotTurnLimit,
+  type CopilotMemory, type MemorySource, type SourceIdentity, type StoredAnswer,
+} from './contracts.js';
+import { copilotKind, verifyCopilotInputs } from './admission.js';
 import { decodeTurn, messagesFor, requestFor, recentTranscript, type Message } from './protocol.js';
 
 export { copilotKind } from './admission.js';
 const leaseMs = 30_000;
 const turnsPerLease = 8;
-const maxTurns = 24;
-const maxResearchAddresses = 4;
 const maxStagnantTurns = 4;
-const maxOpened = 6;
-const maxFound = maxCopilotInputRefs - maxResearchAddresses;
 const retryable = new Set(['route_busy', 'route_rate_limited', 'primary_barrier', 'dispatch_not_started', 'recovery_required']);
 
 export type CopilotRoute = {
@@ -266,7 +265,7 @@ async function run(work: LeasedJob, runtime: CopilotRuntime, signal: AbortSignal
     }
     if (research && !research.finished) {
       if (!runtime.research) { await suspend('research_unavailable'); return; }
-      if (attempted.length >= maxResearchAddresses || progress.found.length >= maxCopilotInputRefs) {
+      if (attempted.length >= copilotOcrLimit || progress.found.length >= copilotJournalLimit) {
         await suspend('copilot_research_budget');
         return;
       }
@@ -292,7 +291,7 @@ async function run(work: LeasedJob, runtime: CopilotRuntime, signal: AbortSignal
       research.finished = true;
       if (!await save(research.sourceId)) return;
     }
-    const leaseEndsAt = Math.min(progress.turn + turnsPerLease, maxTurns);
+    const leaseEndsAt = Math.min(progress.turn + turnsPerLease, copilotTurnLimit);
     while (!active.aborted && progress.turn < leaseEndsAt) {
       if ((progress.stagnantTurns ?? 0) >= maxStagnantTurns) { await suspend('copilot_no_progress'); return; }
       const allowed = await withOwner(db, question, async () => true);
@@ -326,9 +325,7 @@ async function run(work: LeasedJob, runtime: CopilotRuntime, signal: AbortSignal
             const found = await withOwner(db, question, (session) => memory.search(session, work.projectId, action.args.query));
             if (!found) { await suspend('access_changed'); return; }
             const selected: MemorySource[] = [];
-            for (const source of [...found.sources.slice(0, 4), ...found.windows.slice(0, 2)]) {
-              if (selected.length >= 6) break;
-              if (progress.found.length >= maxFound && !progress.found.some(({ id }) => id === source.id)) continue;
+            for (const source of [...found.sources.slice(0, copilotSearchResultLimit - 2), ...found.windows.slice(0, 2)]) {
               include(progress, source);
               selected.push(source);
             }
@@ -340,10 +337,6 @@ async function run(work: LeasedJob, runtime: CopilotRuntime, signal: AbortSignal
           }
           case 'open_source': {
             const key = action.args.sourceId;
-            if (!progress.opened.includes(key) && progress.opened.length >= maxOpened) {
-              reply(progress, callId, { code: 'source_limit' });
-              break;
-            }
             const original = availableSources.has(key) ? await authorizedSource(key) : null;
             if (original) {
               if (original.source.text && !progress.opened.includes(key)) progress.opened.push(key);
@@ -386,7 +379,7 @@ async function run(work: LeasedJob, runtime: CopilotRuntime, signal: AbortSignal
     }
     if (!active.aborted) {
       if ((progress.stagnantTurns ?? 0) >= maxStagnantTurns) await suspend('copilot_no_progress');
-      else if (progress.turn >= maxTurns) await suspend('copilot_turn_budget');
+      else if (progress.turn >= copilotTurnLimit) await suspend('copilot_turn_budget');
       else await suspend('copilot_quantum', new Date());
     }
   } finally {
