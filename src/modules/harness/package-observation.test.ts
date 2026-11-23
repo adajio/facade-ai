@@ -1,10 +1,12 @@
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import { test } from 'node:test';
-import type { PoolClient } from 'pg';
+import type { Pool, PoolClient } from 'pg';
 import { groundComponents } from '../pdf/components.js';
+import { createReaderService, sha256 } from '../pdf/service.js';
 import type { Evidence, Observation, ReaderComponentInput, ReaderLine } from '../pdf/types.js';
-import { packageCommonGrounded, packageNonDeliveryGrounded, publishPackageObservation } from './package-observation.js';
+import { complementaryNativeCrops, type NativeLineCrop } from '../pdf/native-line.js';
+import { packageCommonGrounded, packageNonDeliveryGrounded, publishPackageObservation, verifiedNativeInventoryRole } from './package-observation.js';
 import type { ObservationInput, ReaderContext } from './contracts.js';
 
 const item = 'Теплотехнический расчёт';
@@ -56,6 +58,108 @@ function addressedFixture(quote: string) {
   } } as unknown as PoolClient;
   return { observation, evidence, context, issued, facts, tx };
 }
+
+test('a split native line verifies only the submitted non-delivery and inventory role', async () => {
+  const quote = 'Torsion test report not supplied';
+  const f = addressedFixture(quote);
+  const left = randomUUID();
+  const { lineId, evidenceId } = f.observation;
+  const box = (x: number, width: number) => ({ x, y: 20, width, height: 10 });
+  const full = { id: lineId!, text: 'Inventory | Item: Torsion test report | ' + quote, box: box(10, 400) };
+  const crops: NativeLineCrop[] = [
+    { evidenceId: left, frame: box(0, 230), line: { ...full, text: 'Inventory | Item: Torsion test', box: box(10, 210) } },
+    { evidenceId, frame: box(198, 245), line: { ...full, text: 'Item: Torsion test report | ' + quote, box: box(200, 210) } },
+  ];
+  const pair = complementaryNativeCrops(full, crops, left, quote);
+  assert.equal(pair?.anchorEvidenceId, evidenceId);
+  assert.equal(complementaryNativeCrops(full, crops.slice(0, 1), left, quote), undefined);
+  for (const line of [
+    { ...crops[1].line, id: 'adjacent' },
+    { ...crops[1].line, box: box(225, 185) },
+    { ...crops[1].line, text: 'Item: Altered test report | ' + quote },
+  ]) assert.equal(complementaryNativeCrops(full, [crops[0], { ...crops[1], line }], left, quote), undefined);
+  const proof = { ...pair!, line: full, canonicalSha256: 'd'.repeat(64), submittedEvidenceId: left };
+  const claim = { evidence: f.evidence, sourceRole: 'inventory', quote, lineId,
+    deliveryStatement: { status: 'not_delivered' as const, item: 'Torsion test report',
+      context: { lineId: lineId!, quote: 'Inventory' } } };
+  assert.equal(packageNonDeliveryGrounded(claim, false, crops[1].line.text), false);
+  const role = verifiedNativeInventoryRole(claim, proof);
+  assert.deepEqual(role, { evidenceId: left, quote: 'Inventory' });
+  assert.deepEqual(verifiedNativeInventoryRole({ ...claim, quote: crops[0].line.text,
+    deliveryStatement: { ...claim.deliveryStatement, context: { lineId: lineId!, quote } } }, proof), role);
+  assert.equal(verifiedNativeInventoryRole({ ...claim, package: { role: { value: 'inventory', quote: 'Other inventory' } } }, proof), undefined);
+  assert.equal(verifiedNativeInventoryRole({ ...claim, deliveryStatement: { ...claim.deliveryStatement,
+    context: { lineId: 'different', quote: 'Inventory' } } }, proof), undefined);
+  assert.equal(verifiedNativeInventoryRole({ ...claim, deliveryStatement: { ...claim.deliveryStatement, item: 'Another report' } }, proof), undefined);
+  assert.equal(verifiedNativeInventoryRole(claim, { ...proof, line: { ...full, text: full.text + ' | it was supplied' } }), undefined);
+  const result = await publishPackageObservation(f.tx, f.context, { ...claim, verifiedDelivery: { ...proof, role: role! } },
+    { ...f.observation, deliveryStatement: claim.deliveryStatement });
+  assert.deepEqual(f.facts[0].slice(4, 9), ['Torsion test report', 'inventory', null, null, 'unknown']);
+  assert.deepEqual(result?.confirmed.map(({ field, evidenceId }) => [field, evidenceId]), [['sourceRole', left]]);
+  const basis = f.facts[0][9] as { deliveryLine: { submittedEvidenceId: string; crops: { evidenceId: string }[] } };
+  assert.equal(basis.deliveryLine.submittedEvidenceId, left);
+  assert.deepEqual(basis.deliveryLine.crops.map((entry) => entry.evidenceId), [left, evidenceId]);
+});
+
+test('reader checks stored PDF bytes and excludes a crop from another run or branch', async () => {
+  const f = addressedFixture('Panel report not supplied');
+  const source = f.observation.source;
+  const readerVersion = 'fixture';
+  const scope = { runId: f.observation.runId, branch: f.observation.branch, operationKey: 'save' };
+  const locator = { page: 1, rotation: 0 };
+  const address = { unitId: '1', locator };
+  const lineId = '1.0.2.0';
+  const box = (x: number, width: number) => ({ x, y: 20, width, height: 10 });
+  const line = { id: lineId, text: 'Inventory | Item: Panel report | Panel report not supplied', box: box(10, 400) };
+  const canonical = Buffer.from(JSON.stringify({ address, lines: [line], limitations: [] }));
+  const identity = { sha256: sha256(canonical), size: canonical.length, address };
+  const files = new Map([[identity.sha256, canonical]]);
+  const evidence = new Map<string, Evidence>();
+  for (const [text, x, width] of [['Inventory | Item: Panel', 10, 210], ['Item: Panel report | Panel report not supplied', 200, 210]] as const) {
+    const id = randomUUID();
+    const clipped = { ...address, box: box(x, width) };
+    const bytes = Buffer.from(JSON.stringify({ address: clipped, lines: [{ ...line, text, box: clipped.box }], limitations: [] }));
+    const receipted: Evidence = { id, source, receiptId: f.observation.receiptId, runId: scope.runId, branch: scope.branch,
+      readerVersion, format: 'pdf', address: clipped, representation: 'native', mediaType: 'application/json',
+      sha256: sha256(bytes), size: bytes.length, limitations: [] };
+    evidence.set(id, receipted);
+    files.set(receipted.sha256, bytes);
+  }
+  const db = { query: async (sql: string, params: string[]) => {
+    if (sql.includes('project_memory_blocks')) {
+      assert.equal(params[1], source.projectId);
+      assert.equal(params[2], source.versionId);
+      assert.equal(params[6], source.documentId);
+      assert.equal(params[7], source.sha256);
+      return { rows: params[5] === readerVersion ? [identity] : [] };
+    }
+    assert.match(sql, /reader_evidence/);
+    const payload = evidence.get(params[1]);
+    return { rows: payload ? [{ payload }] : [] };
+  } };
+  const reader = createReaderService(db as unknown as Pool, {
+    async resolveOriginal() { assert.fail('Canonical verification must not reopen an original or use a model'); },
+    artifacts: {
+      async put() { assert.fail('Verification must not modify the artifact store'); },
+      async get(projectId, hash) { assert.equal(projectId, source.projectId); return files.get(hash)!; },
+    },
+  }, []);
+  const ids = [...evidence.values()].map(({ id: evidenceId, sha256 }) => ({ evidenceId, sha256 }));
+  const verify = () => reader.verifyNativeDeliveryLine(source, scope, {
+    readerVersion, unitId: '1', lineId, submittedEvidenceId: ids[1].evidenceId,
+    quote: 'Panel report not supplied', issued: ids,
+  }, db as unknown as PoolClient);
+  assert.equal((await verify())?.canonicalSha256, identity.sha256);
+  const left = evidence.get(ids[0].evidenceId)!;
+  for (const changed of [{ runId: randomUUID() }, { branch: 'A' as const }, { readerVersion: 'different' },
+    { source: { ...source, versionId: randomUUID() } }]) {
+    evidence.set(left.id, { ...left, ...changed });
+    assert.equal(await verify(), undefined);
+  }
+  evidence.set(left.id, left);
+  files.set(identity.sha256, Buffer.from('damaged'));
+  await assert.rejects(verify(), { code: 'reader_artifact_mismatch' });
+});
 
 test('printed revision with a colon is published from the addressed source', async () => {
   for (const [mark, value] of [['Revision: C-62K current', 'C-62K'], ['Ред.: Д-27 действующая', 'Д-27']]) {

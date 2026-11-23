@@ -215,9 +215,21 @@ export function connectReader(
         return refusal(error);
       }
     },
+    async verifyDeliveryLine(tx, context, input, issued) {
+      const readerVersion = await checkPackage(context, tx);
+      const { evidence, lineId, quote } = input;
+      if (!readerVersion || readerVersion !== evidence.readerVersion || !lineId || !quote) return;
+      try {
+        return await service.verifyNativeDeliveryLine(evidence.place.source, executionScope(context), {
+          readerVersion, unitId: evidence.place.unitId, lineId, submittedEvidenceId: evidence.evidenceId, quote, issued,
+        }, tx);
+      } catch (error) {
+        return refusal(error);
+      }
+    },
     async record(tx, context, input) {
       const readerVersion = await checkPackage(context, tx);
-      const { evidence, alternatives, sourceRole, components, package: metadata, ...observation } = input;
+      const { evidence, alternatives, sourceRole, components, package: metadata, verifiedDelivery, ...observation } = input;
       if (readerVersion && evidence.readerVersion !== readerVersion) throw new ReaderRefusal('reader_profile_changed', 'temporary');
       const limitation = alternatives
         ? [observation.limitation, ...alternatives].filter(Boolean).join(' · ').slice(0, 500)
@@ -225,7 +237,7 @@ export function connectReader(
       try {
         const pinned = await service.pin(evidence.place.source, executionScope(context), {
           ...observation, scope: context.task.scopeId, evidenceId: evidence.evidenceId, ...(limitation ? { limitation } : {}),
-        }, tx, components);
+        }, tx, components, verifiedDelivery);
         const packageMetadata = await publish(tx, context, input, pinned);
         return { observationId: pinned.id, ...(packageMetadata ? { packageMetadata } : {}) };
       } catch (error) {

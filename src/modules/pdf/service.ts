@@ -7,6 +7,7 @@ import { pipeline } from 'node:stream/promises';
 import type { Pool, PoolClient } from 'pg';
 import { blockId, fingerprint, memoryVersion } from '../project-memory/contracts.js';
 import { groundComponents } from './components.js';
+import { complementaryNativeCrops, type NativeLineCrop, type VerifiedNativeDeliveryLine } from './native-line.js';
 import {
   type ArtifactStore, type Box, type DocumentKey, type Evidence, type Observation, type ReaderComponentInput,
   type NativeArtifact, type NativeBlock, type NativePresentation, type ReaderOutput,
@@ -500,13 +501,41 @@ export function createReaderService(db: Pool, deps: ReaderDependencies, adapters
     return rows[0]?.payload;
   }
 
+  async function verifyNativeDeliveryLine(sourceRef: SourceRef, scope: ReadScope, input: {
+    readerVersion: string; unitId: string; lineId: string; submittedEvidenceId: string; quote: string;
+    issued: { evidenceId: string; sha256: string }[];
+  }, tx: PoolClient): Promise<VerifiedNativeDeliveryLine | undefined> {
+    const source = checkedSource(sourceRef);
+    const { readerVersion, unitId, lineId, submittedEvidenceId, quote, issued } = input;
+    const cached = await indexedNative(source, readerVersion, 'pdf', { address: { unitId }, representation: 'native' });
+    const fullAddress = cached?.output.address;
+    const full = cached?.output.lines?.filter((line) => line.id === lineId);
+    if (!cached || !fullAddress || fullAddress.locator?.page !== Number(unitId) || full?.length !== 1) return;
+    const crops: NativeLineCrop[] = [];
+    for (const { evidenceId, sha256 } of issued) {
+      const evidence = await findEvidence(source.projectId, evidenceId, tx);
+      const frame = evidence?.address.box;
+      if (!evidence || !frame || evidence.runId !== scope.runId || evidence.branch !== scope.branch
+        || evidence.format !== 'pdf' || evidence.representation !== 'native' || evidence.mediaType !== 'application/json'
+        || evidence.readerVersion !== readerVersion || evidence.sha256 !== sha256 || !sameSource(source, evidence.source)
+        || evidence.address.unitId !== unitId || evidence.address.locator?.page !== Number(unitId)
+        || fingerprint(evidence.address.locator) !== fingerprint(fullAddress.locator)) continue;
+      const body = JSON.parse((await content(evidence)).toString('utf8')) as NativePresentation;
+      if (!body?.address || !Array.isArray(body.lines) || fingerprint(body.address) !== fingerprint(evidence.address)) continue;
+      const lines = body.lines.filter((line) => line.id === lineId);
+      if (lines.length === 1) crops.push({ evidenceId, frame, line: lines[0] });
+    }
+    const proof = complementaryNativeCrops(full[0], crops, submittedEvidenceId, quote);
+    if (proof) return { ...proof, line: full[0], canonicalSha256: cached.artifact.sha256, submittedEvidenceId };
+  }
+
   async function pin(sourceRef: SourceRef, readScope: ReadScope, input: PinInput, tx?: PoolClient,
-    parts?: readonly ReaderComponentInput[]): Promise<Observation> {
+    parts?: readonly ReaderComponentInput[], verifiedLine?: VerifiedNativeDeliveryLine): Promise<Observation> {
     const source = checkedSource(sourceRef);
     const scope = checkedScope(readScope);
     const candidate = checkedPin(input);
     const conn = tx ?? db;
-    const requestHash = sha256(JSON.stringify({ source, candidate, ...(parts ? { parts } : {}) }));
+    const requestHash = sha256(JSON.stringify({ source, candidate, ...(parts ? { parts } : {}), ...(verifiedLine ? { verifiedLine } : {}) }));
     const previous = await replay<Observation>(conn, 'reader_observations', source.projectId, scope, requestHash);
     if (previous) return previous;
 
@@ -567,7 +596,10 @@ export function createReaderService(db: Pool, deps: ReaderDependencies, adapters
       }
       const [line] = matches;
       const context = candidate.deliveryStatement?.context;
-      if (context && !lines.some((row) => row.id === context.lineId && row.text.includes(context.quote))) {
+      const verifiedContext = verifiedLine && candidate.deliveryStatement?.status === 'not_delivered'
+        && verifiedLine.anchorEvidenceId === evidence.id && verifiedLine.line.id === line.id && context?.lineId === line.id
+        && verifiedLine.crops.some(({ line: part }) => part.text.includes(context.quote));
+      if (context && !verifiedContext && !lines.some((row) => row.id === context.lineId && row.text.includes(context.quote))) {
         throw new ReaderError('reader_quote_mismatch', 'Контекст утверждения отсутствует в этой выдаче', 422);
       }
       address = {
@@ -631,7 +663,7 @@ export function createReaderService(db: Pool, deps: ReaderDependencies, adapters
       );
       if (rows[0]) return mapFromRow(rows[0]);
     },
-    open, pin, findEvidence, content, readPdfFragment, materializeNative, readMaterializedNative,
+    open, pin, findEvidence, content, readPdfFragment, materializeNative, readMaterializedNative, verifyNativeDeliveryLine,
     async findObservation(projectId: string, id: string): Promise<Observation | undefined> {
       const { rows } = await db.query<{ payload: Observation }>(
         'SELECT payload FROM reader_observations WHERE project_id = $1 AND id = $2', [projectId, id],

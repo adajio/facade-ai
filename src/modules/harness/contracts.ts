@@ -1,6 +1,7 @@
 import type { PoolClient } from 'pg';
 import type { VerifiedPairEvidence } from '../assessment/domain.js';
 import type { DeliveryStatement, ReaderComponentInput } from '../pdf/types.js';
+import type { VerifiedNativeDeliveryLine } from '../pdf/native-line.js';
 import { z } from 'zod';
 import type { PackageDetails, PackageMetadataReceipt } from './package-observation.js';
 
@@ -174,6 +175,7 @@ export interface ObservationInput {
   sourceRole?: string;
   package?: PackageDetails;
   components?: readonly ReaderComponentInput[];
+  verifiedDelivery?: VerifiedNativeDeliveryLine & { role: { evidenceId: string; quote: string } };
 }
 
 export interface ReaderContext {
@@ -226,6 +228,8 @@ export interface ReaderPort {
   contexts?(context: ReaderContext, offset: number): Promise<{ items: { id: string; place: Place; format: string; support?: Branch }[]; nextOffset?: number }>;
   openContext?(context: ReaderContext, id: string, representation: 'native' | 'ocr' | 'render', box?: Place['box']): Promise<Representation>;
   read(context: ReaderContext, request: ReadRequest): Promise<Representation>;
+  verifyDeliveryLine?(tx: PoolClient, context: ReaderContext, input: ObservationInput, issued: EvidenceRef[]):
+    Promise<VerifiedNativeDeliveryLine | undefined>;
   record(
     tx: PoolClient, context: ReaderContext, observation: ObservationInput
   ): Promise<{ observationId: string; packageMetadata?: PackageMetadataReceipt }>;

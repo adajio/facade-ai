@@ -3,6 +3,7 @@ import { z } from 'zod';
 import { hash } from '../gateway/types.js';
 import { deliveredLines } from '../questions/attribute-aliases.js';
 import type { Observation } from '../pdf/types.js';
+import type { VerifiedNativeDeliveryLine } from '../pdf/native-line.js';
 import { supportsFacadeHeader, type ObservationInput, type ReaderContext } from './contracts.js';
 import { packageRoles, type PackageBinding, type PackageSourceRole } from './package-analysis.js';
 import { hasPrintedRevision } from './pair-evidence.js';
@@ -61,6 +62,26 @@ export function packageNonDeliveryGrounded(input: Omit<ObservationInput, 'eviden
     (!fullLine || !directlyDelivered(fullLine, input.deliveryStatement.item)));
 }
 
+export function verifiedNativeInventoryRole(input: Omit<ObservationInput, 'evidence'>, proof: VerifiedNativeDeliveryLine) {
+  const claim = input.deliveryStatement;
+  const role = input.package?.role;
+  const full = proof.line.text;
+  if (claim?.status !== 'not_delivered' || input.sourceRole !== 'inventory' || (role && role.value !== 'inventory')
+    || input.package?.references?.role !== undefined || input.package?.facadeHeaderLineId
+    || !input.quote || !full.includes(input.quote)
+    || !(directlyNotDelivered(input.quote, claim.item) || directlyNotDelivered(claim.context?.quote ?? '', claim.item))
+    || !directlyNotDelivered(full, claim.item) || delivered.test(full.replace(new RegExp(absent.source, 'giu'), ''))
+    || (claim.context && (claim.context.lineId !== proof.line.id ||
+      !proof.crops.some(({ line }) => line.text.includes(claim.context!.quote))))) return;
+  const segments = roleSegments(full);
+  if (segments.some((segment) => roleWords.other!.exec(segment)?.index === 0)) return;
+  if (role && !roleSegments(role.quote).some((segment) => inventoryRolePrefix.test(segment))) return;
+  const printed = segments.find((segment) => inventoryRolePrefix.test(segment) && (!role || segment.includes(role.quote)));
+  const quote = role?.quote ?? (printed && inventoryRolePrefix.exec(printed)?.[0]);
+  const crop = quote && printed && proof.crops.find(({ line }) => line.text.includes(quote));
+  if (crop && quote) return { evidenceId: crop.evidenceId, quote };
+}
+
 const common = /(?:\b(?:(?:applies to|for) all facades?|common materials?|entire building)\b|для\s+все[хм]?\s+фасад|общ(?:ие|ий|ая|его)\s+(?:материал|раздел|требован)|для\s+здания\s+в\s+целом)/iu;
 const exclusion = /(?:\b(?:except|excluding|only|not|other than)\b|(?<!\p{L})(?:кроме|исключая|только|не)(?!\p{L}))/iu;
 const commonRegister = /(?:\b(?:no common materials|all common materials (?:are )?(?:listed|included|checked))\b|общи\p{L}*\s+материал\p{L}*\s+(?:перечислен\p{L}*|проверен\p{L}*)\s+полностью|общи\p{L}*\s+материал\p{L}*\s+нет)/iu;
@@ -105,6 +126,9 @@ const roleWords: Partial<Record<PackageSourceRole, RegExp>> = {
   correspondence: /correspondence|letter|переписка|письмо/iu, model: /model|модель/iu,
   other: /commercial offer|quotation|reference material|коммерческ\p{L}*\s+предложен|справочн\p{L}*\s+материал/iu,
 };
+const roleSegments = (line: string) => line.split(/[|;·]/u).map((segment) => segment.trim().replace(
+  /^(?:document(?: type| role)?|type|title|тип документа|вид документа|документ)\s*:\s*/iu, ''));
+const inventoryRolePrefix = /^(?:inventory|transmittal|опись|сопроводительн\p{L}*\s+письмо)(?![\p{L}\p{N}_])/iu;
 const normalized = (value: string) => value.normalize('NFC').trim();
 function hasLiteral(quote: string, value: string) {
   const escaped = value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -195,14 +219,20 @@ export async function publishPackageObservation(
     return [field,part?.binding&&part.source.versionId===observation.source.versionId&&
       part.source.sha256===observation.source.sha256?part:undefined];
   })) as Record<typeof fields[number],typeof anchor|undefined>;
+  const verified = input.verifiedDelivery;
+  const roleCrop = verified?.crops.find(({ evidenceId }) => evidenceId === verified.role.evidenceId);
+  if (verified && roleCrop) citations.role = {
+    ...anchor, evidenceId: roleCrop.evidenceId, lineId: verified.line.id, quote: verified.role.quote,
+    address: { ...anchor.address, box: roleCrop.line.box },
+  };
   const rolePart=citations.role;
   const fullRole=rolePart&&fullLine(rolePart.evidenceId,rolePart.lineId);
-  const segments = fullRole?.split(/[|;·]/u).map((segment) => segment.trim().replace(
-    /^(?:document(?: type| role)?|type|title|тип документа|вид документа|документ)\s*:\s*/iu, ''));
+  const segments = fullRole === undefined ? undefined : roleSegments(fullRole);
   const role = details.role;
   const isCommercial = Boolean(segments?.some((segment) => roleWords.other!.exec(segment)?.index === 0));
-  const confirmedRole = role && rolePart?.quote?.includes(role.quote) && (!isCommercial || role.value === 'other') &&
-    segments?.some((segment) => segment.includes(role.quote) && roleWords[role.value]?.exec(segment)?.index === 0) ? role : undefined;
+  const confirmedRole = verified && roleCrop ? { value: 'inventory' as const, quote: verified.role.quote }
+    : role && rolePart?.quote?.includes(role.quote) && (!isCommercial || role.value === 'other') &&
+      segments?.some((segment) => segment.includes(role.quote) && roleWords[role.value]?.exec(segment)?.index === 0) ? role : undefined;
   const stage = details.stage && citations.stage?.quote?.includes(details.stage.quote) && hasLiteral(details.stage.quote, details.stage.value)
     ? details.stage : undefined;
   const revision = details.revision && citations.revision?.quote?.includes(details.revision.quote) &&
@@ -237,11 +267,15 @@ export async function publishPackageObservation(
   const qualified={attribute:attributeGrounded,role:confirmedRole,stage,revision,binding:scopedBinding,valueRole};
   const parts=Object.fromEntries(fields.flatMap((name)=>{
     const part=citations[name];
-    return qualified[name]&&(references[name]!==undefined||header&&headerFields.has(name))&&part?.lineId&&part.quote?
-      [[name,{lineId:part.lineId,evidenceId:part.evidenceId,quote:part.quote,...(part===header?{address:header.address}:{})}]]:[];
+    const verifiedRole = name === 'role' && roleCrop;
+    return qualified[name]&&(references[name]!==undefined||header&&headerFields.has(name)||verifiedRole)&&part?.lineId&&part.quote?
+      [[name,{lineId:part.lineId,evidenceId:part.evidenceId,quote:part.quote,...(part===header||verifiedRole?{address:part.address}:{})}]]:[];
   }));
   const basis = { role: confirmedRole?.quote, stage: stage?.quote, revision: revision?.quote,
-    valueRole,...(Object.keys(parts).length?{parts}:{}) };
+    valueRole,...(Object.keys(parts).length?{parts}:{}),
+    ...(verified ? { deliveryLine: { canonicalSha256: verified.canonicalSha256, lineId: verified.line.id,
+      box: verified.line.box, submittedEvidenceId: verified.submittedEvidenceId,
+      crops: verified.crops.map(({ evidenceId, frame, line }) => ({ evidenceId, frame, box: line.box })) } } : {}) };
   const saved = await tx.query(
     `INSERT INTO harness_package_facts(id,project_id,window_id,job_id,attribute,source_role,design_stage,revision,revision_status,basis,subject_register,materials)
      VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) ON CONFLICT(id) DO NOTHING RETURNING id`,
@@ -264,6 +298,11 @@ export async function publishPackageObservation(
     receipt.rejected.push({ field, code, nextAction, ...(itemIndex !== undefined ? { itemIndex } : {}) });
   }
   for (const field of fields) {
+    if (field === 'role' && verified && rolePart) {
+      confirm('sourceRole', rolePart);
+      if (details.role) confirm('role', rolePart);
+      continue;
+    }
     if (field === 'role' && !details.role && input.sourceRole) {
       reject(field, 'reference_required', fieldGuidance.role);
       continue;

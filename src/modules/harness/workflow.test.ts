@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { randomUUID } from 'node:crypto';
+import { complementaryNativeCrops } from '../pdf/native-line.js';
 import type { PoolClient } from 'pg';
 import type { ModelResult, ResearchTask } from './contracts.js';
 import { hashBytes, initialMessages, observationArguments, request } from './openrouter.js';
@@ -526,6 +527,59 @@ test('delivery statements require a literal quote and preserve the legacy tool w
   assert.equal(schema.safeParse({
     ...input, quote: 'Torsion test report is not included.',
   }).success, true);
+});
+
+test('split delivery verifies against this branch’s delivered crops and keeps the submitted address in the proof', async () => {
+  const { task, ports, textId, observationId } = setup();
+  if (task.job.mode !== 'primary') assert.fail();
+  task.scopeId = null;
+  task.job.packageWindow = { id: randomUUID(), readerVersion: 'test', routeRevision: 'known', walkProtocol: 1 };
+  task.job.observationProtocol = 2;
+  const { place } = task.job;
+  const secondId = randomUUID();
+  const lineId = '1.0.2.0';
+  const quote = 'Torsion report not supplied';
+  const box = (x: number, width: number) => ({ x, y: 20, width, height: 10 });
+  const full = { id: lineId, text: 'Inventory | Item: Torsion report | ' + quote, box: box(10, 400) };
+  const crops = [
+    { evidenceId: textId, frame: box(0, 231), line: { ...full, text: 'Inventory | Item: Torsion', box: box(10, 220) } },
+    { evidenceId: secondId, frame: box(198, 245), line: { ...full, text: 'Item: Torsion report | ' + quote, box: box(200, 210) } },
+  ];
+  const view = (crop: typeof crops[number]) => {
+    const bytes = Buffer.from(JSON.stringify({ lines: [crop.line] }));
+    return { place: { ...place, box: crop.frame }, evidenceId: crop.evidenceId, readerVersion: 'test',
+      sha256: hashBytes(bytes), mediaType: 'application/json' as const, bytes };
+  };
+  const read = ports.reader.read;
+  ports.reader.read = async (context, request) => request.kind === 'extract' ? view(crops[0]) : read(context, request);
+  ports.reader.openContext = async () => view(crops[1]);
+  ports.reader.verifyDeliveryLine = async (_tx, { branch }, input, issued) => {
+    assert.equal(branch, 'A');
+    assert.deepEqual(issued.map(({ evidenceId }) => evidenceId), [textId, secondId]);
+    const proof = complementaryNativeCrops(full, crops, input.evidence.evidenceId, quote)!;
+    return { ...proof, line: full, canonicalSha256: '8'.repeat(64), submittedEvidenceId: textId };
+  };
+  ports.reader.record = async (_tx, _context, input) => {
+    assert.equal(input.evidence.evidenceId, secondId);
+    assert.equal(input.verifiedDelivery?.submittedEvidenceId, textId);
+    assert.equal(input.quote, quote);
+    assert.equal(input.package, undefined);
+    return { observationId };
+  };
+  let turn = 0;
+  ports.call = async () => {
+    switch (++turn) {
+      case 1: return receipt('survey', {});
+      case 2: return receipt('extract', {});
+      case 3: return receipt('open_context', { contextId: randomUUID() });
+      case 4: return receipt('save_observation', { evidenceId: textId, lineId, quote, sourceRole: 'inventory',
+        deliveryStatement: { status: 'not_delivered', item: 'Torsion report' } });
+      case 5: return receipt('finish_reading', { status: 'covered', explanation: 'Наблюдение сохранено.' });
+      default: return assert.fail('Unexpected model turn');
+    }
+  };
+  assert.deepEqual(await runResearchWorkflow(task, ports, new AbortController().signal),
+    { status: 'done', outcome: { kind: 'covered', observationIds: [observationId] } });
 });
 
 test('both package save tools give field-specific feedback on the next model turn', async () => {

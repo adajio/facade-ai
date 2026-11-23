@@ -8,7 +8,7 @@ import { contains } from '../pdf/types.js';
 import { canonicalJson, isInventoryRole } from '../assessment/domain.js';
 import { deliveredLines } from '../questions/attribute-aliases.js';
 import { currentRevision, hasPrintedPairScope, locatePairQuote, pairSourceEvidence, type PairQuote } from './pair-evidence.js';
-import { packageCommonGrounded, packageNonDeliveryGrounded } from './package-observation.js';
+import { packageCommonGrounded, packageNonDeliveryGrounded, verifiedNativeInventoryRole } from './package-observation.js';
 import { escapeRegex } from '../questions/domain.js';
 import {
   checkToolArguments, commands, parseCompound, parseContext, decodeCompletion, hashBytes, imageMessage, initialMessages, observationArguments, permittedTool, request,
@@ -340,6 +340,7 @@ const preconditionRefusals = new Set(['evidence_not_delivered', 'survey_required
   'partial_coverage', 'both_supports_required']);
 const stableRefusals = new Set(['invalid_arguments', 'unknown_tool', 'foreign_branch', 'support_required',
   'value_not_in_quote', 'unit_not_in_evidence', 'visual_box_required', 'source_role_unassigned',
+  'package_non_delivery_unproven',
   'proposal_pair_mismatch', ...Object.keys(readerCorrections).filter((code) => code !== 'reader_evidence_scope_mismatch')]);
 
 function actionKey(call: FunctionCall) {
@@ -557,9 +558,32 @@ async function executeTool(
       const representation = prior.body as { content?: string };
       const fullLine = input.deliveryStatement && input.quote ? deliveredLines(representation.content ?? null)
         .find(({ id, text }) => (!input.lineId || id === input.lineId) && text.includes(input.quote!))?.text : undefined;
+      let evidence = prior.evidence;
+      let verifiedDelivery: ObservationInput['verifiedDelivery'];
       if (task.job.packageWindow && !packageNonDeliveryGrounded(input, Boolean(prior.image), fullLine)) {
-        return { reply: failedTool('package_non_delivery_unproven',
-          'Нужна дословная строка описи с явным утверждением о непередаче и подтверждённой ролью inventory.') };
+        if (reader.verifyDeliveryLine && !prior.image && evidence.place.box && input.lineId && input.quote &&
+          input.sourceRole === 'inventory' && input.deliveryStatement?.status === 'not_delivered') {
+          const lineId = input.lineId;
+          const issued = [evidence, ...[...state.delivered].flatMap((id) => {
+            const view = state.replies.get(id);
+            const candidate = view?.evidence;
+            const body = view?.body as { content?: string } | undefined;
+            return id !== evidenceId && candidate?.place.box && !view?.image && samePlace(prior.evidence!.place, candidate.place)
+              && candidate.readerVersion === prior.evidence!.readerVersion
+              && deliveredLines(body?.content ?? null).some((line) => line.id === lineId) ? [candidate] : [];
+          })].slice(0, 16);
+          if (issued.length > 1) {
+            const proof = await reader.verifyDeliveryLine(tx, context, { ...input, evidence }, issued);
+            const role = proof && verifiedNativeInventoryRole(input, proof);
+            const anchor = proof && issued.find(({ evidenceId: id }) => id === proof.anchorEvidenceId);
+            if (proof && role && anchor) {
+              evidence = anchor;
+              verifiedDelivery = { ...proof, role };
+            }
+          }
+        }
+        if (!verifiedDelivery) return { reply: failedTool('package_non_delivery_unproven',
+          'Откройте нативную строку целиком или обе допущенные рамки той же строки. Укажите дословную роль описи в package.role и однозначное отрицание по этой позиции. Если опоры относятся к разным строкам или статус расходится, оставьте место на уточнении.') };
       }
       const inventoryStatement = input.deliveryStatement && input.sourceRole && isInventoryRole(input.sourceRole);
       if (input.sourceRole && !inventoryStatement && !task.job.packageWindow && !task.job.question?.sourceRoles?.includes(input.sourceRole)) {
@@ -582,7 +606,7 @@ async function executeTool(
           return { reply: failedTool('unit_not_in_evidence', 'Подтвердите исходную unit в строке значения, соседней ячейке или заголовке его столбца. Иначе сохраните limitation без числовых полей.') };
         }
       }
-      const stored = await reader.record(tx, context, { ...input, evidence: prior.evidence });
+      const stored = await reader.record(tx, context, { ...input, evidence, ...(verifiedDelivery ? { verifiedDelivery } : {}) });
       const qualified = !input.limitation && !input.alternatives;
       return { reply: {
         body: { ok: true, ...stored, qualified },
