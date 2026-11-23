@@ -204,7 +204,7 @@ export async function listReceipts(db: Pool, input: { projectId: string; uploadi
   return { receipts, nextCursor: rows.length > 50 ? receipts.at(-1)?.number : null };
 }
 
-export async function getInventory(db: Pool, input: ReceiptContext) {
+export async function getInventory(db: Pool | PoolClient, input: ReceiptContext) {
   const { rows: [receipt] } = await db.query<{ number: string; sealed: boolean; inventoryOpen: boolean }>(
     `SELECT r.number, r.sealed_at IS NOT NULL AS sealed, ${inventoryOpen} AS "inventoryOpen",
             r.project_id AS "projectId", ${manifestProjection} AS manifest,
