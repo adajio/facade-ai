@@ -589,7 +589,13 @@ test('a single PDF crop requires a canonical line and holds contradictions on th
   for (const [suffix, accepted] of [
     [undefined, false],
     [' | Anchor layout delivered', false],
+    ['. Anchor layout delivered', false],
+    ['\nAnchor layout delivered', false],
+    ['. It was supplied', false],
+    ['. Confirmation unclear. It was supplied', false],
     [' | Seal schedule delivered', true],
+    ['. Seal schedule delivered', true],
+    ['\nSeal schedule delivered', true],
     [' | Supplemental Anchor layout delivered', true],
     ['', true],
   ] as const) {

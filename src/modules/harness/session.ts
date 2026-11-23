@@ -6,9 +6,10 @@ import type {
 import { pairConfirmed, pairCriteria, ReaderRefusal, type PairChecks } from './contracts.js';
 import { contains } from '../pdf/types.js';
 import { canonicalJson, isInventoryRole } from '../assessment/domain.js';
+import { contradictoryDeliveryLine } from '../../domain/delivery-statement.js';
 import { deliveredLines } from '../questions/attribute-aliases.js';
 import { currentRevision, hasPrintedPairScope, locatePairQuote, pairSourceEvidence, type PairQuote } from './pair-evidence.js';
-import { canonicalDeliveryContradicts, packageCommonGrounded, packageNonDeliveryGrounded, verifiedNativeInventoryRole } from './package-observation.js';
+import { packageCommonGrounded, packageNonDeliveryGrounded, verifiedNativeInventoryRole } from './package-observation.js';
 import { escapeRegex } from '../questions/domain.js';
 import {
   checkToolArguments, commands, parseCompound, parseContext, decodeCompletion, hashBytes, imageMessage, initialMessages, observationArguments, permittedTool, request,
@@ -577,8 +578,8 @@ async function executeTool(
               && deliveredLines(body?.content ?? null).some((line) => line.id === lineId) ? [candidate] : [];
           })].slice(0, 16);
           const proof = await reader.verifyDeliveryLine(tx, context, { ...input, evidence, lineId }, issued);
-          if (proof && canonicalDeliveryContradicts(proof.line.text, input.deliveryStatement.item)) {
-            nextAction = 'В канонической строке указаны оба статуса этой позиции. Сверьте противоречие по оригиналу и оставьте непередачу на уточнении.';
+          if (proof && contradictoryDeliveryLine(proof.line.text, input.deliveryStatement.item)) {
+            nextAction = 'В канонической строке есть отметка о передаче. Сверьте по оригиналу, относятся ли оба статуса к этой позиции, и оставьте непередачу на уточнении.';
           } else if (proof) {
             const role = verifiedNativeInventoryRole(input, proof);
             const anchor = issued.find(({ evidenceId: id }) => id === proof.anchorEvidenceId);

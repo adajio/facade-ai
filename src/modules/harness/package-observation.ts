@@ -1,5 +1,6 @@
 import type { PoolClient } from 'pg';
 import { z } from 'zod';
+import { contradictoryDeliveryLine, exactDeliveryStatement } from '../../domain/delivery-statement.js';
 import { hash } from '../gateway/types.js';
 import { deliveredLines } from '../questions/attribute-aliases.js';
 import type { Observation } from '../pdf/types.js';
@@ -57,9 +58,9 @@ const fieldGuidance: Record<ReferenceField, string> = {
 export function packageNonDeliveryGrounded(input: Omit<ObservationInput, 'evidence'>, image: boolean, fullLine?: string) {
   if (input.deliveryStatement?.status !== 'not_delivered') return true;
   const role = input.package?.role;
-  return !image && Boolean(input.quote && directlyNotDelivered(input.quote, input.deliveryStatement.item) &&
+  return !image && Boolean(input.quote && exactDeliveryStatement(input.quote, input.deliveryStatement.item, 'not_delivered') &&
     role?.value === 'inventory' && input.quote.includes(role.quote) && roleWords.inventory!.test(role.quote) &&
-    (!fullLine || !directlyDelivered(fullLine, input.deliveryStatement.item)));
+    (!fullLine || !contradictoryDeliveryLine(fullLine, input.deliveryStatement.item)));
 }
 
 export function verifiedNativeInventoryRole(input: Omit<ObservationInput, 'evidence'>, proof: VerifiedNativeDeliveryLine) {
@@ -69,8 +70,9 @@ export function verifiedNativeInventoryRole(input: Omit<ObservationInput, 'evide
   if (claim?.status !== 'not_delivered' || (input.sourceRole ?? role?.value) !== 'inventory' || (role && role.value !== 'inventory')
     || input.package?.references?.role !== undefined || input.package?.facadeHeaderLineId
     || !input.quote || !full.includes(input.quote)
-    || !(directlyNotDelivered(input.quote, claim.item) || directlyNotDelivered(claim.context?.quote ?? '', claim.item))
-    || !directlyNotDelivered(full, claim.item) || canonicalDeliveryContradicts(full, claim.item)
+    || !(exactDeliveryStatement(input.quote, claim.item, 'not_delivered') ||
+      exactDeliveryStatement(claim.context?.quote ?? '', claim.item, 'not_delivered'))
+    || !exactDeliveryStatement(full, claim.item, 'not_delivered') || contradictoryDeliveryLine(full, claim.item)
     || (claim.context && (claim.context.lineId !== proof.line.id ||
       !proof.crops.some(({ line }) => line.text.includes(claim.context!.quote))))) return;
   const segments = roleSegments(full);
@@ -90,52 +92,6 @@ export function packageCommonGrounded(quote: string) {
   return common.test(quote) && !exclusion.test(quote);
 }
 const entireRegister = /(?:\b(?:complete|full|exhaustive)\s+(?:list|schedule|register)\s+of\s+facades?\b|(?:полн\p{L}*|исчерпывающ\p{L}*)\s+(?:перечень|список|ведомость)\s+фасад)/iu;
-const absent = /(?:\b(?:not (?:supplied|provided|delivered|included|sent)|omitted|was not transmitted)\b|не\s+(?:(?:передан|предоставлен|поставлен|направлен|приложен)(?:а|о|ы)?(?!\p{L})|вош[её]л(?!\p{L}))|отсутствует\s+в\s+(?:составе|комплекте))/iu;
-const delivered = /(?:\b(?:supplied|provided|delivered|included|sent|transmitted|received)\b|(?:передан|предоставлен|поставлен|направлен|приложен|получен|принят)(?:а|о|ы)?(?!\p{L}))/iu;
-const statementSeparator = /[|;·,]+|\s+(?:and|but|whereas|or|и|но|а|однако|либо|или)\s+/iu;
-
-function directlyNotDelivered(quote: string, item: string) {
-  return statementAbout(quote, item, absent);
-}
-
-function directlyDelivered(quote: string, item: string) {
-  return statementAbout(quote, item, delivered, absent, true);
-}
-
-export function canonicalDeliveryContradicts(line: string, item: string) {
-  const compact = (value: string) => value.normalize('NFKC').trim().replace(/\s+/gu, ' ');
-  const name = compact(item).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  if (!name) return false;
-  const subject = `(?:the )?(?:(?:document|file|item|материал|документ|файл|позиция) )?[«"“]?${name}[»"”]?`;
-  const auxiliary = '(?:(?:is|was|has been|бы(?:л|ла|ло|ли)) )?';
-  const predicate = delivered.source;
-  const implicit = new RegExp(`^(?:(?:it|он|она|оно|они) )?${auxiliary}${predicate}[.!?]?$`, 'iu');
-  const explicit = new RegExp(`^(?:${subject}(?: [–—-] |: | )${auxiliary}${predicate}` +
-    `(?: in (?:this|the|current) (?:package|submission|delivery)| в (?:текущем )?(?:пакете|комплекте|составе))?` +
-    `|${predicate}[: ]+${subject})[.!?]?$`, 'iu');
-  const subjectLabel = /^(?:item|subject|position|document|предмет|позиция|документ)\s*:\s*/iu;
-  const negative = new RegExp(absent.source, 'giu');
-  return line.split(statementSeparator).some((clause) => clause.split(negative).some((span) => {
-    const text = compact(span).replace(subjectLabel, '');
-    return implicit.test(text) || explicit.test(text);
-  }));
-}
-
-function statementAbout(quote: string, item: string, expression: RegExp, excluding?: RegExp, allowOmittedSubject = false) {
-  const adjacent = /^[\s:—–-]*(?:(?:is|was|бы(?:л|ла|ло|ли))\s+)?[\s:—–-]*$/iu;
-  const name = item.toLocaleLowerCase('ru');
-  return quote.split(statementSeparator).some((clause) => {
-    const predicate = expression.exec(clause);
-    if (!predicate || excluding?.test(clause)) return false;
-    const before = clause.slice(0, predicate.index).toLocaleLowerCase('ru');
-    const after = clause.slice(predicate.index + predicate[0].length).toLocaleLowerCase('ru');
-    const beforeIndex = before.lastIndexOf(name);
-    const afterIndex = after.indexOf(name);
-    if (allowOmittedSubject && adjacent.test(before) && /^[\s.!?—–-]*$/u.test(after)) return true;
-    return (beforeIndex !== -1 && hasLiteral(before, name) && adjacent.test(before.slice(beforeIndex + name.length))) ||
-      (afterIndex !== -1 && hasLiteral(after, name) && adjacent.test(after.slice(0, afterIndex)));
-  });
-}
 const current = /(?:\b(?:current|effective)\b|действующ\p{L}*|актуальн\p{L}*)/iu;
 const inactive = /(?:\b(?:superseded|obsolete|withdrawn|draft|not[ -]+current)\b|замен[её]н\p{L}*|архивн\p{L}*|не\s+действующ\p{L}*|недействующ\p{L}*|неактуальн\p{L}*|отмен[её]н\p{L}*|черновик)/iu;
 const roleWords: Partial<Record<PackageSourceRole, RegExp>> = {

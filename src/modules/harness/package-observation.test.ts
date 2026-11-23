@@ -32,6 +32,15 @@ test('package non-delivery requires the referenced item to govern the negative p
     'Опись | Теплотехнический расчёт не передан, но Паспорт передан'), true);
 });
 
+test('package non-delivery keeps a compound printed item intact beside a separate status', () => {
+  const quote = 'Опись | Схема и паспорт не переданы. Расчёт передан.';
+  const claim = (item: string) => ({ ...input(quote), deliveryStatement: { status: 'not_delivered' as const, item } });
+  assert.equal(packageNonDeliveryGrounded(claim('Схема и паспорт'), false, quote), true);
+  assert.equal(packageNonDeliveryGrounded(claim('Паспорт'), false, quote), false);
+  assert.equal(packageNonDeliveryGrounded(claim('Расчёт'), false, quote), false);
+  assert.equal(packageNonDeliveryGrounded(claim('Схема и паспорт'), false, `${quote} Схема и паспорт переданы.`), false);
+});
+
 test('common materials require a positive statement that covers the entire building', () => {
   assert.equal(packageCommonGrounded('Specification | applies to all facades'), true);
   assert.equal(packageCommonGrounded('Does not apply to all facades'), false);
