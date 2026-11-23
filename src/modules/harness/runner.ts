@@ -108,7 +108,7 @@ function sessionPorts(
         const { rows: [stored] } = await tx.query<{ event: typeof event }>(
           'INSERT INTO harness_research_events(job_id,sequence,event) VALUES($1,$2,$3) RETURNING event',
           [lease.jobId, expectedLength + 1, JSON.stringify(event)]);
-        if (event.kind === 'tool' && event.stop) await tx.query(
+        if ((event.kind === 'tool' || event.kind === 'checkpoint_stop') && event.stop) await tx.query(
           'INSERT INTO harness_research_stops(id,job_id,sequence) VALUES($1,$2,$3)',
           [event.stop.id, lease.jobId, expectedLength + 1]);
         return stored.event;

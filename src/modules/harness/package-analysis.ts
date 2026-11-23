@@ -1,7 +1,8 @@
 import type { Pool, PoolClient } from 'pg';
+import { allowsCatalogPair } from '../access/catalog-comparison.js';
 import { getCatalog, getProject, matchesDefaultProfile } from '../access/project-state.js';
 import type { CatalogRequirement } from '../access/input.js';
-import type { Branch, Place } from './contracts.js';
+import type { Branch, PackageBlock, PackageSemanticCheck, Place } from './contracts.js';
 import type { Observation } from '../pdf/types.js';
 import type { VerifiedPairEvidence } from '../assessment/domain.js';
 import { printedPairVariant } from './pair-evidence.js';
@@ -32,9 +33,24 @@ export interface PackageFact {
   variant: string | null;
   revisionStatus: 'current' | 'superseded' | 'unknown';
   basis: { role?: string; stage?: string; revision?: string;
-    revisionEvidence?: { evidenceId: string; quote: string; lineId?: string; href: string } };
+    revisionEvidence?: { evidenceId: string; quote: string; lineId?: string; href: string };
+    valueRole?: {kind:'design'|'as_built'|'limit';quote:string};
+    parts?: Partial<Record<'attribute'|'role'|'stage'|'revision'|'binding'|'valueRole',
+      {evidenceId:string;lineId:string;quote:string}>> };
   binding: PackageBinding;
   materials: { id: string; label: string; quote: string }[];
+}
+
+export interface PackageWalkState {
+  status:'pending'|'ready';
+  limitation:string|null;
+  blocks:PackageBlock[];
+  branches:Record<Branch,{
+    reviewed:{blockId:string;evidenceId:string}[];
+    remaining:{blockId:string;reason:string}[];
+    complete:boolean;
+    followup:{jobId:string;status:string;reason:string|null}|null;
+  }>;
 }
 
 export interface PackageWindow {
@@ -42,6 +58,7 @@ export interface PackageWindow {
   place: Place;
   readerVersion: string | null;
   format: string;
+  structure?: PackageWalkState;
   branches: Record<Branch, {
     status: 'pending' | 'queued' | 'reading' | 'held' | 'covered' | 'reviewed_no_match' | 'refused';
     reason: string | null;
@@ -58,10 +75,11 @@ export interface PackageComparison {
 
 export interface PackageAnalysis {
   facts: PackageFact[];
+  semanticChecks: PackageSemanticCheck[];
   candidates: PackageBinding['candidates'];
   windows: PackageWindow[];
   comparisons: PackageComparison[];
-  reviewCandidates: { a: string; b: string; property: string; scope: { id: string; label: string } }[];
+  reviewCandidates: { a: string; b: string; property: string; scope: { id: string; label: string };catalogVersionId?:string;stage?:string }[];
   verifiedPairs: { a: string; b: string; proof: VerifiedPairEvidence;
     titles: { A: ReviewTitle | null; B: ReviewTitle | null } }[];
   coverage: {
@@ -71,6 +89,7 @@ export interface PackageAnalysis {
     refusedVersions: number;
     pendingVersions: number;
     completedWindows: number;
+    structurallyReviewedWindows: number;
     physicalBoundary: 'mapped_places' | 'verified';
     facadeBoundary: 'observed_facades' | 'verified';
     physicalProof: PackageCoverageProof | null;
@@ -89,6 +108,7 @@ interface PackageCoverageProof {
 type FactRow = Omit<PackageFact, 'variant' | 'evidenceHref'> & { register: { quote: string; commonChecked: boolean } | null };
 type WindowRow = Omit<PackageWindow, 'branches'> & {
   branch: Branch | null;
+  walk: boolean;
   state: 'ready' | 'leased' | 'held' | 'done' | null;
   jobId: string | null;
   outcome: { kind?: string; reason?: string } | null;
@@ -143,17 +163,28 @@ function bindingScope(a: PackageFact, b: PackageFact) {
   return ids.length === 1 ? ids[0] : undefined;
 }
 
-function pairCandidate(a: PackageFact, b: PackageFact, scope: { id: string; label: string } | undefined) {
+type ComparisonCatalog={versionId:string;stage:string|null;requirements:CatalogRequirement[]};
+
+function pairCandidate(a: PackageFact, b: PackageFact, scope: { id: string; label: string } | undefined,
+  property:string,catalog?:ComparisonCatalog) {
   const left = a.observation;
   const right = b.observation;
   if (!scope || !left.quote || !right.quote || left.grounding !== 'text' || right.grounding !== 'text' ||
     left.source.documentId === right.source.documentId || left.source.sha256 === right.source.sha256 ||
-    !a.basis.role || !b.basis.role || a.sourceRole !== b.sourceRole ||
-    ['other', 'inventory', 'correspondence', 'unknown'].includes(a.sourceRole) ||
+    !a.basis.role || !b.basis.role ||
+    [a,b].some(({sourceRole})=>['other','inventory','correspondence','unknown'].includes(sourceRole)) ||
     a.revisionStatus === 'superseded' || b.revisionStatus === 'superseded' ||
     (a.variant && b.variant && a.variant !== b.variant) ||
     (a.designStage && b.designStage && a.designStage !== b.designStage)) return;
-  return { a: a.id, b: b.id, scope };
+  const rules=catalog?.requirements.filter((rule)=>normalizeAttribute(rule.part)===normalizeAttribute(property)&&
+    (!rule.level||rule.level===(scope.id==='common'?'common':'facade')))??[];
+  const rule=rules.length===1?rules[0]:undefined;
+  const crossRole=a.sourceRole!==b.sourceRole;
+  const roles=[a,b].map(({sourceRole,basis})=>({sourceRole,valueRole:basis.valueRole?.kind}));
+  if(!allowsCatalogPair(rule?.comparison,roles[0],roles[1]))return;
+  if(crossRole&&(!rule?.comparison||rule.facadeKinds?.length||!catalog?.stage||
+    ![a,b].every(({designStage})=>designStage&&normalizeAttribute(designStage)===normalizeAttribute(catalog.stage!))))return;
+  return { a: a.id, b: b.id, scope,...(rule?.comparison&&catalog?.stage?{catalogVersionId:catalog.versionId,stage:catalog.stage}:{}) };
 }
 
 function normalizeAttribute(value: string) {
@@ -174,15 +205,16 @@ export function packageCatalogAliases(requirements: Pick<CatalogRequirement, 'ke
     positions.size === 1 ? [[name, positions.values().next().value!] as const] : []));
 }
 
-async function approvedAliases(db: Pool | PoolClient, projectId: string) {
+async function approvedComparisonCatalog(db: Pool | PoolClient, projectId: string):Promise<ComparisonCatalog|undefined> {
   const project = await getProject(db, projectId);
-  if (!project.catalogVersionId) return new Map<string, string>();
+  if (!project.catalogVersionId) return;
   const catalog = await getCatalog(db, project.organizationId, project.catalogVersionId);
-  if (project.intakeMode && !matchesDefaultProfile(project, catalog)) return new Map<string, string>();
-  return packageCatalogAliases(catalog.requirements.filter(({ applicability }) => {
-    const rule = normalizeAttribute(applicability);
-    return !rule.startsWith('stage:') || normalizeAttribute(project.stage ?? '') === rule.slice(6).trim();
-  }));
+  if (project.intakeMode && !matchesDefaultProfile(project, catalog)) return;
+  return {versionId:catalog.id,stage:project.stage,requirements:catalog.requirements.filter(({applicability})=>{
+    const rule=normalizeAttribute(applicability);
+    return ['all','applicable','*','все','для всех','все фасады'].includes(rule)||
+      rule.startsWith('stage:')&&normalizeAttribute(project.stage??'')===rule.slice(6).trim();
+  })};
 }
 
 const lengthPowers = new Map([['m', 3], ['м', 3], ['cm', 1], ['см', 1], ['mm', 0], ['мм', 0]]);
@@ -209,7 +241,7 @@ function possibleDisagreement(left: Observation, right: Observation) {
   return a.unit !== b.unit || a.literal !== b.literal;
 }
 
-export function comparePackageFacts(facts: PackageFact[], aliases: ReadonlyMap<string, string> = new Map()) {
+export function comparePackageFacts(facts: PackageFact[], aliases: ReadonlyMap<string, string> = new Map(), catalog?:ComparisonCatalog) {
   const comparisons: PackageComparison[] = [];
   const reviewCandidates: PackageAnalysis['reviewCandidates'] = [];
   const grouped = new Map<string, { A: PackageFact[]; B: PackageFact[]; property: string }>();
@@ -231,7 +263,7 @@ export function comparePackageFacts(facts: PackageFact[], aliases: ReadonlyMap<s
       const scope = bindingScope(a, b);
       if (!sameLocation && !scope) continue;
       const different = possibleDisagreement(left, right);
-      const proposal = different ? pairCandidate(a, b, scope) : undefined;
+      const proposal = different ? pairCandidate(a, b, scope,property,catalog) : undefined;
       if (proposal) reviewCandidates.push({ ...proposal, property });
       if (comparisons.length >= 200) continue;
       const comparable = sameLocation && left.unit === right.unit && a.variant === b.variant;
@@ -257,6 +289,7 @@ export async function readPackageAnalysis(db: Pool | PoolClient, projectId: stri
     `WITH accepted AS (${accepted})
      SELECT w.id,w.place,m.reader_version AS "readerVersion",m.format,
        b.branch,j.state,j.id AS "jobId",j.result AS outcome,j.reason,j.next_action AS "nextAction",
+       coalesce(j.payload#>>'{packageWindow,walkProtocol}'='1',false) AS walk,
        CASE WHEN prior.state IS NOT NULL THEN b.blocker_job_id END AS blocker,prior.state AS "blockerState",
        m.refusal AS "mapRefusal"
      FROM accepted a JOIN harness_package_maps m ON m.version_id=a.version_id AND m.active
@@ -275,7 +308,8 @@ export async function readPackageAnalysis(db: Pool | PoolClient, projectId: stri
        jsonb_build_object('state',b.state,'quote',b.quote,'reason',b.reason,'candidates',b.candidates,'version',b.version,'actorId',b.actor_id) AS binding
      FROM harness_package_facts f JOIN reader_observations o ON o.id=f.id
      JOIN accepted a ON a.version_id=o.version_id
-     JOIN harness_package_branches active ON active.job_id=f.job_id AND active.active
+     LEFT JOIN harness_package_followups followup ON followup.job_id=f.job_id
+     JOIN harness_package_branches active ON active.job_id=coalesce(followup.root_job_id,f.job_id) AND active.active
      JOIN harness_package_windows w ON w.id=f.window_id
      JOIN harness_package_maps m ON m.version_id=w.version_id AND m.fingerprint=w.map_fingerprint AND m.active
      JOIN LATERAL (SELECT * FROM harness_package_bindings h WHERE h.fact_id=f.id ORDER BY version DESC LIMIT 1) b ON true
@@ -287,6 +321,58 @@ export async function readPackageAnalysis(db: Pool | PoolClient, projectId: stri
        ) OR EXISTS (SELECT 1 FROM intake_imports i WHERE i.receipt_id=r.id AND i.state IN ('queued','running','paused')))
      ) AS closed`, args);
   const windows = projectWindows(windowRows);
+  const walkIds=[...new Set(windowRows.filter(({walk})=>walk).map(({id})=>id))];
+  const {rows:walkRows}=walkIds.length?await db.query<{
+    id:string;blocks:PackageBlock[]|null;limitation:string|null;branch:Branch;checks:{blockId:string;evidenceId:string;reviewed:boolean;reason:string}[];
+    childId:string|null;childState:string|null;childReason:string|null;
+  }>(
+    `SELECT b.window_id AS id,s.blocks,s.limitation,b.branch,
+       coalesce(checked.items,'[]') AS checks,child.id AS "childId",child.state AS "childState",child.reason AS "childReason"
+     FROM harness_package_branches b LEFT JOIN harness_package_structures s ON s.window_id=b.window_id
+     LEFT JOIN LATERAL (
+       SELECT j.id,j.state,j.reason FROM harness_package_followups f JOIN gateway_jobs j ON j.id=f.job_id
+       WHERE f.root_job_id=b.job_id ORDER BY j.created_at DESC,j.id LIMIT 1
+     ) child ON true
+     LEFT JOIN LATERAL (
+       SELECT jsonb_agg(jsonb_build_object('blockId',block_id,'evidenceId',evidence_id,'reviewed',reviewed,'reason',reason)
+         ORDER BY job_id IS DISTINCT FROM child.id,reviewed DESC) AS items
+       FROM harness_package_block_checks c WHERE c.job_id=b.job_id OR EXISTS (
+         SELECT 1 FROM harness_package_followups history WHERE history.root_job_id=b.job_id AND history.job_id=c.job_id)
+     ) checked ON true WHERE b.active AND b.window_id=ANY($1::uuid[])`,[walkIds]):{rows:[]};
+  const byWindow=new Map(windows.map((window)=>[window.id,window]));
+  for(const row of walkRows) {
+    const window=byWindow.get(row.id)!;
+    const waiting={reviewed:[],remaining:[],complete:false,followup:null};
+    const structure=window.structure??={status:row.blocks?'ready':'pending',limitation:row.limitation,blocks:row.blocks??[],
+      branches:{A:waiting,B:waiting}};
+    const reviewed=structure.blocks.flatMap(({id})=>{
+      const check=row.checks.find((check)=>check.blockId===id&&check.reviewed);
+      return check?[{blockId:id,evidenceId:check.evidenceId}]:[];
+    });
+    const remaining=structure.blocks.filter(({id})=>!reviewed.some(({blockId})=>blockId===id)).map(({id})=>({
+      blockId:id,reason:row.checks.find((check)=>check.blockId===id)?.reason??'block_not_reviewed',
+    }));
+    structure.branches[row.branch]={reviewed,remaining,complete:structure.status==='ready'&&Boolean(structure.blocks.length)&&!remaining.length&&!structure.limitation,
+      followup:row.childId?{jobId:row.childId,status:row.childState!,reason:row.childReason}:null};
+  }
+  const {rows:semanticChecks}=walkIds.length?await db.query<PackageSemanticCheck>(
+    `SELECT s.window_id AS "windowId",s.branch,s.job_id AS "jobId",b.job_id AS "primaryJobId",s.reader_version AS "readerVersion",
+       s.facade_id AS "facadeId",s.position_id AS "positionId",s.catalog_version_id AS "catalogVersionId",s.stage,s.basis_ids AS "basisIds",s.disposition,s.subject,s.reason
+     FROM harness_package_semantic_checks s JOIN gateway_jobs job ON job.id=s.job_id
+     JOIN projects p ON p.id=job.project_id AND p.catalog_version_id=s.catalog_version_id AND p.project_stage=s.stage
+     LEFT JOIN harness_semantic_epochs epoch ON epoch.project_id=p.id
+     LEFT JOIN harness_semantic_scope_epochs scope_epoch ON scope_epoch.project_id=p.id
+       AND scope_epoch.scope_key=coalesce(s.facade_id::text,'common')
+     LEFT JOIN harness_package_followups f ON f.job_id=s.job_id
+     JOIN harness_package_branches b ON b.job_id=coalesce(f.root_job_id,s.job_id) AND b.active
+     WHERE s.window_id=ANY($1::uuid[]) AND p.id=$2 AND s.applicability_epoch=coalesce(epoch.epoch,0)
+       AND s.scope_epoch=coalesce(scope_epoch.epoch,0) AND NOT EXISTS (
+       SELECT 1 FROM unnest(s.basis_ids) item(id)
+       JOIN LATERAL (SELECT state,candidates FROM harness_package_bindings x WHERE x.fact_id=item.id ORDER BY version DESC LIMIT 1) current ON true
+       WHERE (s.facade_id IS NULL AND current.state<>'common') OR (s.facade_id IS NOT NULL AND
+         (current.state<>'identified' OR NOT EXISTS(SELECT 1 FROM jsonb_array_elements(current.candidates) c WHERE c->>'id'=s.facade_id::text)))
+     ) ORDER BY s.window_id,s.branch,s.position_id`,[walkIds,projectId]):{rows:[]};
+
   const facts = rows.map(({ register, ...fact }) => ({
     ...fact, evidenceHref: `/api/v1/evidence/${fact.observation.evidenceId}`,
     variant: (fact.observation.grounding === 'text' && fact.observation.quote ?
@@ -296,6 +382,7 @@ export async function readPackageAnalysis(db: Pool | PoolClient, projectId: stri
     .map((candidate) => [candidate.id, candidate])).values()];
   const completedWindows = windows.filter(({ branches }) => Object.values(branches)
     .every(({ status }) => status === 'covered' || status === 'reviewed_no_match')).length;
+  const structurallyReviewedWindows=windows.filter(({structure})=>structure?.branches.A.complete&&structure.branches.B.complete).length;
   const versionIds = versions.rows.map(({ id }) => id);
   const physicalProof = versionIds.length && versions.rows.every(({ basis }) => basis)
     ? { versionIds, basisIds: versions.rows.map(({ basis }) => basis!) } : null;
@@ -309,11 +396,13 @@ export async function readPackageAnalysis(db: Pool | PoolClient, projectId: stri
     fact.observation.source.versionId === a.observation.source.versionId &&
     fact.observation.address.unitId === a.observation.address.unitId && fact.register?.quote === a.register?.quote);
   const subjectProof = a && b && inventory.closed && physicalProof && completedWindows === windows.length &&
+    windows.every(({structure})=>!structure||structure.branches.A.complete&&structure.branches.B.complete) &&
     !facts.some(({ binding, attribute, observation, materials }) => binding.state === 'unclear' ||
       (binding.state === 'unidentified' && (attribute || observation.value !== undefined || materials.length)))
     ? { versionIds, basisIds: [a.id, b.id], facadeIds, commonChecked: true } : null;
   const mappedVersions = new Set(windows.map(({ place }) => place.source.versionId)).size;
-  const comparison = comparePackageFacts(facts, facts.length ? await approvedAliases(db, projectId) : undefined);
+  const catalog=facts.length?await approvedComparisonCatalog(db,projectId):undefined;
+  const comparison=comparePackageFacts(facts,catalog&&packageCatalogAliases(catalog.requirements),catalog);
   const reviewed = await db.query<PackageAnalysis['verifiedPairs'][number]>(
     `SELECT p.a_fact_id AS a,p.b_fact_id AS b,p.proof,
        jsonb_build_object('A',a_title.title,'B',b_title.title) AS titles
@@ -360,10 +449,10 @@ export async function readPackageAnalysis(db: Pool | PoolClient, projectId: stri
       } },
     };
   });
-  return { facts: published, candidates, windows, ...comparison, verifiedPairs, coverage: {
+  return { facts: published, semanticChecks, candidates, windows, ...comparison, verifiedPairs, coverage: {
     inventory: inventory.closed ? 'closed' : 'open', acceptedVersions: versionIds.length, mappedVersions,
     refusedVersions: versions.rows.filter(({ refusal }) => refusal !== null).length,
-    pendingVersions: versionIds.length - mappedVersions, completedWindows,
+    pendingVersions: versionIds.length - mappedVersions, completedWindows, structurallyReviewedWindows,
     physicalBoundary: physicalProof ? 'verified' : 'mapped_places', facadeBoundary: subjectProof ? 'verified' : 'observed_facades',
     physicalProof, subjectProof,
     physicalLimitations: versions.rows.flatMap(({ id, basis, limitation }) =>

@@ -153,7 +153,7 @@ export class Gateway extends WorkQueue {
       // Reader publication and source replacement lock the intake project before the generation.
       await tx.query(
         `SELECT pg_advisory_xact_lock(hashtextextended('intake/project/' || project_id::text, 0))
-         FROM gateway_jobs WHERE id=$1 AND (purpose='review' OR ($2 AND kind='harness_research'))`,
+         FROM gateway_jobs WHERE id=$1 AND (purpose='review' OR ($2 AND kind IN ('harness_research','harness_package_followup')))`,
         [input.lease.jobId, Boolean(this.researchAdmission)],
       );
     }

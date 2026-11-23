@@ -10,10 +10,14 @@ const literal = z.string().trim().min(1).max(500).refine((value) => !value.inclu
 const label = z.string().trim().min(1).max(160).refine((value) => !value.includes('\0'));
 const bindingFields = { state: z.enum(['identified', 'common', 'unclear', 'unidentified']), reason: literal };
 export const packageBindingEdit = z.strictObject({ ...bindingFields, candidateIds: z.array(z.string().uuid()).max(24) });
+const partIndex=z.number().int().min(0).max(11);
 const sourceField = z.strictObject({ value: literal, quote: literal });
 
 export const packageDetails = z.strictObject({
   attribute: literal.optional(),
+  valueRole:z.strictObject({kind:z.enum(['design','as_built','limit']),quote:literal}).optional(),
+  references:z.strictObject({attribute:partIndex.optional(),role:partIndex.optional(),stage:partIndex.optional(),
+    revision:partIndex.optional(),binding:partIndex.optional(),valueRole:partIndex.optional()}).optional(),
   role: z.strictObject({ value: z.enum(packageRoles), quote: literal }).optional(),
   stage: sourceField.optional(),
   revision: sourceField.extend({ status: z.enum(['current', 'superseded', 'unknown']) }).optional(),
@@ -111,9 +115,9 @@ function contextIdentity(ctx: NonNullable<PackageDetails['binding']>['projectCon
   return JSON.stringify(['building-axes', normalized(building.value), normalized(axes.value)]);
 }
 
-function bindingFor(observation: Observation, details: PackageDetails, fullLine?: string): PackageBinding {
+function bindingFor(observation: Observation, details: PackageDetails, fullLine?: string, citedQuote=observation.quote): PackageBinding {
   const proposal = details.binding;
-  const quote = proposal?.quote && observation.quote?.includes(proposal.quote) ? proposal.quote : null;
+  const quote = proposal?.quote && citedQuote?.includes(proposal.quote) ? proposal.quote : null;
   const labels = [...new Set(proposal?.labels.map(normalized))];
   const candidates = labels.filter((name) => quote && hasLiteral(quote, name))
     .map((label) => {
@@ -139,27 +143,45 @@ export async function publishPackageObservation(
   const details = input.package ?? {};
   const { quote, grounding, deliveryStatement } = observation;
   const text = grounding === 'text' ? quote : undefined;
-  const { rows: [issued] } = grounding === 'text' && (details.role || details.binding)
-    ? await tx.query<{ content: string | null }>(
-      `SELECT event#>>'{reply,body,content}' AS content FROM harness_research_events
-       WHERE job_id=$1 AND event#>>'{reply,evidence,evidenceId}'=$2 ORDER BY sequence LIMIT 1`,
-      [task.jobId, observation.evidenceId])
-    : { rows: [] };
-  const fullLine = deliveredLines(issued?.content ?? null).find(({ id }) => id === observation.lineId)?.text;
-  const segments = fullLine?.split(/[|;·]/u).map((segment) => segment.trim().replace(
+  const references=details.references??{};
+  const fields=['attribute','role','stage','revision','binding','valueRole'] as const;
+  const supportIds=[...new Set([observation.evidenceId,...(observation.components??[]).map(({evidenceId})=>evidenceId)])];
+  const {rows:issued}=grounding==='text'&&(details.role||details.binding||Object.keys(references).length)
+    ? await tx.query<{ id:string;content:string|null }>(
+      `SELECT DISTINCT ON(event#>>'{reply,evidence,evidenceId}') event#>>'{reply,evidence,evidenceId}' AS id,
+        event#>>'{reply,body,content}' AS content FROM harness_research_events
+        WHERE job_id=$1 AND event#>>'{reply,evidence,evidenceId}'=ANY($2::text[])
+        ORDER BY event#>>'{reply,evidence,evidenceId}',sequence`,[task.jobId,supportIds]):{rows:[]};
+  function fullLine(evidenceId:string,lineId:string|undefined) {
+    return deliveredLines(issued.find(({id})=>id===evidenceId)?.content??null).find(({id})=>id===lineId)?.text;
+  }
+  const anchor={evidenceId:observation.evidenceId,lineId:observation.lineId,quote:observation.quote,
+    address:observation.address};
+  const citations=Object.fromEntries(fields.map((field)=>{
+    const reference=references[field];
+    if(reference===undefined)return [field,anchor];
+    const part=observation.components?.[reference];
+    return [field,part?.binding&&part.source.versionId===observation.source.versionId&&
+      part.source.sha256===observation.source.sha256?part:undefined];
+  })) as Record<typeof fields[number],typeof anchor|undefined>;
+  const rolePart=citations.role;
+  const fullRole=rolePart&&fullLine(rolePart.evidenceId,rolePart.lineId);
+  const segments = fullRole?.split(/[|;·]/u).map((segment) => segment.trim().replace(
     /^(?:document(?: type| role)?|type|title|тип документа|вид документа|документ)\s*:\s*/iu, ''));
   const role = details.role;
   const isCommercial = Boolean(segments?.some((segment) => roleWords.other!.exec(segment)?.index === 0));
-  const confirmedRole = role && quote?.includes(role.quote) && (!isCommercial || role.value === 'other') &&
+  const confirmedRole = role && rolePart?.quote?.includes(role.quote) && (!isCommercial || role.value === 'other') &&
     segments?.some((segment) => segment.includes(role.quote) && roleWords[role.value]?.exec(segment)?.index === 0) ? role : undefined;
-  const stage = details.stage && quote?.includes(details.stage.quote) && hasLiteral(details.stage.quote, details.stage.value)
+  const stage = details.stage && citations.stage?.quote?.includes(details.stage.quote) && hasLiteral(details.stage.quote, details.stage.value)
     ? details.stage : undefined;
-  const revision = details.revision && quote?.includes(details.revision.quote) &&
+  const revision = details.revision && citations.revision?.quote?.includes(details.revision.quote) &&
     hasLiteral(details.revision.quote, details.revision.value) && /(?:\brev(?:ision)?\.?\s|редакция|ревизия|ред\.\s)/iu.test(details.revision.quote)
     ? details.revision : undefined;
   const revisionStatus = revision?.status === 'current' && current.test(revision.quote) && !inactive.test(revision.quote)
     ? 'current' : revision?.status === 'superseded' && inactive.test(revision.quote) ? 'superseded' : 'unknown';
-  const binding = bindingFor(observation, details, fullLine);
+  const bindingPart=citations.binding;
+  const bindingAnchor=bindingPart?{...observation,lineId:bindingPart.lineId,address:bindingPart.address}:observation;
+  const binding=bindingFor(bindingAnchor,details,bindingPart&&fullLine(bindingPart.evidenceId,bindingPart.lineId),bindingPart?.quote??'');
   const proposal = details.subjectRegister;
   const register = proposal && revisionStatus === 'current' && (confirmedRole?.value === 'schedule' || confirmedRole?.value === 'inventory') &&
     text?.includes(proposal.quote) && entireRegister.test(proposal.quote) && !exclusion.test(proposal.quote) &&
@@ -167,12 +189,26 @@ export async function publishPackageObservation(
     binding.candidates.every(({ label }) => proposal.labels.includes(label))
     ? { quote: proposal.quote, commonChecked: Boolean(proposal.commonQuote && text.includes(proposal.commonQuote) && commonRegister.test(proposal.commonQuote) && !exclusion.test(proposal.commonQuote)) }
     : null;
-  const attribute = details.attribute && quote && hasLiteral(quote.toLocaleLowerCase('ru'), details.attribute.toLocaleLowerCase('ru'))
+  const attributeQuote=citations.attribute?.quote;
+  const attribute = details.attribute && attributeQuote && hasLiteral(attributeQuote.toLocaleLowerCase('ru'), details.attribute.toLocaleLowerCase('ru'))
     ? details.attribute : deliveryStatement?.item ?? null;
   const materials = details.materials?.filter((material) => quote?.includes(material.quote) &&
     hasLiteral(material.quote, material.label)).map((material) => ({ ...material,
       id: packageCandidateId(observation, material.label) })) ?? [];
-  const basis = { role: confirmedRole?.quote, stage: stage?.quote, revision: revision?.quote };
+  const functionalRoles={design:/(?:design value|nominal value|проектн\p{L}* значен|номинальн\p{L}* значен)/iu,
+    as_built:/(?:as[- ]built|actual value|фактическ\p{L}* значен|исполнительн\p{L}* размер)/iu,
+    limit:/(?:limit|maximum|minimum|предел|предельн\p{L}* значен|не более|не менее)/iu};
+  const proposedRole=details.valueRole;
+  const valueRole=proposedRole&&citations.valueRole?.quote?.includes(proposedRole.quote)&&
+    functionalRoles[proposedRole.kind].test(proposedRole.quote)?proposedRole:undefined;
+  const qualified={attribute,role:confirmedRole,stage,revision,binding:binding.quote,valueRole};
+  const parts=Object.fromEntries(fields.flatMap((name)=>{
+    const part=citations[name];
+    return qualified[name]&&references[name]!==undefined&&part?.lineId&&part.quote?
+      [[name,{lineId:part.lineId,evidenceId:part.evidenceId,quote:part.quote}]]:[];
+  }));
+  const basis = { role: confirmedRole?.quote, stage: stage?.quote, revision: revision?.quote,
+    valueRole,...(Object.keys(parts).length?{parts}:{}) };
   await tx.query(
     `INSERT INTO harness_package_facts(id,project_id,window_id,job_id,attribute,source_role,design_stage,revision,revision_status,basis,subject_register,materials)
      VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) ON CONFLICT(id) DO NOTHING`,

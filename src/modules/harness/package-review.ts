@@ -54,7 +54,7 @@ export async function schedulePackageReview(db: Pool, queue: WorkQueue, profile:
       }
       const analysis = await readPackageAnalysis(tx, project.projectId);
       const byId = new Map(analysis.facts.map((fact) => [fact.id, fact]));
-      for (const { a, b, scope, property } of analysis.reviewCandidates) {
+      for (const { a, b, scope, property,catalogVersionId,stage } of analysis.reviewCandidates) {
         const left = byId.get(a)!;
         const right = byId.get(b)!;
         const { label } = scope;
@@ -64,7 +64,8 @@ export async function schedulePackageReview(db: Pool, queue: WorkQueue, profile:
           id, question: { subject: label, property, ...(variant ? { variant } : {}) },
           a: citation(left, 'A'), b: citation(right, 'B'),
         }, packageReview: { scopeId: scope.id, scopeLabel: label, routeRevision: pinned.lead.revision,
-          readerVersions: { A: left.observation.readerVersion, B: right.observation.readerVersion } } };
+          readerVersions: { A: left.observation.readerVersion, B: right.observation.readerVersion },
+          ...(catalogVersionId&&stage?{catalogVersionId,stage}:{}) } };
         const sources = [job.dispute.a, job.dispute.b].map(({ place, value, unit }) => hash([place, value, unit])).sort();
         const signature = hash([scope.id, variant, left.attribute, sources]);
         const result = await tx.query(
@@ -95,6 +96,10 @@ export async function authorizedPackageReview(db: Pool | PoolClient, projectId: 
      JOIN gateway_jobs j ON j.id=$4 AND j.project_id=p.project_id AND j.generation_id=p.generation_id
        AND j.scope_id IS NULL AND j.purpose='review' AND j.subject_id=p.id::text AND j.payload=$5
      WHERE p.project_id=$1 AND p.generation_id=$2 AND p.id=$3
+       AND (p.assignment#>>'{packageReview,catalogVersionId}' IS NULL OR EXISTS (
+         SELECT 1 FROM projects current WHERE current.id=p.project_id AND
+           current.catalog_version_id::text=p.assignment#>>'{packageReview,catalogVersionId}' AND
+           current.project_stage=p.assignment#>>'{packageReview,stage}'))
        AND $4::uuid=CASE $5::jsonb->>'mode' WHEN 'lead' THEN p.lead_job_id
          ELSE CASE $5::jsonb->>'branch' WHEN 'A' THEN p.a_job_id ELSE p.b_job_id END END
        AND p.assignment->'dispute'=$5::jsonb->'dispute'
@@ -103,7 +108,8 @@ export async function authorizedPackageReview(db: Pool | PoolClient, projectId: 
          (x.fact_id=p.a_fact_id AND x.version>p.a_binding_version) OR (x.fact_id=p.b_fact_id AND x.version>p.b_binding_version)
        )
        AND (SELECT count(*) FROM harness_package_facts f
-         JOIN harness_package_branches b ON b.job_id=f.job_id AND b.active
+         LEFT JOIN harness_package_followups followup ON followup.job_id=f.job_id
+         JOIN harness_package_branches b ON b.job_id=coalesce(followup.root_job_id,f.job_id) AND b.active
          JOIN harness_package_windows w ON w.id=f.window_id AND w.project_id=p.project_id
          JOIN harness_package_maps m ON m.version_id=w.version_id AND m.fingerprint=w.map_fingerprint AND m.active
          WHERE f.id IN (p.a_fact_id,p.b_fact_id) AND EXISTS (

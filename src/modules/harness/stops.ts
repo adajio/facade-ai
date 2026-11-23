@@ -9,7 +9,7 @@ import { readPackageAnalysis } from './package-analysis.js';
 import { packageBindingEdit } from './package-observation.js';
 import type { ResearchStop } from './session.js';
 
-const reason = 'repeated_rejected_action';
+const reasons = ['repeated_rejected_action','turn_limit'];
 const latest = `NOT EXISTS (SELECT 1 FROM harness_research_stops later WHERE later.job_id=s.job_id AND later.sequence>s.sequence)`;
 const unavailable = () => new AccessError(404, 'not_found', 'Остановка исследования недоступна.');
 
@@ -18,10 +18,10 @@ export async function resumeResearchStops(db: Pool, queue: Pick<WorkQueue, 'resu
     const { rows: [row] } = await tx.query<{ job_id: string }>(
       `SELECT s.job_id FROM harness_research_stops s JOIN gateway_jobs j ON j.id=s.job_id
        JOIN gateway_generations g USING(generation_id)
-       WHERE s.resume_requested_at IS NOT NULL AND j.state='held' AND j.reason=$1 AND g.current AND ${latest}
+       WHERE s.resume_requested_at IS NOT NULL AND j.state='held' AND j.reason=ANY($1::text[]) AND g.current AND ${latest}
        AND NOT EXISTS (SELECT 1 FROM gateway_attempts a WHERE a.job_id=j.id AND a.state IN ('sending','unknown'))
-       ORDER BY s.resume_requested_at,s.id LIMIT 1 FOR UPDATE OF s SKIP LOCKED`, [reason]);
-    return row ? queue.resume(row.job_id, [reason]) : false;
+       ORDER BY s.resume_requested_at,s.id LIMIT 1 FOR UPDATE OF s SKIP LOCKED`, [reasons]);
+    return row ? queue.resume(row.job_id, reasons) : false;
   });
 }
 
@@ -77,10 +77,10 @@ export async function register(app: FastifyInstance) {
         `SELECT e.event->'stop' AS stop,j.id AS "jobId",j.generation_id AS "generationId",s.sequence AS version,
          CASE WHEN j.payload->>'mode'='lead' THEN 'lead' ELSE j.payload->>'branch' END AS branch,
          CASE WHEN NOT g.current THEN 'historical' WHEN s.resume_requested_at IS NULL THEN 'held'
-              WHEN j.state='held' AND j.reason=$3 AND ${latest} THEN 'continuation_requested' ELSE 'continued' END AS status
+              WHEN j.state='held' AND j.reason=ANY($3::text[]) AND ${latest} THEN 'continuation_requested' ELSE 'continued' END AS status
          FROM harness_research_stops s JOIN harness_research_events e USING(job_id,sequence)
          JOIN gateway_jobs j ON j.id=s.job_id JOIN gateway_generations g USING(generation_id)
-         WHERE j.project_id=$1 AND j.scope_id IS NOT DISTINCT FROM $2::uuid ORDER BY e.created_at DESC,s.id LIMIT 100`, [projectId, scopeId, reason]);
+         WHERE j.project_id=$1 AND j.scope_id IS NOT DISTINCT FROM $2::uuid ORDER BY e.created_at DESC,s.id LIMIT 100`, [projectId, scopeId, reasons]);
       return { items: rows.map(({ stop, ...item }) => ({ ...stop, ...item })) };
     });
 
@@ -120,7 +120,7 @@ export async function register(app: FastifyInstance) {
            resume_requested_by=coalesce(s.resume_requested_by,$3)
          FROM gateway_jobs j JOIN gateway_generations g USING(generation_id)
          WHERE s.job_id=j.id AND s.id=$1 AND j.project_id=$2 AND g.current AND ${latest}
-           AND (s.resume_requested_at IS NOT NULL OR j.state='held' AND j.reason=$4)`, [id, projectId, actor.userId, reason]);
+           AND (s.resume_requested_at IS NOT NULL OR j.state='held' AND j.reason=ANY($4::text[]))`, [id, projectId, actor.userId, reasons]);
       if (!updated.rowCount) throw new AccessError(409, 'research_stop_not_current', 'Остановка больше не ожидает продолжения.');
       return { status: 202, body: { id, status: 'continuation_requested' }, audit: { objectId: id } };
     });

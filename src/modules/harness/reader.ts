@@ -1,5 +1,6 @@
 import type { Pool, PoolClient } from 'pg';
 import { occurrenceScope, occurrenceScopeJoin } from './occurrence-scope.js';
+import { packageStructure, savePackageBlocks, saveSemanticCheck } from './package-walk.js';
 import { authorizedPackageReview } from './package-review.js';
 import { authorizedPackageWindow } from './package-dispatch.js';
 import type { createRuntimePdfService } from '../pdf/index.js';
@@ -50,8 +51,21 @@ export function connectReader(
     return task.job.packageWindow.readerVersion;
   }
 
-  async function contextPlaces({ task, branch }: ReaderContext, id: string | null, offset: number) {
-    if (task.scopeId === null || task.job.mode !== 'primary') return [];
+  async function contextPlaces(context: ReaderContext, id: string | null, offset: number) {
+    const {task,branch}=context;
+    if (task.job.mode !== 'primary') return [];
+    if (task.scopeId === null) {
+      if(!task.job.packageWindow?.walkProtocol) return [];
+      await checkPackage(context);
+      const {rows}=await db.query<{ id:string;place:Place;format:string }>(
+        `SELECT w.id,w.place,m.format
+         FROM harness_package_windows w JOIN harness_package_maps m ON m.version_id=w.version_id AND m.fingerprint=w.map_fingerprint AND m.active
+         JOIN harness_package_windows anchor ON anchor.id=$1 AND anchor.version_id=w.version_id AND anchor.map_fingerprint=w.map_fingerprint
+         WHERE w.project_id=$2 AND m.reader_version=$3 AND ($4::uuid IS NULL OR w.id=$4)
+         ORDER BY abs(w.ordinal-anchor.ordinal),w.ordinal LIMIT 33 OFFSET $5`,
+        [task.job.packageWindow.id,task.projectId,task.job.packageWindow.readerVersion,id,offset]);
+      return rows;
+    }
     const { rows } = await db.query<{ id: string; place: Place; format: string }>(
       `SELECT hp.obligation_id AS id,hp.place,m.format FROM harness_primary_places hp
        JOIN gateway_generations g USING(generation_id) JOIN harness_document_maps m ON m.version_id=hp.version_id
@@ -97,28 +111,42 @@ export function connectReader(
   }
 
   return {
+    async structure(context,tx) {
+      await checkPackage(context,tx);
+      return packageStructure(tx??db,context);
+    },
+    async checkBlocks(tx,context,checks) {
+      await checkPackage(context,tx);
+      await savePackageBlocks(tx,context,checks);
+    },
+    async checkSemantics(tx,context,check) {
+      await checkPackage(context,tx);
+      await saveSemanticCheck(tx,context,check);
+    },
     async contexts(context, offset) {
       const rows = context.task.job.mode === 'primary' ? await contextPlaces(context, null, offset) :
         await reviewWindows(context, null, offset);
       return { items: rows.slice(0, 32), ...(rows.length > 32 ? { nextOffset: offset + 32 } : {}) };
     },
-    async openContext(context, id, representation) {
+    async openContext(context, id, representation, box) {
       const [authorized] = context.task.job.mode === 'primary'
         ? await contextPlaces(context, id, 0) : await reviewWindows(context, id, 0);
       if (!authorized) throw new ReaderRefusal('context_window_unavailable', 'permanent');
       const { place } = authorized;
+      if (box && place.box && !contains(place.box,box)) throw new ReaderRefusal('outside_assigned_window','permanent');
       try {
         const support = 'support' in authorized ? authorized.support as 'A' | 'B' : undefined;
         const readerVersion = await checkPackage(context, db, support);
         const { evidence, bytes } = await service.open(place.source, executionScope(context), {
-          address: { unitId: place.unitId, ...(place.box ? { box: place.box } : {}) }, representation, readerVersion,
+          address: { unitId: place.unitId, box:box??place.box }, representation, readerVersion,
+          ...(representation==='render' && box ? { dpi:200 } : {}),
         });
         if (evidence.source.versionId !== place.source.versionId || evidence.source.sha256 !== place.source.sha256
-          || evidence.address.unitId !== place.unitId || evidence.mediaType !== 'application/json') {
+          || evidence.address.unitId !== place.unitId || !mediaTypes.has(evidence.mediaType as Representation['mediaType'])) {
           throw new ReaderRefusal('context_window_unavailable', 'permanent');
         }
-        return { evidenceId: evidence.id, place, readerVersion: evidence.readerVersion, sha256: evidence.sha256,
-          mediaType: evidence.mediaType, bytes, limitations: evidence.limitations,
+        return { evidenceId: evidence.id, place:{ ...place,box:evidence.address.box ?? place.box }, readerVersion: evidence.readerVersion, sha256: evidence.sha256,
+          mediaType: evidence.mediaType as Representation['mediaType'], bytes, limitations: evidence.limitations,transform:evidence.transform,
           ...('support' in authorized ? { support: authorized.support as 'A' | 'B' } : {}) };
       } catch (error) {
         return refusal(error);

@@ -495,8 +495,10 @@ export function createReaderService(db: Pool, deps: ReaderDependencies, adapters
     const linkedScope = candidate.scope === null
       ? await conn.query(
         `SELECT 1 FROM gateway_jobs j JOIN gateway_generations g USING(generation_id)
-         JOIN harness_package_branches b ON b.job_id=j.id AND b.active
+         LEFT JOIN harness_package_followups f ON f.job_id=j.id
+         JOIN harness_package_branches b ON b.job_id=coalesce(f.root_job_id,j.id) AND b.active
          JOIN harness_package_windows w ON w.id=b.window_id AND w.project_id=j.project_id
+           AND (f.job_id IS NULL OR f.window_id=w.id AND f.branch=b.branch)
          JOIN harness_package_maps m ON m.version_id=w.version_id AND m.fingerprint=w.map_fingerprint AND m.active
          WHERE j.id=$1 AND j.project_id=$2 AND g.current AND j.scope_id IS NULL
            AND w.version_id=$3 AND b.branch=$4 AND m.reader_version=$5`,

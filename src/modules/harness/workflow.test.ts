@@ -527,3 +527,36 @@ test('delivery statements require a literal quote and preserve the legacy tool w
     ...input, quote: 'Torsion test report is not included.',
   }).success, true);
 });
+
+test('package turn exhaustion records the last request and permits exactly one bounded continuation', async () => {
+  const {task,ports,events}=setup();
+  assert.equal(task.job.mode,'primary');
+  if(task.job.mode!=='primary')assert.fail();
+  task.scopeId=null;
+  task.job.packageWindow={id:randomUUID(),readerVersion:'test',routeRevision:'known',walkProtocol:1};
+  task.job.settings={...task.job.settings,maxTurns:1};
+  let resumed=false;
+  const attempts:string[]=[];
+  ports.continued=async()=>resumed;
+  ports.call=async({effectKey})=>{
+    attempts.push(effectKey);
+    return { status:'paid',attemptId:randomUUID(),output:{choices:[
+      {finish_reason:'stop',message:{role:'assistant',content:'Еще требуется проверка.'}},
+    ]} };
+  };
+  const signal=new AbortController().signal;
+  const pause=await runResearchWorkflow(task,ports,signal);
+  assert.equal(pause.status==='suspended'&&pause.hold.reason,'turn_limit');
+  const checkpoint=events.at(-1);
+  assert.equal(checkpoint?.kind,'checkpoint_stop');
+  if(checkpoint?.kind!=='checkpoint_stop')assert.fail();
+  assert.equal(checkpoint.stop.lastRequest.turn,1);
+  assert.ok(checkpoint.stop.lastRequest.requestHash);
+  await runResearchWorkflow(task,ports,signal);
+  assert.deepEqual(attempts,[`${task.jobId}:model:1`]);
+  resumed=true;
+  const final=await runResearchWorkflow(task,ports,signal);
+  assert.equal(final.status==='suspended'&&final.hold.reason,'turn_limit_final');
+  await runResearchWorkflow(task,ports,signal);
+  assert.deepEqual(attempts,[`${task.jobId}:model:1`,`${task.jobId}:model:2`]);
+});

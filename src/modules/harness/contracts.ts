@@ -57,7 +57,7 @@ export const settingsSchema = z.strictObject({
 });
 
 const packageReviewSchema = z.strictObject({ scopeId: text, scopeLabel: text,
-  readerVersions: z.strictObject({ A: text, B: text }), routeRevision: text });
+  readerVersions: z.strictObject({ A: text, B: text }), routeRevision: text, catalogVersionId:id.optional(), stage:text.optional() });
 export const jobSchema = z.discriminatedUnion('mode', [
   z.strictObject({
     mode: z.literal('primary'),
@@ -66,7 +66,13 @@ export const jobSchema = z.discriminatedUnion('mode', [
     question: questionSchema.optional(),
     localRefusal: text.optional(),
     observationProtocol: z.literal(2).optional(),
-    packageWindow: z.strictObject({ id, readerVersion: text, routeRevision: text }).optional(),
+    packageWindow: z.strictObject({ id, readerVersion: text, routeRevision: text,
+      walkProtocol: z.literal(1).optional(), followup: z.strictObject({ rootJobId: id,
+        blocks: z.array(z.string().min(1).max(60)).min(1).max(4096),
+        semantic:z.strictObject({catalogVersionId:id,stage:text,epoch:z.string().regex(/^\d+$/),
+          positions:z.array(z.strictObject({facadeId:id.nullable(),positionId:text,scopeEpoch:z.string().regex(/^\d+$/)})).max(4096)}).optional(),
+      }).optional(),
+    }).optional(),
     settings: settingsSchema.nullable(),
   }),
   z.strictObject({ mode: z.literal('lead'), dispute: disputeSchema, settings: settingsSchema.nullable(), packageReview: packageReviewSchema.optional() }),
@@ -169,11 +175,45 @@ export type ReadRequest =
   | { kind: 'survey' | 'extract' | 'ocr' | 'zoom'; support?: Branch; box?: z.infer<typeof boxSchema> }
   | { kind: 'search'; query: string; support?: Branch };
 
+export interface PackageBlock {
+  id: string;
+  kind: 'native' | 'visual';
+  lineIds?: string[];
+  rows?:{first:number;last:number};
+  box?: Place['box'];
+}
+
+export interface PackageSemanticCheck {
+  windowId: string;
+  branch: Branch;
+  jobId: string;
+  primaryJobId: string;
+  readerVersion: string;
+  facadeId: string | null;
+  positionId: string;
+  catalogVersionId: string;
+  stage: string;
+  basisIds: string[];
+  disposition:'supported'|'alternatives_checked';
+  subject?:string|null;
+  reason?:string|null;
+}
+
+export interface BlockCheck {
+  blockId: string;
+  evidenceId: string;
+  reviewed: boolean;
+  reason: string;
+}
+
 export interface ReaderPort {
+  structure?(context: ReaderContext, tx?:PoolClient): Promise<{ blocks: PackageBlock[]; limitation: string | null }>;
+  checkBlocks?(tx: PoolClient, context: ReaderContext, checks: BlockCheck[]): Promise<void>;
+  checkSemantics?(tx: PoolClient, context: ReaderContext, check: Omit<PackageSemanticCheck, 'windowId' | 'branch' | 'jobId' | 'primaryJobId' | 'readerVersion'>): Promise<void>;
   inventory(context: ReaderContext): Promise<unknown>;
   next?(context: ReaderContext): Promise<Place | null>;
   contexts?(context: ReaderContext, offset: number): Promise<{ items: { id: string; place: Place; format: string; support?: Branch }[]; nextOffset?: number }>;
-  openContext?(context: ReaderContext, id: string, representation: 'native' | 'ocr'): Promise<Representation>;
+  openContext?(context: ReaderContext, id: string, representation: 'native' | 'ocr' | 'render', box?: Place['box']): Promise<Representation>;
   read(context: ReaderContext, request: ReadRequest): Promise<Representation>;
   record(
     tx: PoolClient, context: ReaderContext, observation: ObservationInput

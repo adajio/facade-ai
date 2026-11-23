@@ -1,3 +1,7 @@
+import { createCopilotMemory, createCopilotResearch, copilotKind, copilotModelAdmission, processNextCopilot } from '../copilot/index.js';
+import type { CopilotRoute } from '../copilot/worker.js';
+import { indexNextProjectMemory } from '../project-memory/index.js';
+import { dispatchPackageFollowup, packageFollowupKind, scanPackageStructure } from './package-walk.js';
 import { randomUUID } from 'node:crypto';
 import { setTimeout as delay } from 'node:timers/promises';
 import type { Pool } from 'pg';
@@ -13,7 +17,7 @@ import { isReaderId } from '../pdf/service.js';
 import { ReaderError } from '../pdf/types.js';
 import { createRuntimeInquiryPorts, processNextInquiry } from '../questions/index.js';
 import { dispatchNext } from './dispatch.js';
-import type { ResearchTask } from './contracts.js';
+import { settingsSchema, type ResearchTask } from './contracts.js';
 import { validateLivePolicy } from './live-policy.js';
 import { loadResearchProfile, profileHold, researchSlot, type ResearchProfile } from './profile.js';
 import { activatePackageProjects, dispatchPackagePair, packageModelAdmission, preparePackageMap } from './package-dispatch.js';
@@ -42,18 +46,32 @@ interface ManagedTestOptions {
   toolSha256: string;
 }
 
+function configuredCopilot(): CopilotRoute | null {
+  try {
+    const value:unknown=JSON.parse(process.env.FACADE_COPILOT_PROFILE??'null');
+    if(!value||typeof value!=='object')return null;
+    const parsed=settingsSchema.safeParse({...value,maxTurns:8,maxKnownRejections:1});
+    if(!parsed.success)return null;
+    const {routeId,model,dataClass,maxTokens,toolChoice}=parsed.data;
+    return {routeId,model,dataClass,maxTokens,toolChoice};
+  } catch {return null;}
+}
+
 function modelGateway(context: WorkerContext, external: ReturnType<typeof journalFromEnv>, profile: ResearchProfile, packageEnabled: boolean, packageProjects: readonly string[], test?: ManagedTestOptions) {
+  const packageAdmission=packageModelAdmission(packageEnabled,packageProjects,process.env.FACADE_HARNESS_PACKAGE_EFFECTS==='enabled');
+  const copilotAdmission=copilotModelAdmission();
+  const reviewAdmission:typeof reviewPairAdmission=async (tx,work)=>work.kind===copilotKind?'early':reviewPairAdmission(tx,work);
   const policyOptions = {
-    researchAdmission: packageModelAdmission(packageEnabled, packageProjects, process.env.FACADE_HARNESS_PACKAGE_EFFECTS === 'enabled'),
+    researchAdmission: ((tx,work,route,input)=>work.kind===copilotKind?copilotAdmission(tx,work,route,input):packageAdmission(tx,work,route,input)) as typeof packageAdmission,
     replayOnly: process.env.FACADE_HARNESS_REPLAY_ONLY === '1',
   };
-  const localGateway = () => createGateway(context.db, { journal: external?.journal, reviewAdmission: reviewPairAdmission, ...policyOptions });
+  const localGateway = () => createGateway(context.db, { journal: external?.journal, reviewAdmission, ...policyOptions });
   if (test) {
     if (!external || process.env.FACADE_GATEWAY_LIVE_MODE || process.env.FACADE_GATEWAY_OPENROUTER_KEY) {
       throw new Error('Managed model tests require an isolated journal and disabled live gateway');
     }
     const gateway = createGateway(context.db, {
-      journal: external.journal, transport: test.transport, reviewAdmission: reviewPairAdmission, ...policyOptions,
+      journal: external.journal, transport: test.transport, reviewAdmission, ...policyOptions,
     });
     return { gateway, hasTransport: true, mode: 'managed-test', admit: (task: ResearchTask) => profileHold(profile, task) };
   }
@@ -71,7 +89,7 @@ function modelGateway(context: WorkerContext, external: ReturnType<typeof journa
       endpoint: (process.env.FACADE_GATEWAY_OPENROUTER_ENDPOINT ?? 'https://openrouter.ai') as Step15Approval['endpoint'],
     };
     const approvals = configuredApprovals();
-    const policy = validateLivePolicy(profile, approvals, process.env, (route) => {
+    const usable=(route:OpenRouterProfile)=>{
       if (!(Date.parse(route.validUntil) > Date.now()) ||
         approvals.filter(({ routeId, revision }) => routeId === route.routeId && revision === route.revision).length !== 1) {
         return false;
@@ -83,12 +101,16 @@ function modelGateway(context: WorkerContext, external: ReturnType<typeof journa
       } catch {
         return false;
       }
-    });
-    const gateway = policy.approvals.length === 0 ? localGateway() :
-      createStep15Gateway(context.db, external.journal, { ...approval, profiles: policy.approvals }, reviewPairAdmission, policyOptions);
-    const hasTransport = policy.approvals.length > 0;
-    return { gateway, admit: policy.hold, hasTransport,
-      mode: hasTransport ? policyOptions.replayOnly ? 'openrouter-replay' : 'openrouter-live' : 'disabled' };
+    };
+    const policy=validateLivePolicy(profile,approvals,process.env,usable);
+    const copilot=configuredCopilot();
+    const copilotPolicy=copilot?validateLivePolicy({A:null,B:null,lead:{...copilot,maxTurns:8,maxKnownRejections:1}},
+      approvals,process.env,usable):null;
+    const profiles=[...new Set([...policy.approvals,...copilotPolicy?.approvals??[]])];
+    const gateway=profiles.length?createStep15Gateway(context.db,external.journal,{...approval,profiles},reviewAdmission,policyOptions):localGateway();
+    const hasTransport=profiles.length>0;
+    return {gateway,admit:policy.hold,hasTransport,copilotRoute:copilotPolicy?.approvals.length?copilot:null,
+      mode:hasTransport?policyOptions.replayOnly?'openrouter-replay':'openrouter-live':'disabled'};
   }
   return {
     gateway: localGateway(), hasTransport: false, mode: 'disabled',
@@ -154,7 +176,7 @@ export async function startWorker(context: WorkerContext, test?: ManagedTestOpti
   }
 
   try {
-    const { gateway, admit, hasTransport, mode } = modelGateway(context, external, profile, packageEnabled, packageProjects, test);
+    const { gateway, admit, hasTransport, mode, copilotRoute } = modelGateway(context, external, profile, packageEnabled, packageProjects, test);
     if (test) {
       if (test.transport.kind !== 'managed' || !/^[a-f0-9]{64}$/.test(test.toolSha256) ||
         Object.values(profile).some((slot) => slot && (slot.dataClass !== 'synthetic' || !slot.model.startsWith('managed/')))) {
@@ -174,15 +196,32 @@ export async function startWorker(context: WorkerContext, test?: ManagedTestOpti
     const publish = publication(db, gateway, profile);
     const reader = connectReader(db, service, publish.observation);
     const inquiry = createRuntimeInquiryPorts(db, service, storage.objects);
+    const walk=packageEnabled&&process.env.FACADE_HARNESS_PACKAGE_WALK==='1';
+    const localReads=[
+      ()=>dispatchNext(db,gateway,service.map,profile,publish.onSeal,packageProjects),
+      ()=>indexNextProjectMemory(db,base,signal),
+      ...(packageEnabled?[()=>preparePackageMap(db,gateway,service,packageProjects)]:[]),
+      ...(walk?[()=>scanPackageStructure(db,service)]:[]),
+    ];
+    let nextLocal=0;
+    const copilot={db,gateway,workerId:randomUUID(),route:copilotRoute??null,
+      memory:createCopilotMemory(db,()=>service),research:createCopilotResearch(db,service)};
     lanes.push(
-      poll('dispatch', () => dispatchNext(db, gateway, service.map, profile, publish.onSeal, packageProjects)),
+      poll('local reader and index',async()=>{
+        for(let index=0;index<localReads.length;index++) {
+          const run=localReads[nextLocal];
+          nextLocal=(nextLocal+1)%localReads.length;
+          if(await run())return true;
+        }
+        return false;
+      }),
+      poll('copilot',()=>processNextCopilot(copilot,signal)),
       poll('review', publish.readyReview),
       poll('questions', () => processNextInquiry(db, inquiry, signal)),
       startImports({ ...context, signal }, { storage }),
     );
     if (packageEnabled) lanes.push(
-      poll('package map', () => preparePackageMap(db, gateway, service, packageProjects)),
-      poll('package primary scheduler', () => dispatchPackagePair(db, gateway, profile)),
+      poll('package primary scheduler', () => dispatchPackagePair(db, gateway, profile,walk)),
       poll('package review scheduler', () => schedulePackageReview(db, gateway, profile)),
     );
     if (hasTransport && external) {
@@ -194,10 +233,12 @@ export async function startWorker(context: WorkerContext, test?: ManagedTestOpti
         return true;
       }, true));
     }
-    for (let lane = 0; lane < (hasTransport ? 3 : 1); lane++) {
+    if(walk) lanes.push(poll('package followup scheduler',()=>dispatchPackageFollowup(db,gateway)));
+    const workKinds=[...Array.from({length:hasTransport?3:1},()=>researchKind),...(walk?[packageFollowupKind]:[])];
+    for (const kind of workKinds) {
       const workerId = randomUUID();
-      lanes.push(poll('research', async () => {
-        const work = await gateway.claim({ workerId, kinds: [researchKind], leaseMs: 30_000 });
+      lanes.push(poll(kind, async () => {
+        const work = await gateway.claim({ workerId, kinds: [kind], leaseMs: 30_000 });
         if (!work) return false;
         await executeResearch(work, {
           db, gateway, reader, admit, configured: (slot) => profile[slot],

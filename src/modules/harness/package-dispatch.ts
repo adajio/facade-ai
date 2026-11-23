@@ -10,6 +10,7 @@ import type { ResearchProfile } from './profile.js';
 import type { ReaderService } from './reader.js';
 import { authorizedPackageReview } from './package-review.js';
 import { jobSchema } from './contracts.js';
+import { packageFollowupKind } from './package-walk.js';
 import { researchKind } from './runner.js';
 
 const branches = ['A', 'B'] as const;
@@ -132,20 +133,21 @@ const selectedWindows = `harness_package_windows w JOIN harness_package_maps m
 const activeJobs = `harness_package_branches b JOIN ${selectedWindows} ON w.id=b.window_id
   JOIN gateway_jobs j ON j.id=b.job_id AND j.state<>'done' WHERE b.active AND ${currentSource}`;
 
-async function priorEffect(tx: PoolClient, projectId: string, place: Place, branch: Branch, readerVersion: string, jobId?: string) {
+async function priorEffect(tx: PoolClient, projectId: string, place: Place, branch: Branch, readerVersion: string, jobId?: string, rootJobId?: string) {
   const { rows: [prior] } = await tx.query<{ job_id: string }>(
     `SELECT a.job_id FROM gateway_jobs j JOIN gateway_attempts a ON a.job_id=j.id
-     WHERE j.project_id=$1 AND j.subject_id=$2 AND j.purpose=$3 AND j.id IS DISTINCT FROM $5::uuid
+     WHERE j.project_id=$1 AND j.subject_id=$2 AND j.purpose=$3 AND j.id IS DISTINCT FROM $5::uuid AND ((j.id IS DISTINCT FROM $8::uuid AND NOT EXISTS(SELECT 1 FROM harness_package_followups sibling
+        WHERE sibling.root_job_id=$8 AND sibling.job_id=j.id)) OR a.state<>'paid')
        AND ((j.payload#>>'{packageWindow,readerVersion}' IS NOT NULL AND j.payload#>>'{packageWindow,readerVersion}'<>$7)
          OR (j.payload#>>'{place,unitId}'=$4 AND
              j.payload#>'{place,box}' IS NOT DISTINCT FROM $6::jsonb))
        AND a.state IN ('reserved','prepared','sending','unknown','paid')
      ORDER BY CASE WHEN a.state IN ('sending','unknown') THEN 0 ELSE 1 END,a.created_at LIMIT 1`,
-    [projectId, place.source.versionId, branch === 'A' ? 'primary_a' : 'primary_b', place.unitId, jobId ?? null, place.box ? JSON.stringify(place.box) : null, readerVersion]);
+    [projectId, place.source.versionId, branch === 'A' ? 'primary_a' : 'primary_b', place.unitId, jobId ?? null, place.box ? JSON.stringify(place.box) : null, readerVersion, rootJobId ?? null]);
   return prior?.job_id ?? null;
 }
 
-export async function dispatchPackagePair(db: Pool, queue: WorkQueue, profile: ResearchProfile) {
+export async function dispatchPackagePair(db: Pool, queue: WorkQueue, profile: ResearchProfile, walk = false) {
   if (!profile.A || !profile.B) return false;
   return transaction(db, async (tx) => {
     // Serialize the slot decision. Reader and sender locks always follow the project lock.
@@ -210,7 +212,7 @@ export async function dispatchPackagePair(db: Pool, queue: WorkQueue, profile: R
         const key = hash([next.windowId, branchHash]);
         await queue.declarePrimary(ref, { id: key + ':' + branch, branch, place: key }, tx);
         const payload: PrimaryJob = { mode: 'primary', branch, settings, place: next.place, observationProtocol: 2,
-          packageWindow: { id: next.windowId, readerVersion: next.readerVersion, routeRevision: revision } };
+          packageWindow: { id: next.windowId, readerVersion: next.readerVersion, routeRevision: revision, ...(walk ? { walkProtocol: 1 as const } : {}) } };
         jobId = await queue.enqueue({ ...ref, key: 'package:' + key + ':' + branch, kind: researchKind,
           subjectId: next.place.source.versionId, obligationId: key + ':' + branch,
           purpose: branch === 'A' ? 'primary_a' : 'primary_b', payload }, tx);
@@ -234,12 +236,22 @@ export async function authorizedPackageWindow(
     `SELECT 1 FROM ${selectedWindows}
      JOIN harness_package_branches b ON b.window_id=w.id AND b.active
      JOIN harness_package_projects p ON p.project_id=w.project_id
-     JOIN gateway_jobs j ON j.id=b.job_id AND j.generation_id=p.generation_id AND j.scope_id IS NULL
+     LEFT JOIN harness_package_followups f ON f.root_job_id=b.job_id AND f.window_id=w.id AND f.branch=b.branch AND f.job_id=$5
+     JOIN gateway_jobs j ON (j.id=b.job_id OR j.id=f.job_id) AND j.generation_id=p.generation_id AND j.scope_id IS NULL
      JOIN gateway_generations g ON g.generation_id=j.generation_id AND g.current AND g.scope_id IS NULL
      JOIN intake_reader_jobs ij ON ij.version_id=w.version_id AND ij.project_id=w.project_id
      JOIN intake_originals o ON o.id=ij.original_id AND o.project_id=w.project_id
      WHERE w.id=$1 AND w.project_id=$2 AND w.place=$3 AND m.reader_version=$4 AND j.id=$5
-       AND j.generation_id=$6 AND b.branch=$7 AND o.sha256=w.place#>>'{source,sha256}' AND ${currentSource}`,
+       AND j.generation_id=$6 AND b.branch=$7
+       AND (j.payload#>>'{packageWindow,followup,semantic,catalogVersionId}' IS NULL OR EXISTS (
+         SELECT 1 FROM projects catalog WHERE catalog.id=w.project_id
+          AND catalog.catalog_version_id::text=j.payload#>>'{packageWindow,followup,semantic,catalogVersionId}'
+          AND catalog.project_stage=j.payload#>>'{packageWindow,followup,semantic,stage}'
+          AND coalesce((SELECT epoch FROM harness_semantic_epochs e WHERE e.project_id=catalog.id),0)::text=
+            j.payload#>>'{packageWindow,followup,semantic,epoch}'
+          AND NOT EXISTS(SELECT 1 FROM jsonb_array_elements(j.payload#>'{packageWindow,followup,semantic,positions}') item
+            WHERE coalesce((SELECT epoch FROM harness_semantic_scope_epochs se WHERE se.project_id=catalog.id AND
+              se.scope_key=coalesce(item->>'facadeId','common')),0)::text<>item->>'scopeEpoch'))) AND o.sha256=w.place#>>'{source,sha256}' AND ${currentSource}`,
     [work.windowId, work.projectId, work.place, work.readerVersion, work.id, work.generationId, work.branch]);
   return Boolean(result.rowCount);
 }
@@ -251,7 +263,7 @@ export function packageModelAdmission(enabled: boolean, packageProjects: readonl
       const native = await tx.query('SELECT 1 FROM projects WHERE id=$1 AND intake_mode', [work.projectId]);
       return Boolean(native.rowCount) || packageProjects.includes(work.projectId);
     }
-    if (work.kind !== researchKind) return {};
+    if (work.kind !== researchKind && work.kind !== packageFollowupKind) return {};
     if (work.purpose === 'review' && work.scopeId !== null) return {};
     if (work.scopeId !== null) {
       const transition = await tx.query(`SELECT 1 FROM projects p WHERE p.id=$1 AND (p.intake_mode OR EXISTS (
@@ -274,7 +286,7 @@ export function packageModelAdmission(enabled: boolean, packageProjects: readonl
       return await paidPackageEffectsAllowed() ? {} : { dispatchBlock: 'analysis_replay_only' };
     }
     const { place, branch, packageWindow } = work.payload as PrimaryJob;
-    if (!packageWindow || packageWindow.routeRevision !== route.revision) return { deny: 'analysis_target_changed' };
+    if (!packageWindow || packageWindow.routeRevision !== route.revision || (work.kind === packageFollowupKind) !== Boolean(packageWindow.followup)) return { deny: 'analysis_target_changed' };
     if (!await authorizedPackageWindow(tx, { id: work.lease.jobId, projectId: work.projectId,
       generationId: work.generationId, branch, place, windowId: packageWindow.id, readerVersion: packageWindow.readerVersion })) {
       return { deny: 'analysis_input_denied' };
@@ -285,7 +297,7 @@ export function packageModelAdmission(enabled: boolean, packageProjects: readonl
       [work.projectId, place.source.versionId, packageWindow.readerVersion, work.lease.jobId, branch, input.inputRefs]);
     if (evidence.rowCount !== new Set(input.inputRefs).size) return { deny: 'analysis_input_denied' };
     if (!await paidPackageEffectsAllowed()) return { dispatchBlock: 'analysis_replay_only' };
-    if (await priorEffect(tx, work.projectId, place, branch, packageWindow.readerVersion, work.lease.jobId)) return { dispatchBlock: 'analysis_prior_effect' };
+    if (await priorEffect(tx, work.projectId, place, branch, packageWindow.readerVersion, work.lease.jobId, packageWindow.followup?.rootJobId)) return { dispatchBlock: 'analysis_prior_effect' };
     return {};
   };
 }

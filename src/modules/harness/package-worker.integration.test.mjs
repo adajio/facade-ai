@@ -14,9 +14,9 @@ const built = (file) => process.env.FACADE_HARNESS_TEST_DIST
   : new URL(`../../../dist/${file}`, import.meta.url).href;
 const sha = (bytes) => createHash('sha256').update(bytes).digest('hex');
 
-function pdf(lines) {
-  const drawing = lines.map((line) => `(${line}) Tj`).join(' 0 -24 Td ');
-  const stream = `BT /T 7 Tf 20 140 Td ${drawing} ET`;
+function pdf(lines,{size=7,leading=24,top=140}={}) {
+  const drawing = lines.map((line) => `(${line}) Tj`).join(` 0 -${leading} Td `);
+  const stream = `BT /T ${size} Tf 20 ${top} Td ${drawing} ET`;
   const objects = [
     '<< /Type /Catalog /Pages 2 0 R >>',
     '<< /Type /Pages /Kids [4 0 R] /Count 1 >>',
@@ -93,7 +93,7 @@ function observation(line) {
 }
 
 test('ordinary intake publishes independent package evidence before questions and retains it on passive replay', {
-  skip: !enabled, timeout: 310_000,
+  skip: !enabled, timeout: 420_000,
 }, async (t) => {
   const { createApi } = await import(built('src/platform/api.js'));
   const { readConfig } = await import(built('src/platform/config.js'));
@@ -112,6 +112,8 @@ test('ordinary intake publishes independent package evidence before questions an
   const warnings = [];
   let worker;
   let driver;
+  let walkOriginal;
+  const walkthrough=[];
   const provider = createServer(async (req, res) => {
     try {
       const { attempt, request } = await new Response(req).json();
@@ -151,6 +153,55 @@ test('ordinary intake publishes independent package evidence before questions an
         }
         res.setHeader('content-type', 'application/json');
         res.end(JSON.stringify({ receipt: { state: 'paid', costUsdNanos: 0, providerId: attempt.id, evidenceRef: 'synthetic:pair' }, output }));
+        return;
+      }
+      if (assignment.place?.source.sha256 === walkOriginal) {
+        const plan=replies.find(({blocks})=>blocks);
+        const survey=replies.find(({evidence,transform})=>evidence&&transform);
+        const native=replies.find(({content})=>content&&JSON.parse(content).lines);
+        const recorded=replies.some(({reviewed})=>reviewed);
+        const observation=replies.some(({observationId})=>observationId);
+        const child=assignment.objective==='package_followup';
+        const second=child&&assignment.blocks.length===1;
+        assert.equal(assignment.question,undefined);
+        const context=replies.find(({items})=>items);
+        let output;
+        if(assignment.semantic) {
+          const checked=replies.filter((reply)=>reply.ok&&Object.keys(reply).length===1).length;
+          if(!plan)output=tool('inspect_structure',{});
+          else if(checked<assignment.semantic.positions.length) {
+            const {facadeId,positionId}=assignment.semantic.positions[checked];
+            const basisIds=[...new Set(plan.earlierBranchChecks.map(({evidenceId})=>evidenceId))];
+            output=tool('record_semantic_check',{
+              catalogVersionId:assignment.semantic.catalogVersionId,stage:assignment.semantic.stage,positionId,facadeId,
+              disposition:'alternatives_checked',reason:'This sheet is a material list. The possible anchor-plan alternative was checked against every listed block.',basisIds,
+            });
+          } else if(!survey)output=tool('survey',{});
+          else output=tool('finish_reading',{status:'no_match',explanation:'Current alternatives have addressed receipts.'});
+          res.setHeader('content-type','application/json');
+          res.end(JSON.stringify({receipt:{state:'paid',costUsdNanos:0,providerId:attempt.id,evidenceRef:'synthetic:catalog'},output}));
+          return;
+        }
+        if(!plan)output=tool('inspect_structure',{});
+        else if(!survey)output=tool('survey',{});
+        else if(child&&!native)output=tool('extract',{});
+        else if(!recorded) {
+          const block=child?plan.blocks.find(({kind})=>kind==='native'):plan.blocks.find(({kind})=>kind==='visual');
+          walkthrough.push({jobId:attempt.jobId,branch:attempt.purpose,child,block:block.id});
+          output=tool('record_blocks',{checks:[{blockId:block.id,evidenceId:child?native.evidence.evidenceId:survey.evidence.evidenceId,
+            status:'reviewed',reason:'Checked the addressed region.'}]});
+        } else if(second&&!context)output=tool('context_inventory',{});
+        else if(second&&!observation) {
+          const line=JSON.parse(native.content).lines.find(({text})=>text.includes('Graphite'));
+          output=tool('save_compound_observation',{components:[
+            {role:'value',evidenceId:native.evidence.evidenceId,lineId:line.id,quote:'Graphite',literal:'Graphite',link:{kind:'anchor'}},
+            {role:'identifier',evidenceId:native.evidence.evidenceId,lineId:line.id,quote:'Material',literal:'Material',link:{kind:'source_context',to:0}},
+            {role:'identifier',evidenceId:native.evidence.evidenceId,lineId:line.id,quote:'project facade ID: K-88',literal:'K-88',link:{kind:'source_context',to:0}},
+          ],package:{attribute:'Material',references:{attribute:1,binding:2},binding:{state:'identified',labels:['K-88'],
+            reason:'Printed project identifier.',quote:'project facade ID: K-88',projectIdentifiers:[{label:'K-88',quote:'project facade ID: K-88'}]}}});
+        } else output=tool('finish_reading',{status:second?'covered':'no_match',explanation:'Reviewed the assigned part of the window.'});
+        res.setHeader('content-type','application/json');
+        res.end(JSON.stringify({receipt:{state:'paid',costUsdNanos:0,providerId:attempt.id,evidenceRef:'synthetic:walk'},output}));
         return;
       }
       assert.equal(assignment.question, undefined);
@@ -365,6 +416,75 @@ test('ordinary intake publishes independent package evidence before questions an
   assert.equal(journal.rows[0].spend, 0);
   driver.abort();
   await worker;
+
+  await t.test('both branches revisit missed blocks without candidates and preserve their separate lineage',async()=>{
+    delete process.env.FACADE_HARNESS_REPLAY_ONLY;
+    process.env.FACADE_HARNESS_PACKAGE_WALK='1';
+    const walked=(await command('POST','/api/projects',{name:'Neutral walkthrough',mode:'intake'})).json();
+    for(const [routeId,purpose] of [['managed-a','primary_a'],['managed-b','primary_b']]){
+      await gateway.grantRoute({projectId:walked.id,routeId,revision:'fixture-v1',purpose,dataClass:'synthetic',allowed:true});
+    }
+    const incoming=(await command('POST',`/api/projects/${walked.id}/receipts`,{source:'upload'})).json();
+    const target=`/api/receipts/${incoming.receiptId}`;
+    const bytes=pdf([...Array.from({length:40},(_,row)=>'Record '+(row+1)),'Material Graphite | project facade ID: K-88'],
+      {size:5,leading:5,top:250});
+    walkOriginal=sha(bytes);
+    run();
+    try {
+      await upload('walk.pdf',bytes,target);
+      await command('POST',target+'/seal',{});
+      const result=await until(()=>readPackageAnalysis(app.db,walked.id),({facts,coverage})=>facts.length===2&&
+        coverage.structurallyReviewedWindows===1,'independent followup');
+      assert.deepEqual(result.facts.map(({branch,attribute,observation})=>[branch,attribute,observation.value]).sort(),
+        [['A','Material','Graphite'],['B','Material','Graphite']]);
+      const structure=result.windows[0].structure;
+      assert.equal(structure.blocks.flatMap(({lineIds})=>lineIds??[]).length,41);
+      assert.deepEqual(result.candidates.map(({label})=>label),['K-88']);
+      for(const [branch,purpose] of [['A','primary_a'],['B','primary_b']]){
+        assert.equal(structure.branches[branch].reviewed.length,3);
+        assert.equal(walkthrough.filter((check)=>check.branch===purpose&&check.child).length,2);
+      }
+      const count=await app.db.query(`SELECT count(*)::int AS count FROM harness_package_followups f
+        JOIN gateway_jobs j ON j.id=f.job_id WHERE j.project_id=$1`,[walked.id]);
+      assert.equal(count.rows[0].count,4);
+      await command('GET',`/api/v1/projects/${walked.id}/facade-assessment`,undefined);
+      const catalog=(await command('POST','/api/catalogs',{key:'walk-rd',name:'Walk RD',
+        defaultProfile:{stage:'RD',facadeKinds:['universal'],approvalReference:'synthetic fixture'},
+        requirements:[{key:'anchor-plan',part:'Anchor plan',level:'facade',formats:['pdf'],equivalents:[],
+          aliases:['Setting-out diagram'],applicability:'all',sourceRoles:['drawing'],completenessCriterion:'Addressed anchor plan',addressee:'customer'}],
+      })).json();
+      // Isolated scheduler fixture for an approved catalogue, before any facade type has been assigned.
+      await app.db.query(`UPDATE projects SET project_stage='RD',confirmed_facade_kinds=ARRAY['universal'],catalog_version_id=$2
+        WHERE id=$1`,[walked.id,catalog.id]);
+      const checked=await until(()=>readPackageAnalysis(app.db,walked.id),({semanticChecks})=>semanticChecks.length===2,'universal catalogue followup');
+      const ids=checked.semanticChecks.map(({jobId})=>jobId);
+      assert.ok(checked.semanticChecks.every(({primaryJobId,branch,disposition,facadeId})=>
+        primaryJobId===result.windows[0].branches[branch].jobId && disposition==='alternatives_checked'&&facadeId===result.candidates[0].id));
+      assert.equal((await app.db.query('SELECT count(*)::int AS count FROM facade_type_assignments WHERE project_id=$1',[walked.id])).rows[0].count,0);
+      driver.abort();
+      await worker;
+      await app.db.query("UPDATE projects SET project_stage='P' WHERE id=$1",[walked.id]);
+      await app.db.query("UPDATE projects SET project_stage='RD' WHERE id=$1",[walked.id]);
+      assert.equal((await readPackageAnalysis(app.db,walked.id)).semanticChecks.length,0);
+      run();
+      const updated=await until(()=>readPackageAnalysis(app.db,walked.id),({semanticChecks})=>semanticChecks.length===2,'stage rollback creates a fresh addressed check');
+      assert.ok(updated.semanticChecks.every(({jobId})=>!ids.includes(jobId)));
+      driver.abort();
+      await worker;
+      const fact=updated.facts[0];
+      await command('POST',`/api/projects/${walked.id}/package-facts/${fact.id}/binding`,{
+        state:'identified',candidateIds:[result.candidates[0].id],reason:'Engineer rechecked the printed facade designation.',
+      },{'if-match':'"1"'});
+      assert.equal((await readPackageAnalysis(app.db,walked.id)).semanticChecks.length,0);
+      assert.deepEqual(errors,[]);
+      assert.deepEqual(warnings,[]);
+    } finally {
+      driver.abort();
+      await worker;
+      delete process.env.FACADE_HARNESS_PACKAGE_WALK;
+      process.env.FACADE_HARNESS_REPLAY_ONLY='1';
+    }
+  });
 
   await t.test('addressed legacy transition preserves paid keys and unknown reserve under fair slot caps', async () => {
     const catalog = (await command('POST', '/api/catalogs', { key: 'legacy', name: 'Legacy',

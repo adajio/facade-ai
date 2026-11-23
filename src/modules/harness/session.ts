@@ -11,8 +11,8 @@ import { currentRevision, hasPrintedPairScope, locatePairQuote, pairSourceEviden
 import { packageCommonGrounded, packageNonDeliveryGrounded } from './package-observation.js';
 import { escapeRegex } from '../questions/domain.js';
 import {
-  checkToolArguments, commands, decodeCompletion, hashBytes, imageMessage, initialMessages, observationArguments, permittedTool, request,
-  reviewCommands, toolMessage, type AssistantMessage, type FunctionCall, type ToolReply,
+  checkToolArguments, commands, parseCompound, parseContext, decodeCompletion, hashBytes, imageMessage, initialMessages, observationArguments, permittedTool, request,
+  reviewCommands, toolMessage, walkJob, type AssistantMessage, type FunctionCall, type ToolReply,
 } from './openrouter.js';
 
 type AssistantEvent = {
@@ -31,14 +31,14 @@ type ToolResult = {
 
 export interface ResearchStop {
   id: string;
-  reason: 'repeated_rejected_action';
+  reason: 'repeated_rejected_action' | 'turn_limit';
   refusalCode: string;
   nextAction: string;
   evidence: (EvidenceRef & { href: string })[];
   lastRequest: { turn: number; attemptId: string; requestHash: string; toolCallId: string; tool: string; arguments: string };
 }
 
-export type ResearchEvent = AssistantEvent | RejectionEvent | ToolIntent | ToolResult;
+export type ResearchEvent = AssistantEvent | RejectionEvent | ToolIntent | ToolResult | {kind:'checkpoint_stop';stop:ResearchStop};
 export type FlowState =
   | { status: 'continue' }
   | { status: 'suspended'; hold: ResearchSuspension }
@@ -79,6 +79,7 @@ function restore(task: ResearchTask, events: ResearchEvent[]) {
   const observations: NonNullable<ToolReply['observation']>[] = [];
   const failedActions = new Map<string, { turn: number; code: string; nextAction: string; progress: string }>();
   let stop: ResearchStop | undefined;
+  let limitStop: ResearchStop | undefined;
   let pending: { model: AssistantEvent; calls: FunctionCall[]; results: ToolResult[]; intent?: ToolIntent } | null = null;
   let latestModel = 0;
   let rejections: RejectionEvent[] = [];
@@ -88,6 +89,9 @@ function restore(task: ResearchTask, events: ResearchEvent[]) {
   };
   for (const event of events) {
     switch (event.kind) {
+      case 'checkpoint_stop':
+        stop=limitStop=event.stop;
+        break;
       case 'rejected':
         rejections.push(event);
         break;
@@ -161,7 +165,7 @@ function restore(task: ResearchTask, events: ResearchEvent[]) {
     ? previousCurrentMessages.filter((_, index) => !emptyTruncations.has(index)) : previousCurrentMessages;
   return { messages, currentMessages, previousCurrentMessages,
     roleMessages: render(legacyCorrections), replies, delivered, observations, pending, latestModel, rejections, outcome,
-    failedActions, stop };
+    failedActions, stop, limitStop };
 }
 
 function branchOf(task: ResearchTask): Branch {
@@ -430,17 +434,64 @@ async function executeTool(
       return { reply: { body: { ok: true, ...await reader.contexts(context, offset ?? 0) } } };
     }
     case 'open_context': {
-      const { contextId, representation } = commands.open_context.parse(parsed.data);
+      const selection=parseContext(task.job,parsed.data);
+      const { contextId, representation }=selection;
       if (!reader.openContext) return { reply: failedTool('context_window_unavailable', readerCorrections.context_window_unavailable) };
-      const view = await reader.openContext(context, contextId, representation ?? 'native');
+      const view = await reader.openContext(context, contextId, representation ?? 'native',selection.box);
       if (view.bytes.byteLength > 4 * 1024 * 1024) return { reply: failedTool('representation_limit', 'Откройте более узкое назначенное окно.') };
-      if (view.place.source.projectId !== task.projectId || view.mediaType !== 'application/json' || hashBytes(view.bytes) !== view.sha256) {
+      const image=walkJob(task.job)&&view.mediaType.startsWith('image/')?
+        {mediaType:view.mediaType,data:view.bytes.toString('base64')}:undefined;
+      if (view.place.source.projectId !== task.projectId || (!image&&view.mediaType !== 'application/json') || hashBytes(view.bytes) !== view.sha256) {
         return { reply: failedTool('evidence_mismatch') };
       }
       const { evidenceId, place, readerVersion, sha256 } = view;
       const evidence = { evidenceId, place, readerVersion, sha256 };
-      return { reply: { body: { ok: true, evidence, content: view.bytes.toString('utf8'), limitations: view.limitations },
-        evidence, readKind: name, ...(view.support ? { support: view.support } : {}) } };
+      return { reply: { body: { ok: true, evidence, content:image?undefined:view.bytes.toString('utf8'), limitations: view.limitations,
+        ...(image?{transform:view.transform}:{}) }, evidence,image,readKind:name, ...(view.support ? { support: view.support } : {}) } };
+    }
+    case 'inspect_structure': {
+      if(!reader.structure) return {reply:failedTool('package_walk_unavailable')};
+      const {offset=0}=commands.inspect_structure.parse(parsed.data);
+      const structure=await reader.structure(context);
+      return {reply:{body:{ok:true,...structure,blocks:structure.blocks.slice(offset,offset+24),
+        ...(offset+24<structure.blocks.length?{nextOffset:offset+24}:{})}}};
+    }
+    case 'record_blocks': {
+      if(!tx||!reader.structure||!reader.checkBlocks||task.job.mode!=='primary') throw new Error('Block checks require a fenced package assignment');
+      const { checks }=commands.record_blocks.parse(parsed.data);
+      const { blocks }=await reader.structure(context,tx);
+      const seen=new Set<string>();
+      for(const check of checks) {
+        const block=blocks.find(({id})=>id===check.blockId);
+        const support=state.replies.get(check.evidenceId);
+        if(!block||seen.has(check.blockId)) return {reply:failedTool('package_block_unassigned','Укажите один из назначенных блоков один раз.')};
+        seen.add(check.blockId);
+        if(!support?.evidence||!state.delivered.has(check.evidenceId)||!samePlace(support.evidence.place,task.job.place)) {
+          return {reply:failedTool('evidence_not_delivered','Откройте представление текущего окна и укажите выданный evidenceId.')};
+        }
+        if(check.status==='limited') continue;
+        const body=support.body as {content?:string;limitations?:string[];transform?:{pixelsPerPoint:number}};
+        const lines=new Set(deliveredLines(body.content??null).map(({id})=>id));
+        const fullNative=support.readKind==='extract' && !body.limitations?.length && block.lineIds?.every((id)=>lines.has(id));
+        const frame=support.evidence.place.box??(support.readKind==='survey'&&!task.job.place.box?block.box:undefined);
+        const fullVisual=(support.readKind==='zoom'||support.readKind==='survey')&&
+          Boolean(support.image&&block.box&&frame&&contains(frame,block.box)&&
+            (support.readKind==='zoom'||(body.transform?.pixelsPerPoint??0)>=1.5));
+        if(!(block.kind==='native'?fullNative:fullVisual)) return {reply:failedTool('package_block_evidence_incomplete',
+          'Откройте все строки блока или подробно рассмотрите его полную рамку. При ограничении сохраните limited и причину.')};
+      }
+      await reader.checkBlocks(tx,context,checks.map(({status,...check})=>({...check,reviewed:status==='reviewed'})));
+      return {reply:{body:{ok:true,reviewed:checks.filter(({status})=>status==='reviewed').length}}};
+    }
+    case 'record_semantic_check': {
+      if(!tx||!reader.checkSemantics) throw new Error('Semantic checks require a fenced package assignment');
+      const check=commands.record_semantic_check.parse(parsed.data);
+      if(check.disposition==='alternatives_checked'?!check.reason:
+        check.basisIds.some((id)=>!state.observations.some((entry)=>entry.id===id&&entry.qualified))) {
+        return {reply:failedTool('package_semantic_basis_unproven','Укажите квалифицированные наблюдения этой ветви.')};
+      }
+      await reader.checkSemantics(tx,context,check);
+      return {reply:{body:{ok:true}}};
     }
     case 'survey': case 'zoom': case 'extract': case 'ocr': case 'search': {
       // Parse by tool name to retain the argument type at the dispatch boundary.
@@ -473,7 +524,7 @@ async function executeTool(
     }
     case 'save_compound_observation': {
       if (!tx || task.job.mode !== 'primary') throw new Error('Compound observation requires a fenced primary transaction');
-      const { components, sourceRole } = commands.save_compound_observation.parse(parsed.data);
+      const {components,sourceRole,package:metadata}=parseCompound(task.job,parsed.data);
       const [anchor] = components;
       if (components.some(({ evidenceId }) => !state.delivered.has(evidenceId) || !state.replies.get(evidenceId)?.evidence)) {
         return { reply: failedTool('evidence_not_delivered', evidenceCorrection) };
@@ -482,12 +533,12 @@ async function executeTool(
       if (anchor.role !== 'value' || prior.readKind === 'open_context' || !samePlace(prior.evidence!.place, task.job.place)) {
         return { reply: failedTool('reader_component_anchor_mismatch', readerCorrections.reader_component_anchor_mismatch) };
       }
-      if (sourceRole && !task.job.question?.sourceRoles?.includes(sourceRole)) {
+      if (sourceRole && !walkJob(task.job) && !task.job.question?.sourceRoles?.includes(sourceRole)) {
         return { reply: failedTool('source_role_unassigned', 'Используйте подтверждённую роль из назначения либо опустите её.') };
       }
       const stored = await reader.record(tx, context, { evidence: prior.evidence!, quote: anchor.quote,
         lineId: anchor.lineId, value: anchor.literal, unit: components.find(({ role }) => role === 'unit')?.literal,
-        sourceRole, components });
+        sourceRole, components, package:metadata });
       return { reply: { body: { ok: true, observationId: stored.observationId, qualified: true },
         observation: { id: stored.observationId, qualified: true } } };
     }
@@ -660,7 +711,7 @@ export async function advance(task: ResearchTask, ports: SessionPorts): Promise<
     };
     const sequence = before + (prior ? 0 : 1);
     try {
-      if (call.function.name === 'save_observation' || call.function.name === 'save_compound_observation') await ports.append(sequence, execute);
+      if (['save_observation','save_compound_observation','record_blocks','record_semantic_check'].includes(call.function.name)) await ports.append(sequence, execute);
       else {
         const receipt = await execute();
         await ports.append(sequence, () => receipt);
@@ -672,7 +723,26 @@ export async function advance(task: ResearchTask, ports: SessionPorts): Promise<
     return { status: 'continue' };
   }
 
-  if (state.latestModel >= task.job.settings.maxTurns) return outcomeAfterLimit(task);
+  const baseLimit=task.job.settings.maxTurns;
+  const extension=state.limitStop && await ports.continued?.(state.limitStop.id)?Math.min(4,baseLimit):0;
+  if(state.latestModel>=baseLimit+extension) {
+    if(!walkJob(task.job)) return outcomeAfterLimit(task);
+    if(state.limitStop || (task.job.mode==='primary'&&task.job.packageWindow?.followup)) return {
+      status:'suspended',hold:{reason:'turn_limit_final',nextAction:'Предел продолжения достигнут. Непроверенные блоки сохранены.'},
+    };
+    const last=events.findLast((event)=>event.kind==='model');
+    if(!last) return outcomeAfterLimit(task);
+    const call=last.message?.tool_calls?.at(-1);
+    const stop:ResearchStop={id:randomUUID(),reason:'turn_limit',refusalCode:'turn_limit',
+      nextAction:'Разрешить одно ограниченное продолжение с сохранённого места.',
+      evidence:[...state.delivered].flatMap((id)=>{
+        const evidence=state.replies.get(id)?.evidence;
+        return evidence?[{...evidence,href:`/api/v1/evidence/${id}`}]:[];
+      }),lastRequest:{turn:last.turn,attemptId:last.attemptId,requestHash:last.requestHash,toolCallId:call?.id??'',
+        tool:call?.function.name??'',arguments:call?.function.arguments??''}};
+    await ports.append(events.length,()=>({kind:'checkpoint_stop',stop}));
+    return {status:'suspended',hold:{reason:stop.reason,nextAction:stop.nextAction}};
+  }
   const rejected = state.rejections.at(-1);
   if (rejected && (!rejected.retryable || state.rejections.length > task.job.settings.maxKnownRejections)) {
     return {
