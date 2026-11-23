@@ -48,6 +48,7 @@ function hasText(value: unknown): value is string {
 
 function validProfile(profile: CheaperInferenceProfile) {
   return profile.transport === 'cheaperinference' && profile.model === terraModel && profile.mode === 'strict-zdr'
+    && !('reasoningEffort' in profile)
     && [profile.routeId, profile.revision, profile.zdrEvidenceRef, profile.boundEvidenceRef].every(hasText)
     && Number.isFinite(Date.parse(profile.validUntil)) && validSyntheticScopes(profile.syntheticScopes)
     // Use maker list prices for the largest context tier, including cache writes and reasoning output.

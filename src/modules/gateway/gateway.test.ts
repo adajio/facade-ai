@@ -12,7 +12,7 @@ import { resumeInterruptedResearch } from '../harness/runner.js';
 import { registerOperatorRoutes } from './operator.js';
 import { Gateway } from './gateway.js';
 import { PostgresIntentJournal } from './journal.js';
-import { estimateOpenRouterRequest, openRouterTransport, type OpenRouterProfile } from './openrouter.js';
+import { estimateOpenRouterRequest, openRouterTransport, qwen38Max, type OpenRouterProfile } from './openrouter.js';
 import { BUDGET_USD_NANOS, type Attempt, type CallInput, type CallResult,
   type GenerationRef, type ModelTransport, type Obligation, type RoutePolicy } from './types.js';
 
@@ -302,6 +302,73 @@ test('qualified short-request bounds price the serialized wire and fall back out
       assert.equal(estimateOpenRouterRequest(bounded, route, larger), null);
     }
   }
+});
+
+test('Qwen3.8 low reasoning requires explicit qualification and reserves separate reasoning at full rates', async t => {
+  const ref = project();
+  const route = { ...baseRoute, id: 'qwen38-fixture', transport: 'openrouter', ceilingUsdNanos: 2_593_848_000 } as const;
+  const profile = {
+    ...fixtureRates, routeId: route.id, revision: route.revision, model: qwen38Max,
+    provider: 'alibaba', expectedResponseProvider: 'Alibaba', mode: 'synthetic-research',
+    boundEvidenceRef: 'fixture:alibaba-reasoning-and-rates', validUntil: '2099-01-01T00:00:00Z',
+    syntheticScopes: [{ ...ref, approvalRef: 'fixture:alibaba-scope', originalSha256s: ['a'.repeat(64)], retentionApproval: {
+      approvalRef: 'fixture:retention', noTrainingEvidenceRef: 'fixture:no-training', validUntil: '2099-01-01T00:00:00Z',
+    } }],
+    knownNoChargeStatuses: [], inputTokenUpperBound: 1_000_000, outputTokenLimit: 8192,
+    promptNanosPerToken: 2_000, completionNanosPerToken: 6_000, reasoningNanosPerToken: 6_000,
+    cacheReadNanosPerToken: 250, cacheWriteNanosPerToken: 2_500, requestNanos: 0, additionalNanos: 20_000_000,
+  } as const satisfies OpenRouterProfile;
+  const qualified = { ...profile, reasoningEffort: 'low', completionCapIncludesReasoning: false } as const;
+  const approval = { qualification: 'step-15', endpoint: 'https://openrouter.ai', apiKey: 'fixture-key' } as const;
+  const build = (profile: OpenRouterProfile) => openRouterTransport({ ...approval, profiles: [profile] });
+  const toolCall = { id: 'call_fixture', type: 'function', function: { name: 'fixture_tool', arguments: '{}' } };
+  const request = {
+    model: qwen38Max, max_tokens: 8192, stream: false, tool_choice: 'auto', parallel_tool_calls: false,
+    tools: [{ type: 'function', function: { name: 'fixture_tool', parameters: { type: 'object' } } }],
+    messages: [{ role: 'user', content: 'synthetic' }, { role: 'assistant', content: null, tool_calls: [toolCall] },
+      { role: 'tool', tool_call_id: toolCall.id, content: '{"ok":true}' }],
+  };
+  const standard = build(profile);
+  const low = build(qualified);
+  assert.equal(standard.quote?.(route, request)?.ceilingUsdNanos, 2_569_212_000);
+  const quote = low.quote?.(route, request);
+  assert.ok(quote);
+  assert.equal(quote.ceilingUsdNanos, route.ceilingUsdNanos);
+  assert.equal(estimateOpenRouterRequest(qualified, route, request)?.ceilingUsdNanos, quote.ceilingUsdNanos);
+  assert.equal(low.quote?.({ ...route, ceilingUsdNanos: route.ceilingUsdNanos - 1 }, request), null);
+  assert.equal(low.quote?.(route, { ...request, reasoning_effort: 'low' }), null);
+  assert.equal(low.quote?.(route, { ...request, reasoning: { max_tokens: 512 } }), null);
+  assert.equal(low.quote?.(route, { ...request, max_tokens: 2048 }), null);
+  assert.equal(low.requestBlock?.(route, { ...request, tool_choice: 'required' }), 'route_parameters_unsupported');
+  assert.equal(low.requestBlock?.(route, { ...request, tool_choice: { type: 'function', function: toolCall.function } }),
+    'route_parameters_unsupported');
+  for (const disallowed of [{ model: 'qwen/qwen4-max' }, { provider: 'alibaba/us-east-1' },
+    { reasoningEffort: 'none' }, { reasoningEffort: null }, { boundEvidenceRef: '' },
+    { completionNanosPerToken: 0 }, { reasoningNanosPerToken: 0 }, { cacheWriteNanosPerToken: 0 }]) {
+    assert.throws(() => build({ ...qualified, ...disallowed } as OpenRouterProfile), /invalid_openrouter_profile/);
+  }
+  const baseQuote = standard.quote!(route, request)!;
+  assert.notEqual(baseQuote.pricingFingerprint, quote.pricingFingerprint);
+  const attempt: Attempt = { ...ref, ...quote, id: randomUUID(), jobId: randomUUID(), purpose: 'primary_b',
+    effectKey: 'fixture:qwen38', requestHash: 'fixture:request', routeId: route.id, revision: route.revision,
+    dataClass: 'synthetic', previousRejectedId: null };
+  const wires: Record<string, unknown>[] = [];
+  t.mock.method(globalThis, 'fetch', async (url: string, options: RequestInit) => {
+    assert.equal(url, 'https://openrouter.ai/api/v1/chat/completions');
+    wires.push(JSON.parse(options.body as string));
+    return Response.json({ id: 'gen-fixture-qwen38', model: qwen38Max, provider: 'Alibaba', usage: { cost: 0 }, choices: [] });
+  });
+  const signal = new AbortController().signal;
+  assert.equal((await low.send({ ...attempt, ...baseQuote }, route, request, signal)).receipt.state, 'rejected');
+  assert.equal(wires.length, 0);
+  assert.equal((await standard.send({ ...attempt, ...baseQuote }, route, request, signal)).receipt.state, 'paid');
+  assert.equal((await low.send(attempt, route, request, signal)).receipt.state, 'paid');
+  const { reasoning_effort, ...wireWithoutEffort } = wires[1];
+  assert.equal(reasoning_effort, 'low');
+  assert.deepEqual(wireWithoutEffort, wires[0]);
+  assert.deepEqual(wires[1].messages, request.messages);
+  assert.deepEqual(wires[1].provider, { only: ['alibaba'], order: ['alibaba'], allow_fallbacks: false, require_parameters: true,
+    data_collection: 'allow', zdr: false, max_price: { prompt: 2, completion: 6, request: 0, image: 0.00002 } });
 });
 
 test('Decart is scoped to the qualified synthetic Kimi route and requires a supported tool choice', async t => {

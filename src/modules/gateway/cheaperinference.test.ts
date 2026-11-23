@@ -33,6 +33,9 @@ test('the direct transport bounds the request and verifies the approved original
     image_url: { url: 'https://example.invalid/a.png' } }] }] }), null);
   assert.throws(() => cheaperInferenceTransport({ apiKey: 'wrong-provider-fixture', profiles: [profile] }),
     { code: 'cheaperinference_key_required' });
+  const unsupportedProfile = { ...profile, reasoningEffort: 'low' };
+  assert.throws(() => cheaperInferenceTransport({ apiKey: key, profiles: [unsupportedProfile] }),
+    { code: 'invalid_cheaperinference_profile' });
 
   const source = { projectId: scope.projectId, versionId: randomUUID(), documentId: randomUUID(), sha256 };
   const context: ModelAuthorization = { projectId: scope.projectId, scopeId: null, jobId: randomUUID(),

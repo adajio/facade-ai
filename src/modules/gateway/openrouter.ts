@@ -11,7 +11,7 @@ type OpenRouterPricingQualification = {
   cacheBilling: 'replaces-input' | 'supplement';
   reasoningNanosPerToken: number;
   reasoningBilling: 'replaces-output' | 'supplement';
-  completionCapIncludesReasoning: true;
+  completionCapIncludesReasoning: boolean;
   completionParameter: 'max_tokens' | 'max_completion_tokens';
 };
 
@@ -37,6 +37,7 @@ export type OpenRouterProfile = {
   syntheticScopes?: readonly SyntheticScope[];
   boundEvidenceRef: string;
   validUntil: string;
+  reasoningEffort?: 'low';
   inputTokenUpperBound: number;
   inputEnvelope?: OpenRouterInputEnvelope;
   outputTokenLimit: number;
@@ -64,6 +65,8 @@ const messageFields = new Set(['role','name','content','tool_call_id','tool_call
 const functionFields = new Set(['name','description','parameters','strict']);
 const endpoints = ['https://openrouter.ai','https://eu.openrouter.ai','https://us.openrouter.ai'];
 export const qwen38Max = 'qwen/qwen3.8-max-0902';
+const qwen38LowReasoningTokens = 4_096;
+const alibabaTokenTolerance = 10;
 const allowedModel = /^[a-z0-9._-]+\/[a-z0-9._-]+$/;
 const allowedProvider = /^[a-z0-9._-]+(?:\/[a-z0-9._-]+)*$/;
 const tracePlaceholder = '00000000-0000-0000-0000-000000000000';
@@ -213,9 +216,13 @@ function endpointBlock(profile: QualifiedOpenRouterProfile, request: unknown, en
   const body = record(request);
   const choice = body?.tool_choice;
   const named = record(choice);
-  const choiceSupported = choice === undefined || choice === 'none' || choice === 'auto' || (!decart && choice === 'required')
-    || (named?.type === 'function' && typeof record(named.function)?.name === 'string');
+  const lowReasoning = profile.reasoningEffort === 'low';
+  const choiceSupported = choice === undefined || choice === 'none' || choice === 'auto'
+    || (!lowReasoning && ((!decart && choice === 'required')
+      || (named?.type === 'function' && typeof record(named.function)?.name === 'string')));
+  const tokens = body?.max_completion_tokens ?? body?.max_tokens;
   if (profile.completionParameter !== 'max_tokens' || !choiceSupported
+    || (lowReasoning && typeof tokens === 'number' && tokens <= qwen38LowReasoningTokens + alibabaTokenTolerance)
     || (body?.parallel_tool_calls !== undefined && body.parallel_tool_calls !== false)) {
     return 'route_parameters_unsupported';
   }
@@ -305,6 +312,7 @@ function requestBody(profile: QualifiedOpenRouterProfile, value: unknown, route:
   const decart = isDecartKimiK31Pro(profile.model, profile.provider);
   const wire = {
     ...approved, messages, [profile.completionParameter]: tokens, stream: false, usage: { include: true },
+    ...(profile.reasoningEffort === 'low' ? { reasoning_effort: profile.reasoningEffort } : {}),
     plugins: disabledPlugins,
     ...(!alibaba && !wafer && !decart && parallelTools !== undefined ? { parallel_tool_calls: parallelTools } : {}),
     provider: {
@@ -326,8 +334,9 @@ function requestBody(profile: QualifiedOpenRouterProfile, value: unknown, route:
     const fallbackCost = BigInt(extraOutputTokens) * BigInt(outputRate);
     if (BigInt(profile.additionalNanos) < fallbackCost) return null;
   }
-  // Alibaba documents a tolerance of ten generated tokens on the equivalent completion cap.
-  const billedOutputTokens = tokens + (alibaba ? 10 : 0);
+  // Cover both combined and separate output caps on the opted-in Qwen3.8 route.
+  const separateReasoning = profile.reasoningEffort === 'low' ? qwen38LowReasoningTokens + alibabaTokenTolerance : 0;
+  const billedOutputTokens = tokens + (alibaba ? alibabaTokenTolerance : 0) + separateReasoning;
   const input = BigInt(inputTokens) * BigInt(inputRate);
   const outputAndReasoning = BigInt(billedOutputTokens) * BigInt(outputRate);
   const imageCharge = BigInt(images) * BigInt(profile.imageNanos);
@@ -342,12 +351,24 @@ function requestBody(profile: QualifiedOpenRouterProfile, value: unknown, route:
   };
 }
 
+function validReasoningProfile(profile: OpenRouterProfile): boolean {
+  if (profile.reasoningEffort === undefined) return profile.completionCapIncludesReasoning === true;
+  return profile.reasoningEffort === 'low' && profile.model === qwen38Max && profile.provider === 'alibaba'
+    && profile.expectedResponseProvider === 'Alibaba' && profile.mode === 'synthetic-research'
+    && profile.completionParameter === 'max_tokens' && typeof profile.completionCapIncludesReasoning === 'boolean'
+    && profile.outputTokenLimit > qwen38LowReasoningTokens + alibabaTokenTolerance && profile.outputTokenLimit <= 131_072
+    // Public list rates in USD nanos/token for the two eligible Alibaba endpoints.
+    && profile.promptNanosPerToken >= 2_000 && profile.completionNanosPerToken >= 6_000
+    && (profile.reasoningNanosPerToken ?? -1) >= 6_000 && (profile.cacheReadNanosPerToken ?? -1) >= 250
+    && (profile.cacheWriteNanosPerToken ?? -1) >= 2_500;
+}
+
 function validProfile(profile: OpenRouterProfile): profile is QualifiedOpenRouterProfile {
   return Boolean(profile.routeId && profile.revision && allowedModel.test(profile.model) && allowedProvider.test(profile.provider)
     && profile.expectedResponseProvider?.trim() && approvedProfile(profile) && validInputEnvelope(profile)
     && profile.boundEvidenceRef?.trim() && Number.isFinite(Date.parse(profile.validUntil))
     && positiveInteger(profile.inputTokenUpperBound, 10_000_000) && positiveInteger(profile.outputTokenLimit, 1_000_000)
-    && profile.completionCapIncludesReasoning === true
+    && validReasoningProfile(profile)
     && (profile.completionParameter === 'max_tokens' || profile.completionParameter === 'max_completion_tokens')
     && (profile.cacheBilling === 'replaces-input' || profile.cacheBilling === 'supplement')
     && (profile.reasoningBilling === 'replaces-output' || profile.reasoningBilling === 'supplement')
