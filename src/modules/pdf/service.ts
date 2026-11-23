@@ -401,11 +401,11 @@ export function createReaderService(db: Pool, deps: ReaderDependencies, adapters
     return nativePresentation(bytes);
   }
 
-  async function indexedNative(source: SourceRef, version: string, format: string, request: ReadRequest) {
+  async function indexedNative(source: SourceRef, version: string, format: string, request: ReadRequest, tx?: PoolClient) {
     if (request.representation !== 'native' || request.query !== undefined || request.address.box) return;
     const { unitId, locator } = request.address;
     const id = blockId(source, version, unitId);
-    const { rows: [stored] } = await db.query<NativeArtifact & { address: ReaderAddress }>(
+    const { rows: [stored] } = await (tx ?? db).query<NativeArtifact & { address: ReaderAddress }>(
       `SELECT b.artifact_sha256 AS sha256,b.artifact_size AS size,b.address
          FROM project_memory_blocks b
          JOIN project_memory_versions v USING(project_id,version_id,contract)
@@ -424,7 +424,7 @@ export function createReaderService(db: Pool, deps: ReaderDependencies, adapters
       throw new ReaderError('reader_artifact_mismatch', 'Адрес сохранённого представления расходится с индексом', 424);
     }
     const output: ReaderOutput = { ...presentation, bytes, mediaType: 'application/json' };
-    return { id, artifact: { sha256, size }, output };
+    return { id, artifact: { sha256, size }, output, presentation };
   }
 
   async function open(sourceRef: SourceRef, readScope: ReadScope, input: ReadRequest) {
@@ -628,9 +628,20 @@ export function createReaderService(db: Pool, deps: ReaderDependencies, adapters
         }
         const partBytes = view === evidence ? bytes : await content(view);
         if (view.inputImage && view !== evidence) await content(view, 'ocr-input');
-        deliveredParts.set(id, { evidence: view, lines: JSON.parse(partBytes.toString('utf8')).lines });
+        const presentation = JSON.parse(partBytes.toString('utf8')) as NativePresentation;
+        if (view.format === 'pdf' && view.representation === 'native' && view.address.box
+          && (!presentation.address || fingerprint(presentation.address) !== fingerprint(view.address))) {
+          throw new ReaderError('reader_artifact_mismatch', 'Адрес сохранённого PDF-фрагмента расходится с выдачей', 424);
+        }
+        deliveredParts.set(id, { evidence: view, lines: presentation.lines });
       }
-      compound = groundComponents(parts, deliveredParts);
+      const needsCanonical = evidence.format === 'pdf' && evidence.representation === 'native' && evidence.address.box
+        && parts.some(({ evidenceId, lineId, link }) => (link.kind === 'same_row' || link.kind === 'source_context')
+          && lineId === anchor.lineId && parts[link.to]?.lineId === lineId && parts[link.to].evidenceId !== evidenceId);
+      const canonical = needsCanonical && await indexedNative(source, evidence.readerVersion, 'pdf', {
+        address: { unitId: evidence.address.unitId, locator: evidence.address.locator }, representation: 'native',
+      }, tx);
+      compound = groundComponents(parts, deliveredParts, canonical ? canonical.presentation : undefined);
     }
     const observation: Observation = {
       ...candidate, id: randomUUID(), source, receiptId: evidence.receiptId, readerVersion: evidence.readerVersion,

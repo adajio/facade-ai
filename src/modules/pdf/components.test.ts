@@ -189,3 +189,70 @@ test('IFC default uses the project length assignment, with an explicit property 
   assert.equal(projectLengthAssignment([project, line('#2', 'IFCUNITASSIGNMENT((#3,#5))'), metric, metre]
     .map(({ text }) => text)), undefined);
 });
+
+test('split native PDF components require the independently indexed line and retain their own visible citations', () => {
+  const id = '1.0.4.0';
+  const locator = { page: 1, rotation: 0 };
+  const visible = { x: 0, y: 0, width: 864, height: 612 };
+  const line = (text: string, x: number, width: number): ReaderLine => ({ id, text, box: { x, y: 186, width, height: 10 } });
+  const left = line('Drawing | Facade: QF-82 | Building: C2 | Axes: D4-D8 | Guide offset:', 47, 403);
+  const right = line('Guide offset: 44 mm', 414, 78);
+  const leftView = view([left], 'pdf');
+  const rightView = view([right], 'pdf', leftView.evidence);
+  leftView.evidence.address = { unitId: '1', locator, box: { ...visible, width: 450 } };
+  rightView.evidence.address = { unitId: '1', locator, box: { ...visible, x: 414, width: 450 } };
+  const row = line(left.text + ' 44 mm', 47, 445);
+  const index = { address: { unitId: '1', locator }, lines: [row], limitations: [] };
+  const value = { ...part(rightView, right, 'value', '44', { kind: 'anchor' }), quote: '44 mm' };
+  const unit = { ...part(rightView, right, 'unit', 'mm', { kind: 'source_context', to: 0 }), quote: '44 mm' };
+  const identifier = part(leftView, left, 'identifier', 'QF-82', { kind: 'same_row', to: 0 });
+  const input = [value, unit, identifier];
+  const views = lookup(leftView, rightView);
+
+  assert.throws(() => groundComponents(input, views), { code: 'reader_component_link_invalid' });
+  const { components } = groundComponents(input, views, index);
+  assert.equal(components[2].binding?.kind, 'row_context');
+  assert.equal(components[2].evidenceId, leftView.evidence.id);
+  assert.equal(components[2].quote, left.text);
+  assert.deepEqual(components[2].address.box, left.box);
+  assert.deepEqual(components[0].address.box, right.box);
+  assert.equal(groundComponents([value, unit, { ...identifier, link: { kind: 'source_context', to: 0 } }], views, index).components.length, 3);
+
+  for (const modified of [
+    { ...leftView.evidence, runId: randomUUID() },
+    { ...leftView.evidence, branch: 'B' as const },
+    { ...leftView.evidence, receiptId: randomUUID() },
+    { ...leftView.evidence, source: { ...leftView.evidence.source, documentId: randomUUID() } },
+    { ...leftView.evidence, source: { ...leftView.evidence.source, versionId: randomUUID() } },
+    { ...leftView.evidence, source: { ...leftView.evidence.source, sha256: '0'.repeat(64) } },
+    { ...leftView.evidence, readerVersion: 'different' },
+    { ...leftView.evidence, representation: 'ocr' as const },
+    { ...leftView.evidence, address: { ...leftView.evidence.address, unitId: '2' } },
+    { ...leftView.evidence, address: { ...leftView.evidence.address, locator: { ...locator, rotation: 90 } } },
+    { ...leftView.evidence, address: { ...leftView.evidence.address, box: { ...visible, width: 100 } } },
+  ]) {
+    assert.throws(() => groundComponents(input, lookup({ ...leftView, evidence: modified }, rightView), index),
+      { code: 'reader_component_link_invalid' });
+  }
+  assert.throws(() => groundComponents(input, views, { ...index, lines: [row, row] }), { code: 'reader_component_link_invalid' });
+  assert.throws(() => groundComponents(input, views, { ...index, lines: [{ ...row, text: row.text.replace('QF-82', 'QF-83') }] }),
+    { code: 'reader_component_link_invalid' });
+  assert.throws(() => groundComponents([value, unit, { ...identifier, lineId: 'different' }], views, index),
+    { code: 'reader_component_quote_mismatch' });
+  assert.throws(() => groundComponents([value, unit, { ...identifier, quote: row.text }], views, index),
+    { code: 'reader_component_quote_mismatch' });
+  assert.throws(() => groundComponents([value, unit, { ...identifier, link: { kind: 'column_header', to: 0 } }], views, index),
+    { code: 'reader_component_link_invalid' });
+  assert.throws(() => groundComponents([value, unit, { ...identifier, link: { kind: 'shared_identifier', to: 0 } }], views, index),
+    { code: 'reader_component_link_invalid' });
+  const competing = { ...index, lines: [{ ...row, text: row.text + ' | Facade: QF-83' }] };
+  assert.throws(() => groundComponents(input, views, competing), { code: 'reader_component_identifier_unbound' });
+  assert.throws(() => groundComponents([value, unit, { ...identifier, role: 'relationship' }], views, competing),
+    { code: 'reader_component_identifier_unbound' });
+  const repeated = { ...index, lines: [{ ...row, text: row.text + ' | Mark: QF-82' }] };
+  assert.throws(() => groundComponents(input, views, repeated), { code: 'reader_component_identifier_unbound' });
+  const otherLine = { ...left, id: '1.0.3.0' };
+  const sameBand = { ...leftView, lines: [otherLine] };
+  assert.throws(() => groundComponents([value, unit, { ...identifier, lineId: otherLine.id }], lookup(sameBand, rightView),
+    { ...index, lines: [row, otherLine] }), { code: 'reader_component_link_invalid' });
+});

@@ -1,7 +1,9 @@
-import { ReaderError, type Evidence, type ReaderComponentInput, type ReaderLine, type ReaderObservationComponent } from './types.js';
+import { ReaderError, type Evidence, type NativePresentation, type ReaderComponentInput, type ReaderLine, type ReaderObservationComponent } from './types.js';
 import { assignmentReferences, ifcLengthProperty, lengthSiUnit, stepEntity } from '../formats/ifc-units.js';
+import { fingerprint } from '../project-memory/contracts.js';
+import { nativeLineFragment } from './native-line.js';
 
-type Addressed = { component: ReaderObservationComponent; line: ReaderLine; lines: readonly ReaderLine[]; format: string };
+type Addressed = { component: ReaderObservationComponent; line: ReaderLine; lines: readonly ReaderLine[]; format: string; view: Evidence };
 type Binding = NonNullable<ReaderObservationComponent['binding']>;
 type Span = { start: number; end: number };
 const invalid = (code = 'reader_component_link_invalid') => new ReaderError(code, 'Составная опора не подтверждена указанными адресами', 422);
@@ -15,7 +17,7 @@ function numbers(text: string) {
     .map(({ 0: literal, index }) => ({ start: index, end: index + literal.length, literal }));
 }
 
-function quoteSpan({ component: { quote }, line }: Addressed): Span | undefined {
+function quoteSpan({ component: { quote }, line }: Pick<Addressed, 'component' | 'line'>): Span | undefined {
   const start = line.text.indexOf(quote);
   return start >= 0 && line.text.indexOf(quote, start + 1) < 0 ? { start, end: start + quote.length } : undefined;
 }
@@ -267,6 +269,49 @@ function verifyLink(a: Addressed, b: Addressed, kind: Exclude<ReaderComponentInp
   }
 }
 
+function nativeComponentLine(part: Addressed, target: Addressed, anchor: Addressed, canonical?: NativePresentation) {
+  const { kind } = part.component.link;
+  if (!canonical || (kind !== 'same_row' && kind !== 'source_context') || part.view.id === target.view.id
+    || part.line.id !== anchor.line.id || target.line.id !== anchor.line.id) return;
+  const { source, address, runId, branch, readerVersion, receiptId } = anchor.view;
+  if (canonical.address.box || canonical.address.unitId !== address.unitId
+    || canonical.address.locator?.page !== Number(address.unitId)) return;
+  const matches = canonical.lines.filter(({ id }) => id === anchor.line.id);
+  if (matches.length !== 1) return;
+  const [line] = matches;
+  const pageLocator = fingerprint(canonical.address.locator);
+  for (const { view, line: visible, component } of [part, target, anchor]) {
+    const frame = view.address.box;
+    if (!frame || view.format !== 'pdf' || view.representation !== 'native' || view.mediaType !== 'application/json'
+      || view.runId !== runId || view.branch !== branch || view.readerVersion !== readerVersion || view.receiptId !== receiptId
+      || view.source.projectId !== source.projectId || view.source.documentId !== source.documentId
+      || view.source.versionId !== source.versionId || view.source.sha256 !== source.sha256
+      || view.address.unitId !== address.unitId || fingerprint(view.address.locator ?? {}) !== pageLocator
+      || !nativeLineFragment(line, { evidenceId: view.id, frame, line: visible })
+      || !quoteSpan({ component, line })) return;
+  }
+  return line;
+}
+
+const facadeField = /^\s*(?:(?:project\s+)?facade(?:\s+(?:identifier|id))?|фасад|(?:код|идентификатор)\s+фасада(?:\s+проекта)?)\s*[:=№]\s*(.*?)\s*$/iu;
+
+function boundNativeComponent(part: Addressed, target: Addressed, anchor: Addressed, line: ReaderLine): Binding {
+  const facades = line.text.split(fieldSeparator).flatMap((field) => facadeField.exec(field)?.[1] ?? []);
+  // A compound citation must not select one facade out of a list or competing declarations.
+  if (facades.length > 1 || (facades.length === 1 && !/^[\p{L}\p{N}][\p{L}\p{N}_.-]*$/u.test(facades[0]))) {
+    throw invalid('reader_component_identifier_unbound');
+  }
+  if (part.component.role === 'identifier') {
+    const literal = escaped(part.component.literal);
+    if ([...line.text.matchAll(new RegExp(`(?<![\\p{L}\\p{N}_-])${literal}(?![\\p{L}\\p{N}_-])`, 'gu'))].length !== 1) {
+      throw invalid('reader_component_identifier_unbound');
+    }
+    const binding = boundComponent({ ...part, line }, { ...anchor, line });
+    return { ...binding, text: part.component.quote };
+  }
+  return boundComponent({ ...part, line }, { ...target, line });
+}
+
 function verifiedIfcUnit(addressed: Addressed[]) {
   const [anchor] = addressed;
   if (anchor.format !== 'ifc') return;
@@ -295,7 +340,8 @@ function verifiedIfcUnit(addressed: Addressed[]) {
   return normalized;
 }
 
-export function groundComponents(inputs: readonly ReaderComponentInput[], evidence: ReadonlyMap<string, { evidence: Evidence; lines: ReaderLine[] }>) {
+export function groundComponents(inputs: readonly ReaderComponentInput[],
+  evidence: ReadonlyMap<string, { evidence: Evidence; lines: ReaderLine[] }>, canonical?: NativePresentation) {
   if (inputs.length < 2 || inputs.length > 12 || inputs[0].role !== 'value' || inputs[0].link.kind !== 'anchor' ||
     ['value', 'unit', 'variant', 'revision'].some((role) => inputs.filter((part) => part.role === role).length > 1)) throw invalid();
   if (/^[+-]?\d+(?:[,.]\d*)?(?:[eE][+-]?\d+)?$/u.test(inputs[0].literal) && !inputs.some(({ role }) => role === 'unit')) {
@@ -310,16 +356,26 @@ export function groundComponents(inputs: readonly ReaderComponentInput[], eviden
     }
     const { evidence: view, lines } = issued;
     const [line] = matches;
-    const current: Addressed = { line, lines, format: view.format, component: { ...part, source: view.source, receiptId: view.receiptId,
+    const current: Addressed = { line, lines, format: view.format, view, component: { ...part, source: view.source, receiptId: view.receiptId,
       readerVersion: view.readerVersion, evidenceHref: `/api/v1/evidence/${view.id}`,
       address: { ...view.address, box: line.box ?? view.address.box, locator: { ...view.address.locator, ...line.locator } },
     } };
-    if (part.link.kind === 'anchor' ? index !== 0 : !Number.isInteger(part.link.to) || part.link.to < 0
-      || part.link.to >= index || !verifyLink(current, addressed[part.link.to], part.link.kind)) throw invalid();
+    const target = part.link.kind === 'anchor' ? undefined : addressed[part.link.to];
+    let canonicalLine: ReaderLine | undefined;
+    if (part.link.kind === 'anchor') {
+      if (index !== 0) throw invalid();
+    } else {
+      if (!Number.isInteger(part.link.to) || !target) throw invalid();
+      if (!verifyLink(current, target, part.link.kind)) {
+        canonicalLine = nativeComponentLine(current, target, addressed[0], canonical);
+        if (!canonicalLine) throw invalid();
+      }
+    }
     if (part.role === 'unit' && (part.link.kind === 'anchor' || (part.link.kind !== 'ifc_reference'
       && (part.link.kind === 'shared_identifier' || addressed[part.link.to]?.component.role !== 'value'))
       || /^[+-]?\d+(?:[,.]\d+)?$/u.test(part.literal))) throw invalid();
-    current.component.binding = boundComponent(current, part.link.kind === 'anchor' ? undefined : addressed[part.link.to]);
+    current.component.binding = canonicalLine && target
+      ? boundNativeComponent(current, target, addressed[0], canonicalLine) : boundComponent(current, target);
     addressed.push(current);
   }
   return { components: addressed.map(({ component }) => component), ifcUnit: verifiedIfcUnit(addressed) };

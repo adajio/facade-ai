@@ -9,6 +9,18 @@ export type VerifiedNativeDeliveryLine = {
   crops: [NativeLineCrop] | [NativeLineCrop, NativeLineCrop];
 };
 
+export function nativeLineFragment(line: ReaderLine, crop: NativeLineCrop) {
+  const full = line.box;
+  const box = crop.line.box;
+  const text = crop.line.text;
+  const start = line.text.indexOf(text);
+  if (!text || start < 0 || line.text.indexOf(text, start + 1) >= 0 || crop.line.id !== line.id
+    || !full || !validBox(full) || !box || !validBox(box) || !validBox(crop.frame)
+    || !contains(crop.frame, box) || !contains(full, box)
+    || Math.abs(full.y - box.y) > 0.02 || Math.abs(full.height - box.height) > 0.02) return;
+  return { crop, box, start, endText: start + text.length };
+}
+
 // Verify text and original PDF coordinates against the canonical line. The
 // pair must cover the whole line to use positive evidence from both crops.
 export function verifiedNativeLineCrops(
@@ -17,15 +29,7 @@ export function verifiedNativeLineCrops(
   const full = line.box;
   if (!full || !validBox(full)) return;
   const end = (box: Box) => box.x + box.width;
-  const fragments = crops.flatMap((crop) => {
-    const box = crop.line.box;
-    const text = crop.line.text;
-    const start = text && line.text.indexOf(text);
-    if (typeof start !== 'number' || start < 0 || line.text.indexOf(text, start + 1) >= 0 || crop.line.id !== line.id
-      || !box || !validBox(box) || !validBox(crop.frame) || !contains(crop.frame, box) || !contains(full, box)
-      || Math.abs(full.y - box.y) > 0.02 || Math.abs(full.height - box.height) > 0.02) return [];
-    return [{ crop, box, start, endText: start + text.length }];
-  });
+  const fragments = crops.map((crop) => nativeLineFragment(line, crop)).filter((crop) => crop !== undefined);
   for (const left of fragments) {
     if (left.start !== 0 || Math.abs(left.box.x - full.x) > 0.02) continue;
     for (const right of fragments) {
