@@ -25,7 +25,6 @@
   const commands = new Commands(() => api);
   let units = $state<ReaderMap['units']>([]);
   let cadMap = $state<{ versionId: string; readerVersion: string }>();
-  const cadVersion = $derived(cadMap?.versionId === versionId ? cadMap?.readerVersion : undefined);
   let work = $state<Work>();
   let readerError = $state('');
   let workError = $state('');
@@ -39,6 +38,7 @@
 
   const documentId = $derived(occurrence.documentId);
   const versionId = $derived(occurrence.versionId);
+  const cadVersion = $derived(cadMap?.versionId === versionId ? cadMap?.readerVersion : undefined);
   const originalHash = $derived(occurrence.sha256);
   const snapshotRevision = $derived(context.refreshKey);
   const mapReady = $derived(work?.mapReady);
