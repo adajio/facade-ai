@@ -1,17 +1,20 @@
 import assert from "node:assert/strict";
-import { copyFile, mkdir, readFile, writeFile } from "node:fs/promises";
+import { copyFile, mkdir, readFile, unlink, writeFile } from "node:fs/promises";
+import { createWriteStream } from "node:fs";
+import { Readable, Writable } from "node:stream";
 import { dirname, join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 
-import { convertBytes, converterImage } from "../../../converter-port/index.ts";
+import { convertDwg, dwgProfile } from "../../../converter-port/index.ts";
 import { sha256, stagePair } from "./pair.mjs";
 
 assert.equal(process.argv.length, 3, "Supply a new directory for the run");
 const output = resolve(process.argv[2]);
 const { cases } = await stagePair(output);
 const originals = new Map(cases.map((item) => [item.name, item]));
-const image = await converterImage("dwg");
-assert.ok(image, "The private DWG broker must be ready");
+const profile = await dwgProfile();
+assert.ok(profile, "The private DWG broker must be ready");
+const image = profile.id;
 assert.equal(image, process.env.FACADE_DWG_IMAGE, "Unexpected broker image");
 const evidence = [];
 
@@ -20,19 +23,23 @@ async function convertCase(name, inputPath = originals.get(name).libreInput, run
   const originalSha256 = sha256(bytes);
   assert.equal(originalSha256, originals.get(name).sha256);
   const started = performance.now();
-  const result = await convertBytes("dwg", bytes, { image });
+  const temporary = join(output, runName + ".wire");
+  const result = await convertDwg(Readable.from([bytes]), createWriteStream(temporary, { flags: "wx", mode: 0o600 }),
+    { size: bytes.length, image, timeout: profile.timeout });
   const elapsedMs = Math.round(performance.now() - started);
-  assert.equal(result.sha256, sha256(result.bytes));
-  const derivative = result.bytes.toString("latin1");
+  const payload = await readFile(temporary);
+  await unlink(temporary);
+  assert.equal(result.sha256, sha256(payload));
+  const derivative = payload.toString("latin1");
   const format = derivative.trimStart().startsWith("{") ? "json" : "dxf";
   if (format === "dxf") {
     assert.match(derivative, /(?:^|\r?\n)[ \t]*0\r?\nSECTION\r?\n[ \t]*2\r?\nENTITIES\r?\n/u);
     assert.match(derivative, /\r?\n[ \t]*0\r?\nEOF\s*$/u);
   }
-  await writeFile(join(output, runName + "." + format), result.bytes);
+  await writeFile(join(output, runName + "." + format), payload);
   evidence.push({ name: runName, image, originalSha256, inputBytes: bytes.length,
-    format, derivativeSha256: result.sha256, outputBytes: result.bytes.length, elapsedMs });
-  return { derivative, format, bytes: result.bytes };
+    format, derivativeSha256: result.sha256, outputBytes: payload.length, elapsedMs });
+  return { derivative, format, bytes: payload };
 }
 
 const schedule = await convertCase("schedule");
@@ -48,7 +55,9 @@ assert.equal(decoded.created_by, "LibreDWG 0.13.4");
 assert.ok(decoded.OBJECTS.some((object) => object.text_value === "Rib L2 | 13.25 mm" && object.entmode === 2));
 
 const damaged = await readFile(originals.get("unreadable").libreInput);
-await assert.rejects(convertBytes("dwg", damaged, { image }), { code: "invalid_request" });
+await assert.rejects(convertDwg(Readable.from([damaged]),
+  new Writable({ write(_chunk, _encoding, done) { done(); } }),
+  { size: damaged.length, image, timeout: profile.timeout }), { code: "invalid_request" });
 evidence.push({ name: "unreadable", image, originalSha256: sha256(damaged), code: "invalid_request" });
 
 const references = {

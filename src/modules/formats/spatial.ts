@@ -56,6 +56,124 @@ export function parseDxf(input: Buffer, checkInventory = false): Parsed {
   return checkInventory ? { ...parsed, inventory: dxfInventory(records, parsed.units) } : parsed;
 }
 
+const cadRowsPerSpace = 6000;
+const cadShapesPerSpace = 15000;
+const cadTextEntities = new Set(["TEXT", "MTEXT", "ATTRIB", "ATTDEF"]);
+const polylineGroups = new Set([10, 20, 40, 41, 42, 43]);
+const cadEntityGroups = new Set([1, 3, 5, 8, 10, 11, 20, 21, 30, 31, 40, 41, 42, 43, 50, 67, 70, 72, 73,
+  210, 220, 230, 330, 410]);
+const cadMetadataGroups = new Map<string, Set<number>>([
+  ["SECTION", new Set([2])], ["ENDSEC", new Set()],
+  ["LAYOUT", new Set([1, 330])], ["VIEW", new Set([2, 10, 11, 20, 21, 31, 40, 41, 50])],
+  ["BLOCK", new Set([70])], ["STYLE", new Set([3, 4])],
+]);
+
+// Stream converted DXF without indexing BLOCKS, proxy data or other sections the CAD reader cannot open.
+export async function parseConvertedDxf(
+  lines: AsyncIterable<string>, decodeValue = (line: string) => line,
+): Promise<Parsed> {
+  const records: Entity[] = [];
+  const counts = new Map<string, number>();
+  const groupBudget = 250_000;
+  const textBudget = 8_000_000;
+  let projectionHold: string | undefined;
+  let footprint = 0;
+  let characters = 0;
+  let section = "";
+  let seenEntities = false;
+  let eof = false;
+  let record: Entity = { type: "", groups: [] };
+
+  function holdProjection(code: string): void {
+    projectionHold ??= code;
+    records.length = 0;
+  }
+
+  function keep(): void {
+    if (record.type === "") return;
+    if (eof) throw new FormatHold("dxf_group_invalid");
+    if (record.type === "EOF") {
+      if (section) throw new FormatHold("dxf_eof_missing");
+      eof = true;
+      return;
+    }
+    if (record.type === "SECTION") {
+      if (section) throw new FormatHold("dxf_section_inventory_invalid");
+      section = first(record, 2) ?? "";
+      if (!section || (section === "ENTITIES" && seenEntities)) throw new FormatHold("dxf_section_inventory_invalid");
+      if (section === "ENTITIES") seenEntities = true;
+    } else if (record.type === "ENDSEC") {
+      if (!section) throw new FormatHold("dxf_section_inventory_invalid");
+      section = "";
+    } else if (section === "ENTITIES") {
+      const key = first(record, 410)
+        ? JSON.stringify(["name", first(record, 410)])
+        : JSON.stringify(["owner", first(record, 330)?.toUpperCase(), first(record, 67) === "1"]);
+      const count = counts.get(key);
+      // After a projection hold, count known spaces without retaining more geometry or space keys.
+      if (!projectionHold || count !== undefined) {
+        const next = (count ?? 0) + 1;
+        if (next > cadRowsPerSpace) throw new FormatHold("cad_entity_limit");
+        counts.set(key, next);
+      }
+    } else if (!cadMetadataGroups.has(record.type)) return;
+
+    if (projectionHold) return;
+    footprint += 1 + record.groups.length;
+    if (footprint > groupBudget) holdProjection("dxf_projected_group_limit");
+    else records.push(record);
+  }
+
+  let code: number | undefined;
+  let keys: Set<number> | undefined;
+  const firstGroups = new Map<number, Group>();
+
+  function keepGroup(code: number, line: string): void {
+    if (!keys?.has(code)) return;
+    const address = section === "ENTITIES" && [67, 330, 410].includes(code)
+      || record.type === "SECTION" && code === 2;
+    if (!projectionHold && record.groups.length >= groupBudget - footprint) {
+      holdProjection("dxf_projected_group_limit");
+    }
+    if (projectionHold && !address) return;
+
+    const repeated = record.type === "LWPOLYLINE" && polylineGroups.has(code)
+      || cadTextEntities.has(record.type) && (code === 1 || code === 3);
+    const previous = repeated ? undefined : firstGroups.get(code);
+    if (!previous) {
+      characters += line.length;
+      const group = { code, value: decodeValue(line) };
+      record.groups.push(group);
+      if (!repeated) firstGroups.set(code, group);
+    } else if (record.type === "LAYOUT" && code === 330) {
+      const value = decodeValue(line);
+      characters += value.length - previous.value.length;
+      previous.value = value;
+    }
+    if (!projectionHold && characters > textBudget) holdProjection("dxf_projected_text_limit");
+  }
+
+  for await (const line of lines) {
+    if (code === undefined) {
+      if (!/^[ \t]*\d{1,4}[ \t]*$/.test(line)) throw new FormatHold("dxf_group_invalid");
+      code = Number(line);
+    } else {
+      if (code === 0) {
+        keep();
+        record = { type: decodeValue(line).trim().toUpperCase(), groups: [] };
+        keys = cadMetadataGroups.get(record.type) ?? (section === "ENTITIES" ? cadEntityGroups : undefined);
+        firstGroups.clear();
+      } else keepGroup(code, line);
+      code = undefined;
+    }
+  }
+  if (code !== undefined) throw new FormatHold("dxf_group_limit_or_invalid");
+  keep();
+  if (!eof) throw new FormatHold("dxf_eof_missing");
+  if (projectionHold) throw new FormatHold(projectionHold);
+  return parseCadRecords(records);
+}
+
 const dxfAddressLimits = new Set(["cad_entity_handle_unconfirmed"]);
 
 function dxfInventory(records: Entity[], units: Unit[]): PhysicalInventory {
@@ -192,14 +310,14 @@ function parseCadRecords(records: Entity[], issues = new Set<string>()): Parsed 
     const name = first(record, 410) || ownerLayouts.get(first(record, 330)?.toUpperCase() ?? "")
       || (first(record, 67) === "1" ? "Paper" : "Model");
     const layout = space(name);
-    if (layout.rows.length >= 6000 || layout.shapes.length > 15000) throw new FormatHold("cad_entity_limit");
+    if (layout.rows.length >= cadRowsPerSpace || layout.shapes.length > cadShapesPerSpace) throw new FormatHold("cad_entity_limit");
     const candidate = first(record, 5)?.toUpperCase();
     const handle = candidate && /^[0-9A-F]{1,16}$/.test(candidate) && handleCounts.get(candidate) === 1
       ? candidate : undefined;
     const entityOrdinal = index + 1;
     if (!handle) layout.limitations.add("cad_entity_handle_unconfirmed");
     const type = record.type;
-    const text = ["TEXT", "MTEXT", "ATTRIB", "ATTDEF"].includes(type) ? cadText(record) : "";
+    const text = cadTextEntities.has(type) ? cadText(record) : "";
     const x = numeric(record, 10);
     const y = numeric(record, 20);
     const layer = first(record, 8) ?? "0";
@@ -280,15 +398,13 @@ function parseCadRecords(records: Entity[], issues = new Set<string>()): Parsed 
   return { units };
 }
 
-export function parseDwgRecovery(input: Buffer): Parsed {
-  const document: { created_by?: unknown; OBJECTS?: unknown } = JSON.parse(decodeText(input));
-  if (typeof document?.created_by !== "string" || !document.created_by.startsWith("LibreDWG ")
-      || !Array.isArray(document.OBJECTS)) throw new FormatHold("dwg_recovery_invalid");
-  if (document.OBJECTS.length > 60_000) throw new FormatHold("cad_entity_limit");
-
+export async function parseDwgRecovery(objects: AsyncIterable<unknown>): Promise<Parsed> {
   const issues = new Set(["cad_dwg_json_recovery"]);
   const recovered: Entity[] = [];
-  for (const value of document.OBJECTS as unknown[]) {
+  const rowsBySpace = new Map<number, number>();
+  let total = 0;
+  for await (const value of objects) {
+    if (++total > 60_000) throw new FormatHold("cad_entity_limit");
     if (value === null || typeof value !== "object") continue;
     const object = value as Record<string, unknown>;
     const { entity, entmode, ins_pt: point, height, rotation, handle } = object;
@@ -298,10 +414,14 @@ export function parseDwgRecovery(input: Buffer): Parsed {
       continue;
     }
     const text = entity === "MTEXT" ? object.text : object.text_value;
-    if (!["TEXT", "MTEXT", "ATTRIB", "ATTDEF"].includes(entity) || typeof text !== "string") {
+    if (!cadTextEntities.has(entity) || typeof text !== "string") {
       issues.add("cad_dwg_recovery_text_only");
       continue;
     }
+    if (text.length > 8192) throw new FormatHold("cad_text_limit");
+    const rows = (rowsBySpace.get(entmode) ?? 0) + 1;
+    if (rows > cadRowsPerSpace) throw new FormatHold("cad_entity_limit");
+    rowsBySpace.set(entmode, rows);
     const groups: Group[] = [
       { code: 67, value: entmode === 1 ? "1" : "0" },
       { code: 8, value: "?" },

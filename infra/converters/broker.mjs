@@ -1,7 +1,7 @@
 import { execFile, spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { once } from "node:events";
-import { lstat, mkdir, mkdtemp, open, readdir, rm, statfs } from "node:fs/promises";
+import { chmod, lstat, mkdir, mkdtemp, open, readdir, rm, statfs } from "node:fs/promises";
 import { createServer } from "node:http";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { promisify } from "node:util";
@@ -9,9 +9,11 @@ import { promisify } from "node:util";
 const exec = promisify(execFile);
 const imageId = /^sha256:[a-f0-9]{64}$/;
 const containerId = /^[a-f0-9]{64}$/;
-const archiveLimit = 10 * 1024 ** 3;
+const receiptLimit = 10 * 1024 ** 3;
 const formatLimit = 16 * 1024 ** 2;
 const archiveSeconds = 1800;
+const largeUploadMs = 1_800_000;
+const dwgTransferMs = 1_800_000;
 const oleMagic = Buffer.from("d0cf11e0a1b11ae1", "hex");
 const status = {
   unavailable: 503, busy: 503, timeout: 504, memory_limit: 422, resource_limit: 413,
@@ -46,6 +48,16 @@ function absoluteEnv(key) {
   return resolve(path);
 }
 
+function profileValue(key, fallback, max) {
+  const value = integer(process.env[key] ?? String(fallback), max);
+  if (!value) throw new Error(`${key} must be positive`);
+  return value;
+}
+
+const dwgSeconds = profileValue("FACADE_DWG_TIMEOUT_SECONDS", 420, 3600);
+const dwgMemoryMiB = profileValue("FACADE_DWG_MEMORY_MIB", 1536, 65_536);
+const dwgReserveBytes = profileValue("FACADE_DWG_SCRATCH_RESERVE_BYTES", 1024 ** 3, 99_999_999_999);
+const dwgClientTimeoutMs = largeUploadMs + dwgSeconds * 1000 + dwgTransferMs + 60_000;
 const socketPath = absoluteEnv("FACADE_CONVERTER_SOCKET");
 const scope = createHash("sha256").update(socketPath).digest("hex").slice(0, 24);
 const label = `io.facade.converter-broker=${scope}`;
@@ -98,7 +110,7 @@ async function stage(input, target, size, operation, signal) {
     if (operation !== "archive") {
       const magic = Buffer.alloc(8);
       const { bytesRead } = await handle.read(magic, 0, magic.length, 0);
-      const expected = operation === "dwg" ? /^AC10\d{2}$/.test(magic.toString("ascii", 0, 6)) : magic.equals(oleMagic);
+      const expected = operation === "dwg" ? /^AC10\d{2}$/.test(magic.toString("latin1", 0, 6)) : magic.equals(oleMagic);
       if (bytesRead < (operation === "dwg" ? 6 : 8) || !expected) throw new Rejected("invalid_request");
     }
     await handle.chmod(0o444);
@@ -108,40 +120,75 @@ async function stage(input, target, size, operation, signal) {
   }
 }
 
-async function run(id, output, signal, maxOutput, archive) {
+async function run(id, signal, name, stream) {
   const child = spawn("docker", ["container", "start", "--attach", id], {
-    signal, killSignal: "SIGKILL", stdio: ["ignore", "pipe", "ignore"],
+    signal, killSignal: "SIGKILL", stdio: ["ignore", stream ? "pipe" : "ignore", "ignore"],
   });
   child.on("error", () => {});
   const closed = new Promise(resolveClose => child.once("close", resolveClose));
   let size = 0;
   try {
-    for await (const chunk of child.stdout) {
+    if (stream) for await (const chunk of child.stdout) {
       signal.throwIfAborted();
       size += chunk.length;
-      if (size > maxOutput) throw new Rejected("resource_limit");
-      if (!output.write(chunk)) await once(output, "drain", { signal });
+      if (size > stream.maxOutput) throw new Rejected("resource_limit");
+      if (!stream.output.write(chunk)) await once(stream.output, "drain", { signal });
     }
     const exitCode = await closed;
     signal.throwIfAborted();
     const state = JSON.parse(await docker("container", "inspect", "--format", "{{json .State}}", id));
     if (state.OOMKilled) throw new Rejected("memory_limit");
-    if (archive && state.ExitCode === 142) throw new Rejected("timeout");
+    if (name === "archive" && state.ExitCode === 142) throw new Rejected("timeout");
+    if (name === "dwg" && [73, 153].includes(state.ExitCode)) throw new Rejected("scratch_unavailable");
     if (state.Status !== "exited" || state.Error) throw new Rejected("unavailable");
     if (state.ExitCode !== 0 || exitCode !== 0) throw new Rejected("failed");
-    if (!size) throw new Rejected("output_missing");
+    if (stream && !size) throw new Rejected("output_missing");
   } finally {
     if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
     await closed;
   }
 }
 
-function reply(output, result) {
+async function streamDwg(path, output, signal) {
+  const entry = await lstat(path).catch(error => {
+    if (error.code === "ENOENT") throw new Rejected("output_missing");
+    throw error;
+  });
+  if (!entry.isFile() || entry.nlink !== 1 || !entry.size) throw new Rejected("output_missing");
+  const file = await open(path, "r");
+  try {
+    const head = Buffer.alloc(128);
+    const tail = Buffer.alloc(Math.min(entry.size, 128));
+    const { bytesRead } = await file.read(head, 0, head.length, 0);
+    await file.read(tail, 0, tail.length, entry.size - tail.length);
+    const json = /^\s*\{/.test(head.toString("utf8", 0, bytesRead));
+    if (json ? !/}\s*$/.test(tail.toString("ascii"))
+      : !/(?:^|[\r\n])[ \t]*0[ \t]*[\r\n]+EOF[ \t\r\n]*$/.test(tail.toString("ascii"))) {
+      throw new Rejected("failed");
+    }
+
+    output.setHeader("x-converter-bytes", String(entry.size));
+    const hash = createHash("sha256");
+    let size = 0;
+    for await (const chunk of file.createReadStream({ signal })) {
+      size += chunk.length;
+      hash.update(chunk);
+      if (!output.write(chunk)) await once(output, "drain", { signal });
+    }
+    if (size !== entry.size) throw new Rejected("failed");
+    return { "x-converter-sha256": hash.digest("hex"), "x-converter-bytes": String(size) };
+  } finally {
+    await file.close();
+  }
+}
+
+function reply(output, result, identity) {
   if (output.destroyed) return;
-  if (output.headersSent) output.addTrailers({ "x-converter-result": result });
+  if (output.headersSent) output.addTrailers({ "x-converter-result": result, ...(result === "ok" ? identity : undefined) });
   else {
     output.removeHeader("trailer");
     output.removeHeader("content-type");
+    output.removeHeader("x-converter-bytes");
     output.writeHead(status[result], { "x-converter-result": result, "content-length": 0 });
   }
   output.end();
@@ -152,7 +199,7 @@ async function handle(input, output, expectContinue = false) {
   const operation = operations.get(input.url);
   if (!ready) return reply(output, "unavailable");
   if (input.method === "GET" && input.url === "/v1/info") {
-    return output.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify(images));
+    return output.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({ ...images, ...(images.dwg ? { dwgClientTimeoutMs, dwgReserveBytes } : {}) }));
   }
   if (input.method !== "POST" || !operation || input.httpVersion !== "1.1") return reply(output, "invalid_request");
   const { name } = operation;
@@ -162,11 +209,12 @@ async function handle(input, output, expectContinue = false) {
   }
 
   const archive = name === "archive";
+  const dwg = name === "dwg";
   let size, expanded, entries;
   try {
-    size = integer(input.headers["content-length"], archive ? archiveLimit : formatLimit);
+    size = integer(input.headers["content-length"], archive || dwg ? receiptLimit : formatLimit);
     if (archive) {
-      expanded = integer(input.headers["x-expanded-bytes"], archiveLimit);
+      expanded = integer(input.headers["x-expanded-bytes"], receiptLimit);
       entries = integer(input.headers["x-archive-entries"], 10_000);
     }
   } catch {
@@ -179,14 +227,16 @@ async function handle(input, output, expectContinue = false) {
   let id;
   let creating = false;
   let result = "ok";
+  let identity;
   const disconnected = new AbortController();
   output.once("close", () => disconnected.abort());
   const active = AbortSignal.any([disconnected.signal, stopping.signal]);
-  const uploadDeadline = AbortSignal.timeout(archive ? 1_800_000 : 30_000);
+  const uploadDeadline = AbortSignal.timeout(archive || dwg ? largeUploadMs : 30_000);
   let runDeadline;
+  let transferDeadline;
   try {
     const free = await statfs(scratch, { bigint: true });
-    if (free.bavail * free.bsize < BigInt(size)) throw new Rejected("scratch_unavailable");
+    if (free.bavail * free.bsize < BigInt(size) + (dwg ? BigInt(dwgReserveBytes) : 0n)) throw new Rejected("scratch_unavailable");
     directory = await mkdtemp(join(scratch, "job-"));
     const source = join(directory, "input");
     if (expectContinue) output.writeContinue();
@@ -194,7 +244,20 @@ async function handle(input, output, expectContinue = false) {
     active.throwIfAborted();
 
     const destination = archive ? "/source" : `/original.${name}`;
-    const memory = archive ? "1024m" : "512m";
+    const memory = dwg ? `${dwgMemoryMiB}m` : archive ? "1024m" : "512m";
+    const dwgOut = join(directory, "out");
+    let dwgDiskArgs = [];
+    if (dwg) {
+      await mkdir(dwgOut);
+      // The private parent stays 0700. The converter UID can only write this mount.
+      await chmod(dwgOut, 0o733);
+      const space = await statfs(dwgOut, { bigint: true });
+      // A reader spool may use the same disk. Leave space for both copies and the reserve.
+      const budget = (space.bavail * space.bsize - BigInt(dwgReserveBytes)) / 2n;
+      if (budget <= 0n) throw new Rejected("scratch_unavailable");
+      dwgDiskArgs = ["--mount", `type=bind,src=${dwgOut},dst=/out`, "--ulimit", `fsize=${budget}:${budget}`,
+        "--env", `FACADE_DWG_OUTPUT_BUDGET=${budget}`];
+    }
     creating = true;
     id = await docker("container", "create", "--pull=never", "--init", "--network=none", "--read-only",
       "--cap-drop=ALL", "--security-opt=no-new-privileges=true", "--ipc=none", "--user=65534:65534",
@@ -203,15 +266,22 @@ async function handle(input, output, expectContinue = false) {
       "--label", label, "--name", `facade-converter-${randomUUID()}`,
       "--mount", `type=bind,src=${source},dst=${destination},readonly`,
       ...(archive ? [] : ["--tmpfs=/tmp:rw,noexec,nosuid,nodev,size=96m,mode=1777"]),
+      ...dwgDiskArgs,
       image, ...(archive ? [String(expanded), String(entries), String(archiveSeconds)] : [name]));
     if (!containerId.test(id)) throw new Error("Invalid container ID");
     creating = false;
-    output.setHeader("trailer", "x-converter-result");
+    output.setHeader("trailer", dwg ? "x-converter-result, x-converter-sha256, x-converter-bytes" : "x-converter-result");
     output.setHeader("content-type", "application/octet-stream");
-    runDeadline = AbortSignal.timeout(archive ? archiveSeconds * 1000 + 3000 : 35_000);
+    runDeadline = AbortSignal.timeout(dwg ? dwgSeconds * 1000 : archive ? archiveSeconds * 1000 + 3000 : 35_000);
     // The extractor limits actual expanded bytes; this caps the framed transport.
-    const maxOutput = archive ? expanded + entries * 8256 + Math.ceil(expanded / 65_536) * 16 + 64 * 1024 ** 2 : formatLimit;
-    await run(id, output, AbortSignal.any([runDeadline, active]), maxOutput, archive);
+    const stream = dwg ? undefined : { output, maxOutput: archive
+      ? expanded + entries * 8256 + Math.ceil(expanded / 65_536) * 16 + 64 * 1024 ** 2 : formatLimit };
+    await run(id, AbortSignal.any([runDeadline, active]), name, stream);
+    runDeadline = undefined;
+    if (dwg) {
+      transferDeadline = AbortSignal.timeout(dwgTransferMs);
+      identity = await streamDwg(join(dwgOut, "derivative"), output, AbortSignal.any([transferDeadline, active]));
+    }
   } catch (error) {
     if (creating) {
       // The create outcome may be unknown; recovery must enumerate matching containers before serving again.
@@ -220,7 +290,7 @@ async function handle(input, output, expectContinue = false) {
       console.error(`converter broker could not confirm container creation (${cliStatus}); restart required`);
     }
     if (error instanceof Rejected) result = error.message;
-    else if (runDeadline?.aborted || uploadDeadline.aborted) result = "timeout";
+    else if (runDeadline?.aborted || transferDeadline?.aborted || uploadDeadline.aborted) result = "timeout";
     else if (error.code === "ENOSPC" || error.code === "EDQUOT") result = "scratch_unavailable";
     else result = "unavailable";
   } finally {
@@ -234,7 +304,7 @@ async function handle(input, output, expectContinue = false) {
     }
     occupied = false;
   }
-  reply(output, result);
+  reply(output, result, identity);
 }
 
 function dispatch(input, output, expectContinue = false) {

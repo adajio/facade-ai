@@ -1,11 +1,12 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
+import { createReadStream } from "node:fs";
 import { once } from "node:events";
-import { readFile } from "node:fs/promises";
-import { PassThrough, Readable } from "node:stream";
+import { readFile, stat } from "node:fs/promises";
+import { PassThrough, Readable, Writable } from "node:stream";
 import { setTimeout as delay } from "node:timers/promises";
 import { crc32 } from "node:zlib";
-import { archiveBytes, convertBytes, converterImage } from "../../src/modules/converter-port/index.ts";
+import { archiveBytes, convertBytes, convertDwg, converterImage, dwgProfile } from "../../src/modules/converter-port/index.ts";
 
 function storedZip(name, payload) {
   const path = Buffer.from(name);
@@ -82,31 +83,41 @@ async function retryWhenBusy(run) {
   }
 }
 
+async function checkDwg() {
+  const profile = await dwgProfile();
+  assert.ok(profile);
+  const path = process.env.FACADE_SMOKE_DWG ??
+    new URL("../../src/modules/formats/test/fixtures/schedule.dwg", import.meta.url);
+  const size = (await stat(path)).size;
+  const badImage = `sha256:${"0".repeat(64)}`;
+  const sink = () => new Writable({ write(_chunk, _encoding, done) { done(); } });
+  const run = (source, length, image = profile.id) =>
+    convertDwg(source, sink(), { size: length, image, timeout: profile.timeout });
+  await assert.rejects(run(createReadStream(path), size, badImage), { code: "unavailable" });
+  const result = await run(createReadStream(path), size);
+  assert.ok(result.size > 0);
+  assert.match(result.sha256, /^[a-f0-9]{64}$/);
+  await assert.rejects(run(Readable.from([Buffer.from("INVALID")]), 7), { code: "invalid_request" });
+  console.log(`dwg ${profile.id} passed: pinned image, verified derivative, incorrect image, wrong input signature`);
+}
+
 async function checkConversion(operation) {
   const image = await converterImage(operation);
   assert.match(image ?? "", /^sha256:[a-f0-9]{64}$/);
-  const fixture = process.env.FACADE_SMOKE_DWG && operation === "dwg" ? process.env.FACADE_SMOKE_DWG :
-    new URL(`../../src/modules/formats/test/fixtures/schedule.${operation}`, import.meta.url);
-  const input = await readFile(fixture);
+  const input = await readFile(new URL(`../../src/modules/formats/test/fixtures/schedule.${operation}`, import.meta.url));
   await assert.rejects(convertBytes(operation, input, { image: `sha256:${"0".repeat(64)}` }), { code: "unavailable" });
   const output = await convertBytes(operation, input, { image });
   assert.equal(output.sha256, createHash("sha256").update(output.bytes).digest("hex"));
-  if (operation === "dwg") {
-    const dxf = output.bytes.toString("latin1");
-    assert.match(dxf, /SECTION/);
-    assert.match(dxf, /ENTITIES/);
-    assert.match(dxf, /EOF/);
-  } else {
-    assert.equal(output.bytes.readUInt32LE(), 0x04034b50);
-    assert.ok(output.bytes.includes(operation === "doc" ? "word/document.xml" : "xl/workbook.xml"));
-  }
+  assert.equal(output.bytes.readUInt32LE(), 0x04034b50);
+  assert.ok(output.bytes.includes(operation === "doc" ? "word/document.xml" : "xl/workbook.xml"));
   await assert.rejects(convertBytes(operation, Buffer.from("synthetic wrong format"), { image }), { code: "invalid_request" });
   console.log(`${operation} ${image} passed: pinned image, valid derivative, incorrect image, wrong input signature`);
 }
 
 for (const operation of process.argv.slice(2)) {
   if (operation === "archive") await checkArchive();
-  else if (["doc", "xls", "dwg"].includes(operation)) await checkConversion(operation);
+  else if (operation === "dwg") await checkDwg();
+  else if (["doc", "xls"].includes(operation)) await checkConversion(operation);
   else throw new Error("Use archive, doc, xls or dwg");
 }
 if (process.argv.length < 3) throw new Error("Supply at least one operation to check");

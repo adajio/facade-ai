@@ -3,13 +3,15 @@ import type { FastifyInstance } from "fastify";
 import { ReaderError } from "../pdf/types.js";
 import type { ReaderAdapter, ReaderOutput, ReaderUnit, ReadRequest } from "../pdf/types.js";
 import { cadFrame, renderCad } from "./cad-render.js";
-import { convert, converterFor } from "./conversion.js";
-import type { Legacy } from "./conversion.js";
+import { convert, converterFor, withDwgDerivative } from "./conversion.js";
+import type { Converter, Legacy } from "./conversion.js";
+import { recoveryObjects } from "./dwg-recovery.js";
+import { derivativeLines, derivativeText, dxfBytes, dxfValue } from "./dwg-text.js";
 import { FormatHold, originalOnly, parseText, readInput, readerVersion } from "./model.js";
 import type { Locator, Parsed, Row, Unit } from "./model.js";
 import { cellAddress, parseDocx, parseXlsx } from "./office.js";
 import { stampPhysicalInventory } from "./physical-inventory.js";
-import { parseDwgRecovery, parseDxf, parseIfc } from "./spatial.js";
+import { parseConvertedDxf, parseDwgRecovery, parseDxf, parseIfc } from "./spatial.js";
 
 const formats = ["docx", "xlsx", "txt", "csv", "tsv", "dxf", "ifc", "doc", "xls", "dwg", "rvt", "image", "unknown"] as const;
 type Format = typeof formats[number];
@@ -117,6 +119,26 @@ function rawOutput(parsed: Parsed, current: Unit, request: ReadRequest): ReaderO
   return { address, lines, bytes, mediaType: "application/json", limitations };
 }
 
+function converted(derived: Parsed, converter: Converter, hash: string, kind: string): Parsed {
+  const { id, format } = converter;
+  // An address produced by a converter belongs to the derivative. Preserve this in every line.
+  for (const current of derived.units) {
+    current.locator.derivative = kind;
+    current.coverage = current.coverage === "held" ? "held" : "partial";
+    current.limitations.push(format === "dwg" ? "cad_converted_handle_unverified"
+      : format === "xls" ? "xls_conversion_recalculation_unverified" : "doc_converted_address_approximate");
+    for (const row of current.rows) {
+      if (format === "dwg" && typeof row.locator.handle === "string") {
+        row.locator.derivativeHandle = row.locator.handle;
+        delete row.locator.handle;
+      }
+      if (format === "xls" && row.details?.formulaAttributes) row.details.cacheSource = "converter";
+    }
+  }
+  return { ...derived, converter: id, representationSha256: hash,
+    inventory: { limitation: `${format}_original_inventory_unverified` } };
+}
+
 function adapter(format: Format): ReaderAdapter {
   const legacy = isLegacy(format) ? format : undefined;
   const profile = native.has(format) || format === "image" ? "formats-1.1.3"
@@ -136,6 +158,23 @@ function adapter(format: Format): ReaderAdapter {
     const converter = await resolve();
     try {
       if (legacy && !converter) throw new FormatHold(`${legacy}_converter_unavailable`);
+      if (converter?.format === "dwg") {
+        return await withDwgDerivative(path, converter, async (file, sha256) => {
+          const head = Buffer.alloc(128);
+          const { bytesRead } = await file.read(head, 0, head.length, 0);
+          const recovery = /^\s*\{/.test(head.toString("utf8", 0, bytesRead));
+          try {
+            const utf16 = (head[0] === 0xff && head[1] === 0xfe) || (head[0] === 0xfe && head[1] === 0xff);
+            const parsed = recovery ? await parseDwgRecovery(recoveryObjects(derivativeText(file)))
+              : utf16 ? await parseConvertedDxf(derivativeLines(derivativeText(file)))
+                : await parseConvertedDxf(derivativeLines(dxfBytes(file)), dxfValue);
+            return converted(parsed, converter, sha256, recovery ? "dwg-json" : "dxf");
+          } catch (error) {
+            if (!(error instanceof FormatHold)) throw error;
+            return { ...originalOnly(error.code, "held"), converter: converter.id, representationSha256: sha256 };
+          }
+        });
+      }
       const input = await readInput(path);
       if (!converter) {
         const parsed = await native.get(format)!(input, checkInventory);
@@ -145,31 +184,12 @@ function adapter(format: Format): ReaderAdapter {
             ? { originalSha256: createHash("sha256").update(input).digest("hex") } : {}),
         };
       }
-      const magic = input.subarray(0, 8).toString("hex");
-      const valid = legacy === "dwg" ? /^AC10\d{2}$/.test(input.subarray(0, 6).toString("ascii"))
-        : magic === "d0cf11e0a1b11ae1";
-      if (!valid) throw new FormatHold(`${legacy}_signature_invalid`);
-      const derivative = await convert(converter, input);
-      const dwgRecovery = legacy === "dwg" && /^\s*\{/.test(derivative.bytes.subarray(0, 128).toString("utf8"));
-      const derived = legacy === "doc" ? await parseDocx(derivative.bytes)
-        : legacy === "xls" ? await parseXlsx(derivative.bytes)
-        : dwgRecovery ? parseDwgRecovery(derivative.bytes) : parseDxf(derivative.bytes);
-      // Coordinates assigned by a converter describe the derivative. Preserve that distinction in every line.
-      for (const current of derived.units) {
-        current.locator.derivative = legacy === "doc" ? "docx" : legacy === "xls" ? "xlsx" : dwgRecovery ? "dwg-json" : "dxf";
-        current.coverage = current.coverage === "held" ? "held" : "partial";
-        current.limitations.push(legacy === "dwg" ? "cad_converted_handle_unverified"
-          : legacy === "xls" ? "xls_conversion_recalculation_unverified" : "doc_converted_address_approximate");
-        for (const row of current.rows) {
-          if (legacy === "dwg" && typeof row.locator.handle === "string") {
-            row.locator.derivativeHandle = row.locator.handle;
-            delete row.locator.handle;
-          }
-          if (legacy === "xls" && row.details?.formulaAttributes) row.details.cacheSource = "converter";
-        }
+      if (input.subarray(0, 8).toString("hex") !== "d0cf11e0a1b11ae1") {
+        throw new FormatHold(`${legacy}_signature_invalid`);
       }
-      return { ...derived, converter: converter.id, representationSha256: derivative.sha256,
-        inventory: { limitation: `${legacy}_original_inventory_unverified` } };
+      const derivative = await convert(converter, input);
+      const derived = converter.format === "doc" ? await parseDocx(derivative.bytes) : await parseXlsx(derivative.bytes);
+      return converted(derived, converter, derivative.sha256, converter.format === "doc" ? "docx" : "xlsx");
     } catch (error) {
       if (error instanceof ReaderError || (!(error instanceof FormatHold) && (error as NodeJS.ErrnoException).syscall)) {
         throw error;

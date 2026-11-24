@@ -15,6 +15,9 @@ services:
       FACADE_ARCHIVE_IMAGE: ${FACADE_ARCHIVE_IMAGE:-}
       FACADE_OFFICE_IMAGE: ${FACADE_OFFICE_IMAGE:-}
       FACADE_DWG_IMAGE: ${FACADE_DWG_IMAGE:-}
+      FACADE_DWG_MEMORY_MIB: ${FACADE_DWG_MEMORY_MIB:-1536}
+      FACADE_DWG_TIMEOUT_SECONDS: ${FACADE_DWG_TIMEOUT_SECONDS:-420}
+      FACADE_DWG_SCRATCH_RESERVE_BYTES: ${FACADE_DWG_SCRATCH_RESERVE_BYTES:-1073741824}
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
       - converter-socket:/run/facade-ai-stand-converters
