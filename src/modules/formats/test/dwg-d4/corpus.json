@@ -33,5 +33,10 @@
     "name": "xref-foreign",
     "source": "./fixtures/xref-foreign.dwg",
     "expectedSha256": "4e67ca02abf29610c36e0680ce2e05cd46e57ba120be6c5ca66dc889d0750635"
+  },
+  {
+    "name": "cyrillic",
+    "source": "./fixtures/cyrillic.dwg",
+    "expectedSha256": "0e420bdfb0ba5d2963ec16f77bad57b565beaccb3924456a39c1c3cf615fee41"
   }
 ]

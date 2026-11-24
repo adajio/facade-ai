@@ -16,7 +16,7 @@ function toolMessage(name, args = {}) {
 }
 
 export async function verifyOrdinaryDwg({
-  db, config, load, projectId, scopeId, upload, seal, evidence,
+  db, config, load, projectId, scopeId, upload, seal, evidence, expectedOutcome = "covered", reviewControl = false,
 }) {
   assert.ok(process.env.FACADE_CONVERTER_SOCKET, "connect the installed DWG converter");
   assert.notEqual(process.env.FACADE_GATEWAY_LIVE_MODE, "step-15", "use a managed synthetic gateway");
@@ -84,12 +84,18 @@ export async function verifyOrdinaryDwg({
     }
   });
   try {
-    for (const [branch, purpose] of [["a", "primary_a"], ["b", "primary_b"]]) {
+    const routes = [["a", "primary_a"], ["b", "primary_b"]];
+    if (reviewControl) routes.push(["lead", "review"]);
+    for (const [branch, purpose] of routes) {
       const routeId = `managed-${branch}`;
       await gateway.configureRoute({ id: routeId, revision: "step11-replay", transport: "managed", enabled: true,
         maxRequestBytes: 16 * 1024 ** 2, ceilingUsdNanos: 1, timeoutMs: 25_000 });
       await gateway.grantRoute({ projectId, routeId, revision: "step11-replay", purpose,
         dataClass: "synthetic", allowed: true });
+      if (reviewControl && purpose !== "review") {
+        await gateway.grantRoute({ projectId, routeId, revision: "step11-replay", purpose: "review",
+          dataClass: "synthetic", allowed: true });
+      }
     }
     await new Promise((resolve, reject) => provider.listen(0, "127.0.0.1", resolve).once("error", reject));
     const options = managedWorkerOptions(`http://127.0.0.1:${provider.address().port}/replay`, import.meta.url);
@@ -134,12 +140,13 @@ export async function verifyOrdinaryDwg({
     const { rows: [projection] } = await db.query(
       `SELECT machine FROM assessment_question_revisions WHERE scope_id=$1 ORDER BY version DESC LIMIT 1`, [scopeId],
     );
-    assert.equal(projection.machine.outcome, "covered");
+    assert.equal(projection.machine.outcome, expectedOutcome);
     assert.deepEqual(
       projection.machine.citations.map(({ evidenceId }) => evidenceId).sort(),
       rows.map(({ payload }) => payload.evidenceId).sort(),
     );
     assert.equal((await journalConnection.journal.balance()).spentUsdNanos, 0);
+    return { source, observations: rows.map(({ payload }) => payload) };
   } finally {
     driver.abort();
     await Promise.allSettled([worker]);
