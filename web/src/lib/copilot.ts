@@ -16,7 +16,7 @@ export type SourceAddress = {
 };
 
 export type OriginalSource = {
-  id: string; label: string; documentId: string; versionId: string;
+  id: string; label: string; documentId: string; versionId: string; sha256?: string; readerVersion?: string;
   text: string; context?: { id: string; text: string; address: SourceAddress }[]; window?: true; address: SourceAddress; version: 'current' | 'historical' | 'unknown';
   representation: 'native' | 'ocr' | 'render'; limitations: string[];
 };

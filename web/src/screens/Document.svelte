@@ -6,11 +6,11 @@
   import type { Occurrence } from '../lib/intake';
   import { V1, scopedUrl, type OpenEvidence, type WorkspaceProps } from '../lib/workspace';
   import Notice from '../lib/Notice.svelte';
+  import CadDocument from './CadDocument.svelte';
+  import type { ReaderMap } from '../lib/cad';
   import WorkJob, { type Job } from './DocumentJob.svelte';
   import { pageCache } from '../lib/page-cache';
 
-  type Unit = { id: string; label?: string; locator?: Record<string, string | number> };
-  type ReaderMap = { source: { documentId: string; versionId: string; sha256: string }; units: Unit[] };
   type Work = {
     jobs: Job[]; jobCount: number;
     branches: { branch: string; completed: number; total: number; outcome: string }[];
@@ -23,7 +23,9 @@
     open: OpenEvidence; renew: () => void;
   } = $props();
   const commands = new Commands(() => api);
-  let units = $state<Unit[]>([]);
+  let units = $state<ReaderMap['units']>([]);
+  let cadMap = $state<{ versionId: string; readerVersion: string }>();
+  const cadVersion = $derived(cadMap?.versionId === versionId ? cadMap?.readerVersion : undefined);
   let work = $state<Work>();
   let readerError = $state('');
   let workError = $state('');
@@ -66,7 +68,7 @@
       preview = { key, url: cached };
       return () => { preview = undefined; };
     }
-    const { signal } = stop;
+    const signal = AbortSignal.any([stop.signal, AbortSignal.timeout(8000)]);
     const fetchPage = async () => {
       const response = await api.response(url, { signal }).catch(async (error) => {
         if (!(error instanceof ApiError) || error.code !== 'reader_resource_wait') throw error;
@@ -82,7 +84,7 @@
       if (generation === pageCache.generation) preview = { key, url: pageCache.add(key, body, generation) };
     };
     void fetchPage().catch(() => {
-      if (!signal.aborted) preview = { key };
+      if (!stop.signal.aborted) preview = { key };
     });
     return () => { stop.abort(); preview = undefined; };
   });
@@ -124,13 +126,16 @@
       if (value.source.documentId !== expected.documentId || value.source.versionId !== expected.versionId ||
           expected.sha256 && value.source.sha256 !== expected.sha256) {
         units = [];
+        cadMap = undefined;
         readerError = 'Карта относится к другой версии оригинала.';
         return;
       }
       units = value.units;
+      cadMap = value.format === 'dwg' ? { versionId: expected.versionId, readerVersion: value.readerVersion } : undefined;
     }).catch((error) => {
       if (controller.signal.aborted || interrupted(error)) return;
       units = [];
+      cadMap = undefined;
       readerError = error instanceof ApiError && error.code === 'reader_map_unavailable'
         ? 'Карта физических единиц ещё недоступна.' : describe(error);
     });
@@ -246,7 +251,10 @@
   </dl>
   <h3>Физические единицы</h3>
   <Notice message={readerError} />
-  {#if units.length}
+  {#if cadVersion && ready && !context.masked && units.some(unit => unit.locator?.partSha256)}
+    <CadDocument {api} {units} readerVersion={cadVersion} endpoint={V1 + path.slice(4) + '/reader/units'}
+      partId={context.params.get('part')} entity={context.params.get('entity')} select={context.setDocumentCad} />
+  {:else if units.length}
     <ul class="plain-list unit-list">
       {#each units as unit (unit.id)}
         {@const number = unit.locator?.page}

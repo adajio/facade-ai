@@ -18,12 +18,30 @@ case "$1" in
     version-office) exec soffice --version ;;
     version-dwg) exec dwg2dxf --version ;;
     dwg)
-        if dwg2dxf -o /tmp/original.dxf /original.dwg >&2 &&
-            [ "$(tail -n 1 /tmp/original.dxf | tr -d '\r')" = EOF ]; then
-            exec cat /tmp/original.dxf
+        set --
+        if [ "$(head -c 6 /original.dwg)" = AC1027 ]; then
+            set -- --as r2013
         fi
-        dwgread -O JSON -o /tmp/original.json /original.dwg >&2
-        exec cat /tmp/original.json
+        cd /out
+        check_disk_result() {
+            if [ "$2" -eq 153 ] || { [ -f "$1" ] &&
+                [ "$(stat -c %s "$1")" -ge "$FACADE_DWG_OUTPUT_BUDGET" ]; }; then
+                exit 73
+            fi
+        }
+        result=0
+        dwg2dxf "$@" -o original.dxf /original.dwg >&2 || result=$?
+        check_disk_result original.dxf "$result"
+        if [ "$result" -eq 0 ] && [ "$(tail -n 1 original.dxf | tr -d '\r')" = EOF ]; then
+            mv original.dxf derivative
+        else
+            rm -f original.dxf
+            result=0
+            dwgread -O JSON -o derivative /original.dwg >&2 || result=$?
+            check_disk_result derivative "$result"
+            [ "$result" -eq 0 ] || exit "$result"
+        fi
+        chmod 0444 derivative
         ;;
     doc)
         format='docx:Office Open XML Text'

@@ -16,6 +16,7 @@ export interface Original extends SourceRef {
   format: string;
   size: number;
   relativePath?: string;
+  check?(): Promise<void>;
   open(): Promise<Readable>;
 }
 
@@ -86,9 +87,11 @@ export interface ReaderOutput {
 export interface ReaderAdapter {
   format: string;
   version(): Promise<string>;
-  inspect(path: string): Promise<ReaderUnit[]>;
-  read(path: string, request: ReadRequest, unit: ReaderUnit, containedWords?: boolean): Promise<ReaderOutput>;
-  readNativeUnits?(path: string, units: readonly ReaderUnit[]): AsyncIterable<ReaderOutput | ReaderError>;
+  inspect(path: string, source?: SourceRef): Promise<ReaderUnit[]>;
+  read(path: string, request: ReadRequest, unit: ReaderUnit, containedWords?: boolean, source?: SourceRef): Promise<ReaderOutput>;
+  readCached?(source: SourceRef, request: ReadRequest, unit: ReaderUnit): Promise<ReaderOutput | undefined>;
+  readCachedNativeUnits?(source: SourceRef, units: readonly ReaderUnit[]): Promise<AsyncIterable<ReaderOutput | ReaderError> | undefined>;
+  readNativeUnits?(path: string, units: readonly ReaderUnit[], source?: SourceRef): AsyncIterable<ReaderOutput | ReaderError>;
 }
 
 export interface NativePresentation {

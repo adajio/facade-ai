@@ -144,6 +144,7 @@ export type WorkspaceProps = {
   masked?: boolean;
   refreshKey: number;
   setDocumentPage: (page?: number) => void;
+  setDocumentCad: (part?: string, entity?: string) => void;
   params: URLSearchParams;
 };
 

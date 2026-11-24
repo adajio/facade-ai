@@ -27,8 +27,8 @@ function text(value: unknown, limit: number) {
 }
 
 export function publicSource(source: MemorySource) {
-  const { id, label, address, documentId, versionId, text, context, window, version, representation, limitations } = source;
-  return { id, label, address, documentId, versionId, text, context, window, version, representation, limitations };
+  const { id, label, address, documentId, versionId, sha256, readerVersion, text, context, window, version, representation, limitations } = source;
+  return { id, label, address, documentId, versionId, sha256, readerVersion, text, context, window, version, representation, limitations };
 }
 
 export async function register(app: FastifyInstance) {

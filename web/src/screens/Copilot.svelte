@@ -7,6 +7,8 @@
     type CopilotBudget, type CopilotQuestion, type OriginalSource, type SearchResult, type SourceDetail, type VersionDetail } from '../lib/copilot';
   import { projectApi, scopedUrl, type WorkspaceProps } from '../lib/workspace';
   import Notice from '../lib/Notice.svelte';
+  import CadEvidence from '../lib/CadEvidence.svelte';
+  import { cadAddress } from '../lib/cad';
 
   let { api, context, navigate, budget }: {
     api: Api; context: WorkspaceProps; navigate: (path: string) => boolean; budget?: CopilotBudget;
@@ -302,6 +304,7 @@
     <Notice kind="error" message={sourceProblem} />
     {#if source?.mode === 'originals'}
       {@const item = source.source}
+      {@const cad = cadAddress(item.address.unitId, item.address.locator)}
       <h3>{item.label}</h3>
       <p>{renderAddress(item.address)}</p>
       <p class="meta">{sourceVersions[item.version]} · {item.window ? 'Осталось проверить' : representations[item.representation]} · версия {item.versionId}</p>
@@ -321,6 +324,12 @@
         <iframe title={'Страница оригинала · ' + item.label} src={originalUrl(item.documentId, item.versionId, item.address.locator.page)}></iframe>
       {/if}
       <a href={originalUrl(item.documentId, item.versionId, item.address.locator?.page)} target="_blank" rel="noopener noreferrer">Открыть оригинал этой версии</a>
+      {#if cad}
+        {#key item.id}
+          <CadEvidence {api} projectId={context.project.id} documentId={item.documentId} versionId={item.versionId}
+            sha256={item.sha256} readerVersion={item.readerVersion} address={cad} />
+        {/key}
+      {/if}
     {:else if source?.mode === 'publications'}
       <p>Страница {source.source.page}</p>
       <blockquote>{source.source.quote}</blockquote>

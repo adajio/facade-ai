@@ -111,7 +111,7 @@ export function createRuntimePdfService(
       const format = formatFor(original.mediaType, original.relativePath);
       return {
         ...document, receiptId: assignment.receipt_id, sha256: original.sha256, size: original.size, format,
-        relativePath: original.relativePath, open: () => original.open(),
+        relativePath: original.relativePath, check: () => original.check(), open: () => original.open(),
       };
     },
   }, adapters);
@@ -187,6 +187,29 @@ export async function register(
     await authorize(app.db, await readSession(app.db, request), { action: 'project:read', projectId: document.projectId });
     return reply.header('X-Content-Type-Options', 'nosniff').header('ETag', '"sha256-' + map.source.sha256 + '"')
       .type('image/png').send(bytes);
+  });
+
+  type CadPreviewRoute = { Params: UnitsRoute['Params'] & { unitId: string }; Querystring: {
+    readerVersion?: string; representation?: string; entityOrdinal?: string; derivativeHandle?: string; textFont?: string;
+  } };
+  app.get<CadPreviewRoute>(documentReader + '/units/:unitId', async (request, reply) => {
+    const document = await authorizedDocument(request);
+    const { readerVersion, representation = 'native', entityOrdinal, derivativeHandle, textFont } = request.query;
+    const ordinal = entityOrdinal === undefined ? undefined : Number(entityOrdinal);
+    if (!readerVersion || !['native', 'render'].includes(representation)
+      || (entityOrdinal !== undefined && (!/^[1-9]\d*$/.test(entityOrdinal) || !Number.isSafeInteger(ordinal)))
+      || (derivativeHandle !== undefined && !/^[0-9A-F]{1,16}$/.test(derivativeHandle))
+      || (ordinal !== undefined && derivativeHandle !== undefined)
+      || (textFont !== undefined && (representation !== 'render' || ordinal === undefined && !derivativeHandle
+        || !/^[a-f0-9]{64}$/.test(textFont)))) {
+      throw new ReaderError('reader_address_invalid', 'Некорректный адрес части DWG', 422);
+    }
+    const locator: Record<string, string | number> | undefined = ordinal !== undefined ? { entityOrdinal: ordinal } : derivativeHandle ? { derivativeHandle } : undefined;
+    if (locator && textFont) locator.textFont = textFont;
+    const result = await reader().previewDwg(document, { readerVersion, address: { unitId: request.params.unitId, locator },
+      representation: representation as 'native' | 'render' });
+    await authorize(app.db, await readSession(app.db, request), { action: 'project:read', projectId: document.projectId });
+    return reply.header('X-Content-Type-Options', 'nosniff').type(result.mediaType).send(result.bytes);
   });
 
   app.get<EvidenceRoute>('/api/v1/evidence/:id', async (request) => {

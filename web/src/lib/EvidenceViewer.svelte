@@ -3,6 +3,8 @@
   import { denied, describe, id, interrupted, type Api, type RecordData } from './http';
   import { V1, type Citation } from './workspace';
   import Notice from './Notice.svelte';
+  import CadEvidence from './CadEvidence.svelte';
+  import { cadAddress } from './cad';
   import { pageCache } from './page-cache';
 
   type Box = { x: number; y: number; width: number; height: number };
@@ -57,6 +59,15 @@
   let viewport = $state<HTMLDivElement>();
   let selectedAddress = $derived(citation?.address as Evidence['address'] | undefined);
   let locator = $derived({ ...evidence?.address.locator, ...selectedAddress?.locator, ...observation?.address?.locator });
+  let cad = $derived.by(() => {
+    const address = evidence?.address;
+    if (!address?.unitId) return;
+    return cadAddress(address.unitId, {
+      ...address.locator,
+      ...(selectedAddress?.unitId === address.unitId ? selectedAddress.locator : undefined),
+      ...(observation?.address?.unitId === address.unitId ? observation.address.locator : undefined),
+    });
+  });
   let box = $derived.by(() => {
     const placed = observation?.box ?? observation?.address?.box ?? selectedAddress?.box ?? evidence?.address?.box;
     return placed && [placed.x, placed.y, placed.width, placed.height].every(Number.isFinite) &&
@@ -277,6 +288,12 @@
     {:else}
       {@render sourceDetails(evidence)}
       {#if fullOriginal}<a class="button" target="_blank" rel="noopener" href={fullOriginal}>Открыть оригинал</a>{/if}
+    {/if}
+    {#if cad}
+      {#key evidence.id}
+        <CadEvidence {api} {projectId} documentId={evidence.source.documentId} versionId={evidence.source.versionId}
+          sha256={evidence.source.sha256} readerVersion={evidence.readerVersion} address={cad} />
+      {/key}
     {/if}
     <Notice message={observation?.limitation ?? evidence.limitations?.join(' · ') ?? ''} />
     <Notice kind="error" message={previewError} />

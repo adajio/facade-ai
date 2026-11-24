@@ -57,6 +57,20 @@
     route = { ...route, params };
   }
 
+  function setDocumentCad(part?: string, entity?: string) {
+    const url = new URL(window.location.href);
+    const params = new URLSearchParams(route.params);
+    for (const query of [url.searchParams, params]) {
+      if (part) query.set('part', part);
+      else query.delete('part');
+      if (entity) query.set('entity', entity);
+      else query.delete('entity');
+    }
+    history.replaceState(history.state, '', url);
+    activeLocation = url.pathname + url.search;
+    route = { ...route, params };
+  }
+
   function expired() {
     const next = window.location.pathname + window.location.search;
     clear();
@@ -307,7 +321,7 @@
           <Projects {api} {session} refresh={verify} />
         {:else if route.page === 'project' && project}
           {#key project.id}
-            <Workspace {api} {project} {route} {masked} {session} {signOut} {navigate} {setDocumentPage} refresh={verify}
+            <Workspace {api} {project} {route} {masked} {session} {signOut} {navigate} {setDocumentPage} {setDocumentCad} refresh={verify}
               onDenied={() => lockScreen('denied')} />
           {/key}
         {:else if route.page === 'admin' && session.actions?.includes('organization:admin')}

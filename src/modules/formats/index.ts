@@ -1,15 +1,19 @@
 import { createHash } from "node:crypto";
 import type { FastifyInstance } from "fastify";
 import { ReaderError } from "../pdf/types.js";
-import type { ReaderAdapter, ReaderOutput, ReaderUnit, ReadRequest } from "../pdf/types.js";
+import type { ReaderAdapter, ReaderOutput, ReaderUnit, ReadRequest, SourceRef } from "../pdf/types.js";
+import { dwgFontAssets } from "./cad-font-assets.js";
+import type { CadFontAssets } from "./cad-font-assets.js";
 import { cadFrame, renderCad } from "./cad-render.js";
-import { convert, converterFor } from "./conversion.js";
-import type { Legacy } from "./conversion.js";
+import { convert, converterFor, withDwgDerivative } from "./conversion.js";
+import type { Converter, Legacy } from "./conversion.js";
+import { buildDwgIndex, dwgReaderProfile, openDwgIndex } from "./dwg-index.js";
+import type { DwgIndex } from "./dwg-index.js";
 import { FormatHold, originalOnly, parseText, readInput, readerVersion } from "./model.js";
 import type { Locator, Parsed, Row, Unit } from "./model.js";
 import { cellAddress, parseDocx, parseXlsx } from "./office.js";
 import { stampPhysicalInventory } from "./physical-inventory.js";
-import { parseDwgRecovery, parseDxf, parseIfc } from "./spatial.js";
+import { parseDxf, parseIfc } from "./spatial.js";
 
 const formats = ["docx", "xlsx", "txt", "csv", "tsv", "dxf", "ifc", "doc", "xls", "dwg", "rvt", "image", "unknown"] as const;
 type Format = typeof formats[number];
@@ -39,7 +43,7 @@ function invalid(): never {
 function select(current: Unit, request: Locator = {}): { rows: Row[]; locator: Locator; handle?: string } {
   const locator = { ...current.locator };
   const qualifiers = new Set(["line", "paragraph", "section", "row", "column", "cell", "range", "handle",
-    "derivativeHandle", "entityOrdinal", "step", "globalId", "merge"]);
+    "derivativeHandle", "derivativeSection", "entityOrdinal", "step", "globalId", "merge"]);
   for (const [key, value] of Object.entries(request)) {
     if (Object.hasOwn(locator, key) && locator[key] === value) continue;
     if (key === "coverage" && current.coverage === value) continue;
@@ -81,16 +85,21 @@ function mapUnit(current: Unit): ReaderUnit {
   };
 }
 
-function rawOutput(parsed: Parsed, current: Unit, request: ReadRequest): ReaderOutput {
-  const query = Object.fromEntries(Object.entries(request.address.locator ?? {}).filter(([key, value]) =>
+function rawOutput(parsed: Parsed, current: Unit, request: ReadRequest,
+  load?: Parameters<typeof renderCad>[3], fonts?: CadFontAssets): ReaderOutput {
+  const { textFont, ...requested } = request.address.locator ?? {};
+  const query = Object.fromEntries(Object.entries(requested).filter(([key, value]) =>
     !["limitations", "candidateCount"].includes(key) || mapUnit(current).locator?.[key] !== value));
   const { rows, locator, handle } = select(current, query);
-  const address = { ...request.address, locator };
+  if (textFont !== undefined && (!fonts || !handle || request.representation !== "render" || request.address.box
+      || typeof textFont !== "string" || !/^[a-f0-9]{64}$/.test(textFont)
+      || !rows.some(row => Array.isArray(row.details?.fonts) && row.details.fonts.some((font) => font.sha256 === textFont)))) invalid();
+  const address = { ...request.address, locator: textFont ? { ...locator, textFont } : locator };
   if (request.address.box && !current.cad) invalid();
   if (request.representation === "render") {
-    const image = current.cad ? renderCad(current, address, handle) : undefined;
+    const image = current.cad ? renderCad(current, address, handle, load, fonts, typeof textFont === "string" ? textFont : undefined) : undefined;
     if (!image) {
-      throw new ReaderError(current.limitations[0] ?? "format_render_unavailable",
+      throw new ReaderError(handle ? "cad_entity_geometry_unavailable" : current.limitations[0] ?? "format_render_unavailable",
         "Для указанного места доступно текстовое открытие или исходное ограничение", 424);
     }
     return { address: { ...address, box: image.crop }, bytes: image.bytes, mediaType: "image/png",
@@ -117,17 +126,42 @@ function rawOutput(parsed: Parsed, current: Unit, request: ReadRequest): ReaderO
   return { address, lines, bytes, mediaType: "application/json", limitations };
 }
 
+function converted(derived: Parsed, converter: Converter, hash: string, kind: string): Parsed {
+  const { id, format } = converter;
+  // An address produced by a converter belongs to the derivative. Preserve this in every line.
+  for (const current of derived.units) {
+    current.locator.derivative = kind;
+    current.coverage = current.coverage === "held" ? "held" : "partial";
+    current.limitations.push(format === "dwg" ? "cad_converted_handle_unverified"
+      : format === "xls" ? "xls_conversion_recalculation_unverified" : "doc_converted_address_approximate");
+    for (const row of current.rows) {
+      if (format === "dwg" && typeof row.locator.handle === "string") {
+        row.locator.derivativeHandle = row.locator.handle;
+        delete row.locator.handle;
+      }
+      if (format === "xls" && row.details?.formulaAttributes) row.details.cacheSource = "converter";
+    }
+  }
+  return { ...derived, converter: format === "dwg" ? converter.identity : id, representationSha256: hash,
+    inventory: { limitation: `${format}_original_inventory_unverified` } };
+}
+
 function adapter(format: Format): ReaderAdapter {
   const legacy = isLegacy(format) ? format : undefined;
   const profile = native.has(format) || format === "image" ? "formats-1.1.3"
-    : format === "doc" || format === "dwg" ? "formats-1.1.1" : readerVersion;
+    : format === "dwg" ? dwgReaderProfile : format === "doc" ? "formats-1.1.1" : readerVersion;
+  const fonts = format === "dwg" ? dwgFontAssets() : undefined;
   let configured: ReturnType<typeof converterFor> | undefined;
   const resolve = () => legacy ? configured ??= converterFor(legacy).catch((error) => {
     configured = undefined;
     throw error;
   }) : undefined;
-  const version = async () => legacy ? `${profile}:${format}:${(await resolve())?.id ?? "unavailable"}`
-    : `${profile}:${format}`;
+  const version = async () => {
+    const converter = await resolve();
+    const identity = converter?.format === "dwg" ? converter.identity : converter?.id;
+    return legacy ? `${profile}:${format}:${identity ?? "unavailable"}${fonts ? `:fonts:sha256:${fonts.identity}` : ""}`
+      : `${profile}:${format}`;
+  };
 
   async function parse(path: string, checkInventory = false): Promise<Parsed> {
     if (format === "rvt") return originalOnly("rvt_original_only", "original_only");
@@ -136,6 +170,7 @@ function adapter(format: Format): ReaderAdapter {
     const converter = await resolve();
     try {
       if (legacy && !converter) throw new FormatHold(`${legacy}_converter_unavailable`);
+      if (converter?.format === "dwg") throw new Error("DWG must use its part index");
       const input = await readInput(path);
       if (!converter) {
         const parsed = await native.get(format)!(input, checkInventory);
@@ -145,31 +180,12 @@ function adapter(format: Format): ReaderAdapter {
             ? { originalSha256: createHash("sha256").update(input).digest("hex") } : {}),
         };
       }
-      const magic = input.subarray(0, 8).toString("hex");
-      const valid = legacy === "dwg" ? /^AC10\d{2}$/.test(input.subarray(0, 6).toString("ascii"))
-        : magic === "d0cf11e0a1b11ae1";
-      if (!valid) throw new FormatHold(`${legacy}_signature_invalid`);
-      const derivative = await convert(converter, input);
-      const dwgRecovery = legacy === "dwg" && /^\s*\{/.test(derivative.bytes.subarray(0, 128).toString("utf8"));
-      const derived = legacy === "doc" ? await parseDocx(derivative.bytes)
-        : legacy === "xls" ? await parseXlsx(derivative.bytes)
-        : dwgRecovery ? parseDwgRecovery(derivative.bytes) : parseDxf(derivative.bytes);
-      // Coordinates assigned by a converter describe the derivative. Preserve that distinction in every line.
-      for (const current of derived.units) {
-        current.locator.derivative = legacy === "doc" ? "docx" : legacy === "xls" ? "xlsx" : dwgRecovery ? "dwg-json" : "dxf";
-        current.coverage = current.coverage === "held" ? "held" : "partial";
-        current.limitations.push(legacy === "dwg" ? "cad_converted_handle_unverified"
-          : legacy === "xls" ? "xls_conversion_recalculation_unverified" : "doc_converted_address_approximate");
-        for (const row of current.rows) {
-          if (legacy === "dwg" && typeof row.locator.handle === "string") {
-            row.locator.derivativeHandle = row.locator.handle;
-            delete row.locator.handle;
-          }
-          if (legacy === "xls" && row.details?.formulaAttributes) row.details.cacheSource = "converter";
-        }
+      if (input.subarray(0, 8).toString("hex") !== "d0cf11e0a1b11ae1") {
+        throw new FormatHold(`${legacy}_signature_invalid`);
       }
-      return { ...derived, converter: converter.id, representationSha256: derivative.sha256,
-        inventory: { limitation: `${legacy}_original_inventory_unverified` } };
+      const derivative = await convert(converter, input);
+      const derived = converter.format === "doc" ? await parseDocx(derivative.bytes) : await parseXlsx(derivative.bytes);
+      return converted(derived, converter, derivative.sha256, converter.format === "doc" ? "docx" : "xlsx");
     } catch (error) {
       if (error instanceof ReaderError || (!(error instanceof FormatHold) && (error as NodeJS.ErrnoException).syscall)) {
         throw error;
@@ -179,14 +195,97 @@ function adapter(format: Format): ReaderAdapter {
     }
   }
 
+  async function index(path?: string, source?: SourceRef, expected?: string | number) {
+    const converter = await resolve();
+    if (converter?.format !== "dwg") throw new FormatHold("dwg_converter_unavailable");
+    const pin = source && { source, converter: converter.identity, reserve: converter.reserve };
+    const cached = pin && await openDwgIndex(pin, fonts);
+    if (cached || !path) return cached;
+    return withDwgDerivative(path, converter, (file, sha) => {
+      if (expected !== undefined && expected !== sha) {
+        throw new ReaderError("dwg_index_identity_changed", "Повторная конвертация вернула другую производную DWG", 409);
+      }
+      return buildDwgIndex(file, sha, converter.identity, pin, fonts);
+    });
+  }
+
+  function pinned(index: DwgIndex, unit: Unit, digest: string): Unit {
+    return { ...unit, locator: { ...unit.locator, derivativeSha256: index.identity.derivative, partSha256: digest } };
+  }
+
+  function output(index: DwgIndex, request: ReadRequest, selected: ReaderUnit) {
+    const { unit, digest } = index.read(selected);
+    const current = pinned(index, unit, digest);
+    return rawOutput({ units: [], converter: index.identity.converter, representationSha256: index.identity.derivative },
+      current, request, block => index.definition(block), fonts);
+  }
+
+  async function inspectDwg(path: string, source?: SourceRef): Promise<ReaderUnit[]> {
+    let units: ReaderUnit[];
+    try {
+      const stored = (await index(path, source))!;
+      try {
+        units = Array.from(stored.units(), ({ unit, digest }) => mapUnit(pinned(stored, unit, digest)));
+      } finally {
+        await stored.close();
+      }
+    } catch (error) {
+      if (!(error instanceof FormatHold)) throw error;
+      units = originalOnly(error.code, "held").units.map(mapUnit);
+    }
+    return stampPhysicalInventory(units, { units: [], inventory: { limitation: "dwg_original_inventory_unverified" } },
+      format, await version());
+  }
+
+  async function readDwg(path: string | undefined, request: ReadRequest, unit: ReaderUnit, source?: SourceRef) {
+    try {
+      const stored = await index(path, source, unit.locator?.derivativeSha256);
+      if (!stored) return;
+      try {
+        return output(stored, request, unit);
+      } finally {
+        await stored.close();
+      }
+    } catch (error) {
+      if (!(error instanceof FormatHold)) throw error;
+      if (!path) return;
+      if (unit.id !== "original") throw new ReaderError(error.code, "Часть DWG временно недоступна", 424);
+      const held = originalOnly(error.code, "held");
+      return rawOutput(held, held.units[0], request);
+    }
+  }
+
+  async function* nativeDwg(stored: DwgIndex, units: readonly ReaderUnit[]) {
+    try {
+      for (const unit of units) {
+        try { yield output(stored, { address: { unitId: unit.id }, representation: "native" }, unit); }
+        catch (error) { if (!(error instanceof ReaderError)) throw error; yield error; }
+      }
+    } finally { await stored.close(); }
+  }
+
   return {
     format,
     version,
-    async inspect(path) {
+    async inspect(path, source) {
+      if (format === "dwg") return inspectDwg(path, source);
       const parsed = await parse(path, true);
       return stampPhysicalInventory(parsed.units.map(mapUnit), parsed, format, await version());
     },
-    async read(path, request, unit) {
+    ...(format === "dwg" ? {
+      readCached: (source: SourceRef, request: ReadRequest, unit: ReaderUnit) => readDwg(undefined, request, unit, source),
+      async readCachedNativeUnits(source: SourceRef, units: readonly ReaderUnit[]) {
+        try {
+          const stored = await index(undefined, source);
+          return stored && nativeDwg(stored, units);
+        } catch (error) {
+          if (!(error instanceof FormatHold)) throw error;
+          return undefined;
+        }
+      },
+    } : {}),
+    async read(path, request, unit, _containedWords, source) {
+      if (format === "dwg") return (await readDwg(path, request, unit, source))!;
       const parsed = await parse(path);
       const current = parsed.units.find(({ id }) => id === unit.id);
       if (!current) {
@@ -195,7 +294,23 @@ function adapter(format: Format): ReaderAdapter {
       }
       return rawOutput(parsed, current, request);
     },
-    async *readNativeUnits(path, units) {
+    async *readNativeUnits(path, units, source) {
+      if (format === "dwg") {
+        try {
+          const stored = (await index(path, source, units[0]?.locator?.derivativeSha256))!;
+          yield* nativeDwg(stored, units);
+        } catch (error) {
+          if (!(error instanceof FormatHold)) throw error;
+          const held = originalOnly(error.code, "held");
+          for (const unit of units) {
+            if (unit.id === "original") yield rawOutput(held, held.units[0], {
+              address: { unitId: unit.id }, representation: "native",
+            });
+            else yield new ReaderError(error.code, "Часть DWG временно недоступна", 424);
+          }
+        }
+        return;
+      }
       const parsed = await parse(path);
       const byId = new Map(parsed.units.map((current) => [current.id, current]));
       for (const { id } of units) {

@@ -21,9 +21,24 @@ export type Unit = {
   limitations: string[];
   coverage: Coverage;
   cad?: CadShape[];
+  cadContext?: CadShape[];
   cadView?: { x: number; y: number; width: number; height: number };
   physicalRows?: number[];
 };
+export type CadBounds = { left: number; right: number; top: number; bottom: number };
+// A block transform is expressed in SVG coordinates (CAD Y points up).
+export type CadBlockUse = { digest: string; matrix: [number, number, number, number, number, number] };
+// Points and circular arcs are expressed in SVG coordinates.
+export type CadPath = (["M" | "L", number, number] | ["A", number, number, number, number, number])[];
+export type CadPoint = [number, number];
+export type CadHatchLine = { base: CadPoint; direction: CadPoint; step: CadPoint; dashes: number[] };
+export type CadArea = { loops: CadPath[]; mode: "solid" | "pattern" | "mask"; pattern?: CadHatchLine[] };
+export type CadDefinition = { shapes: CadShape[] };
+export type CadFontUse = { name: string; sha256?: string; kind?: "ttf" | "shx";
+  fallback?: "font" | "glyph" | "bigfont"; glyph?: string };
+export type CadTextSpan = { text: string; sha256?: string; x: number; y: number; height: number; width: number;
+  oblique: number; advance: number };
+export type CadFontRequest = { name: string; bold?: boolean; italic?: boolean; width?: number; oblique?: number; bigfont?: string };
 export type CadShape = {
   handle: string;
   layer: string;
@@ -36,6 +51,15 @@ export type CadShape = {
   angle?: number;
   radius?: number;
   text?: string;
+  textSpans?: CadTextSpan[];
+  fontRequest?: CadFontRequest;
+  path?: CadPath;
+  bounds?: CadBounds;
+  block?: CadBlockUse;
+  clip?: CadBounds;
+  area?: CadArea;
+  pieces?: CadShape[];
+  order?: string;
 };
 export type Parsed = {
   units: Unit[];
