@@ -1,0 +1,10 @@
+^github\.com$
+^api\.github\.com$
+^codeload\.github\.com$
+(^|\.)actions\.githubusercontent\.com$
+^objects\.githubusercontent\.com$
+^github-releases\.githubusercontent\.com$
+^github-registry-files\.githubusercontent\.com$
+^release-assets\.githubusercontent\.com$
+(^|\.)blob\.core\.windows\.net$
+^registry\.npmjs\.org$
