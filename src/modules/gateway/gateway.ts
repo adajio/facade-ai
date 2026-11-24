@@ -3,8 +3,8 @@ import type { Pool, PoolClient } from 'pg';
 import { PostgresIntentJournal, type OperatorAuthorization, type ReconciliationInput } from './journal.js';
 import { WorkQueue, type LeasedJob } from './queue.js';
 import {
-  BUDGET_USD_NANOS, encode, GatewayError, hash, positiveInteger, transaction,
-  type Attempt, type CallInput, type CallResult, type JournalEntry, type ModelPurpose,
+  BUDGET_USD_NANOS, encode, GatewayError, hash, positiveInteger, sameBudget, transaction,
+  type Attempt, type BudgetAttribution, type CallInput, type CallResult, type JournalEntry, type ModelPurpose,
   type ModelTransport, type ProviderOutcome, type Receipt, type RequestQuote, type RouteGrant, type RoutePolicy,
 } from './types.js';
 
@@ -22,6 +22,10 @@ const actions: Record<string, string> = {
   budget_reserve_wait: 'wait_for_reserve_settlement',
   budget_exhausted: 'inspect_budget_and_unresolved_reserves',
   budget_frozen: 'operator_review_ledger',
+  copilot_budget_exhausted: 'use_saved_project_evidence',
+  budget_attribution_required: 'bind_work_budget',
+  invalid_budget_attribution: 'bind_work_budget',
+  budget_project_unconfigured: 'configure_project_budget',
   journal_unavailable: 'restore_external_journal',
   journal_identity_mismatch: 'restore_pinned_journal',
   effect_already_claimed: 'inspect_attempt_status',
@@ -63,6 +67,14 @@ export type ReviewAdmission = (tx: PoolClient, work: LeasedJob) => Promise<'earl
 export type ResearchAdmission = (tx: PoolClient, work: LeasedJob, route: RoutePolicy, input: CallInput) =>
   Promise<{ deny?: string; dispatchBlock?: string }>;
 const active = "('reserved','prepared','sending','unknown')";
+
+function validBudget(value: BudgetAttribution): boolean {
+  return Boolean(value && Object.getPrototypeOf(value) === Object.prototype
+    && (value.initiatedBy === 'background' || value.initiatedBy === 'copilot')
+    && Object.keys(value).every(key => key === 'initiatedBy' || key === 'packageId')
+    && (value.packageId === undefined || (typeof value.packageId === 'string'
+      && /^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$/.test(value.packageId))));
+}
 
 function knownCost(value: unknown): value is number {
   return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0;
@@ -221,29 +233,30 @@ export class Gateway extends WorkQueue {
     const tx = client ?? this.db;
     await tx.query(
       `INSERT INTO gateway_attempts(id,ledger_id,project_id,scope_id,generation_id,job_id,purpose,effect_key,
-         request_hash,route_id,revision,ceiling_usd_nanos,previous_rejected_id,state,receipt)
-       VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
-       ON CONFLICT(id) DO UPDATE SET state=EXCLUDED.state,receipt=EXCLUDED.receipt
+         request_hash,route_id,revision,ceiling_usd_nanos,previous_rejected_id,state,receipt,budget)
+       VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
+       ON CONFLICT(id) DO UPDATE SET state=EXCLUDED.state,receipt=EXCLUDED.receipt,budget=EXCLUDED.budget
        WHERE gateway_attempts.ledger_id=EXCLUDED.ledger_id
          AND gateway_attempts.state NOT IN ('paid','rejected')
          AND (gateway_attempts.state NOT IN ('sending','unknown') OR EXCLUDED.state NOT IN ('prepared','sending'))
          AND (gateway_attempts.state<>'cancelled' OR EXCLUDED.state IN ('paid','unknown','rejected'))`,
       [attempt.id, journal.ledgerId, attempt.projectId, attempt.scopeId, attempt.generationId, attempt.jobId,
        attempt.purpose, attempt.effectKey, attempt.requestHash, attempt.routeId, attempt.revision,
-       attempt.ceilingUsdNanos, attempt.previousRejectedId, state, encode(receipt)],
+       attempt.ceilingUsdNanos, attempt.previousRejectedId, state, encode(receipt), attempt.budget ? encode(attempt.budget) : null],
     );
   }
 
   private async findOrReserve(
     tx: PoolClient, gate: Gate, input: CallInput, journal: PostgresIntentJournal,
   ): Promise<Attempt> {
-    const result = await tx.query<{ id: string; request_hash: string; previous_rejected_id: string | null }>(
-      `SELECT id,request_hash,previous_rejected_id FROM gateway_attempts
+    const result = await tx.query<{ id: string; request_hash: string; previous_rejected_id: string | null; budget: BudgetAttribution | null }>(
+      `SELECT id,request_hash,previous_rejected_id,budget FROM gateway_attempts
        WHERE effect_key=$1 AND state IN ('reserved','prepared') ORDER BY created_at DESC LIMIT 1 FOR UPDATE`, [gate.effect],
     );
     const pending = result.rows[0];
     const previousRejectedId = input.retryRejectedAttemptId ?? null;
-    if (pending && (pending.request_hash !== gate.requestHash || pending.previous_rejected_id !== previousRejectedId)) {
+    if (pending && (pending.request_hash !== gate.requestHash || pending.previous_rejected_id !== previousRejectedId
+      || (pending.budget && !sameBudget(pending.budget, input.budget)))) {
       throw new GatewayError('effect_conflict');
     }
     const { work, route } = gate;
@@ -252,16 +265,22 @@ export class Gateway extends WorkQueue {
       generationId: work.generationId, jobId: work.lease.jobId, purpose: work.purpose,
       effectKey: gate.effect, requestHash: gate.requestHash, routeId: route.id, revision: route.revision,
       ceilingUsdNanos: gate.quote?.ceilingUsdNanos ?? route.ceilingUsdNanos, previousRejectedId,
+      ...(input.budget ? { budget: input.budget } : {}),
       ...(gate.quote ? { pricingFingerprint: gate.quote.pricingFingerprint } : {}), dataClass: input.dataClass,
     };
-    if (pending) return attempt;
+    if (pending) {
+      if (!pending.budget && input.budget) {
+        await tx.query("UPDATE gateway_attempts SET budget=$2 WHERE id=$1 AND state='reserved'", [attempt.id, encode(input.budget)]);
+      }
+      return attempt;
+    }
     await tx.query(
       `INSERT INTO gateway_attempts(id,ledger_id,project_id,scope_id,generation_id,job_id,purpose,effect_key,
-        request_hash,route_id,revision,ceiling_usd_nanos,previous_rejected_id,state,input_refs)
-       VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,'reserved',$14)`,
+        request_hash,route_id,revision,ceiling_usd_nanos,previous_rejected_id,state,input_refs,budget)
+       VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,'reserved',$14,$15)`,
       [attempt.id, journal.ledgerId, attempt.projectId, attempt.scopeId, attempt.generationId, attempt.jobId, attempt.purpose,
        attempt.effectKey, attempt.requestHash, attempt.routeId, attempt.revision, attempt.ceilingUsdNanos, previousRejectedId,
-       encode(input.inputRefs)],
+       encode(input.inputRefs), attempt.budget ? encode(attempt.budget) : null],
     );
     return attempt;
   }
@@ -351,9 +370,12 @@ export class Gateway extends WorkQueue {
       || !Array.isArray(source.inputRefs) || source.inputRefs.length > 1024 || !source.inputRefs.every(shortRef)) {
       return held('invalid_request');
     }
+    if (source.budget !== undefined && !validBudget(source.budget)) return held('invalid_budget_attribution');
     let wire: string;
     try { wire = encode(source.request); } catch { return held('invalid_request'); }
-    const input = { ...source, lease: { ...source.lease }, inputRefs: [...source.inputRefs], request: JSON.parse(wire) as unknown };
+    const input = { ...source, lease: { ...source.lease }, inputRefs: [...source.inputRefs], request: JSON.parse(wire) as unknown,
+      budget: source.budget && { initiatedBy: source.budget.initiatedBy,
+        ...(source.budget.packageId ? { packageId: source.budget.packageId } : {}) } };
     let attemptId: string | undefined;
     try {
       const first = await transaction(this.db, async tx => {
@@ -362,14 +384,17 @@ export class Gateway extends WorkQueue {
       });
       if (typeof first === 'string') return held(first);
       const { previous, blocked } = await journal.probe(first.effect, first.dispatchBlock ? undefined : {
-        projectId: first.work.projectId, generationId: first.work.generationId, purpose: first.work.purpose,
+        projectId: first.work.projectId, budget: input.budget, generationId: first.work.generationId, purpose: first.work.purpose,
         jobId: first.work.lease.jobId, route: first.route, earlyReview: first.earlyReview,
         ceilingUsdNanos: first.quote?.ceilingUsdNanos ?? first.route.ceilingUsdNanos,
         retryRejectedAttemptId: input.retryRejectedAttemptId,
       });
       if (previous) {
         attemptId = previous.attempt.id;
-        if (previous.attempt.requestHash !== first.requestHash) return held('effect_conflict', attemptId);
+        if (previous.attempt.requestHash !== first.requestHash
+          || (previous.attempt.budget && !sameBudget(previous.attempt.budget, input.budget))) {
+          return held('effect_conflict', attemptId);
+        }
         await this.mirror(previous, journal);
         if (previous.state === 'paid' || previous.state === 'sending' || previous.state === 'unknown'
           || (previous.state === 'rejected' && previous.attempt.id !== input.retryRejectedAttemptId)) {
@@ -382,6 +407,11 @@ export class Gateway extends WorkQueue {
         return held('effect_conflict', attemptId);
       }
       if (blocked) return held(blocked, attemptId);
+      if (previous?.state === 'prepared' && !previous.attempt.budget && input.budget) {
+        const cancelled = await journal.cancelPrepared(previous.attempt.id);
+        await this.mirror(cancelled, journal);
+        return cancelled.state === 'cancelled' ? held('dispatch_not_started', attemptId) : this.terminal(input, cancelled, true);
+      }
 
       const reserved = await transaction(this.db, async tx => {
         const current = await this.gate(tx, input, wire);
@@ -398,7 +428,10 @@ export class Gateway extends WorkQueue {
         await this.db.query("UPDATE gateway_attempts SET state='cancelled' WHERE id=$1 AND state='reserved'", [attemptId]);
         if (typeof prepared === 'string') return held(prepared, attemptId);
         await this.mirror(prepared, journal);
-        if (prepared.attempt.requestHash !== first.requestHash) return held('effect_conflict', prepared.attempt.id);
+        if (prepared.attempt.requestHash !== first.requestHash
+          || (prepared.attempt.budget && !sameBudget(prepared.attempt.budget, input.budget))) {
+          return held('effect_conflict', prepared.attempt.id);
+        }
         return this.terminal(input, prepared, true);
       }
       await this.mirror(prepared, journal);
@@ -436,7 +469,8 @@ export class Gateway extends WorkQueue {
         if (['route_denied','route_data_unapproved','synthetic_retention_not_approved','route_training_policy_unverified',
           'route_parameters_unsupported','route_zdr_unavailable','route_endpoint_unverified','invalid_request',
           'route_bound_unavailable','primary_barrier','review_pair_stale','effect_conflict','route_busy','route_rate_limited',
-          'route_reconciliation','budget_frozen','budget_exhausted','budget_reserve_wait','analysis_replay_only','analysis_prior_effect',
+          'route_reconciliation','budget_frozen','budget_exhausted','copilot_budget_exhausted','budget_reserve_wait',
+          'budget_attribution_required','invalid_budget_attribution','budget_project_unconfigured','analysis_replay_only','analysis_prior_effect',
           'analysis_target_changed','analysis_input_denied','analysis_legacy_replay_only'].includes(denied)) {
           // Cancellation is conditional in the journal because a concurrent caller may already own the attempt.
           await this.mirror(await journal.cancelPrepared(reserved.id), journal);
@@ -482,9 +516,11 @@ export class Gateway extends WorkQueue {
         }
         const missing = transport?.lookup && paid && paid.routeVerified !== false && !await this.response(this.db, entry.attempt.id, paid);
         if (unsettled || missing) {
+          const providerId = entry.receipt && 'providerId' in entry.receipt ? entry.receipt.providerId : undefined;
           const outcome = (unsettled ? await this.savedOutcome(entry.attempt) : null)
-            ?? await transport?.lookup?.(entry.attempt).catch(() => null);
-          if (outcome && validReceipt(outcome.receipt) && outcome.receipt.state !== 'unknown') {
+            ?? await transport?.lookup?.(entry.attempt, { providerId }).catch(() => null);
+          if (outcome && validReceipt(outcome.receipt) && outcome.receipt.state !== 'unknown'
+            && (outcome.receipt.state !== 'paid' || !providerId || outcome.receipt.providerId === providerId)) {
             const receipt = durableReceipt(outcome.receipt);
             final = await journal.settle(entry.attempt.id, receipt);
             await this.mirror(final, journal);
@@ -567,7 +603,7 @@ export class Gateway extends WorkQueue {
          ORDER BY j.created_at DESC LIMIT 200`, [projectId],
       ),
       this.db.query(
-        `SELECT id,job_id AS "jobId",route_id AS "routeId",state,route_isolated AS "routeIsolated",
+        `SELECT id,job_id AS "jobId",route_id AS "routeId",state,route_isolated AS "routeIsolated",budget,
          CASE WHEN state IN ${active} THEN ceiling_usd_nanos::float8 ELSE 0 END AS "reserveUsdNanos",
          coalesce((receipt->>'costUsdNanos')::float8,0) AS "spentUsdNanos",
          coalesce(receipt->>'code', CASE WHEN state='sending' THEN 'awaiting_provider_receipt' END) AS reason,

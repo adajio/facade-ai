@@ -1,7 +1,7 @@
 import type { Pool, PoolClient } from 'pg';
 import {
-  BUDGET_USD_NANOS, GatewayError, encode, hash, positiveInteger, transaction,
-  type Attempt, type JournalEntry, type KnownReceipt, type Receipt, type RoutePolicy,
+  BUDGET_USD_NANOS, GatewayError, encode, hash, positiveInteger, sameBudget, transaction,
+  type Attempt, type BudgetAttribution, type JournalEntry, type KnownReceipt, type Receipt, type RoutePolicy,
 } from './types.js';
 
 export type OperatorAuthorization = { actorId: string; authority: 'gateway:reconcile' };
@@ -12,12 +12,15 @@ export type ReconciliationInput = {
   resolution: KnownReceipt | { state: 'unknown'; code: string } | { state: 'isolate_unknown' };
 };
 
+type BudgetScope = 'installation' | 'project' | 'package' | 'copilot';
+
 type JournalRow = JournalEntry & {
   createdOrder: string;
   startedAt: Date | null;
 };
 type DispatchTarget = Pick<Attempt, 'projectId' | 'generationId' | 'purpose' | 'jobId'>;
-type DispatchProbe = DispatchTarget & {
+type BudgetTarget = Pick<Attempt, 'projectId' | 'budget'>;
+type DispatchProbe = DispatchTarget & BudgetTarget & {
   route: RoutePolicy;
   ceilingUsdNanos: number;
   earlyReview: boolean;
@@ -54,19 +57,20 @@ export class PostgresIntentJournal {
   private async bound(tx: PoolClient) {
     await tx.query('SET LOCAL synchronous_commit=on');
     // Deployed journals without the limit column keep their original ten-dollar cap.
-    const result = await tx.query<{ frozen: boolean; limitUsdNanos: string }>(
-      `SELECT frozen, coalesce((to_jsonb(ledger)->>'limit_usd_nanos')::bigint,$2::bigint)::text AS "limitUsdNanos"
+    const result = await tx.query<{ frozen: boolean; limitUsdNanos: string; scoped: boolean }>(
+      `SELECT frozen, to_regprocedure('gateway_budget_block(uuid,jsonb,bigint,bigint)') IS NOT NULL AS scoped,
+         coalesce((to_jsonb(ledger)->>'limit_usd_nanos')::bigint,$2::bigint)::text AS "limitUsdNanos"
        FROM gateway_external_ledger ledger WHERE singleton AND ledger_id=$1 FOR UPDATE`,
       [this.ledgerId, BUDGET_USD_NANOS],
     );
     if (!result.rows[0]) throw new GatewayError('journal_identity_mismatch');
-    const { frozen } = result.rows[0];
+    const { frozen, scoped } = result.rows[0];
     const limitUsdNanos = Number(result.rows[0].limitUsdNanos);
     if (!positiveInteger(limitUsdNanos, BUDGET_USD_NANOS) ||
         (this.expectedLimitUsdNanos !== undefined && this.expectedLimitUsdNanos !== limitUsdNanos)) {
       throw new GatewayError('journal_limit_mismatch');
     }
-    return { frozen, limitUsdNanos };
+    return { frozen, limitUsdNanos, scoped };
   }
 
   private async byId(tx: PoolClient, id: string): Promise<JournalRow> {
@@ -90,16 +94,15 @@ export class PostgresIntentJournal {
 
   async probe(effectKey: string, candidate?: DispatchProbe): Promise<{ previous: JournalEntry | null; blocked?: string }> {
     return transaction(this.pool, async tx => {
-      const { frozen, limitUsdNanos } = await this.bound(tx);
+      const bound = await this.bound(tx);
       const previous = await this.latest(tx, effectKey);
       if (!candidate || (previous && (previous.state !== 'rejected' || previous.attempt.id !== candidate.retryRejectedAttemptId
         || await this.hasRouteIsolation(tx, previous.attempt.id)))) {
         return { previous };
       }
-      if (frozen) return { previous, blocked: 'budget_frozen' };
+      if (bound.frozen) return { previous, blocked: 'budget_frozen' };
       const routeBlock = await this.routeBlock(tx, candidate.route, candidate, candidate.earlyReview);
-      if (!routeBlock) return { previous };
-      const budgetBlock = await this.budgetBlock(tx, limitUsdNanos, candidate.ceilingUsdNanos);
+      const budgetBlock = await this.budgetBlock(tx, bound, candidate, candidate.ceilingUsdNanos);
       return { previous, blocked: budgetBlock ?? routeBlock };
     });
   }
@@ -129,7 +132,17 @@ export class PostgresIntentJournal {
     };
   }
 
-  private async budgetBlock(tx: PoolClient, limit: number, additional: number, ownPreparedCeiling = 0) {
+  private async budgetBlock(tx: PoolClient, bound: { scoped: boolean; limitUsdNanos: number },
+    target: BudgetTarget, additional: number, ownPreparedCeiling = 0) {
+    if (bound.scoped) {
+      const result = await tx.query<{ blocked: string | null }>(
+        'SELECT gateway_budget_block($1,$2,$3,$4) AS blocked',
+        [target.projectId, target.budget ? encode(target.budget) : null, additional, ownPreparedCeiling],
+      );
+      return result.rows[0].blocked ?? undefined;
+    }
+    if (target.budget) return 'budget_project_unconfigured';
+    const limit = bound.limitUsdNanos;
     const { spentUsdNanos, reserveUsdNanos, activeReserveUsdNanos } = await this.budget(tx);
     const committed = spentUsdNanos + reserveUsdNanos + additional;
     if (committed <= limit) return undefined;
@@ -146,16 +159,34 @@ export class PostgresIntentJournal {
     });
   }
 
+  async budgetBalances(projectId: string, budget: BudgetAttribution) {
+    return transaction(this.pool, async tx => {
+      if (!(await this.bound(tx)).scoped) throw new GatewayError('budget_project_unconfigured');
+      const { rows } = await tx.query<{
+        scope: BudgetScope; limitUsdNanos: number; spentUsdNanos: number; reserveUsdNanos: number;
+      }>(
+        `SELECT scope,limit_usd_nanos::float8 AS "limitUsdNanos",spent::float8 AS "spentUsdNanos",
+           reserved::float8 AS "reserveUsdNanos" FROM gateway_budget_balances($1,$2) ORDER BY scope`,
+        [projectId, encode(budget)],
+      );
+      return rows;
+    });
+  }
+
   async prepare(attempt: Attempt): Promise<JournalEntry | string> {
     return transaction(this.pool, async tx => {
-      const { frozen, limitUsdNanos } = await this.bound(tx);
+      const bound = await this.bound(tx);
       const current = await this.latest(tx, attempt.effectKey);
-      if (current?.attempt.id === attempt.id) return current;
-      if (current && current.attempt.requestHash !== attempt.requestHash) return 'effect_conflict';
+      if (current?.attempt.id === attempt.id) {
+        return current.attempt.requestHash === attempt.requestHash && sameBudget(current.attempt.budget, attempt.budget)
+          ? current : 'effect_conflict';
+      }
+      if (current && (current.attempt.requestHash !== attempt.requestHash
+        || (current.attempt.budget && !sameBudget(current.attempt.budget, attempt.budget)))) return 'effect_conflict';
       if (current && (current.state !== 'rejected' || current.attempt.id !== attempt.previousRejectedId
         || await this.hasRouteIsolation(tx, current.attempt.id))) return current;
-      if (frozen) return 'budget_frozen';
-      const blocked = await this.budgetBlock(tx, limitUsdNanos, attempt.ceilingUsdNanos);
+      if (bound.frozen) return 'budget_frozen';
+      const blocked = await this.budgetBlock(tx, bound, attempt, attempt.ceilingUsdNanos);
       if (blocked) return blocked;
       const result = await tx.query<JournalRow>(
         `INSERT INTO gateway_external_attempts(id,effect_key,project_id,generation_id,route_id,purpose,
@@ -190,12 +221,12 @@ export class PostgresIntentJournal {
 
   async claim(id: string, route: RoutePolicy, earlyReview = false): Promise<'claimed' | string> {
     return transaction(this.pool, async tx => {
-      const { frozen, limitUsdNanos } = await this.bound(tx);
+      const bound = await this.bound(tx);
       const entry = await this.byId(tx, id);
       if (entry.state !== 'prepared') return 'effect_already_claimed';
-      if (frozen) return 'budget_frozen';
+      if (bound.frozen) return 'budget_frozen';
       const blocked = await this.routeBlock(tx, route, entry.attempt, earlyReview) ??
-        await this.budgetBlock(tx, limitUsdNanos, 0, entry.attempt.ceilingUsdNanos);
+        await this.budgetBlock(tx, bound, entry.attempt, 0, entry.attempt.ceilingUsdNanos);
       if (blocked) return blocked;
       await tx.query(
         `UPDATE gateway_external_attempts SET state='sending', started_at=clock_timestamp(),
@@ -218,6 +249,8 @@ export class PostgresIntentJournal {
     return transaction(this.pool, async tx => {
       await this.bound(tx);
       const entry = await this.byId(tx, id);
+      if (entry.receipt?.state === 'unknown' && entry.receipt.providerId
+        && receipt.state === 'paid' && receipt.providerId !== entry.receipt.providerId) return entry;
       return this.settlement(tx, entry, receipt);
     });
   }
