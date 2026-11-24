@@ -61,6 +61,8 @@ const packageObservation = z.union([
   deliveryForm.extend(metadata),
 ]);
 const scanMetadata={package:profileScanDetails.optional()};
+const packageObservationWire = (job: ResearchJob) =>
+  statementObservation.extend(supportsFacadeHeader(job) ? scanMetadata : metadata);
 const profileScanObservation = z.union([
   z.strictObject({ ...observationAddress, ...quoted, value: argumentText.optional(), ...scanMetadata }),
   ...observationForms.map((form) => form.extend(scanMetadata)),
@@ -167,6 +169,22 @@ export function checkToolArguments(job: ResearchJob, name: keyof typeof commands
     name==='open_context'?contextArguments(job):currentCommands[name];
   return schema.safeParse(args);
 }
+
+export function packageArgumentPaths(job: ResearchJob, name: keyof typeof commands, args: unknown) {
+  if (toolWireFor(job) !== 'package-observation-v2') return [];
+  const schema = name === 'save_observation' ? packageObservationWire(job)
+    : name === 'save_compound_observation' ? walkCompound : undefined;
+  if (!schema) return [];
+  const checked = schema.safeParse(args);
+  if (checked.success) return [];
+  const paths = checked.error.issues.flatMap((issue) => issue.code === 'unrecognized_keys'
+    ? issue.keys.map((key) => [...issue.path, key]) : [issue.path]);
+  return paths.filter((path) => path.length && path.every((part) => typeof part === 'number' ||
+    typeof part === 'string' && /^[a-zA-Z][a-zA-Z0-9_]{0,39}$/.test(part)))
+    .slice(0, 6).map((path) => path.join('.'));
+}
+
+const packageMetadataGuidance = 'Put metadata inside package. Use package.attribute for the printed property label and package.binding for state, labels, reason, quote and projectContext. Put role, stage, revision and valueRole directly inside package as JSON objects. Omit any field without a verbatim supporting phrase in its own addressed fragment.';
 
 const toolDescriptions: Record<keyof typeof commands, string> = {
   inventory: 'List assigned source addresses and physical units.',
@@ -298,13 +316,18 @@ export function initialMessages(job: ResearchJob): Message[] {
   ];
 }
 
-export type ToolWire = 'current' | 'compound-v1' | 'observation-v1' | 'role-v1' | 'shared-v1';
+export type ToolWire = 'package-observation-v2' | 'current' | 'compound-v1' | 'observation-v1' | 'role-v1' | 'shared-v1';
+
+export function toolWireFor(job: ResearchJob): ToolWire {
+  return job.mode === 'primary' && job.observationProtocol === 2 && walkJob(job) ? 'package-observation-v2' : 'current';
+}
 
 type PairWire = { scopeName: string } | { legacy: true };
 
-export function request(job: ResearchJob, messages: Message[], wire: ToolWire = 'current', pair?: PairWire) {
+export function request(job: ResearchJob, messages: Message[], wire: ToolWire = toolWireFor(job), pair?: PairWire) {
   const earlyPair = pair !== undefined;
-  const hasCompound = wire === 'current' || wire === 'compound-v1';
+  const compactPackage = wire === 'package-observation-v2';
+  const hasCompound = compactPackage || wire === 'current' || wire === 'compound-v1';
   const hasObservationForms = hasCompound || wire === 'observation-v1';
   return {
     model: job.settings.model,
@@ -333,8 +356,11 @@ export function request(job: ResearchJob, messages: Message[], wire: ToolWire = 
       }
       if (name === 'save_observation' && job.mode === 'primary') {
         if (job.packageWindow) {
-          schema = statementObservation.extend(supportsFacadeHeader(job)?scanMetadata:metadata);
-          description = 'Save one addressed original quotation. Supply package.attribute for the observed property. The package.role, stage, revision and binding each need a verbatim supporting phrase from this quotation. Print exact facade labels and separate unclear cases. Save material labels only with their verbatim cited text. Give projectIdentifiers only for fields expressly naming a project-wide facade ID. Use projectContext only if both the building and its grid axes are printed with this facade designation. A subjectRegister requires a quote explicitly declaring the complete facade list and its exact labels. Common material needs a direct statement; missing text is not a non-delivery statement.';
+          schema = packageObservationWire(job);
+          description = compactPackage
+            ? 'Save one addressed quotation. For a measurement send quote, literal value and unit. For a printed label or text send quote and lineId if available. For uncertainty send limitation and optionally alternatives. ' + packageMetadataGuidance
+              + ' Cite material labels verbatim. Use projectIdentifiers for explicit project-wide IDs and projectContext only if building and axes are printed with the facade. Cite an explicitly complete list for subjectRegister and an explicit common scope for common material.'
+            : 'Save one addressed original quotation. Supply package.attribute for the observed property. The package.role, stage, revision and binding each need a verbatim supporting phrase from this quotation. Print exact facade labels and separate unclear cases. Save material labels only with their verbatim cited text. Give projectIdentifiers only for fields expressly naming a project-wide facade ID. Use projectContext only if both the building and its grid axes are printed with this facade designation. A subjectRegister requires a quote explicitly declaring the complete facade list and its exact labels. Common material needs a direct statement; missing text is not a non-delivery statement.';
           if(supportsFacadeHeader(job)) description += ' For a printed type on the line immediately after a single-facade heading, open the full native window with extract. Save the type line as quote and lineId. Supply package.facadeHeaderLineId and cite the heading verbatim for role, revision, stage and binding. Never concatenate the two lines.';
         }
         if (job.observationProtocol === 2) {
@@ -351,7 +377,7 @@ export function request(job: ResearchJob, messages: Message[], wire: ToolWire = 
       }
       const parameters = z.toJSONSchema(schema, { io: 'input' });
       if (hasObservationForms) {
-        if (name === 'save_observation') {
+        if (name === 'save_observation' && !compactPackage) {
           const forms = z.toJSONSchema(observationArguments(job), { io: 'input' });
           Object.assign(parameters, { anyOf: forms.anyOf });
         }
@@ -362,8 +388,11 @@ export function request(job: ResearchJob, messages: Message[], wire: ToolWire = 
         const guidance = name === 'save_observation' && job.mode === 'primary' && job.packageWindow ? undefined : currentGuidance[name];
         if (guidance) description += ` ${guidance}`;
       }
-      if (wire === 'current' && name === 'save_compound_observation') {
+      if ((wire === 'current' || compactPackage) && name === 'save_compound_observation') {
         description += ' For text, quote only the selected measurement. Its same-line unit must be adjacent to that number. Cite the applicable header in the same numeric column or a dedicated adjacent unit cell. Use an identifier from the row heading or an explicitly named identifier column. For a variant, cite an explicitly labelled field or a cell under its Variant heading. If these links cannot be established, save an addressed limitation.';
+      }
+      if (compactPackage && name === 'save_compound_observation') {
+        description += ' ' + packageMetadataGuidance + ' For a field supported by a separate component, set package.references.<field> to its zero-based index. An identifier is a printed mark or designation, and a row number or property label belongs outside that component. Save the anchor via save_observation if the entire measurement is proven there and the remaining context is unclear.';
       }
       return { type: 'function', function: { name, description, parameters } };
     }),

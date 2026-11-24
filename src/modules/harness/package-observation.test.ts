@@ -69,6 +69,27 @@ function addressedFixture(quote: string) {
   return { observation, evidence, context, issued, facts, tx };
 }
 
+test('a schedule observation gives field-specific recovery without promoting its title or stage to value purpose', async () => {
+  const quote = 'Schedule | Facade: FX-00AB-Q | Revision: M3 current | Guide offset: 51 mm';
+  const f = addressedFixture(quote);
+  const details = { attribute: 'Guide offset', role: { value: 'schedule' as const, quote: 'Schedule | Facade: FX-00AB-Q' },
+    revision: { value: 'M3', quote: 'Revision: M3 current', status: 'current' as const },
+    stage: { value: 'RD', quote: 'Stage: RD' }, valueRole: { kind: 'design' as const, quote: 'Schedule' } };
+  const first = await publishPackageObservation(f.tx, f.context, { evidence: f.evidence, package: details }, f.observation);
+  assert.deepEqual(first?.confirmed.map(({ field }) => field), ['attribute', 'revision', 'revisionStatus']);
+  assert.deepEqual(first?.rejected.map(({ field, code }) => [field, code]), [
+    ['role', 'field_not_grounded'], ['stage', 'reference_required'], ['valueRole', 'field_not_grounded'],
+  ]);
+  assert.match(first!.rejected[0].nextAction, /только фрагмент с видом документа/);
+  assert.deepEqual(f.facts[0].slice(4, 9), ['Guide offset', 'unknown', null, 'M3', 'current']);
+
+  const next = await publishPackageObservation(f.tx, f.context, { evidence: f.evidence,
+    package: { ...details, role: { ...details.role, quote: 'Schedule' } } }, { ...f.observation, id: randomUUID() });
+  assert.deepEqual(next?.confirmed.map(({ field }) => field), ['attribute', 'role', 'revision', 'revisionStatus']);
+  assert.deepEqual(next?.rejected.map(({ field }) => field), ['stage', 'valueRole']);
+  assert.deepEqual(f.facts[1].slice(4, 9), ['Guide offset', 'schedule', null, 'M3', 'current']);
+});
+
 test('a split native line verifies only the submitted non-delivery and inventory role', async () => {
   const quote = 'Torsion test report not supplied';
   const f = addressedFixture(quote);
