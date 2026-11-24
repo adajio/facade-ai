@@ -1,4 +1,4 @@
-import type { CadBounds, CadShape, Unit } from "./model.js";
+import type { CadBlockUse, CadBounds, CadShape, Unit } from "./model.js";
 
 export const escapeXml = (value: string) => value.replace(/[&<>"']/g, (character) => ({
   "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&apos;",
@@ -47,4 +47,18 @@ export function cadFrame(unit: Unit) {
   const border = Math.max((right - left) * .035, (bottom - top) * .035, 1);
   return { x: left - border, y: top - border,
     width: right - left + 2 * border, height: bottom - top + 2 * border };
+}
+
+export function transformCadBounds([a, b, c, d, x, y]: CadBlockUse["matrix"], box: CadBounds): CadBounds {
+  const { left, right, top, bottom } = box;
+  const xs = [a * left + c * top + x, a * right + c * top + x,
+    a * left + c * bottom + x, a * right + c * bottom + x];
+  const ys = [b * left + d * top + y, b * right + d * top + y,
+    b * left + d * bottom + y, b * right + d * bottom + y];
+  return { left: Math.min(...xs), right: Math.max(...xs), top: Math.min(...ys), bottom: Math.max(...ys) };
+}
+
+export function cadPaintOrder(a: CadShape, b: CadShape) {
+  const left = a.order ?? "", right = b.order ?? "";
+  return left < right ? -1 : Number(left > right);
 }

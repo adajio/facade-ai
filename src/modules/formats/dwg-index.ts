@@ -8,7 +8,8 @@ import { ReaderError } from "../pdf/types.js";
 import type { ReaderUnit, SourceRef } from "../pdf/types.js";
 import { blockKey, dwgGeometry, geometryDigest } from "./dwg-geometry.js";
 import { dwgViewports } from "./dwg-viewport.js";
-import { cadShapeBounds } from "./cad-bounds.js";
+import { dwgMaskContext } from "./dwg-mask-context.js";
+import { cadPaintOrder, cadShapeBounds } from "./cad-bounds.js";
 import { derivativeLines, derivativeText, dxfBytes, dxfValue } from "./dwg-text.js";
 import { recoveryObjects } from "./dwg-recovery.js";
 import { FormatHold, unit } from "./model.js";
@@ -16,7 +17,7 @@ import type { CadDefinition, Unit } from "./model.js";
 import { appendCadEntity, cadMetadata, cadSpace, convertedDxfRecords, first, recoveryCadRecords } from "./spatial.js";
 import type { Entity } from "./spatial.js";
 
-export const dwgReaderProfile = "formats-1.1.6";
+export const dwgReaderProfile = "formats-1.1.7";
 const rowsPerPart = 512;
 const shapesPerPart = 6000;
 const textPerPart = 2 * 1024 ** 2;
@@ -244,16 +245,18 @@ export async function buildDwgIndex(file: FileHandle, sha: string, converter: st
     output = new DatabaseSync(diskFile);
     budget(output, capacity / 3n);
     output.exec(`CREATE TABLE identity (data TEXT); CREATE TABLE parts (
-      ordinal INTEGER PRIMARY KEY, id TEXT UNIQUE, data TEXT, digest TEXT, view INTEGER);
+      ordinal INTEGER PRIMARY KEY, id TEXT UNIQUE, data TEXT, digest TEXT, view INTEGER, mask_source TEXT);
       CREATE TABLE definitions (digest TEXT PRIMARY KEY, data TEXT);`);
     output.prepare("INSERT INTO identity VALUES (?)").run(JSON.stringify({ converter, derivative: sha, kind }));
-    const publish = output.prepare("INSERT INTO parts(id,data,digest,view) VALUES (?,?,?,?)");
-    function save(part: Unit) {
+    const publish = output.prepare("INSERT INTO parts(id,data,digest,view,mask_source) VALUES (?,?,?,?,?)");
+    const masks = dwgMaskContext(records, output);
+    function save(part: Unit, maskSource = part.id) {
       part.coverage = "partial";
       part.locator.derivative = kind;
       part.limitations.push("cad_converted_handle_unverified");
       const data = JSON.stringify(part);
-      publish.run(part.id, data, hash(data), Number(Boolean(part.locator.view)));
+      publish.run(part.id, data, hash(data), Number(Boolean(part.locator.view)), maskSource);
+      if (!part.locator.view) masks.record(part);
     }
     const geometry = dwgGeometry(records, output, sortEnabled);
     const viewport = !recovery && (records.prepare(`SELECT 1 AS present FROM entities WHERE
@@ -281,9 +284,7 @@ export async function buildDwgIndex(file: FileHandle, sha: string, converter: st
         const partUnit = unit(partId, label, {
           space: name, entityCount: size, ...(split ? { part, firstEntity: start, lastEntity: last } : {}),
         }, current.rows, [...new Set([...issues, ...current.limitations])]);
-        partUnit.cad = sortEnabled
-          ? current.shapes.sort((a, b) => (a.order ?? "") < (b.order ?? "") ? -1 : Number((a.order ?? "") > (b.order ?? "")))
-          : current.shapes;
+        partUnit.cad = sortEnabled ? current.shapes.sort(cadPaintOrder) : current.shapes;
         save(partUnit);
         from += size;
         current = cadSpace();
@@ -303,7 +304,7 @@ export async function buildDwgIndex(file: FileHandle, sha: string, converter: st
           }, rows, [...partUnit.limitations.filter(code => code !== "cad_converted_handle_unverified"), "cad_view_projection_approximate"]);
           view.cad = partUnit.cad;
           view.cadView = frame;
-          save(view);
+          save(view, partUnit.id);
         }
       }
       for (const row of select.iterate(name)) {
@@ -353,11 +354,11 @@ export async function buildDwgIndex(file: FileHandle, sha: string, converter: st
         entity.details = { ...entity.details, entityOrdinal: number,
           ...(next.limitations.size ? { limitations: [...next.limitations] } : {}) };
         current.rows.push(entity);
-        if (sortEnabled) {
-          const order = handle ? (typeof row.sortkey === "string" ? row.sortkey : handle.padStart(16, "0"))
-            : "~~" + String(number).padStart(12, "0");
-          for (const shape of next.shapes) shape.order = order;
-        }
+        const ordinal = String(number).padStart(16, "0");
+        const baseOrder = sortEnabled && handle
+          ? (typeof row.sortkey === "string" ? row.sortkey : handle.padStart(16, "0"))
+          : sortEnabled ? "~~" : "";
+        for (const shape of next.shapes) shape.order = `${baseOrder}:${ordinal}`;
         current.shapes.push(...next.shapes);
         if (name === "Model" && viewport) for (const shape of next.shapes) viewport.collect(shape);
         for (const limit of next.limitations) current.limitations.add(limit);
@@ -373,6 +374,7 @@ export async function buildDwgIndex(file: FileHandle, sha: string, converter: st
       const name = String(row.space);
       if (!layouts.has(name)) space(name);
     }
+    masks.attach();
     output.exec("COMMIT");
     records.exec("COMMIT");
     records.close();

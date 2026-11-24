@@ -2,7 +2,7 @@ import { Resvg } from "@resvg/resvg-js";
 import { existsSync } from "node:fs";
 import { crc32, deflateSync } from "node:zlib";
 import { ReaderError } from "../pdf/types.js";
-import { cadShapeBounds, escapeXml } from "./cad-bounds.js";
+import { cadShapeBounds, escapeXml, transformCadBounds } from "./cad-bounds.js";
 import type { CadArea, CadBlockUse, CadBounds, CadDefinition, CadPath, CadShape } from "./model.js";
 
 type Matrix = CadBlockUse["matrix"];
@@ -29,14 +29,6 @@ function position([a, b, c, d, x, y]: Matrix, u: number, v: number): Point {
 function intersect(a: CadBounds, b: CadBounds): CadBounds {
   return { left: Math.max(a.left, b.left), right: Math.min(a.right, b.right),
     top: Math.max(a.top, b.top), bottom: Math.min(a.bottom, b.bottom) };
-}
-
-function mapped(matrix: Matrix, box: CadBounds): CadBounds {
-  const { left, right, top, bottom } = box;
-  const corners = [position(matrix, left, top), position(matrix, right, top),
-    position(matrix, left, bottom), position(matrix, right, bottom)];
-  return { left: Math.min(...corners.map(p => p[0])), right: Math.max(...corners.map(p => p[0])),
-    top: Math.min(...corners.map(p => p[1])), bottom: Math.max(...corners.map(p => p[1])) };
 }
 
 function png(width: number, height: number, pixels: Buffer) {
@@ -253,7 +245,7 @@ export function rasterCad(
 
   function draw(shape: CadShape, matrix: Matrix, box: CadBounds, tint: number, depth: number) {
     if (++visits > 800_000 || depth >= 19) limit();
-    const visible = intersect(mapped(matrix, cadShapeBounds(shape)), box);
+    const visible = intersect(transformCadBounds(matrix, cadShapeBounds(shape)), box);
     if (visible.left > visible.right + 1 || visible.top > visible.bottom + 1) return;
     if (shape.area) {
       drawArea(shape.area, matrix, box, visible, tint);
@@ -272,7 +264,7 @@ export function rasterCad(
         definitions.set(digest, items);
       }
       const nested = product(matrix, local);
-      const clip = shape.clip ? intersect(box, mapped(matrix, shape.clip)) : box;
+      const clip = shape.clip ? intersect(box, transformCadBounds(matrix, shape.clip)) : box;
       for (const item of items) draw(item, nested, clip, tint, depth + 1);
     } else if (shape.path) {
       let previous: Point | undefined;

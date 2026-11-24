@@ -1,6 +1,6 @@
 import { Resvg } from "@resvg/resvg-js";
 import { rasterCad } from "./cad-raster.js";
-import { cadFrame, cadShapeBounds, envelopeOf, escapeXml } from "./cad-bounds.js";
+import { cadFrame, cadPaintOrder, cadShapeBounds, envelopeOf, escapeXml } from "./cad-bounds.js";
 export { cadFrame } from "./cad-bounds.js";
 import { contains, ReaderError, validBox } from "../pdf/types.js";
 import type { Box, ReaderAddress } from "../pdf/types.js";
@@ -13,6 +13,9 @@ function invalid(): never {
 export function renderCad(
   unit: Unit, address: ReaderAddress, handle?: string, load?: (digest: string) => CadDefinition,
 ) {
+  if (unit.limitations.includes("cad_mask_context_limit")) {
+    throw new ReaderError("cad_mask_context_limit", "В области слишком много пересекающихся масок DWG", 424);
+  }
   const entire = cadFrame(unit);
   if (!entire || !unit.cad) return;
   const outer = { ...entire, x: 0, y: 0 };
@@ -52,8 +55,9 @@ export function renderCad(
   const scale = Math.min(width / crop.width, height / crop.height);
   const originX = crop.x * scale - (width - crop.width * scale) / 2;
   const originY = crop.y * scale - (height - crop.height * scale) / 2;
-  const bytes = load && unit.cad.some(shape => shape.block || shape.path || shape.area || shape.pieces)
-    ? rasterCad(unit.cad, width, height, scale, originX + entire.x * scale, originY + entire.y * scale, load, handle)
+  const drawing = unit.cadContext?.length ? [...unit.cad, ...unit.cadContext].sort(cadPaintOrder) : unit.cad;
+  const bytes = load && drawing.some(shape => shape.block || shape.path || shape.area || shape.pieces)
+    ? rasterCad(drawing, width, height, scale, originX + entire.x * scale, originY + entire.y * scale, load, handle)
     : legacyPng(unit.cad, width, height, scale, originX, originY, entire.x, entire.y, handle);
   return { bytes, crop, transform: { width, height, pixelsPerPoint: scale,
     pixelOriginX: originX, pixelOriginY: originY } };

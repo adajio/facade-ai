@@ -42,6 +42,7 @@ const labels: Record<string, string> = {
   cad_hatch_edge_unsupported: 'Тип границы штриховки недоступен для схемы',
   cad_hatch_ellipse_tessellated: 'Эллиптическая граница штриховки показана приближённо',
   cad_hatch_gradient_approximate: 'Градиент на схеме заменён сплошной заливкой',
+  cad_mask_context_limit: 'Слишком много пересекающихся масок DWG',
   cad_wipeout_boundary_invalid: 'Контур маски не подтверждён',
   cad_wipeout_inverse_clip_unsupported: 'Инвертированная граница маски недоступна для схемы',
   cad_entity_hidden: 'Объект скрыт в чертеже',

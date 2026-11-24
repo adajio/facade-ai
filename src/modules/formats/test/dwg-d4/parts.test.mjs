@@ -264,13 +264,18 @@ test("DWG draws proxy shell topology, hatch holes and ordered wipeout occlusion"
   const proxy = [0, "ACAD_PROXY_ENTITY", 5, "D6", 92, shell.length, 310, shell.toString("hex"),
     93, 8, 310, "FF"];
   const text = (handle, y) => [0, "TEXT", 5, handle, 10, 8, 20, y, 40, 1, 1, "TEXT"];
+  const nestedMask = [0, "WIPEOUT", 5, "E2", 8, "cut", ...wipeout.slice(4)];
   const dxf = [
     0, "SECTION", 2, "HEADER", 9, "$SORTENTS", 280, 127, 0, "ENDSEC",
+    0, "SECTION", 2, "BLOCKS", 0, "BLOCK", 2, "MASKED", 330, "90", 10, 0, 20, 0,
+    ...nestedMask, ...line("E1", 8), ...line("E3", 11), 0, "ENDBLK", 0, "ENDSEC",
     0, "SECTION", 2, "ENTITIES", ...wipeout, ...line("D1", 8), ...line("D3", 11), ...hatch, ...pattern, ...proxy,
-    ...text("D7", 3), ...text("D8", 5), 0, "ENDSEC",
+    ...text("D7", 3), ...text("D8", 5), 0, "INSERT", 5, "E5", 2, "MASKED", 10, 40, 20, 0, 0, "ENDSEC",
     0, "SECTION", 2, "OBJECTS", 0, "SORTENTSTABLE", 5, "21", 100, "AcDbSortentsTable", 330, "1F",
     331, "D2", 5, "50", 331, "D1", 5, "40", 331, "D3", 5, "51",
     331, "D7", 5, "49", 331, "D8", 5, "52",
+    0, "SORTENTSTABLE", 5, "22", 100, "AcDbSortentsTable", 330, "90",
+    331, "E1", 5, "70", 331, "E2", 5, "80", 331, "E3", 5, "85",
     0, "ENDSEC", 0, "EOF", "",
   ].join("\n");
   await writeFile(path, dxf);
@@ -279,7 +284,7 @@ test("DWG draws proxy shell topology, hatch holes and ordered wipeout occlusion"
     const index = await buildDwgIndex(fd, "a".repeat(64), "sha256:" + "b".repeat(64));
     try {
       const [{ unit }] = [...index.units()];
-      assert.deepEqual(unit.rows.map(r => r.locator.derivativeHandle), ["D2", "D1", "D3", "D4", "D5", "D6", "D7", "D8"]);
+      assert.deepEqual(unit.rows.map(r => r.locator.derivativeHandle), ["D2", "D1", "D3", "D4", "D5", "D6", "D7", "D8", "E5"]);
       assert.deepEqual(unit.cad.slice(0,5).map(s => s.handle), ["D1", "D7", "D2", "D3", "D8"]);
       assert.ok(unit.rows[5].details.limitations.includes("cad_proxy_shell_traits_approximate"));
       const frame = cadFrame(unit);
@@ -300,6 +305,9 @@ test("DWG draws proxy shell topology, hatch holes and ordered wipeout occlusion"
       assert.equal(pos(11, 8), 255, "mask erases earlier stroke");
       assert.equal(pos(3, 8), 22, "stroke survives outside mask");
       assert.equal(pos(11, 11), 22, "later stroke remains above mask");
+      assert.equal(pos(51, 8), 255, "nested mask uses its block's sort table");
+      assert.equal(pos(43, 8), 22, "nested stroke remains outside its mask");
+      assert.equal(pos(51, 11), 22, "later nested stroke remains above mask");
       assert.equal(pos(1, 25), 172, "solid hatch is filled");
       assert.equal(pos(5, 25), 255, "inner loop is a real hole");
       assert.equal(pos(.5, 44), 22, "pattern draws the on stroke");
@@ -313,6 +321,73 @@ test("DWG draws proxy shell topology, hatch holes and ordered wipeout occlusion"
       };
       assert.equal(wordInk(3), false, "mask erases the earlier glyphs");
       assert.equal(wordInk(5), true, "later glyphs remain above the mask");
+    } finally { await index.close(); }
+  } finally { await fd.close(); await rm(root, { recursive: true, force: true }); }
+});
+
+test("DWG composites later direct and nested masks across parts without moving addresses or the frame", async () => {
+  const { inflateSync } = await import("node:zlib");
+  const { cadFrame, renderCad } = await import("../../../../../dist/src/modules/formats/cad-render.js");
+  const root = await mkdtemp(join(tmpdir(), "dwg-cross-mask-"));
+  const path = join(root, "source");
+  const line = (handle, y) => [0, "LINE", 5, handle, 10, 0, 20, y, 11, 20, 21, y];
+  const wipe = (handle, x, w) => [0, "WIPEOUT", 5, handle, 10, x, 20, 0, 11, w, 21, 0, 12, 0, 22, 7,
+    13, 1, 23, 1, 70, 7, 280, 1, 71, 2, 91, 4,
+    14, -.5, 24, .5, 14, .5, 24, .5, 14, .5, 24, -.5, 14, -.5, 24, -.5];
+  const word = (handle, y) => [0, "TEXT", 5, handle, 10, 7, 20, y, 40, 1, 1, "TEXT"];
+  const fill = Array.from({ length: 508 }, (_, i) => line((0x1000 + i).toString(16), 20)).flat();
+  const dxf = [
+    0, "SECTION", 2, "HEADER", 9, "$SORTENTS", 280, 127, 0, "ENDSEC",
+    0, "SECTION", 2, "BLOCKS", 0, "BLOCK", 2, "CUT", 330, "B0", 10, 0, 20, 0,
+    ...wipe("B1", 0, 300), 0, "ENDBLK", 0, "ENDSEC",
+    0, "SECTION", 2, "ENTITIES", ...line("10", 2), ...word("20", .5), ...line("90", 4), ...word("91", 5), ...fill,
+    ...wipe("30", 5, 7), 0, "INSERT", 5, "40", 2, "CUT", 10, 12, 20, 0,
+    ...wipe("50", 0, 20), 410, "Different sheet", 0, "ENDSEC", 0, "EOF", "",
+  ].join("\n");
+  await writeFile(path, dxf);
+  const fd = await open(path);
+  try {
+    const index = await buildDwgIndex(fd, "9".repeat(64), "sha256:" + "8".repeat(64));
+    try {
+      const [main, cut, sheet] = [...index.units()].map(({ unit }) => unit);
+      assert.equal(main.rows.length, 512);
+      assert.deepEqual(cut.rows.map(r => r.locator.derivativeHandle), ["30", "40"]);
+      assert.equal(sheet.rows[0].locator.derivativeHandle, "50");
+      assert.deepEqual(main.cadContext.map(s => s.handle), ["30", "40"]);
+      assert.ok(!main.rows.some(r => ["30", "40", "50"].includes(r.locator.derivativeHandle)));
+      assert.ok(main.cadContext[1].bounds.right > 20);
+      const frame = cadFrame(main);
+      const without = { ...main, cadContext: [] };
+      assert.deepEqual(frame, cadFrame(without));
+      const load = d => index.definition(d);
+      const result = renderCad(main, { unitId: main.id }, undefined, load);
+      assert.equal(renderCad(main, { unitId: main.id }, "30", load), undefined);
+      const chunks = [];
+      for (let at = 8; at < result.bytes.length;) {
+        const n = result.bytes.readUInt32BE(at);
+        if (result.bytes.toString("ascii", at + 4, at + 8) === "IDAT") chunks.push(result.bytes.subarray(at + 8, at + 8 + n));
+        at += n + 12;
+      }
+      const bytes = inflateSync(Buffer.concat(chunks));
+      const t = result.transform;
+      function pixel(x, y) {
+        const px = Math.round((x - frame.x) * t.pixelsPerPoint - t.pixelOriginX);
+        const py = Math.round((-y - frame.y) * t.pixelsPerPoint - t.pixelOriginY);
+        return bytes[py * (t.width * 3 + 1) + px * 3 + 1];
+      }
+      assert.equal(pixel(2, 2), 22, "different sheet cannot mask Model");
+      assert.equal(pixel(7, 2), 255, "later mask from another part");
+      assert.equal(pixel(17, 2), 255, "nested mask from another part uses INSERT placement");
+      assert.equal(pixel(7, 4), 22, "later line remains visible");
+      assert.equal(pixel(17, 4), 22, "nested mask also leaves later line visible");
+      const wordInk = y => {
+        for (let dx = 0; dx < 4; dx += .03) for (let dy = -.03; dy < 1.1; dy += .03) {
+          if (pixel(7 + dx, y + dy) < 210) return true;
+        }
+        return false;
+      };
+      assert.equal(wordInk(.5), false, "cross-part mask erases earlier text");
+      assert.equal(wordInk(5), true, "cross-part mask preserves later text");
     } finally { await index.close(); }
   } finally { await fd.close(); await rm(root, { recursive: true, force: true }); }
 });

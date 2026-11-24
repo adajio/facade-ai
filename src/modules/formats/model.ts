@@ -21,6 +21,7 @@ export type Unit = {
   limitations: string[];
   coverage: Coverage;
   cad?: CadShape[];
+  cadContext?: CadShape[];
   cadView?: { x: number; y: number; width: number; height: number };
   physicalRows?: number[];
 };
