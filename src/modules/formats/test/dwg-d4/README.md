@@ -47,6 +47,7 @@ node --test src/modules/formats/test/dwg-d4/limits.test.mjs
 в [порте конвертеров](../../../converter-port/README.md).
 
 ```sh
+export FACADE_DWG_ENGINE=libredwg
 export FACADE_DWG_IMAGE="$(docker image inspect "$dwg_image" --format '{{.Id}}')"
 export FACADE_CONVERTER_SCRATCH="$PWD/.local/d4"
 socket_dir="$(mktemp -d /tmp/facade-d4.XXXXXXXX)"
@@ -163,7 +164,7 @@ node src/modules/formats/test/dwg-d4/probe-pair.mjs \
 Добавьте в корень образа [follow-up-dwg.mjs](../../../../../infra/test-stand/follow-up-dwg.mjs)
 и настройте `ENTRYPOINT ["node", "/follow-up-dwg.mjs"]`. Для отдельного
 экземпляра брокера закрепите этот DWG-образ, образ архивного распаковщика
-и установите `FACADE_DWG_MEMORY_MIB=128`. Фикстура `AC1015!` заполняет память
+и установите `FACADE_DWG_ENGINE=libredwg` и `FACADE_DWG_MEMORY_MIB=128`. Фикстура `AC1015!` заполняет память
 до завершения контейнера по OOM. Следующая фикстура публикует целый DXF в
 `/out/derivative`.
 

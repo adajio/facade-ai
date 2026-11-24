@@ -25,7 +25,7 @@ async function convertCase(name, inputPath = originals.get(name).libreInput, run
   const started = performance.now();
   const temporary = join(output, runName + ".wire");
   const result = await convertDwg(Readable.from([bytes]), createWriteStream(temporary, { flags: "wx", mode: 0o600 }),
-    { size: bytes.length, image, timeout: profile.timeout });
+    { size: bytes.length, image, identity: profile.identity, timeout: profile.timeout });
   const elapsedMs = Math.round(performance.now() - started);
   const payload = await readFile(temporary);
   await unlink(temporary);
@@ -57,7 +57,7 @@ assert.ok(decoded.OBJECTS.some((object) => object.text_value === "Rib L2 | 13.25
 const damaged = await readFile(originals.get("unreadable").libreInput);
 await assert.rejects(convertDwg(Readable.from([damaged]),
   new Writable({ write(_chunk, _encoding, done) { done(); } }),
-  { size: damaged.length, image, timeout: profile.timeout }), { code: "invalid_request" });
+  { size: damaged.length, image, identity: profile.identity, timeout: profile.timeout }), { code: "invalid_request" });
 evidence.push({ name: "unreadable", image, originalSha256: sha256(damaged), code: "invalid_request" });
 
 const references = {

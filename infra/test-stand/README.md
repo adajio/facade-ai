@@ -138,14 +138,37 @@ Worker получает `FACADE_IMPORT_HTTPS_PROXY` и собственную с
 
 ## Брокер конвертеров
 
-В отдельное окно возьмите установленные Linux arm64 образы, собранные из текущих
-`src/modules/imports/Dockerfile` и `src/modules/formats/Dockerfile`. Передайте образы архивов, Office и DWG позиционно.
-Пропускаемое семейство передавайте пустой строкой.
+Для архива и Office используются установленные Linux ARM64 образы.
+Для DWG стандартный `broker-up` выбирает ODA File Converter 27.10 через
+обёртку Linux AMD64. На Apple Silicon этот контейнер запускается через эмуляцию.
 
 ```bash
-infra/test-stand/stand broker-up "$archive_image" "$office_image" "$dwg_image"
+docker --context orbstack build --platform linux/amd64 --network=none --pull=false \
+  -t facade-dwg-oda:local -f src/modules/formats/oda.Dockerfile src/modules/formats
+export FACADE_ODA_ROOT=/absolute/private/ODAFileConverter_27.10.0.0
+export FACADE_ODA_RUNTIME=/absolute/private/desktop-runtime/root
+export FACADE_ODA_BINARY_SHA256='<закреплённый SHA-256 ODAFileConverter>'
+infra/test-stand/stand broker-up "$archive_image" "$office_image" facade-dwg-oda:local
 FACADE_STAND_WITH_BROKER=1 infra/test-stand/stand run "$image" "$db_env"
 ```
+
+Образ обёртки содержит Debian и сценарий запуска. Бинарник, плагины и
+среда Xvfb находятся в закрытых неизменяемых каталогах, видимых локальному
+демону Docker. Брокер передаёт их только в контейнеры конвертера и только
+для чтения. Состояние профиля видно в `/v1/info`. Удержание при
+недоступности ODA сохраняет исходник. Локальный запуск использует
+поставку, доступную оператору для этого испытания.
+[Официальный CLI ODA](https://www.opendesign.com/guestfiles/oda_file_converter)
+
+Явный откат на существующий LibreDWG сохраняет историю карт. После смены
+конвертера перезапустите reader и откройте актуальную карту.
+
+```bash
+FACADE_DWG_ENGINE=libredwg infra/test-stand/stand broker-up "$archive_image" "$office_image" "$libredwg_image"
+FACADE_STAND_WITH_BROKER=1 infra/test-stand/stand run "$image" "$db_env"
+```
+
+Пустой аргумент пропускает соответствующее семейство.
 
 Брокер закрепляет установленные ID образов. Его scratch и Unix-сокет живут на томах Linux на внешнем SSD. Worker монтирует том
 с Unix-сокетом. Docker-сокет доступен только отдельному брокеру. Брокер и одноразовые конвертеры работают без сети.

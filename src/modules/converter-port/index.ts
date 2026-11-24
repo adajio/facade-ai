@@ -12,7 +12,7 @@ const formatLimit = 16 * 1024 ** 2;
 const receiptLimit = 10 * 1024 ** 3;
 const errorCodes = [
   "unavailable", "busy", "timeout", "memory_limit", "resource_limit", "failed",
-  "output_missing", "invalid_request", "scratch_unavailable",
+  "output_missing", "invalid_request", "scratch_unavailable", "oda_unavailable", "oda_rejected",
 ] as const;
 type ErrorCode = typeof errorCodes[number];
 
@@ -135,15 +135,17 @@ export async function converterImage(operation: Operation, signal?: AbortSignal)
   if (typeof id === "string" && imageId.test(id)) return id;
 }
 
-export async function dwgProfile(signal?: AbortSignal): Promise<{ id: string; timeout: number; reserve: number } | undefined> {
+export async function dwgProfile(signal?: AbortSignal): Promise<{ id: string; identity: string; timeout: number; reserve: number } | undefined> {
   const info = await converterInfo(signal);
   const id = info?.dwg;
   const timeout = info?.dwgClientTimeoutMs;
   const reserve = info?.dwgReserveBytes;
+  const identity = info?.dwgIdentity ?? (info?.dwgEngine === "oda" ? undefined : id);
   if (typeof id === "string" && imageId.test(id) && typeof timeout === "number"
       && Number.isInteger(timeout) && timeout > 0 && timeout <= 7_260_000
-      && typeof reserve === "number" && Number.isSafeInteger(reserve) && reserve > 0) {
-    return { id, timeout, reserve };
+      && typeof reserve === "number" && Number.isSafeInteger(reserve) && reserve > 0
+      && typeof identity === "string" && imageId.test(identity)) {
+    return { id, identity, timeout, reserve };
   }
 }
 
@@ -189,7 +191,7 @@ export async function convertDwg(
   source: Readable,
   output: Writable,
   options: {
-    size: number; image: string; timeout: number; signal?: AbortSignal;
+    size: number; image: string; identity?: string; timeout: number; signal?: AbortSignal;
     checkSpace?: (size: number) => Promise<void>;
   },
 ): Promise<{ size: number; sha256: string }> {
@@ -205,7 +207,10 @@ export async function convertDwg(
   let declared: string;
   const bytes = responseBytes("/v1/dwg", {
     source, sourceSize: options.size, signal: options.signal, timeout: options.timeout,
-    headers: { "content-length": String(options.size), "x-converter-image": options.image },
+    headers: {
+      "content-length": String(options.size), "x-converter-image": options.image,
+      ...(options.identity ? { "x-converter-profile": options.identity } : {}),
+    },
     async prepare(headers) {
       const length = headers["x-converter-bytes"];
       if (typeof length !== "string" || !/^[1-9]\d*$/.test(length) || !Number.isSafeInteger(Number(length))) {

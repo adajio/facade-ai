@@ -18,6 +18,7 @@ const oleMagic = Buffer.from("d0cf11e0a1b11ae1", "hex");
 const status = {
   unavailable: 503, busy: 503, timeout: 504, memory_limit: 422, resource_limit: 413,
   failed: 422, output_missing: 422, invalid_request: 400, scratch_unavailable: 507,
+  oda_unavailable: 503, oda_rejected: 422,
 };
 const operations = new Map([
   ["/v1/archive", { name: "archive", imageEnv: "FACADE_ARCHIVE_IMAGE" }],
@@ -37,7 +38,7 @@ function integer(value, max) {
 
 async function docker(...args) {
   const { stdout } = await exec("docker", args, {
-    timeout: args[1] === "create" ? 25_000 : 10_000, killSignal: "SIGKILL", maxBuffer: 32 * 1024,
+    timeout: args[0] === "run" ? 120_000 : args[1] === "create" ? 25_000 : 10_000, killSignal: "SIGKILL", maxBuffer: 32 * 1024,
   });
   return stdout.trim();
 }
@@ -63,6 +64,35 @@ const scope = createHash("sha256").update(socketPath).digest("hex").slice(0, 24)
 const label = `io.facade.converter-broker=${scope}`;
 const scratch = join(absoluteEnv("FACADE_CONVERTER_SCRATCH"), `broker-${scope}`);
 const images = Object.create(null);
+const dwgEngine = process.env.FACADE_DWG_ENGINE || "oda";
+let dwgIdentity;
+let odaMounts = [];
+const odaIsolation = ["--platform=linux/amd64"];
+const tmpfs = "--tmpfs=/tmp:rw,noexec,nosuid,nodev,size=96m,mode=1777";
+
+async function probeOda(image) {
+  const root = absoluteEnv("FACADE_ODA_ROOT");
+  const deps = absoluteEnv("FACADE_ODA_RUNTIME");
+  const binaryPin = process.env.FACADE_ODA_BINARY_SHA256;
+  if (!/^[a-f0-9]{64}$/.test(binaryPin ?? "")) throw new Error("Missing ODA binary pin");
+  const mounts = [
+    "--mount", `type=bind,src=${root},dst=/oda,readonly`,
+    "--mount", `type=bind,src=${deps},dst=/deps,readonly`,
+    "--mount", `type=bind,src=${deps}/usr/bin/xkbcomp,dst=/usr/bin/xkbcomp,readonly`,
+    "--mount", `type=bind,src=${deps}/usr/share/fonts,dst=/usr/share/fonts,readonly`,
+  ];
+  const [binary, runtime, extra] = (await docker("run", "--rm", "--pull=never", ...odaIsolation,
+    "--network=none", "--read-only", "--user=65534:65534", "--cap-drop=ALL",
+    "--security-opt=no-new-privileges=true", "--memory=256m", "--cpus=1",
+    "--label", label, tmpfs, ...mounts, image, "oda-probe")).split("\n");
+  if (binary !== binaryPin || !/^[a-f0-9]{64}$/.test(runtime ?? "") || extra !== undefined) {
+    throw new Error("ODA distribution identity mismatch");
+  }
+  dwgIdentity = `sha256:${createHash("sha256")
+    .update(JSON.stringify(["oda", "27.10.0.151591", image, binary, runtime, "ACAD2013", "DXF", 0, 0]))
+    .digest("hex")}`;
+  odaMounts = mounts;
+}
 const stopping = new AbortController();
 let ready = false;
 let occupied = false;
@@ -141,6 +171,10 @@ async function run(id, signal, name, stream) {
     if (name === "archive" && state.ExitCode === 142) throw new Rejected("timeout");
     if (name === "dwg" && [73, 153].includes(state.ExitCode)) throw new Rejected("scratch_unavailable");
     if (state.Status !== "exited" || state.Error) throw new Rejected("unavailable");
+    if (name === "dwg" && dwgEngine === "oda") {
+      if (state.ExitCode === 69) throw new Rejected("oda_unavailable");
+      if (state.ExitCode === 74) throw new Rejected("oda_rejected");
+    }
     if (state.ExitCode !== 0 || exitCode !== 0) throw new Rejected("failed");
     if (stream && !size) throw new Rejected("output_missing");
   } finally {
@@ -199,11 +233,16 @@ async function handle(input, output, expectContinue = false) {
   const operation = operations.get(input.url);
   if (!ready) return reply(output, "unavailable");
   if (input.method === "GET" && input.url === "/v1/info") {
-    return output.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({ ...images, ...(images.dwg ? { dwgClientTimeoutMs, dwgReserveBytes } : {}) }));
+    return output.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({ ...images, dwgEngine,
+      ...(images.dwg ? { dwgClientTimeoutMs, dwgReserveBytes, dwgIdentity } : dwgEngine === "oda" ? { dwgError: "oda_unavailable" } : {}),
+    }));
   }
   if (input.method !== "POST" || !operation || input.httpVersion !== "1.1") return reply(output, "invalid_request");
   const { name } = operation;
   const image = images[name];
+  const oda = name === "dwg" && dwgEngine === "oda";
+  if (oda && !image) return reply(output, "oda_unavailable");
+  if (oda && input.headers["x-converter-profile"] !== dwgIdentity) return reply(output, "unavailable");
   if (!image || (name !== "archive" && input.headers["x-converter-image"] !== image)) {
     return reply(output, "unavailable");
   }
@@ -243,7 +282,7 @@ async function handle(input, output, expectContinue = false) {
     await stage(input, source, size, name, AbortSignal.any([active, uploadDeadline]));
     active.throwIfAborted();
 
-    const destination = archive ? "/source" : `/original.${name}`;
+    const destination = archive ? "/source" : oda ? "/input/original.dwg" : `/original.${name}`;
     const memory = dwg ? `${dwgMemoryMiB}m` : archive ? "1024m" : "512m";
     const dwgOut = join(directory, "out");
     let dwgDiskArgs = [];
@@ -265,7 +304,8 @@ async function handle(input, output, expectContinue = false) {
       `--pids-limit=${archive ? 12 : 64}`, "--log-driver=none", "--no-healthcheck",
       "--label", label, "--name", `facade-converter-${randomUUID()}`,
       "--mount", `type=bind,src=${source},dst=${destination},readonly`,
-      ...(archive ? [] : ["--tmpfs=/tmp:rw,noexec,nosuid,nodev,size=96m,mode=1777"]),
+      ...(archive ? [] : [tmpfs]),
+      ...(oda ? [...odaIsolation, ...odaMounts] : []),
       ...dwgDiskArgs,
       image, ...(archive ? [String(expanded), String(entries), String(archiveSeconds)] : [name]));
     if (!containerId.test(id)) throw new Error("Invalid container ID");
@@ -330,10 +370,13 @@ try {
     if (!imageId.test(id)) throw new Error(`${imageEnv} must contain an image ID`);
     images[name] = id;
   }
-  if (!Object.values(images).length) throw new Error("Configure at least one converter image");
+  if (!["oda", "libredwg"].includes(dwgEngine)) throw new Error("Unknown DWG engine");
+  const odaImage = dwgEngine === "oda" ? images.dwg : undefined;
+  if (odaImage) delete images.dwg;
   for (const id of new Set(Object.values(images))) {
     if (await docker("image", "inspect", "--format", "{{.Id}}", id) !== id) throw new Error("Image unavailable");
   }
+  if (images.dwg) dwgIdentity = images.dwg;
   const parent = await lstat(dirname(socketPath));
   if (!parent.isDirectory() || parent.uid !== process.getuid() || (parent.mode & 0o022)) {
     throw new Error("Socket parent must be owned by the broker and writable only by its owner");
@@ -344,6 +387,14 @@ try {
   process.umask(0o077);
   await recover();
   await prepareScratch();
+  if (odaImage) {
+    try {
+      await probeOda(odaImage);
+      images.dwg = odaImage;
+    } catch {
+      console.error("ODA unavailable: verify the pinned linux/amd64 launcher, binary hash and read-only mounts");
+    }
+  }
   ready = true;
   console.log("converter broker ready");
 } catch {

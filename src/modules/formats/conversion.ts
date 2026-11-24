@@ -9,7 +9,7 @@ import { FormatHold } from "./model.js";
 
 export type Legacy = "doc" | "xls" | "dwg";
 type Office = { id: string; format: Exclude<Legacy, "dwg"> };
-type Dwg = { id: string; format: "dwg"; timeout: number; reserve: number };
+type Dwg = { id: string; identity: string; format: "dwg"; timeout: number; reserve: number };
 export type Converter = Office | Dwg;
 
 export async function converterFor(format: Legacy): Promise<Converter | undefined> {
@@ -24,7 +24,7 @@ export async function converterFor(format: Legacy): Promise<Converter | undefine
 
 function conversionError(error: unknown): never {
   const scratch = ["ENOSPC", "EDQUOT"].includes((error as NodeJS.ErrnoException)?.code ?? "");
-  if (scratch || (error instanceof ConverterPortError && ["unavailable", "busy", "scratch_unavailable"].includes(error.code))) {
+  if (scratch || (error instanceof ConverterPortError && ["unavailable", "busy", "scratch_unavailable", "oda_unavailable"].includes(error.code))) {
     const code = scratch ? "scratch_unavailable" : (error as ConverterPortError).code;
     throw new ReaderError(`converter_${code}`, "Конвертация ожидает доступного брокера или рабочих ресурсов", 503);
   }
@@ -93,7 +93,7 @@ export async function withDwgDerivative<T>(
       source.createReadStream({ start: 0, end: size - 1 }),
       derivativeSink(derivative),
       {
-        size, image: converter.id, timeout: converter.timeout,
+        size, image: converter.id, identity: converter.identity, timeout: converter.timeout,
         async checkSpace(expected) {
           const free = await statfs(tmpdir(), { bigint: true }).catch(() => {
             throw new ConverterPortError("scratch_unavailable");

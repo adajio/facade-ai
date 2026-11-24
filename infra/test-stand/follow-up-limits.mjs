@@ -25,7 +25,7 @@ assert.ok(profile);
 const chunks = [];
 const recover = (input, result) => convertDwg(Readable.from([Buffer.from(input)]),
   new Writable({ write(chunk, _encoding, done) { if (result) chunks.push(chunk); done(); } }),
-  { size: Buffer.byteLength(input), image: profile.id, timeout: profile.timeout });
+  { size: Buffer.byteLength(input), image: profile.id, identity: profile.identity, timeout: profile.timeout });
 await assert.rejects(recover('AC1015!', false), { code: 'memory_limit' });
 const recovered = await recover('AC1015.', true);
 assert.ok(recovered.size > 0);

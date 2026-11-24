@@ -12,9 +12,9 @@ declare function converterImage(operation: Conversion | "archive", signal?: Abor
 declare function archiveBytes(source: Buffer | Readable, options: {
   size: number; bytes: number; entries: number; signal?: AbortSignal;
 }): AsyncGenerator<Buffer>;
-declare function dwgProfile(signal?: AbortSignal): Promise<{ id: string; timeout: number; reserve: number } | undefined>;
+declare function dwgProfile(signal?: AbortSignal): Promise<{ id: string; identity: string; timeout: number; reserve: number } | undefined>;
 declare function convertDwg(source: Readable, output: Writable, options: {
-  size: number; image: string; timeout: number; signal?: AbortSignal;
+  size: number; image: string; identity?: string; timeout: number; signal?: AbortSignal;
   checkSpace?: (size: number) => Promise<void>;
 }): Promise<{ size: number; sha256: string }>;
 declare function convertBytes(operation: "doc" | "xls", input: Buffer, options: {
@@ -24,7 +24,7 @@ declare function convertBytes(operation: "doc" | "xls", input: Buffer, options: 
 
 `converterImage` возвращает закреплённый ID или `undefined` при недоступности. `archiveBytes` выдаёт кадры `extractor.c`. Передавайте точную исходную длину в `size` и оставшиеся лимиты раскрытия в `bytes` и `entries`. Для `convertBytes` передавайте `image` из `converterImage`. Для `convertDwg` используйте размер оригинала и профиль `dwgProfile`. Считайте файл пригодным к чтению после успешного завершения `convertDwg`.
 
-Транспортные и удалённые отказы возвращаются как `ConverterPortError` с полем `code` (`unavailable`, `busy`, `timeout`, `memory_limit`, `resource_limit`, `failed`, `output_missing`, `invalid_request`, `scratch_unavailable`). Клиент сохраняет ошибку исходного потока и причину отмены `signal.reason`. Обрыв ответа до подтверждения результата считается `unavailable`. Прекращение обхода генератора закрывает запрос и отменяет работу. Кадр `done` принимайте после завершения транспортного генератора. `busy`, `unavailable` и `scratch_unavailable` допускают отложенный повтор.
+Транспортные и удалённые отказы возвращаются как `ConverterPortError` с полем `code` (`unavailable`, `busy`, `timeout`, `memory_limit`, `resource_limit`, `failed`, `output_missing`, `invalid_request`, `scratch_unavailable`, `oda_unavailable`, `oda_rejected`). Клиент сохраняет ошибку исходного потока и причину отмены `signal.reason`. Обрыв ответа до подтверждения результата считается `unavailable`. Прекращение обхода генератора закрывает запрос и отменяет работу. Кадр `done` принимайте после завершения транспортного генератора. `busy`, `unavailable` и `scratch_unavailable` допускают отложенный повтор.
 
 ## Установка и ограничения
 
@@ -32,7 +32,9 @@ declare function convertBytes(operation: "doc" | "xls", input: Buffer, options: 
 
 Если брокер сам запускается в служебном контейнере, назначьте ему общий с worker именованный Linux-том для сокета. Доступ к локальному Docker API получает только служебный контейнер брокера. Рабочий том `FACADE_CONVERTER_SCRATCH` в таком профиле монтируется в брокер по тому же абсолютному пути, который видит демон Docker.
 
-Брокер получает `FACADE_ARCHIVE_IMAGE`, `FACADE_OFFICE_IMAGE` и `FACADE_DWG_IMAGE` в виде установленных ID `sha256:<64 hex>`. Можно включить отдельные семейства. Исходники образов находятся в [imports](../imports/Dockerfile) и [formats](../formats/Dockerfile), где цели Office/CAD называются `office` и `dwg`. При смене закреплённых образов перезапускайте процессы, которые кэшируют ID из `converterImage`.
+Брокер получает `FACADE_ARCHIVE_IMAGE`, `FACADE_OFFICE_IMAGE` и `FACADE_DWG_IMAGE` в виде установленных ID `sha256:<64 hex>`. Архив и Office используют [imports](../imports/Dockerfile) и [formats](../formats/Dockerfile). DWG по умолчанию запускает [обёртку ODA](../formats/oda.Dockerfile). Подробности запуска и отката в [локальном профиле](../../../infra/test-stand/README.md#брокер-конвертеров). При смене профиля перезапускайте reader.
+
+Для ODA `/v1/info` публикует `dwgEngine=oda`, ID образа в `dwg` и идентификатор профиля в `dwgIdentity`. При старте изолированный контейнер сверяет SHA-256 бинарника с `FACADE_ODA_BINARY_SHA256` и вычисляет отпечаток содержимого смонтированной поставки и среды. ID профиля включает эти значения, точную сборку ODA, ID обёртки и параметры вывода. Держите закреплённые каталоги неизменяемыми до перезапуска брокера. Клиент передаёт `identity` из `dwgProfile` вместе с ID образа. При ошибке допуска ODA `/v1/info` сообщает `dwgError=oda_unavailable`. Для LibreDWG ID профиля равен ID образа.
 
 `FACADE_CONVERTER_SCRATCH` указывает на рабочий том с местом для seekable копии архива до 10 ГиБ. Путь должен быть доступен демону Docker под тем же абсолютным именем. Брокер обслуживает одну операцию одновременно. Он удаляет вход и производную перед подтверждением результата. Владелец стенда учитывает эту копию в общей схеме дисковых резервов либо размещает её на отдельно ограниченном томе. Вызывающему процессу нужен только каталог сокета. При неопределённом исходе создания контейнера или сбое очистки брокер удерживает новые запросы до рестарта и проверки своего scratch и контейнеров.
 
@@ -40,7 +42,7 @@ declare function convertBytes(operation: "doc" | "xls", input: Buffer, options: 
 входа брокер отнимает резерв от свободного места и отдаёт до половины остатка
 под производную. Вторая половина учитывает временную копию reader на той же
 файловой системе. Этот бюджет применяется через `RLIMIT_FSIZE` и к DXF, и к
-JSON. После обрыва DXF запись удаляется перед восстановлением. Храните scratch
+JSON. Для LibreDWG после обрыва DXF запись удаляется перед восстановлением. ODA выдаёт DXF R2013 после проверки `ENTITIES` и `EOF`. Файл `.err`, отсутствие выходного файла или неполная структура дают `oda_rejected`. Храните scratch
 на выделенном томе или учитывайте одновременных пользователей диска при выборе
 резерва. Worker проверяет свободные байты в `TMPDIR` перед записью и удаляет
 имя временного файла сразу после его открытия. Завершение worker освобождает

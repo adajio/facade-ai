@@ -92,7 +92,7 @@ async function checkDwg() {
   const badImage = `sha256:${"0".repeat(64)}`;
   const sink = () => new Writable({ write(_chunk, _encoding, done) { done(); } });
   const run = (source, length, image = profile.id) =>
-    convertDwg(source, sink(), { size: length, image, timeout: profile.timeout });
+    convertDwg(source, sink(), { size: length, image, identity: profile.identity, timeout: profile.timeout });
   await assert.rejects(run(createReadStream(path), size, badImage), { code: "unavailable" });
   const result = await run(createReadStream(path), size);
   assert.ok(result.size > 0);

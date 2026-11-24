@@ -39,7 +39,7 @@ test("DWG adapter streams both legs above the old limit and broker releases abor
   await mkdir(scratch, { mode: 0o700 });
   await mkdir(join(scratch, "job-ABC123"));
   const broker = spawn(process.execPath, [fileURLToPath(new URL("../../../../../infra/converters/broker.mjs", import.meta.url))], {
-    env: { PATH: bin + delimiter + process.env.PATH, FACADE_DWG_IMAGE: image,
+    env: { PATH: bin + delimiter + process.env.PATH, FACADE_DWG_IMAGE: image, FACADE_DWG_ENGINE: "libredwg",
       FACADE_DWG_TEST_STATE: state, FACADE_CONVERTER_SOCKET: socket, FACADE_CONVERTER_SCRATCH: root },
     stdio: ["ignore", "pipe", "pipe"],
   });

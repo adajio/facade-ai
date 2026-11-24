@@ -135,7 +135,7 @@ function converted(derived: Parsed, converter: Converter, hash: string, kind: st
       if (format === "xls" && row.details?.formulaAttributes) row.details.cacheSource = "converter";
     }
   }
-  return { ...derived, converter: id, representationSha256: hash,
+  return { ...derived, converter: format === "dwg" ? converter.identity : id, representationSha256: hash,
     inventory: { limitation: `${format}_original_inventory_unverified` } };
 }
 
@@ -148,8 +148,11 @@ function adapter(format: Format): ReaderAdapter {
     configured = undefined;
     throw error;
   }) : undefined;
-  const version = async () => legacy ? `${profile}:${format}:${(await resolve())?.id ?? "unavailable"}`
-    : `${profile}:${format}`;
+  const version = async () => {
+    const converter = await resolve();
+    const identity = converter?.format === "dwg" ? converter.identity : converter?.id;
+    return legacy ? `${profile}:${format}:${identity ?? "unavailable"}` : `${profile}:${format}`;
+  };
 
   async function parse(path: string, checkInventory = false): Promise<Parsed> {
     if (format === "rvt") return originalOnly("rvt_original_only", "original_only");
@@ -171,7 +174,7 @@ function adapter(format: Format): ReaderAdapter {
             return converted(parsed, converter, sha256, recovery ? "dwg-json" : "dxf");
           } catch (error) {
             if (!(error instanceof FormatHold)) throw error;
-            return { ...originalOnly(error.code, "held"), converter: converter.id, representationSha256: sha256 };
+            return { ...originalOnly(error.code, "held"), converter: converter.identity, representationSha256: sha256 };
           }
         });
       }

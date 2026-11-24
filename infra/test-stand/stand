@@ -244,16 +244,22 @@ TOML
       echo "Укажите хотя бы один установленный Linux-образ для archive, office или dwg." >&2
       exit 2
     fi
+    export FACADE_DWG_ENGINE="${FACADE_DWG_ENGINE:-oda}"
+    case "$FACADE_DWG_ENGINE" in
+      oda) dwg_arch=amd64 ;;
+      libredwg) dwg_arch=arm64 ;;
+      *) echo "FACADE_DWG_ENGINE must be oda or libredwg" >&2; exit 2 ;;
+    esac
     docker_image_id() {
       if [[ -z "$1" ]]; then return; fi
       local entry
       entry="$(docker --context orbstack image inspect --format '{{.Os}}/{{.Architecture}} {{.Id}}' -- "$1")"
-      [[ "$entry" == "linux/arm64 sha256:"* ]] || return 2
+      [[ "$entry" == "linux/${2:-arm64} sha256:"* ]] || return 2
       printf '%s\n' "${entry#* }"
     }
     FACADE_ARCHIVE_IMAGE="$(docker_image_id "$archive")"
     FACADE_OFFICE_IMAGE="$(docker_image_id "$office")"
-    FACADE_DWG_IMAGE="$(docker_image_id "$dwg")"
+    FACADE_DWG_IMAGE="$(docker_image_id "$dwg" "$dwg_arch")"
     export FACADE_ARCHIVE_IMAGE FACADE_OFFICE_IMAGE FACADE_DWG_IMAGE
     mkdir -p "$FACADE_STAND_DIR/builds"
     snapshot="$(mktemp -d "$FACADE_STAND_DIR/builds/.broker.XXXXXXXX")"
