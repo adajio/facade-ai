@@ -1,0 +1,427 @@
+{
+  "edition": 1,
+  "coordinates": "PDF points from top left, [xMin, yMin, xMax, yMax]",
+  "originals": {
+    "facade-package.pdf": "c2c62a703226559f0ddeca0d6f411610520455232903b75ab361084448c1480c",
+    "facade-supplement.pdf": "973b6cb97040b3f8aaa33ddcf08be6d854c01cc5c5407b3ed2089db2a9554f48"
+  },
+  "places": [
+    {
+      "id": "fa-r1-thickness",
+      "source": "facade-package.pdf",
+      "originalSha256": "c2c62a703226559f0ddeca0d6f411610520455232903b75ab361084448c1480c",
+      "address": {
+        "unit": "1",
+        "box": [
+          36,
+          97,
+          230,
+          110
+        ],
+        "tolerance": [
+          15,
+          12
+        ]
+      },
+      "format": "pdf",
+      "scope": "F-A",
+      "revision": "initial",
+      "readability": "readable",
+      "variants": [
+        {
+          "value": "2",
+          "unit": "mm"
+        }
+      ],
+      "critical": true,
+      "required": [
+        "A",
+        "B",
+        "merged"
+      ],
+      "nativeCandidates": true
+    },
+    {
+      "id": "fb-r1-thickness",
+      "source": "facade-package.pdf",
+      "originalSha256": "c2c62a703226559f0ddeca0d6f411610520455232903b75ab361084448c1480c",
+      "address": {
+        "unit": "1",
+        "box": [
+          36,
+          139,
+          230,
+          152
+        ],
+        "tolerance": [
+          15,
+          12
+        ]
+      },
+      "format": "pdf",
+      "scope": "F-B",
+      "revision": "initial",
+      "readability": "readable",
+      "variants": [
+        {
+          "value": "3",
+          "unit": "mm"
+        }
+      ],
+      "critical": false,
+      "required": [
+        "A",
+        "B",
+        "merged"
+      ],
+      "nativeCandidates": true
+    },
+    {
+      "id": "fa-r1-attachment-notice",
+      "source": "facade-package.pdf",
+      "originalSha256": "c2c62a703226559f0ddeca0d6f411610520455232903b75ab361084448c1480c",
+      "address": {
+        "unit": "1",
+        "box": [
+          36,
+          189,
+          301,
+          201
+        ],
+        "tolerance": [
+          15,
+          12
+        ]
+      },
+      "format": "pdf",
+      "scope": "F-A",
+      "revision": "initial",
+      "readability": "readable",
+      "variants": [
+        {
+          "value": "not included in this delivery",
+          "unit": ""
+        }
+      ],
+      "critical": false,
+      "required": [
+        "A",
+        "B",
+        "merged"
+      ],
+      "nativeCandidates": true
+    },
+    {
+      "id": "fb-r1-width-raster",
+      "source": "facade-package.pdf",
+      "originalSha256": "c2c62a703226559f0ddeca0d6f411610520455232903b75ab361084448c1480c",
+      "address": {
+        "unit": "2",
+        "box": [
+          51,
+          148,
+          560,
+          196
+        ],
+        "tolerance": [
+          15,
+          12
+        ]
+      },
+      "format": "pdf",
+      "scope": "F-B",
+      "revision": "initial",
+      "readability": "readable",
+      "variants": [
+        {
+          "value": "1200",
+          "unit": "mm"
+        }
+      ],
+      "critical": true,
+      "required": [
+        "A",
+        "B",
+        "merged"
+      ],
+      "nativeCandidates": false
+    },
+    {
+      "id": "fb-r2-width-unreadable",
+      "source": "facade-package.pdf",
+      "originalSha256": "c2c62a703226559f0ddeca0d6f411610520455232903b75ab361084448c1480c",
+      "address": {
+        "unit": "2",
+        "box": [
+          51,
+          196,
+          560,
+          248
+        ],
+        "tolerance": [
+          15,
+          12
+        ]
+      },
+      "format": "pdf",
+      "scope": "F-B",
+      "revision": "initial",
+      "readability": "unreadable",
+      "variants": [],
+      "critical": false,
+      "required": [
+        "A",
+        "B",
+        "merged"
+      ],
+      "nativeCandidates": false
+    },
+    {
+      "id": "fa-r1-attachment",
+      "source": "facade-supplement.pdf",
+      "originalSha256": "973b6cb97040b3f8aaa33ddcf08be6d854c01cc5c5407b3ed2089db2a9554f48",
+      "address": {
+        "unit": "1",
+        "box": [
+          36,
+          97,
+          258,
+          110
+        ],
+        "tolerance": [
+          15,
+          12
+        ]
+      },
+      "format": "pdf",
+      "scope": "F-A",
+      "revision": "supplement",
+      "readability": "readable",
+      "variants": [
+        {
+          "value": "D-01",
+          "unit": ""
+        }
+      ],
+      "critical": true,
+      "required": [
+        "A",
+        "B",
+        "merged"
+      ],
+      "nativeCandidates": true
+    },
+    {
+      "id": "fa-r1-thickness-supplement",
+      "source": "facade-supplement.pdf",
+      "originalSha256": "973b6cb97040b3f8aaa33ddcf08be6d854c01cc5c5407b3ed2089db2a9554f48",
+      "address": {
+        "unit": "1",
+        "box": [
+          36,
+          139,
+          230,
+          152
+        ],
+        "tolerance": [
+          15,
+          12
+        ]
+      },
+      "format": "pdf",
+      "scope": "F-A",
+      "revision": "supplement",
+      "readability": "readable",
+      "variants": [
+        {
+          "value": "2",
+          "unit": "mm"
+        }
+      ],
+      "critical": false,
+      "required": [
+        "A",
+        "B",
+        "merged"
+      ],
+      "nativeCandidates": true
+    }
+  ],
+  "letter": {
+    "decisions": {
+      "fa-r1-thickness": {
+        "decision": "sufficient",
+        "sources": [
+          "fa-r1-thickness"
+        ]
+      },
+      "fa-r1-attachment": {
+        "decision": "sufficient",
+        "sources": [
+          "fa-r1-attachment"
+        ]
+      },
+      "fb-r1-thickness": {
+        "decision": "sufficient",
+        "sources": [
+          "fb-r1-thickness"
+        ]
+      },
+      "fb-r1-width": {
+        "decision": "sufficient",
+        "sources": [
+          "fb-r1-width-raster"
+        ]
+      },
+      "fb-r2-width": {
+        "decision": "unreadable",
+        "sources": [
+          "fb-r2-width-unreadable"
+        ]
+      }
+    },
+    "requests": [],
+    "text": null
+  },
+  "scenarios": {
+    "initial": {
+      "originals": [
+        "facade-package.pdf"
+      ],
+      "letter": {
+        "decisions": {
+          "fa-r1-thickness": {
+            "decision": "sufficient",
+            "sources": [
+              "fa-r1-thickness"
+            ]
+          },
+          "fa-r1-attachment": {
+            "decision": "missing",
+            "sources": [
+              "fa-r1-thickness",
+              "fa-r1-attachment-notice"
+            ]
+          },
+          "fb-r1-thickness": {
+            "decision": "sufficient",
+            "sources": [
+              "fb-r1-thickness"
+            ]
+          },
+          "fb-r1-width": {
+            "decision": "sufficient",
+            "sources": [
+              "fb-r1-width-raster"
+            ]
+          },
+          "fb-r2-width": {
+            "decision": "unreadable",
+            "sources": [
+              "fb-r2-width-unreadable"
+            ]
+          }
+        },
+        "requests": [
+          "fa-r1-attachment"
+        ],
+        "text": "Запрос исходных данных\n\nКому: Проектная группа\n\n1. Предоставьте узел крепления R1 фасада F-A. В ведомости материалов (facade-package.pdf, лист 1) указана толщина 2 мм."
+      }
+    },
+    "afterSupplement": {
+      "originals": [
+        "facade-package.pdf",
+        "facade-supplement.pdf"
+      ],
+      "letter": {
+        "decisions": {
+          "fa-r1-thickness": {
+            "decision": "sufficient",
+            "sources": [
+              "fa-r1-thickness"
+            ]
+          },
+          "fa-r1-attachment": {
+            "decision": "sufficient",
+            "sources": [
+              "fa-r1-attachment"
+            ]
+          },
+          "fb-r1-thickness": {
+            "decision": "sufficient",
+            "sources": [
+              "fb-r1-thickness"
+            ]
+          },
+          "fb-r1-width": {
+            "decision": "sufficient",
+            "sources": [
+              "fb-r1-width-raster"
+            ]
+          },
+          "fb-r2-width": {
+            "decision": "unreadable",
+            "sources": [
+              "fb-r2-width-unreadable"
+            ]
+          }
+        },
+        "requests": [],
+        "text": null
+      }
+    },
+    "completeFacade": {
+      "scope": "F-A",
+      "letter": {
+        "decisions": {
+          "fa-r1-thickness": {
+            "decision": "sufficient",
+            "sources": [
+              "fa-r1-thickness"
+            ]
+          },
+          "fa-r1-attachment": {
+            "decision": "sufficient",
+            "sources": [
+              "fa-r1-attachment"
+            ]
+          }
+        },
+        "requests": [],
+        "text": null
+      }
+    },
+    "internalOnly": {
+      "scope": "F-B",
+      "letter": {
+        "decisions": {
+          "fb-r1-thickness": {
+            "decision": "sufficient",
+            "sources": [
+              "fb-r1-thickness"
+            ]
+          },
+          "fb-r1-width": {
+            "decision": "sufficient",
+            "sources": [
+              "fb-r1-width-raster"
+            ]
+          },
+          "fb-r2-width": {
+            "decision": "unreadable",
+            "sources": [
+              "fb-r2-width-unreadable"
+            ]
+          }
+        },
+        "requests": [],
+        "text": null
+      }
+    },
+    "zeroCandidatesNegativeControl": {
+      "removeReading": "fb-r1-width-raster",
+      "expectedAC03": false,
+      "expectedAC06": true
+    }
+  }
+}

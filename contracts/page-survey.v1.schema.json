@@ -1,0 +1,24 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "PageSurvey — промежуточный обзор физического листа",
+  "description": "Запись приложения. Осмотр листа учитывается отдельно от вердиктов по фактам и решения о полноте.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "workId", "turnId", "mode", "documentRevisionId", "pageNumber", "sheetRenderId", "inspectedLocatorIds", "regions", "limitations"],
+  "properties": {
+    "schemaVersion": {"const": 1},
+    "workId": {"$ref": "#/$defs/id"},
+    "turnId": {"$ref": "#/$defs/id"},
+    "mode": {"enum": ["sheet_overview", "coverage_check"]},
+    "documentRevisionId": {"$ref": "#/$defs/id"},
+    "pageNumber": {"type": "integer", "minimum": 1},
+    "sheetRenderId": {"$ref": "#/$defs/id"},
+    "inspectedLocatorIds": {"type": "array", "uniqueItems": true, "minItems": 1, "items": {"$ref": "#/$defs/id"}},
+    "regions": {"type": "array", "items": {
+      "type": "object", "additionalProperties": false, "required": ["locatorId", "description"],
+      "properties": {"locatorId": {"$ref": "#/$defs/id"}, "description": {"$ref": "#/$defs/id"}}
+    }},
+    "limitations": {"type": "array", "items": {"$ref": "#/$defs/id"}}
+  },
+  "$defs": {"id": {"type": "string", "minLength": 1}}
+}

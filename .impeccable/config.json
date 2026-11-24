@@ -1,0 +1,26 @@
+{
+  "detector": {
+    "ignoreRules": [],
+    "ignoreFiles": [],
+    "ignoreValues": [
+      {
+        "rule": "side-tab",
+        "value": "*",
+        "files": [
+          "web/src/style.css"
+        ],
+        "createdAt": "2026-11-24T13:50:39.613Z",
+        "reason": "Agent: the only match in this file is the existing border on semantic blockquote elements that identifies verbatim project evidence."
+      },
+      {
+        "rule": "overused-font",
+        "value": "instrument sans",
+        "files": [
+          "web/src/style.css"
+        ],
+        "createdAt": "2026-11-24T13:50:39.716Z",
+        "reason": "Agent: this exact family is the existing first entry in the application font stack at e35fdde. The UI refresh preserves the typography and adds no Instrument Sans font loading."
+      }
+    ]
+  }
+}

@@ -1,0 +1,375 @@
+#!/usr/bin/env bash
+set -euo pipefail
+umask 077
+
+here="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+disk='/Volumes/ADATA SE920'
+export FACADE_STAND_DIR="$disk/OrbStack/facade-ai-test-server"
+
+if [[ "$(stat -f '%d' "$disk")" == "$(stat -f '%d' /Volumes)" ]] ||
+  [[ ! -d "$FACADE_STAND_DIR" ]]; then
+  echo "Внешний том или каталог стенда недоступен." >&2
+  exit 1
+fi
+
+compose() {
+  docker --context orbstack compose --project-name facade-ai-test-server \
+    --file "$here/compose.yaml" "$@"
+}
+
+start_relay() {
+  local tls_dir="$FACADE_STAND_DIR/secrets"
+  if [[ ! -s "$tls_dir/cert.pem" || ! -s "$tls_dir/key.pem" ]]; then
+    openssl req -x509 -newkey rsa:2048 -nodes -days 90 -subj /CN=localhost \
+      -addext 'subjectAltName=DNS:localhost,IP:127.0.0.1' \
+      -keyout "$tls_dir/key.pem" -out "$tls_dir/cert.pem" 2>/dev/null
+  fi
+  local pid_file="$FACADE_STAND_DIR/relay.pid"
+  local pid
+  pid="$(cat "$pid_file" 2>/dev/null || true)"
+  if ! [[ "$pid" =~ ^[0-9]+$ ]] || ! ps -p "$pid" -o command= | grep -Fq "$here/relay.mjs host"; then
+    python3 - "$pid_file" "$FACADE_STAND_DIR/logs/relay.log" \
+      "$(command -v node)" "$here/relay.mjs" host "$(command -v docker)" \
+      facade-ai-test-server-relay-1 "$tls_dir/cert.pem" "$tls_dir/key.pem" <<'PY'
+import subprocess
+import sys
+from pathlib import Path
+
+pidfile, logfile, *command = sys.argv[1:]
+with open(logfile, "ab") as log:
+    process = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=log,
+                               stderr=log, start_new_session=True)
+Path(pidfile).write_text(f"{process.pid}\n")
+PY
+  fi
+  for attempt in {1..20}; do
+    if nc -z 127.0.0.1 15432 2>/dev/null && nc -z 127.0.0.1 13900 2>/dev/null; then return; fi
+    sleep 0.25
+  done
+  echo "Ретранслятор стенда не слушает 127.0.0.1:15432. Проверьте logs/relay.log." >&2
+  exit 1
+}
+
+sql() {
+  local service="$1"
+  shift
+  compose exec -T --user postgres "$service" psql -X -q -v ON_ERROR_STOP=1 -U postgres -d postgres "$@"
+}
+
+garage() {
+  compose exec -T --env RUST_LOG=warn objects /garage "$@"
+}
+
+add_bucket() {
+  local run="$1" name="${1##*/}"
+  local bucket="${name//_/-}"
+  if [[ ! -s "$run/s3-auth" ]]; then
+    printf '%s\n%s\n' "GK$(openssl rand -hex 12)" "$(openssl rand -hex 32)" > "$run/s3-auth"
+  fi
+  local access secret
+  { read -r access; read -r secret; } < "$run/s3-auth"
+  if ! garage bucket info "$bucket" >/dev/null 2>&1; then
+    garage bucket create "$bucket" >/dev/null
+  fi
+  if ! garage key info "$access" >/dev/null 2>&1; then
+    garage key import --yes -n "$name" "$access" "$secret" >/dev/null 2>&1 || {
+      echo "Не удалось создать ключ S3 для $name." >&2
+      return 1
+    }
+  fi
+  garage bucket allow --read --write "$bucket" --key "$access" >/dev/null
+  if ! grep -q '^FACADE_S3_ENDPOINT=' "$run/runtime.env"; then
+    {
+      printf 'FACADE_S3_ENDPOINT=http://objects:3900\nFACADE_S3_BUCKET=%s\n' "$bucket"
+      printf 'AWS_REGION=us-east-1\nAWS_ACCESS_KEY_ID=%s\nAWS_SECRET_ACCESS_KEY=%s\n' "$access" "$secret"
+    } >> "$run/runtime.env"
+  fi
+  if ! grep -q '^export FACADE_S3_ENDPOINT=' "$run/env"; then
+    {
+      printf "export FACADE_S3_ENDPOINT='http://127.0.0.1:13900'\nexport FACADE_S3_BUCKET='%s'\n" "$bucket"
+      printf "export AWS_REGION='us-east-1'\nexport AWS_ACCESS_KEY_ID='%s'\nexport AWS_SECRET_ACCESS_KEY='%s'\n" "$access" "$secret"
+    } >> "$run/env"
+  fi
+}
+
+check_database_env() {
+  local path="$1"
+  [[ "$(dirname -- "$(dirname -- "$path")")" == "$FACADE_STAND_DIR/databases" ]] &&
+    [[ "$(basename -- "$path")" == env && -s "$path" ]]
+}
+
+create_database() {
+  local server="$1" name="$2" password="$3"
+  sql "$server" <<SQL
+SET log_min_error_statement = 'panic';
+CREATE ROLE "$name" LOGIN PASSWORD '$password' NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION CONNECTION LIMIT 20;
+CREATE DATABASE "$name" OWNER postgres ALLOW_CONNECTIONS false;
+BEGIN;
+REVOKE ALL ON DATABASE "$name" FROM PUBLIC;
+GRANT CONNECT, CREATE, TEMPORARY ON DATABASE "$name" TO "$name";
+ALTER DATABASE "$name" ALLOW_CONNECTIONS true;
+COMMIT;
+\connect $name
+REVOKE ALL ON SCHEMA public FROM PUBLIC;
+ALTER SCHEMA public OWNER TO "$name";
+SQL
+}
+
+case "${1:-}" in
+  up)
+    mkdir -p "$FACADE_STAND_DIR"/{secrets,databases,backups,logs}
+    # The file belongs to this stack and is reused on restart.
+    if [[ ! -s "$FACADE_STAND_DIR/secrets/postgres-password" ]]; then
+      openssl rand -hex 32 > "$FACADE_STAND_DIR/secrets/postgres-password"
+    fi
+    if [[ ! -s "$FACADE_STAND_DIR/secrets/garage.toml" ]]; then
+      cat > "$FACADE_STAND_DIR/secrets/garage.toml" <<TOML
+metadata_dir = "/var/lib/garage/meta"
+data_dir = "/var/lib/garage/data"
+db_engine = "sqlite"
+replication_factor = 1
+rpc_bind_addr = "127.0.0.1:3901"
+rpc_public_addr = "127.0.0.1:3901"
+rpc_secret = "$(openssl rand -hex 32)"
+
+[s3_api]
+s3_region = "us-east-1"
+api_bind_addr = "0.0.0.0:3900"
+TOML
+    fi
+    compose up -d --wait --no-recreate postgres relay objects
+    start_relay
+    ;;
+  new-db)
+    label="${2:-}"
+    if [[ ! "$label" =~ ^[a-z][a-z0-9_]{0,30}$ ]]; then
+      echo "Имя проверки: до 31 символа a-z, 0-9 или _, первый символ a-z." >&2
+      exit 2
+    fi
+    name="test_${label}_$(openssl rand -hex 6)"
+    password="$(openssl rand -hex 24)"
+    create_database postgres "$name" "$password"
+    data_dir="$FACADE_STAND_DIR/databases/$name"
+    mkdir "$data_dir" "$data_dir/objects" "$data_dir/tmp" >&2
+    {
+      printf "export DATABASE_URL='%s'\n" "postgresql://$name:$password@127.0.0.1:15432/$name"
+      printf "export FACADE_DATA_DIR='%s'\n" "$data_dir/objects"
+      printf "export TMPDIR='%s'\n" "$data_dir/tmp"
+    } > "$data_dir/env"
+    printf 'DATABASE_URL=postgresql://%s:%s@postgres:5432/%s\n' \
+      "$name" "$password" "$name" > "$data_dir/runtime.env"
+    add_bucket "$data_dir"
+    printf '%s\n' "$data_dir/env"
+    ;;
+  add-s3)
+    check_database_env "${2:-}" || exit 2
+    add_bucket "$(dirname -- "$2")"
+    ;;
+  add-journal)
+    check_database_env "${2:-}" || exit 2
+    db_dir="$(dirname -- "$2")"
+    if grep -q '^FACADE_GATEWAY_JOURNAL_URL=' "$db_dir/runtime.env"; then
+      echo "Журнал уже назначен этому испытанию." >&2
+      exit 0
+    fi
+    if [[ ! -s "$FACADE_STAND_DIR/secrets/journal-password" ]]; then
+      openssl rand -hex 32 > "$FACADE_STAND_DIR/secrets/journal-password"
+    fi
+    compose up -d --wait --no-recreate postgres-journal
+    name="journal_$(openssl rand -hex 12)"
+    password="$(openssl rand -hex 24)"
+    ledger="$(uuidgen | tr '[:upper:]' '[:lower:]')"
+    create_database postgres-journal "$name" "$password"
+    {
+      printf 'BEGIN; SET ROLE "%s";\n' "$name"
+      cat "$here/../../src/modules/gateway/journal.sql"
+      printf "\nINSERT INTO gateway_external_ledger (ledger_id) VALUES ('%s'); COMMIT;\n" "$ledger"
+    } | sql postgres-journal -d "$name"
+    cp "$db_dir/runtime.env" "$db_dir/runtime.new"
+    {
+      printf 'FACADE_GATEWAY_JOURNAL_URL=postgresql://%s:%s@postgres-journal:5432/%s\n' "$name" "$password" "$name"
+      printf 'FACADE_GATEWAY_LEDGER_ID=%s\n' "$ledger"
+    } >> "$db_dir/runtime.new"
+    mv "$db_dir/runtime.new" "$db_dir/runtime.env"
+    printf '%s\n' "$ledger"
+    ;;
+  build)
+    target="${2:-reader}"
+    [[ "$target" == reader || "$target" == core ]] || exit 2
+    mkdir -p "$FACADE_STAND_DIR/builds"
+    snapshot="$(mktemp -d "$FACADE_STAND_DIR/builds/.snapshot.XXXXXXXX")"
+    trap 'rm -rf -- "$snapshot"' EXIT
+    project="$(cd -- "$here/../.." && pwd)"
+    if [[ -n "${3:-}" ]]; then
+      revision="$(git -C "$project" rev-parse --verify "$3^{commit}")"
+      git -C "$project" archive "$revision" -- package.json package-lock.json tsconfig.json apps src db web |
+        tar -xf - -C "$snapshot"
+      git -C "$project" show "$revision:infra/test-stand/Dockerfile" > "$snapshot/Dockerfile"
+      git -C "$project" show "$revision:infra/test-stand/reader-exec.py" > "$snapshot/reader-exec.py"
+    else
+      revision="$(git -C "$project" rev-parse HEAD)"
+      rsync -rc --exclude '*.env' --exclude '.*' --exclude node_modules --exclude dist \
+        "$project"/{package.json,package-lock.json,tsconfig.json,apps,src,db,web} "$snapshot/"
+      cp "$here/Dockerfile" "$here/reader-exec.py" "$snapshot/"
+    fi
+    (
+      cd "$snapshot"
+      for file in package.json package-lock.json web/package.json web/package-lock.json src/modules/*/package.json; do
+        mkdir -p "dependencies/$(dirname "$file")"
+        cp "$file" "dependencies/$file"
+      done
+    )
+    chmod -R a+rX "$snapshot"
+    manifest="$FACADE_STAND_DIR/builds/manifest-$(date -u +%Y%m%dT%H%M%SZ)-${snapshot##*.}.sha256"
+    (
+      cd "$snapshot"
+      find . -type f -print0 | LC_ALL=C sort -z | xargs -0 shasum -a 256
+    ) > "$manifest"
+    snapshot_hash="$(shasum -a 256 "$manifest" | cut -d ' ' -f 1)"
+    if [[ -n "${FACADE_STAND_EXPECTED_MANIFEST:-}" &&
+      "$snapshot_hash" != "$FACADE_STAND_EXPECTED_MANIFEST" ]]; then
+      printf 'Манифест %s отличается от ожидаемого. Файл %s\n' "$snapshot_hash" "$manifest" >&2
+      exit 1
+    fi
+    image="facade-ai-test-server:${snapshot_hash}"
+    if [[ "$target" == core ]]; then image="${image}-core"; fi
+    docker --context orbstack build --label "org.opencontainers.image.revision=$revision" \
+      --label "io.facade.source-manifest-sha256=$snapshot_hash" --target "$target" --tag "$image" "$snapshot" 2>&1 \
+      | tee "$FACADE_STAND_DIR/builds/${snapshot_hash}-${target}.log" >&2
+    printf '%s\n' "$image"
+    ;;
+  broker-up)
+    archive="${2:-}" office="${3:-}" dwg="${4:-}"
+    if [[ -z "$archive$office$dwg" ]]; then
+      echo "Укажите хотя бы один установленный Linux-образ для archive, office или dwg." >&2
+      exit 2
+    fi
+    export FACADE_DWG_ENGINE="${FACADE_DWG_ENGINE:-oda}"
+    case "$FACADE_DWG_ENGINE" in
+      oda) dwg_arch=amd64 ;;
+      libredwg) dwg_arch=arm64 ;;
+      *) echo "FACADE_DWG_ENGINE must be oda or libredwg" >&2; exit 2 ;;
+    esac
+    docker_image_id() {
+      if [[ -z "$1" ]]; then return; fi
+      local entry
+      entry="$(docker --context orbstack image inspect --format '{{.Os}}/{{.Architecture}} {{.Id}}' -- "$1")"
+      [[ "$entry" == "linux/${2:-arm64} sha256:"* ]] || return 2
+      printf '%s\n' "${entry#* }"
+    }
+    FACADE_ARCHIVE_IMAGE="$(docker_image_id "$archive")"
+    FACADE_OFFICE_IMAGE="$(docker_image_id "$office")"
+    FACADE_DWG_IMAGE="$(docker_image_id "$dwg" "$dwg_arch")"
+    export FACADE_ARCHIVE_IMAGE FACADE_OFFICE_IMAGE FACADE_DWG_IMAGE
+    mkdir -p "$FACADE_STAND_DIR/builds"
+    snapshot="$(mktemp -d "$FACADE_STAND_DIR/builds/.broker.XXXXXXXX")"
+    trap 'rm -rf -- "$snapshot"' EXIT
+    cp "$here/../converters/broker.mjs" "$snapshot/"
+    cp "$here/Broker.Dockerfile" "$snapshot/Dockerfile"
+    hash="$(cd "$snapshot" && shasum -a 256 Dockerfile broker.mjs | shasum -a 256 | cut -d ' ' -f 1)"
+    export FACADE_STAND_BROKER_IMAGE="facade-ai-test-server-broker:$hash"
+    if ! docker --context orbstack image inspect "$FACADE_STAND_BROKER_IMAGE" >/dev/null 2>&1; then
+      docker --context orbstack build --tag "$FACADE_STAND_BROKER_IMAGE" "$snapshot"
+    fi
+    docker --context orbstack volume create facade-ai-test-server_converter-scratch >/dev/null
+    FACADE_STAND_BROKER_SCRATCH="$(docker --context orbstack volume inspect \
+      --format '{{.Mountpoint}}' facade-ai-test-server_converter-scratch)"
+    export FACADE_STAND_BROKER_SCRATCH FACADE_STAND_GID="$(id -g)"
+    compose -f "$here/compose.broker.yaml" up -d --wait --no-deps converter-broker
+    ;;
+  run|run-step15|run-public-import|migrate|bootstrap)
+    image="${2:-}"
+    db_env="${3:-}"
+    if [[ ! "$image" =~ ^facade-ai-test-server:[0-9a-f]{64}(-core)?$ ]] || ! check_database_env "$db_env"; then
+      echo "Укажите тэг от stand build и путь от stand new-db." >&2
+      exit 2
+    fi
+    export FACADE_STAND_IMAGE="$image"
+    export FACADE_STAND_RUN="$(dirname -- "$db_env")"
+    export FACADE_STAND_UID="$(id -u)" FACADE_STAND_GID="$(id -g)"
+    FACADE_STAND_CONFIG_REVISION="$(stat -f '%i-%m-%z' "$FACADE_STAND_RUN/runtime.env")"
+    export FACADE_STAND_CONFIG_REVISION
+    app_compose=(-f "$here/compose.app.yaml")
+    if [[ "${FACADE_STAND_WITH_BROKER:-}" == 1 ]]; then
+      app_compose+=(-f "$here/compose.worker-broker.yaml")
+    fi
+    case "$1" in
+      migrate)
+        compose -f "$here/compose.app.yaml" run --rm --no-deps -T api dist/src/platform/migrate.js
+        ;;
+      bootstrap)
+        compose -f "$here/compose.app.yaml" run --rm --no-deps -T api \
+          dist/src/modules/access/bootstrap.js "${4:?organization}" "${5:?login}"
+        ;;
+      run)
+        # Return the worker to the offline profile when switching from step 15.
+        compose -f "$here/compose.egress.yaml" --profile openrouter --profile public-import \
+          stop openrouter-egress import-egress
+        compose "${app_compose[@]}" up -d --wait --no-deps api worker
+        printf '%s\n%s\n%s\n' "$image" "$db_env" "${FACADE_STAND_WITH_BROKER:-0}" > "$FACADE_STAND_DIR/current-runtime"
+        ;;
+      run-step15)
+        export FACADE_STAND_STEP15_ENV="${4:?step-15 configuration file}"
+        if [[ "$(dirname -- "$FACADE_STAND_STEP15_ENV")" != "$FACADE_STAND_RUN" ||
+          ! -f "$FACADE_STAND_STEP15_ENV" || -L "$FACADE_STAND_STEP15_ENV" ||
+          "$(stat -f '%Lp' "$FACADE_STAND_STEP15_ENV")" != 600 ]] ||
+          ! grep -q '^FACADE_GATEWAY_JOURNAL_URL=' "$FACADE_STAND_RUN/runtime.env" ||
+          [[ "$image" == *-core ]]; then
+          echo "Шагу 15 нужны reader-сборка, отдельный журнал и файл с правами 0600 в каталоге этого прогона." >&2
+          exit 2
+        fi
+        FACADE_STAND_STEP15_CONFIG_REVISION="$(stat -f '%i-%m-%z' "$FACADE_STAND_STEP15_ENV")"
+        FACADE_STAND_MODEL_EGRESS=$(node "$here/step15-config.mjs" "$FACADE_STAND_STEP15_ENV")
+        export FACADE_STAND_STEP15_CONFIG_REVISION FACADE_STAND_MODEL_EGRESS
+        compose -f "$here/compose.egress.yaml" --profile public-import stop import-egress
+        compose -f "$here/compose.egress.yaml" --profile openrouter up -d openrouter-egress
+        compose "${app_compose[@]}" -f "$here/compose.egress.yaml" \
+          -f "$here/compose.openrouter.yaml" --profile openrouter up -d --wait --no-deps api worker
+        printf '%s\n%s\n%s\n' "$image" "$db_env" "${FACADE_STAND_WITH_BROKER:-0}" > "$FACADE_STAND_DIR/current-runtime"
+        ;;
+      run-public-import)
+        compose -f "$here/compose.egress.yaml" --profile openrouter stop openrouter-egress
+        compose -f "$here/compose.egress.yaml" --profile public-import up -d --no-recreate import-egress
+        compose "${app_compose[@]}" -f "$here/compose.egress.yaml" \
+          -f "$here/compose.public-import.yaml" --profile public-import up -d --wait --no-deps api worker
+        printf '%s\n%s\n%s\n' "$image" "$db_env" "${FACADE_STAND_WITH_BROKER:-0}" > "$FACADE_STAND_DIR/current-runtime"
+        ;;
+    esac
+    ;;
+  status)
+    compose ps
+    ;;
+  resume)
+    { read -r image; read -r db_env; read -r broker || broker=0; } < "$FACADE_STAND_DIR/current-runtime"
+    check_database_env "$db_env" || exit 2
+    "$here/stand" up
+    if grep -q '^FACADE_GATEWAY_JOURNAL_URL=' "$(dirname -- "$db_env")/runtime.env"; then
+      compose up -d --wait --no-recreate postgres-journal
+    fi
+    if [[ "$broker" == 1 ]]; then
+      docker --context orbstack start facade-ai-test-server-converter-broker-1
+      export FACADE_STAND_WITH_BROKER=1
+    fi
+    exec "$here/stand" run "$image" "$db_env"
+    ;;
+  stop-app|stop)
+    services=(openrouter-egress import-egress api worker converter-broker)
+    if [[ "$1" == stop ]]; then services+=(relay objects postgres-journal postgres); fi
+    for service in "${services[@]}"; do
+      id="$(docker --context orbstack ps -q \
+        --filter "label=com.docker.compose.project=facade-ai-test-server" \
+        --filter "label=com.docker.compose.service=$service")"
+      if [[ "$id" =~ ^[0-9a-f]+$ ]]; then docker --context orbstack stop "$id"; fi
+    done
+    if [[ "$1" == stop ]]; then
+      pid="$(cat "$FACADE_STAND_DIR/relay.pid" 2>/dev/null || true)"
+      if [[ "$pid" =~ ^[0-9]+$ ]] && ps -p "$pid" -o command= | grep -Fq "$here/relay.mjs host"; then
+        kill "$pid"
+      fi
+    fi
+    ;;
+  *)
+    echo "Использование: $0 {up|resume|status|stop-app|stop|new-db ИМЯ|add-s3 ENV|add-journal ENV|build [reader|core] [GIT_REF]|broker-up АРХИВ [OFFICE] [DWG]|migrate ОБРАЗ ENV|bootstrap ОБРАЗ ENV ОРГАНИЗАЦИЯ ЛОГИН|run ОБРАЗ ENV|run-public-import ОБРАЗ ENV|run-step15 ОБРАЗ ENV КОНФИГ}" >&2
+    exit 2
+    ;;
+esac

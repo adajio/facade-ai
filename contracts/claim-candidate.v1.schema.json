@@ -1,0 +1,60 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Facade AI claim candidate v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "candidateId", "projectId", "scopeId", "subject", "statement", "evidence", "limitations"],
+  "properties": {
+    "schemaVersion": {"const": 1},
+    "candidateId": {"$ref": "#/$defs/id"},
+    "projectId": {"$ref": "#/$defs/id"},
+    "scopeId": {"$ref": "#/$defs/id"},
+    "subject": {
+      "oneOf": [
+        {
+          "type": "object", "additionalProperties": false,
+          "required": ["kind", "positionId", "partId", "finding"],
+          "properties": {"kind": {"const": "coverage"}, "positionId": {"$ref": "#/$defs/id"}, "partId": {"$ref": "#/$defs/id"}, "gapBasis": {"enum": ["explicit_non_delivery", "exhaustive_inventory"]}, "finding": {"enum": ["present", "documented_gap", "wrong_format"]}},
+          "if": {"properties": {"finding": {"const": "documented_gap"}}},
+          "then": {"required": ["gapBasis"]},
+          "else": {"not": {"required": ["gapBasis"]}}
+        },
+        {
+          "type": "object", "additionalProperties": false,
+          "required": ["kind", "parameterId", "observedValue"],
+          "properties": {"kind": {"const": "value"}, "parameterId": {"$ref": "#/$defs/id"}, "observedValue": {"$ref": "#/$defs/observedValue"}}
+        },
+        {
+          "type": "object", "additionalProperties": false,
+          "required": ["kind"], "properties": {"kind": {"const": "observation"}}
+        }
+      ]
+    },
+    "statement": {"type": "string", "minLength": 1},
+    "evidence": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"type": "object", "additionalProperties": false, "required": ["documentRevisionId", "locatorId"], "properties": {"documentRevisionId": {"$ref": "#/$defs/id"}, "locatorId": {"$ref": "#/$defs/id"}}}},
+    "limitations": {"type": "array", "items": {"type": "string", "minLength": 1}}
+  },
+  "$defs": {
+    "id": {"type": "string", "minLength": 1},
+    "observedValue": {
+      "oneOf": [
+        {
+          "type": "object", "additionalProperties": false, "required": ["type", "value"],
+          "properties": {"type": {"const": "boolean"}, "value": {"type": "boolean"}}
+        },
+        {
+          "type": "object", "additionalProperties": false, "required": ["type", "value"],
+          "properties": {"type": {"const": "text"}, "value": {"type": "string", "minLength": 1}}
+        },
+        {
+          "type": "object", "additionalProperties": false, "required": ["type", "value", "unit"],
+          "properties": {
+            "type": {"const": "quantity"},
+            "value": {"type": "string", "pattern": "^-?(0|[1-9][0-9]*)([.][0-9]+)?$"},
+            "unit": {"$ref": "#/$defs/id"}
+          }
+        }
+      ]
+    }
+  }
+}

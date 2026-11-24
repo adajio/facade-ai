@@ -1,0 +1,28 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "PageSurvey — независимое чтение физического листа",
+  "description": "Запись приложения. Квитанция открытия одним читателем. Сервер связывает идентичность эффективной модели с реальной отправкой и проверяет принадлежность адресов.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "workId", "turnId", "mode", "branchId", "inputSnapshotId", "modelRevisionId", "readingProfileRevisionId", "documentRevisionId", "pageNumber", "sheetRenderId", "inspectedLocatorIds", "regions", "limitations"],
+  "properties": {
+    "schemaVersion": {"const": 2},
+    "workId": {"$ref": "#/$defs/id"},
+    "turnId": {"$ref": "#/$defs/id"},
+    "mode": {"const": "independent_read"},
+    "branchId": {"enum": ["A", "B"]},
+    "inputSnapshotId": {"$ref": "#/$defs/id"},
+    "modelRevisionId": {"$ref": "#/$defs/id"},
+    "readingProfileRevisionId": {"$ref": "#/$defs/id"},
+    "documentRevisionId": {"$ref": "#/$defs/id"},
+    "pageNumber": {"type": "integer", "minimum": 1},
+    "sheetRenderId": {"$ref": "#/$defs/id"},
+    "inspectedLocatorIds": {"type": "array", "uniqueItems": true, "minItems": 1, "items": {"$ref": "#/$defs/id"}},
+    "regions": {"type": "array", "items": {
+      "type": "object", "additionalProperties": false, "required": ["locatorId", "description"],
+      "properties": {"locatorId": {"$ref": "#/$defs/id"}, "description": {"$ref": "#/$defs/id"}}
+    }},
+    "limitations": {"type": "array", "items": {"$ref": "#/$defs/id"}}
+  },
+  "$defs": {"id": {"type": "string", "minLength": 1}}
+}

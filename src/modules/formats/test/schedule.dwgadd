@@ -1,0 +1,11 @@
+version 2000
+text "Wing M: Panel schedule" (0 80 0) 3
+text "Panel | Assembly | Total" (0 70 0) 3
+text "AX-17 rev B | 2 x 35 mm | 70 mm" (0 60 0) 3
+text "AX-17 rev C | 5 x 14 mm | 70 mm" (0 50 0) 3
+text "AX-71 rev B | 1 x 45 mm | 45 mm" (0 40 0) 3
+line (0 46 0) (90 46 0)
+line (0 56 0) (90 56 0)
+line (0 66 0) (90 66 0)
+pspace
+text "Wing M: Sheet title" (0 70 0) 3

@@ -1,0 +1,10 @@
+services:
+  worker:
+    environment:
+      FACADE_CONVERTER_SOCKET: /run/facade-ai-stand-converters/broker.sock
+    volumes:
+      - converter-socket:/run/facade-ai-stand-converters:ro
+volumes:
+  converter-socket:
+    name: facade-ai-test-server_converter-socket
+    external: true

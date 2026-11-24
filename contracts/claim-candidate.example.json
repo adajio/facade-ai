@@ -1,0 +1,10 @@
+{
+  "schemaVersion": 1,
+  "candidateId": "candidate-demo-01",
+  "projectId": "project-demo",
+  "scopeId": "facade-A",
+  "subject": {"kind": "coverage", "positionId": "doc.glazing", "partId": "schedule", "finding": "present"},
+  "statement": "На листе показана ведомость СПК фасада А.",
+  "evidence": [{"documentRevisionId": "doc-demo-rev-01", "locatorId": "page-2-table-1"}],
+  "limitations": ["О деталях монтажа эта таблица сведений не даёт."]
+}

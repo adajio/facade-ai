@@ -1,0 +1,29 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Основания выбранного внешнего запроса",
+  "description": "Каноническая запись сервера по решению инженера. Существование, права, текущие версии и содержательную достаточность проверяют по записям проекта.",
+  "type": "object", "additionalProperties": false,
+  "required": ["schemaVersion", "assessmentRevisionId", "engineerDecisionId", "scopeId", "recipientId", "items"],
+  "properties": {
+    "schemaVersion": {"const": 1},
+    "assessmentRevisionId": {"$ref": "#/$defs/id"},
+    "engineerDecisionId": {"$ref": "#/$defs/id"},
+    "scopeId": {"$ref": "#/$defs/id"},
+    "recipientId": {"$ref": "#/$defs/id"},
+    "items": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {
+      "type": "object", "additionalProperties": false,
+      "required": ["obligationId", "issueRevisionId", "kind", "evidenceIds"],
+      "properties": {
+        "obligationId": {"$ref": "#/$defs/id"}, "issueRevisionId": {"$ref": "#/$defs/id"},
+        "kind": {"enum": ["confirmed_missing", "confirmed_conflict"]},
+        "evidenceIds": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"$ref": "#/$defs/id"}},
+        "absenceBasis": {"enum": ["explicit_non_delivery", "exhaustive_inventory"]},
+        "inventoryAssessmentId": {"$ref": "#/$defs/id"}
+      },
+      "if": {"properties": {"kind": {"const": "confirmed_missing"}}},
+      "then": {"required": ["absenceBasis", "inventoryAssessmentId"]},
+      "else": {"properties": {"evidenceIds": {"minItems": 2}, "absenceBasis": false, "inventoryAssessmentId": false}}
+    }}
+  },
+  "$defs": {"id": {"type": "string", "minLength": 1}}
+}

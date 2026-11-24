@@ -1,0 +1,62 @@
+#!/usr/bin/env bash
+set -euo pipefail
+umask 077
+
+# One-time provisioning on a dedicated cluster, as its unprivileged OS owner.
+here=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+: "${JOURNAL_PG_BIN:?PostgreSQL bin directory}"
+: "${JOURNAL_PGDATA:?Absolute path to new PGDATA on the journal volume}"
+: "${JOURNAL_STATE:?Absolute path to private operator directory}"
+: "${JOURNAL_SOCKET:?Absolute path to private Unix socket directory}"
+: "${JOURNAL_LISTEN:?Explicit journal listen address}"
+: "${JOURNAL_CLIENT_CIDR:?Source address of the application on the private network}"
+: "${JOURNAL_PORT:?Journal TCP port}"
+for path in "$JOURNAL_PGDATA" "$JOURNAL_STATE" "$JOURNAL_SOCKET"; do
+  if [[ "$path" != /* || "$path" == *"'"* || "$path" == *\\* || "$path" == *$'\n'* ]]; then
+    echo 'Use absolute paths without single quotes, backslashes or newlines.' >&2
+    exit 1
+  fi
+done
+if [[ ! "$JOURNAL_LISTEN" =~ ^[0-9.]+$ || ! "$JOURNAL_CLIENT_CIDR" =~ ^[0-9.]+/32$ ||
+      ! "$JOURNAL_PORT" =~ ^[1-9][0-9]{0,4}$ || "$JOURNAL_PORT" -gt 65535 ]]; then
+  echo 'Supply explicit IPv4 bind and client /32 addresses and a valid port.' >&2
+  exit 1
+fi
+if [[ -e "$JOURNAL_PGDATA" || -L "$JOURNAL_PGDATA" || -e "$JOURNAL_STATE/initialized" ]]; then
+  echo 'PGDATA or installation marker exists. Recover or migrate the original ledger.' >&2
+  exit 1
+fi
+
+export JOURNAL_ADMIN
+JOURNAL_ADMIN=$(id -un)
+[[ "$JOURNAL_ADMIN" =~ ^[a-zA-Z_][a-zA-Z0-9_-]*$ ]]
+[[ "$JOURNAL_ADMIN" != facade_journal_app ]]
+[[ -d "$(dirname -- "$JOURNAL_PGDATA")" ]]
+[[ -s "$JOURNAL_STATE/server.crt" && -s "$JOURNAL_STATE/server.key" ]]
+node "$here/bootstrap.mjs" validate
+
+mkdir -m 700 -- "$JOURNAL_PGDATA" "$JOURNAL_SOCKET"
+"$JOURNAL_PG_BIN/initdb" -D "$JOURNAL_PGDATA" --username="$JOURNAL_ADMIN" \
+  --auth-local=peer --auth-host=scram-sha-256 --data-checksums --no-instructions
+cat > "$JOURNAL_PGDATA/pg_hba.conf" <<HBA
+local all $JOURNAL_ADMIN peer
+hostssl facade_journal facade_journal_app $JOURNAL_CLIENT_CIDR scram-sha-256
+HBA
+cat >> "$JOURNAL_PGDATA/postgresql.conf" <<CONF
+
+listen_addresses = '$JOURNAL_LISTEN'
+port = $JOURNAL_PORT
+unix_socket_directories = '$JOURNAL_SOCKET'
+unix_socket_permissions = 0700
+ssl = on
+ssl_cert_file = '$JOURNAL_STATE/server.crt'
+ssl_key_file = '$JOURNAL_STATE/server.key'
+fsync = on
+full_page_writes = on
+synchronous_commit = on
+CONF
+
+"$JOURNAL_PG_BIN/pg_ctl" -D "$JOURNAL_PGDATA" -w -t 30 -l "$JOURNAL_STATE/postgres.log" start
+trap '"$JOURNAL_PG_BIN/pg_ctl" -D "$JOURNAL_PGDATA" -w -t 30 -m fast stop' EXIT
+node "$here/bootstrap.mjs"
+cp -- "$JOURNAL_STATE/ledger-id" "$JOURNAL_STATE/initialized"

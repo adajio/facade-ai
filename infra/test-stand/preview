@@ -1,0 +1,70 @@
+#!/usr/bin/env bash
+# Start the already-built v1.1 tree with only the stand's local dependencies.
+set -euo pipefail
+umask 077
+
+here="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+project="$(cd -- "$here/../.." && pwd)"
+if nc -z 127.0.0.1 18081 2>/dev/null; then
+  echo "Порт 18081 уже занят. Проверьте текущий предварительный стенд." >&2
+  exit 2
+fi
+test -s "$project/dist/apps/api/src/main.js" && test -s "$project/web/dist/index.html"
+db_env="$("$here/stand" new-db preview)"
+source "$db_env"
+run="$(dirname -- "$db_env")"
+mkdir -p "$run/runtime/web" "$run/home"
+rsync -rl "$project"/{package.json,db,dist} "$run/runtime/"
+rsync -r "$project/web/dist/" "$run/runtime/web/dist/"
+ln -s "$project/node_modules" "$run/runtime/node_modules"
+ln -s "$project/src" "$run/runtime/src"
+
+{
+  printf 'DATABASE_URL=%s\nFACADE_DATA_DIR="%s"\nTMPDIR="%s"\n' "$DATABASE_URL" "$FACADE_DATA_DIR" "$TMPDIR"
+  printf 'FACADE_S3_ENDPOINT=%s\nFACADE_S3_BUCKET=%s\n' "$FACADE_S3_ENDPOINT" "$FACADE_S3_BUCKET"
+  printf 'AWS_REGION=%s\nAWS_ACCESS_KEY_ID=%s\nAWS_SECRET_ACCESS_KEY=%s\n' "$AWS_REGION" "$AWS_ACCESS_KEY_ID" "$AWS_SECRET_ACCESS_KEY"
+  printf 'HOST=127.0.0.1\nPORT=18081\nFACADE_PUBLIC_ORIGIN=http://127.0.0.1:18081\n'
+} > "$run/preview.env"
+cat > "$run/network.sb" <<'SB'
+(version 1)
+(allow default)
+(deny network*)
+(allow network-bind (local ip "localhost:18081"))
+(allow network-inbound (local ip "localhost:18081"))
+(allow network-outbound (remote ip "localhost:15432") (remote ip "localhost:13900"))
+SB
+
+(
+  cd "$run/runtime"
+  find dist web/dist db/migrations -type f -print0 | LC_ALL=C sort -z | xargs -0 shasum -a 256
+  shasum -a 256 "$project/package-lock.json" "$project/web/package-lock.json"
+) > "$run/runtime-manifest.sha256"
+
+node="$(command -v node)"
+command=(env -i "PATH=/opt/homebrew/bin:/usr/bin:/bin" "HOME=$run/home"
+  /usr/bin/sandbox-exec -f "$run/network.sb" "$node" "--env-file=$run/preview.env")
+cd "$run/runtime"
+"${command[@]}" dist/src/platform/migrate.js > "$run/migrate.log" 2>&1
+python3 - "$run" "${command[@]}" <<'PY'
+import subprocess
+import sys
+from pathlib import Path
+
+run = Path(sys.argv[1])
+for process in ("api", "worker"):
+    with (run / (process + ".log")).open("ab") as log:
+        child = subprocess.Popen([*sys.argv[2:], f"dist/apps/{process}/src/main.js"],
+                                 stdin=subprocess.DEVNULL, stdout=log, stderr=log,
+                                 start_new_session=True)
+    (run / (process + ".pid")).write_text(f"{child.pid}\n")
+PY
+echo "$run" >&2
+for attempt in {1..20}; do
+  if curl --noproxy '*' --silent --fail --max-time 3 http://127.0.0.1:18081/readyz; then
+    printf '\n'
+    exit 0
+  fi
+  sleep 0.5
+done
+echo "См. api.log, worker.log и migrate.log в каталоге выше." >&2
+exit 1

@@ -1,0 +1,257 @@
+#!/usr/bin/env bash
+set -euo pipefail
+umask 077
+
+here=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+volume='/Volumes/ADATA SE920'
+stand_root="$volume/OrbStack/facade-ai-test-server"
+[[ -d "$stand_root" && "$(stat -f '%d' "$volume")" != "$(stat -f '%d' /Volumes)" ]]
+root="$stand_root/step15"
+postgres="$stand_root/native-journal-diagnostic/package/bin"
+docker_bin=$(command -v docker)
+d=("$docker_bin" --context orbstack)
+helper_image='node@sha256:be8204d4bd327363357f532187b752ff62759c31bedf98e9e18fc08c9cbd605c'
+journal_net=facade-ai-step15-journal_private
+or_net=facade-ai-step15-openrouter_private
+main_net=facade-ai-test-server_private
+host_net=facade-ai-step15-journal_host
+uplink=facade-ai-step15-openrouter_uplink
+
+native_up() {
+  if ! "$postgres/pg_ctl" -D "$root/data" status >/dev/null; then
+    "$postgres/pg_ctl" -D "$root/data" -w -l "$root/postgres.log" \
+      -o "-c config_file='$root/postgres.conf'" start >&2
+  fi
+}
+
+ensure_net() {
+  local name=$1 internal=$2
+  local args=()
+  [[ "$internal" != true ]] || args+=(--internal)
+  if ! "${d[@]}" network inspect "$name" >/dev/null 2>&1; then
+    "${d[@]}" network create ${args[@]+"${args[@]}"} "$name" >/dev/null
+  fi
+  [[ "$("${d[@]}" network inspect -f '{{.Internal}}' "$name")" == "$internal" ]]
+}
+
+remove() {
+  local name=$1
+  if "${d[@]}" container inspect "$name" >/dev/null 2>&1; then
+    "${d[@]}" rm -f "$name" >/dev/null
+  fi
+}
+
+egress_up() {
+  local route=${1:-openrouter}
+  ensure_net "$or_net" true
+  ensure_net "$uplink" false
+  local current
+  current=$("${d[@]}" inspect -f '{{index .Config.Labels "io.facade.step15.egress-mode"}}' facade-ai-step15-openrouter 2>/dev/null || true)
+  if [[ "$current" != "$route" ]]; then
+    remove facade-ai-step15-openrouter
+    "${d[@]}" run -d --name facade-ai-step15-openrouter --pull=never --read-only --cap-drop ALL \
+      --security-opt no-new-privileges --memory 128m --user node \
+      --label "io.facade.step15.egress-mode=$route" \
+      --network "name=$or_net,alias=step15-openrouter,driver-opt=com.docker.network.endpoint.ifname=priv0" \
+      --network "name=$uplink,gw-priority=1" \
+      --mount "type=bind,source=$here/connect-proxy.mjs,target=/proxy.mjs,readonly" \
+      "$helper_image" node /proxy.mjs "$route" >/dev/null
+  fi
+  "${d[@]}" exec -i facade-ai-step15-openrouter node --input-type=module - < "$here/proxy-ready.mjs" || {
+    echo 'CONNECT-прокси шага 15 не принимает TCP на приватном интерфейсе.' >&2
+    return 1
+  }
+}
+
+runtime_env=(--env-file=/run/facade/runtime.env --env-file=/run/facade/journal.env)
+
+case "${1:-}" in
+  prepare)
+    mkdir -p "$root/socket"
+    if [[ ! -s "$root/data/PG_VERSION" ]]; then
+      if [[ -e "$root/identity.json" || -e "$root/journal.env" || -e "$root/database-env-path" ]]; then
+        echo 'Восстановите исходный PGDATA серии перед продолжением.' >&2
+        exit 1
+      fi
+      "$postgres/initdb" -D "$root/data" --username=postgres --auth-local=trust \
+        --auth-host=scram-sha-256 --data-checksums > "$root/initdb.log"
+    fi
+    if [[ ! -s "$root/journal.key" || ! -s "$root/journal-ca.pem" ]]; then
+      openssl req -x509 -newkey rsa:2048 -nodes -days 365 -subj /CN=step15-journal \
+        -addext 'subjectAltName=DNS:step15-journal' -addext 'extendedKeyUsage=serverAuth' \
+        -keyout "$root/journal.key" -out "$root/journal-ca.pem" >/dev/null 2>&1
+    fi
+    cat > "$root/journal.hba" <<'HBA'
+local all postgres trust
+hostssl facade_step15 facade_step15 127.0.0.1/32 scram-sha-256
+HBA
+    cat > "$root/postgres.conf" <<EOF
+listen_addresses = '127.0.0.1'
+port = 15435
+unix_socket_directories = '$root/socket'
+hba_file = '$root/journal.hba'
+ssl = on
+ssl_cert_file = '$root/journal-ca.pem'
+ssl_key_file = '$root/journal.key'
+shared_buffers = '32MB'
+max_connections = 20
+log_min_error_statement = 'panic'
+EOF
+    native_up
+    node "$here/step15-journal.mjs" "$root"
+    if [[ ! -s "$root/database-env-path" ]]; then
+      "$here/stand" new-db step15_series > "$root/database-env-path.new"
+      mv "$root/database-env-path.new" "$root/database-env-path"
+    fi
+    if [[ ! -e "$root/step15.env" ]]; then
+      cat > "$root/step15.env" <<'ENV'
+# Fill locally as the step 15 operator. Keep this file mode 0600.
+FACADE_GATEWAY_OPENROUTER_KEY=
+FACADE_GATEWAY_STEP15_PROFILES=
+FACADE_GATEWAY_CHEAPERINFERENCE_KEY=
+FACADE_GATEWAY_CHEAPERINFERENCE_PROFILES=
+# FACADE_HARNESS_PROFILE={}
+FACADE_GATEWAY_OPENROUTER_ENDPOINT=https://openrouter.ai
+# FACADE_HARNESS_LIVE_POLICY=synthetic-research
+ENV
+    fi
+    printf '%s\n' "$root/step15.env"
+    ;;
+  start|offline|offline-api)
+    image=${2:?Use the approved reader image tag}
+    [[ "$image" =~ ^facade-ai-test-server:[0-9a-f]{64}$ ]]
+    broker=${FACADE_STAND_WITH_BROKER:-0}
+    [[ "$broker" == 0 || "$broker" == 1 ]]
+    if [[ "$broker" == 1 && "$("${d[@]}" inspect -f '{{.State.Health.Status}}' facade-ai-test-server-converter-broker-1 2>/dev/null)" != healthy ]]; then
+      echo 'Запрошенный брокер конвертеров стенда недоступен.' >&2
+      exit 1
+    fi
+    "${d[@]}" image inspect "$image" >/dev/null
+    db_env=$(cat "$root/database-env-path")
+    run_dir=$(dirname -- "$db_env")
+    [[ "$run_dir" == "$stand_root/databases/test_step15_series_"* && -s "$run_dir/runtime.env" ]]
+    for secret in journal.env step15.env; do
+      [[ -f "$root/$secret" && ! -L "$root/$secret" && "$(stat -f '%Lp' "$root/$secret")" == 600 ]]
+    done
+    if [[ "$1" == start ]]; then
+      egress_route=$(node "$here/step15-config.mjs" "$root/step15.env")
+    fi
+    native_up
+    ensure_net "$journal_net" true
+    ensure_net "$host_net" false
+    if ! "${d[@]}" container inspect facade-ai-step15-journal-relay >/dev/null 2>&1; then
+      "${d[@]}" run -d --name facade-ai-step15-journal-relay --pull=never --read-only --cap-drop ALL \
+        --security-opt no-new-privileges --memory 96m --user node \
+        --network "name=$journal_net,alias=step15-journal,driver-opt=com.docker.network.endpoint.ifname=priv0" \
+        --network "name=$host_net,gw-priority=1" \
+        --mount "type=bind,source=$here/native-journal-relay.mjs,target=/relay.mjs,readonly" \
+        "$helper_image" node /relay.mjs 15435 >/dev/null
+    fi
+
+    "$here/stand" migrate "$image" "$db_env"
+    common=(--pull=never --read-only --init --cpuset-cpus 0-3 --cap-drop ALL --security-opt no-new-privileges
+      --user "$(id -u):$(id -g)" --network "$main_net" --network "$journal_net"
+      -e FACADE_DATA_DIR=/data/objects -e TMPDIR=/data/tmp
+      --mount "type=bind,source=$run_dir/runtime.env,target=/run/facade/runtime.env,readonly"
+      --mount "type=bind,source=$root/journal.env,target=/run/facade/journal.env,readonly"
+      --mount "type=bind,source=$root/journal-ca.pem,target=/run/facade/journal-ca.pem,readonly"
+      --mount "type=bind,source=$run_dir/objects,target=/data/objects"
+      --mount "type=bind,source=$run_dir/tmp,target=/data/tmp")
+    if [[ "$broker" == 1 ]]; then
+      common+=(-e FACADE_CONVERTER_SOCKET=/run/facade-ai-stand-converters/broker.sock
+        --mount type=volume,source=facade-ai-test-server_converter-socket,target=/run/facade-ai-stand-converters,readonly)
+    fi
+    api_broker=$("${d[@]}" inspect -f '{{index .Config.Labels "io.facade.step15.converter-broker"}}' facade-ai-step15-api 2>/dev/null || true)
+    if [[ "$("${d[@]}" inspect -f '{{.Config.Image}} {{.State.Running}}' facade-ai-step15-api 2>/dev/null)" != "$image true" ||
+      "${api_broker:-0}" != "$broker" ]]; then
+      remove facade-ai-step15-api
+      "${d[@]}" run -d --name facade-ai-step15-api --memory 512m "${common[@]}" \
+        --label "io.facade.step15.converter-broker=$broker" \
+        -e HOST=127.0.0.1 -e PORT=3000 -e FACADE_PUBLIC_ORIGIN=http://127.0.0.1:18085 \
+        -e FACADE_GATEWAY_LIVE_MODE= "$image" "${runtime_env[@]}" dist/apps/api/src/main.js >/dev/null
+    fi
+    pid=$(cat "$root/relay.pid" 2>/dev/null || true)
+    if [[ -z "$pid" ]] || ! ps -p "$pid" -o command= | grep -Fq 'facade-ai-step15-api 18085'; then
+      python3 - "$root" "$(command -v node)" "$here/follow-up-relay.mjs" "$docker_bin" facade-ai-step15-api 18085 <<'PY'
+from pathlib import Path
+import subprocess
+import sys
+
+folder, *cmd = sys.argv[1:]
+folder = Path(folder)
+with (folder / 'relay.log').open('ab') as log:
+    child = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=log, stderr=log,
+                             start_new_session=True)
+(folder / 'relay.pid').write_text(f'{child.pid}\n')
+PY
+    fi
+    for attempt in {1..20}; do
+      if curl --noproxy '*' -fsS --max-time 2 http://127.0.0.1:18085/readyz 2>/dev/null; then break; fi
+      if [[ "$attempt" == 20 ]]; then exit 1; fi
+      sleep 0.5
+    done
+    "$0" balance
+    remove facade-ai-step15-worker
+    if [[ "$1" == offline-api ]]; then
+      remove facade-ai-step15-openrouter
+      printf '\n%s\n' 'http://127.0.0.1:18085'
+      exit 0
+    fi
+    live=(-e FACADE_GATEWAY_LIVE_MODE=)
+    if [[ "$1" == start ]]; then
+      egress_up "$egress_route"
+      live=(--network "$or_net" -e FACADE_GATEWAY_LIVE_MODE=step-15 -e NODE_USE_ENV_PROXY=1
+        -e HTTPS_PROXY=http://step15-openrouter:3128 -e NO_PROXY=postgres,step15-journal,objects,localhost,127.0.0.1
+        --mount "type=bind,source=$root/step15.env,target=/run/facade/step15.env,readonly")
+      runtime_env+=(--env-file=/run/facade/step15.env)
+    else
+      remove facade-ai-step15-openrouter
+    fi
+    "${d[@]}" run -d --name facade-ai-step15-worker --memory 1400m "${common[@]}" "${live[@]}" \
+      "$image" "${runtime_env[@]}" dist/apps/worker/src/main.js >/dev/null
+    sleep 1
+    [[ "$("${d[@]}" inspect -f '{{.State.Running}}' facade-ai-step15-worker)" == true ]]
+    printf '\n%s\n' 'http://127.0.0.1:18085'
+    ;;
+  balance)
+    "${d[@]}" exec facade-ai-step15-api node "${runtime_env[@]}" --input-type=module -e '
+      const { journalFromEnv } = await import("/app/dist/src/modules/gateway/index.js");
+      const connection = journalFromEnv();
+      try { console.log(JSON.stringify(await connection.journal.balance())); }
+      finally { await connection.close(); }' 2>/dev/null || {
+        echo 'Проверка закреплённого журнала не пройдена.' >&2
+        exit 1
+      }
+    ;;
+  verify-egress)
+    if "${d[@]}" container inspect facade-ai-step15-openrouter >/dev/null 2>&1; then
+      echo 'Закройте активный профиль перед проверкой прокси.' >&2
+      exit 1
+    fi
+    trap 'remove facade-ai-step15-openrouter' EXIT
+    egress_up
+    "${d[@]}" run --rm --pull=never --network "$or_net" --read-only --user node --memory 96m \
+      "$helper_image" node --input-type=module -e '
+        import assert from "node:assert/strict";
+        import { readFileSync } from "node:fs";
+        import { request } from "node:http";
+        assert(!readFileSync("/proc/net/route", "utf8").split("\n").slice(1).some(line => line.split(/\s+/)[1] === "00000000"));
+        const status = await new Promise((resolve, reject) => {
+          const req = request({host:"step15-openrouter",port:3128,method:"CONNECT",path:"example.invalid:443",timeout:2000});
+          req.on("connect", (res, socket) => { socket.destroy(); resolve(res.statusCode); });
+          req.on("error", reject);
+          req.on("timeout", () => req.destroy(Error("proxy timeout")));
+          req.end();
+        });
+        assert.equal(status, 403);
+        console.log("direct route absent; off-allowlist CONNECT -> 403");'
+    ;;
+  offline-worker)
+    remove facade-ai-step15-worker
+    remove facade-ai-step15-openrouter
+    ;;
+  *)
+    echo "Использование: $0 {prepare|offline ОБРАЗ|offline-api ОБРАЗ|start ОБРАЗ|balance|verify-egress|offline-worker}" >&2
+    exit 2
+    ;;
+esac

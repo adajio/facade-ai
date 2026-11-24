@@ -1,0 +1,24 @@
+{
+  "fixture": "facade-materials.pdf",
+  "sha256": "0edcde5aea192651c676b14975f70bbc7a008b2d2e89e591c9ce82dae4f4648a",
+  "purpose": "Проверка мест, привязки единицы из заголовка и различения вариантов до построения письма.",
+  "documentRevision": "R1",
+  "coordinates": "physical page number from 1, PDF points from top left, [left,top,right,bottom]",
+  "pageSizePoints": [480, 270],
+  "pages": [
+    {"page": 1, "source": "native_text", "section": "Толщина листа", "columnHeader": "Толщина, мм", "revisionPrinted": "R1"},
+    {"page": 2, "source": "raster_only", "section": "Ширина листа", "columnHeader": "Ширина, м", "revisionPrinted": "R1"}
+  ],
+  "facts": [
+    {"page": 1, "facade": "А", "variant": "AL-01", "parameter": "sheet_thickness", "sourceLiteral": "2,0", "sourceUnit": "мм", "normalizedMm": "2", "cell": [312, 126, 451, 160]},
+    {"page": 1, "facade": "Б", "variant": "AL-02", "parameter": "sheet_thickness", "sourceLiteral": "3,0", "sourceUnit": "мм", "normalizedMm": "3", "cell": [312, 162, 451, 196]},
+    {"page": 2, "facade": "А", "variant": "AL-01", "parameter": "sheet_width", "sourceLiteral": "1,200", "sourceUnit": "м", "normalizedMm": "1200", "cell": [312, 126, 451, 160]},
+    {"page": 2, "facade": "Б", "variant": "AL-02", "parameter": "sheet_width", "sourceLiteral": "0,900", "sourceUnit": "м", "normalizedMm": "900", "cell": [312, 162, 451, 196]}
+  ],
+  "requiredChecks": [
+    "Учтены обе страницы и все четыре размеченные строки с их единицами и вариантами.",
+    "Значение открывается внутри соответствующей ячейки нужной физической страницы; заголовок, область и вариант видны по тому же месту либо связанным местам.",
+    "Исходная надпись редакции на каждой странице R1. Сомнение OCR видно инженеру; другую редакцию утверждать нельзя.",
+    "Подмена значения ширины на странице 2 может оставить письмо по вопросу о толщине прежним. Приёмка распознавания всё равно должна обнаружить ошибку."
+  ]
+}

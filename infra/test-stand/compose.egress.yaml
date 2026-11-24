@@ -1,0 +1,40 @@
+x-proxy: &proxy
+  image: node@sha256:be8204d4bd327363357f532187b752ff62759c31bedf98e9e18fc08c9cbd605c
+  user: node
+  entrypoint: ["node", "/etc/facade/connect-proxy.mjs"]
+  volumes:
+    - ./connect-proxy.mjs:/etc/facade/connect-proxy.mjs:ro
+  read_only: true
+  cap_drop: [ALL]
+  security_opt: ["no-new-privileges:true"]
+  cpuset: "0-3"
+  mem_limit: 128m
+
+services:
+  openrouter-egress:
+    <<: *proxy
+    profiles: [openrouter]
+    command: ["${FACADE_STAND_MODEL_EGRESS:-openrouter}"]
+    networks:
+      openrouter-private:
+        interface_name: priv0
+      openrouter-uplink:
+        gw_priority: 1
+
+  import-egress:
+    <<: *proxy
+    profiles: [public-import]
+    command: ["import"]
+    networks:
+      import-private:
+        interface_name: priv0
+      import-uplink:
+        gw_priority: 1
+
+networks:
+  openrouter-private:
+    internal: true
+  openrouter-uplink: {}
+  import-private:
+    internal: true
+  import-uplink: {}

@@ -1,0 +1,75 @@
+services:
+  postgres: &postgres
+    image: postgres:16.15@sha256:f9a7b9ebf6f56201f949db745e47bc423c0f0f8294bafe991cc10bf74b029657
+    environment:
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+      POSTGRES_INITDB_ARGS: --auth-host=scram-sha-256 --data-checksums
+    secrets:
+      - postgres_password
+    volumes:
+      - postgres:/var/lib/postgresql/data
+      - ./postgres-init.sql:/docker-entrypoint-initdb.d/01-stand.sql:ro
+    cpuset: "0-3"
+    mem_limit: 1536m
+    shm_size: 256m
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d postgres"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  postgres-journal:
+    <<: *postgres
+    profiles: [journal]
+    secrets:
+      - journal_password
+    environment:
+      POSTGRES_PASSWORD_FILE: /run/secrets/journal_password
+      POSTGRES_INITDB_ARGS: --auth-host=scram-sha-256 --data-checksums
+    volumes:
+      - journal:/var/lib/postgresql/data
+      - ./postgres-init.sql:/docker-entrypoint-initdb.d/01-stand.sql:ro
+    mem_limit: 512m
+
+  relay:
+    image: node@sha256:be8204d4bd327363357f532187b752ff62759c31bedf98e9e18fc08c9cbd605c
+    user: node
+    entrypoint: ["sleep", "infinity"]
+    volumes:
+      - ./relay.mjs:/relay.mjs:ro
+    cpuset: "0-3"
+    mem_limit: 384m
+    restart: unless-stopped
+
+  objects:
+    image: dxflrs/garage:v2.5.0@sha256:677e5b758e4425a325b811c425c026bf35a4bf42f7ddbaa773de3f4fd779a5a5
+    entrypoint: ["/garage"]
+    command: ["server", "--single-node"]
+    volumes:
+      - objects:/var/lib/garage
+      - ${FACADE_STAND_DIR:?}/secrets/garage.toml:/etc/garage.toml:ro
+    cpuset: "0-3"
+    mem_limit: 512m
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "/garage", "status"]
+      interval: 2s
+      timeout: 3s
+      retries: 25
+
+networks:
+  default:
+    name: facade-ai-test-server_private
+    internal: true
+
+secrets:
+  postgres_password:
+    file: ${FACADE_STAND_DIR:?}/secrets/postgres-password
+  journal_password:
+    file: ${FACADE_STAND_DIR:?}/secrets/journal-password
+
+volumes:
+  postgres:
+  journal:
+  objects:

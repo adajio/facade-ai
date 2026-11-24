@@ -1,0 +1,1 @@
+REVOKE CONNECT ON DATABASE postgres, template1 FROM PUBLIC;

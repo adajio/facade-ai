@@ -1,0 +1,336 @@
+import type { PoolClient } from "pg";
+import { contradictoryDeliveryLine, exactDeliveryStatement } from "../../domain/delivery-statement.js";
+import { readPackageAnalysis, type PackageAnalysis, type PackageFact } from "../harness/package-analysis.js";
+import { blockedComparisonReads } from "../harness/package-walk.js";
+import { deliveredLines } from "../questions/attribute-aliases.js";
+import { hasAddressedSubject } from "../questions/subject-evidence.js";
+import { canonicalJson, isInventoryRole, requirementSubjectKey } from "./domain.js";
+import type { Evidence, ReaderAddress, ReaderLine } from "../pdf/types.js";
+import { comparisonRows, readCanonicalComparisonRows, type IssuedComparisonEvidence } from "./facade-comparison-rows.js";
+import { deliveryEvidenceIds, fullDeliveryLine, type DeliveryEvidence } from "./facade-delivery.js";
+import { nonDeliveryFromOriginal, type FacadeFact, type FacadeReadout } from "./facade-model.js";
+import { completedReaderJob, indexSemanticInput } from "./facade-semantic.js";
+import type { Gate } from "./store.js";
+import { acceptedOriginals } from "../intake/accepted-originals.js";
+
+type AcceptedVersion = { id: string; sha256: string; documentId: string; label: string };
+type Impact = { receiptId: string; questionId: string };
+type ConfirmedStage = { versionId: string; target: ReaderAddress | null; stage: string; evidenceId: string };
+const typeClause = /^(?:тип фасада|facade (?:kind|type))\s*[:=–—]\s*([\p{L}\p{N}][\p{L}\p{N} _-]{0,99})\s*$/iu;
+type ReplacementReference = { observationId: string; evidenceId: string; versionId: string; address: Record<string, unknown> };
+export type FacadeReplacement = {
+  id: string;
+  questionId: string;
+  catalogVersionId: string;
+  receiptIds: string[];
+  replaced: ReplacementReference[];
+  replacements: ReplacementReference[];
+};
+
+export function convertFact(fact: PackageFact, accepted: Map<string, AcceptedVersion>, formats: Map<string, string>,
+  stages: Map<string, ConfirmedStage>, evidence: Map<string, DeliveryEvidence>, original: ReaderLine[] | undefined,
+  provenFacade: boolean): FacadeFact | null {
+  const { source, quote, value, unit, evidenceId, receiptId, runId, lineId, address, components, deliveryStatement } = fact.observation;
+  const acceptedOriginal = accepted.get(source.versionId);
+  const format = formats.get(fact.windowId);
+  if (!acceptedOriginal || acceptedOriginal.sha256 !== source.sha256 || acceptedOriginal.documentId !== source.documentId || !format) return null;
+  const { state, candidates, actorId } = fact.binding;
+  const anchored = Boolean(fact.binding.quote || actorId);
+  const membership = state === "identified" && provenFacade && candidates.length ?
+    { kind: "facades" as const, facadeIds: candidates.map(({ id }) => id) } :
+    state === "common" && anchored ? { kind: "common" as const } :
+    { kind: state === "unidentified" ? "unidentified" as const : "ambiguous" as const };
+  const attribute = fact.attribute?.trim() || deliveryStatement?.item || null;
+  const subjectVerified = attribute && !deliveryStatement && value != null && quote && lineId &&
+    hasAddressedSubject({ subject: attribute, property: attribute }, fact.observation,
+      original?.length ? original : [{ id: lineId, text: quote, box: address.box, locator: address.locator }]);
+  const literal = attribute?.normalize("NFKC").trim().replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
+  const anchoredPresence = literal && !deliveryStatement && value == null && quote &&
+    fact.observation.grounding === "text" && !exactDeliveryStatement(quote, attribute!, "not_delivered") &&
+    new RegExp(`(?<![\\p{L}\\p{N}])${literal}(?![\\p{L}\\p{N}])`, "iu").test(quote.normalize("NFKC"));
+  const evidenceBound = Boolean(quote) && fact.observation.grounding !== "limited" && !fact.observation.limitation &&
+    Boolean(fact.basis.role) && Boolean(fact.basis.revision) && Boolean(deliveryStatement || subjectVerified || anchoredPresence);
+  const active = evidenceBound && fact.sourceRole !== "unknown" && fact.revisionStatus === "current";
+  function contextAddress(evidenceId: string) {
+    const item = evidence.get(evidenceId);
+    return item?.source.versionId === source.versionId && item.source.sha256 === source.sha256 ? item.address : undefined;
+  }
+  const valueRoleProof = fact.basis.valueRole;
+  const rolePart = fact.basis.parts?.valueRole;
+  const roleAddress = rolePart ? contextAddress(rolePart.evidenceId) : address;
+  const roleQuote = rolePart?.quote ?? quote;
+  const valueRoleBasis = valueRoleProof?.quote && roleAddress && roleQuote?.includes(valueRoleProof.quote)
+    ? { ...valueRoleProof, evidenceId: rolePart?.evidenceId ?? evidenceId, address: { ...roleAddress } } : undefined;
+  const literalInventory = active && fact.observation.grounding === "text" && Boolean(quote) && isInventoryRole(fact.sourceRole);
+  const issuedMatches = original?.filter(({ id }) => id === lineId);
+  const issuedLine = issuedMatches?.length === 1 ? issuedMatches[0] : undefined;
+  const full = deliveryStatement?.status === "not_delivered" ? fullDeliveryLine(fact, format, evidence, issuedLine) : undefined;
+  const originalLine = deliveryStatement?.status === "not_delivered" ? full?.line.text : issuedLine?.text;
+  const canEstablishAbsence = literalInventory && !fact.observation.alternatives?.length && deliveryStatement?.status === "not_delivered";
+  const absence = canEstablishAbsence && nonDeliveryFromOriginal(full?.companion?.quote ?? quote!, originalLine, deliveryStatement.item);
+  const hasLegacyCrop = canEstablishAbsence && !fact.basis.deliveryLine && Boolean(evidence.get(evidenceId)?.address.box) &&
+    Boolean(issuedLine?.text.includes(quote!)) && exactDeliveryStatement(quote!, deliveryStatement.item, "not_delivered");
+  const positiveInOriginal = originalLine && deliveryStatement &&
+    contradictoryDeliveryLine(originalLine, deliveryStatement.item);
+  const negativeInOriginal = originalLine && deliveryStatement &&
+    exactDeliveryStatement(originalLine, deliveryStatement.item, "not_delivered");
+  const deliveryUncertainty = positiveInOriginal && negativeInOriginal ||
+      (positiveInOriginal && deliveryStatement?.status === "not_delivered") ||
+      (negativeInOriginal && deliveryStatement?.status === "delivered") ? "contradictory_original" as const :
+    deliveryStatement?.status === "not_delivered" && !absence ? "original_statement_unverified" as const : undefined;
+  const printedStage = fact.basis.stage ? fact.designStage : null;
+  const confirmation = stages.get(canonicalJson([source.versionId, address])) ??
+    (!printedStage ? stages.get(canonicalJson([source.versionId, null])) : undefined);
+  const receivedTitle = fact.basis.revisionEvidence;
+  const title = receivedTitle && evidence.get(receivedTitle.evidenceId);
+  const revisionPart = fact.basis.parts?.revision;
+  const revisionPartAddress = revisionPart && contextAddress(revisionPart.evidenceId);
+  const revisionBasis = title && title.source.versionId === source.versionId && title.source.sha256 === source.sha256 ?
+    { evidenceId: receivedTitle!.evidenceId, address: title.address, quote: receivedTitle!.quote } :
+    revisionPart && revisionPartAddress && fact.basis.revision && revisionPart.quote.includes(fact.basis.revision) ?
+      { evidenceId: revisionPart.evidenceId, address: revisionPartAddress, quote: fact.basis.revision } :
+    quote && fact.basis.revision && quote.includes(fact.basis.revision) ? { evidenceId, address, quote: fact.basis.revision } : null;
+  return {
+    membership,
+    property: attribute,
+    materials: fact.materials.map(({ label }) => label),
+    variant: fact.variant,
+    addressedValue: Boolean(subjectVerified),
+    ...(format === "pdf" && lineId && (hasLegacyCrop || absence && full?.identity) ? {
+      deliveryLocation: canonicalJson([source, receiptId, fact.observation.readerVersion, address.unitId, lineId, deliveryStatement.item]),
+    } : {}),
+    ...(absence && full?.identity ? { deliveryLineIdentity: full.identity } : {}),
+    printedRevision: fact.basis.revision ? fact.revision : null,
+    stage: confirmation?.stage ?? printedStage,
+    runId,
+    finding: {
+      kind: absence ? "absence" : deliveryStatement || value == null ? "delivery" : "value",
+      applicability: fact.revisionStatus === "superseded" ? "superseded" : active && !deliveryUncertainty ? "active" : "unknown",
+      sourceRole: fact.sourceRole,
+      format,
+      representation: evidence.get(evidenceId)?.representation,
+      ...(valueRoleBasis ? { valueRole: valueRoleBasis.kind } : {}),
+      comparisonKey: "",
+      ...(absence ? { nonDelivery: { kind: "explicit_non_delivery", subjectQuote: deliveryStatement.item, questionId: "", receiptId } } : {}),
+      citation: {
+        observationId: fact.id, evidenceId, branch: fact.branch, receiptId, documentId: source.documentId,
+        versionId: source.versionId, sha256: source.sha256, address: { ...address }, label: acceptedOriginal.label,
+        quote: quote ?? "", value: value ?? null, unit: unit ?? null, href: fact.evidenceHref,
+        ...(components ? { components } : {}),
+        ...(deliveryStatement ? { deliveryStatement } : {}),
+        ...(absence && full?.companion ? { deliveryBasis: full.companion } : {}),
+        ...(deliveryUncertainty ? { deliveryUncertainty } : {}),
+        ...(confirmation ? { stageConfirmation: { stage: confirmation.stage, evidenceId: confirmation.evidenceId } } : {}),
+        ...(valueRoleBasis ? { valueRoleBasis } : {}),
+        ...(fact.revision && revisionBasis ? { documentRevision: {
+          label: fact.revision, ...revisionBasis, address: { ...revisionBasis.address },
+        } } : {}),
+      },
+    },
+  };
+}
+
+function typeInLine(line: string) {
+  const found = new Set(line.split(/[|·;,\n]/u).flatMap((clause) => typeClause.exec(clause.trim())?.[1]?.trim() ?? []));
+  return found.size === 1 ? found.values().next().value! : null;
+}
+
+export function facadeObservation(fact: PackageFact, originalLine?: string) {
+  const { observation, id, branch, attribute, sourceRole, designStage, revision, revisionStatus, basis, binding, evidenceHref } = fact;
+  const quote = observation.quote ?? null;
+  const proposedFacadeKind = quote && basis.role &&
+    binding.state === "identified" && revisionStatus !== "superseded" && observation.grounding === "text"
+    ? typeInLine(quote) : null;
+  const facadeKindSourceVerified = Boolean(proposedFacadeKind && originalLine && quote && originalLine.includes(quote) &&
+    typeInLine(originalLine) === proposedFacadeKind);
+  return { id, branch, attribute, sourceRole, designStage, revision, revisionStatus, basis, binding, evidenceHref,
+    evidenceId: observation.evidenceId, proposedFacadeKind, facadeKindSourceVerified,
+    receiptId: observation.receiptId, documentId: observation.source.documentId, versionId: observation.source.versionId,
+    sha256: observation.source.sha256, address: observation.address, quote,
+    value: observation.value ?? null, unit: observation.unit ?? null,
+    originalHref: `/api/documents/${observation.source.documentId}/versions/${observation.source.versionId}/content` };
+}
+
+export type FacadeObservation = ReturnType<typeof facadeObservation>;
+export type ComparisonRead = { branch: PackageFact["branch"]; state: "route_required" | "ready" | "leased" | "held" | "done" };
+
+async function comparisonReads(tx: PoolClient, projectId: string, windows: PackageAnalysis["windows"], facts: PackageFact[],
+  targetIds: string[]) {
+  const { rows } = await tx.query<ComparisonRead & { windowId: string; lineId: string; property: string }>(
+    `SELECT f.window_id AS "windowId",f.branch,
+      CASE WHEN j.state='leased' AND j.lease_until<=clock_timestamp() THEN 'ready' ELSE j.state END AS state,
+      j.payload#>>'{packageWindow,followup,comparison,lineId}' AS "lineId",
+      j.payload#>>'{packageWindow,followup,comparison,property}' AS property
+     FROM harness_package_followups f JOIN gateway_jobs j ON j.id=f.job_id
+     JOIN gateway_generations g ON g.generation_id=j.generation_id AND g.current
+     JOIN harness_package_branches b ON b.job_id=f.root_job_id AND b.active
+     WHERE j.project_id=$1 AND f.window_id=ANY($2::uuid[]) AND f.plan_key LIKE 'comparison:%'
+     ORDER BY j.created_at,j.id`, [projectId, windows.map(({ id }) => id)]);
+  const places = new Map(windows.map(({ id, place }) => [id, place]));
+  const key = (versionId: string, unitId: string, lineId: string, property: string) =>
+    canonicalJson([versionId, unitId, lineId, requirementSubjectKey(property)]);
+  const byAddress = new Map<string, Map<PackageFact["branch"], ComparisonRead>>();
+  const targetSet = new Set(targetIds);
+  const blocked = await blockedComparisonReads(tx, projectId, facts.filter(({ id }) => targetSet.has(id)));
+  for (const { windowId, lineId, property, branch, state } of [...blocked, ...rows]) {
+    const place = places.get(windowId)!;
+    const address = key(place.source.versionId, place.unitId, lineId, property);
+    const reads = byAddress.get(address) ?? new Map();
+    reads.set(branch, { branch, state });
+    byAddress.set(address, reads);
+  }
+  const byFact = new Map<string, ComparisonRead[]>();
+  for (const { id, attribute, observation: { source, address, lineId } } of facts) {
+    if (!lineId || !attribute) continue;
+    const reads = byAddress.get(key(source.versionId, address.unitId, lineId, attribute));
+    if (reads) byFact.set(id, [...reads.values()]);
+  }
+  return byFact;
+}
+
+export function facadeDiscovery(facts: PackageFact[], profiles: PackageAnalysis["facadeProfiles"],
+  mentions: PackageAnalysis["facadeMentions"]) {
+  const current = new Map(facts.filter((fact) => fact.revisionStatus !== "superseded").map((fact) => [fact.id, fact]));
+  // The publication already applies the persisted identity aliases and hides provisional bindings.
+  const placed = ({ id, binding }: PackageFact) => current.has(id) && binding.state === "identified" && binding.candidates.length > 0;
+  const identity = new Map(profiles.filter(({ identity }) => identity !== "unresolved").map((profile) => [profile.facadeId, {
+    ...profile, mentions: profile.mentions.filter(({ factId }) => {
+      const fact = current.get(factId);
+      return fact && placed(fact) && fact.binding.candidates.some(({ id }) => id === profile.facadeId);
+    }),
+  }]));
+  const unresolved = mentions.filter(({ factId }) => {
+    const fact = current.get(factId);
+    return fact && fact.binding.state !== "common" && !placed(fact);
+  });
+  return { placed, identity, unresolved };
+}
+
+export async function readFacadeInput(tx: PoolClient, projectId: string) {
+  const { rows: [intake] } = await tx.query<{
+    closed: boolean; excluded: boolean; unresolvedImports: boolean; receiptIds: string[]; generation: string;
+  }>(
+    `SELECT EXISTS (SELECT 1 FROM intake_receipts WHERE project_id=$1) AND NOT EXISTS (
+       SELECT 1 FROM intake_receipts r WHERE r.project_id=$1 AND (r.sealed_at IS NULL OR EXISTS (
+         SELECT 1 FROM intake_occurrences o WHERE o.project_id=$1 AND o.receipt_id=r.id
+           AND (o.inventory_pending OR o.state='declared')
+       ) OR EXISTS (
+         SELECT 1 FROM intake_imports i WHERE i.project_id=$1 AND i.receipt_id=r.id
+           AND i.state IN ('queued','running','paused')
+       ))
+     ) AS closed,
+     EXISTS (SELECT 1 FROM intake_manifest_items m JOIN intake_receipts r ON r.id=m.receipt_id
+       WHERE r.project_id=$1 AND m.excluded_at IS NOT NULL) OR EXISTS (
+         SELECT 1 FROM intake_occurrences o WHERE o.project_id=$1 AND o.parent_occurrence_id IS NULL
+           AND o.state IN ('cancelled','expired')
+       ) AS excluded,
+     EXISTS (SELECT 1 FROM intake_imports i WHERE i.project_id=$1
+       AND i.state NOT IN ('completed','queued','running','paused')) AS "unresolvedImports",
+     ARRAY (SELECT id FROM intake_receipts WHERE project_id=$1 ORDER BY number) AS "receiptIds",
+     coalesce((SELECT generation FROM intake_project_generations WHERE project_id=$1), 0)::text AS generation`,
+    [projectId],
+  );
+  const versions = await acceptedOriginals(tx, projectId);
+  const { rows: holds } = await tx.query<Gate["holds"][number]>(
+    `SELECT h.id,h.receipt_id AS "receiptId",h.source,h.source_id AS "sourceId",
+      h.generation::float8 AS generation,h.version,h.scope_ids AS "scopeIds"
+     FROM intake_holds h JOIN intake_receipts r ON r.project_id=h.project_id AND r.id=h.receipt_id
+     WHERE h.project_id=$1 AND h.closed_at IS NULL AND h.scope_ids IS NULL
+       AND EXISTS (SELECT 1 FROM intake_receipts prior WHERE prior.project_id=$1 AND prior.sealed_at <= r.created_at
+         AND prior.id<>r.id)
+       AND NOT EXISTS (SELECT 1 FROM supplement_receipt_links l
+         JOIN letters letter ON letter.id=l.letter_id AND letter.project_id=l.project_id
+         WHERE l.project_id=$1 AND l.receipt_id=r.id AND letter.assessment_context_id IS NOT NULL)
+     ORDER BY h.generation,h.id`, [projectId],
+  );
+  const { rows: impacts } = await tx.query<Impact>(
+    `SELECT DISTINCT l.receipt_id AS "receiptId",(item->>'questionId')::uuid AS "questionId"
+       FROM supplement_receipt_links l
+       JOIN letters letter ON letter.id=l.letter_id AND letter.project_id=l.project_id AND letter.assessment_context_id IS NOT NULL
+       JOIN letter_sends sent ON sent.letter_id=l.letter_id AND sent.id=l.sent_id
+       CROSS JOIN LATERAL jsonb_array_elements(sent.items) AS item
+       WHERE l.project_id=$1 AND (l.item_id IS NULL OR item->>'id'=l.item_id::text)
+       ORDER BY 1,2`, [projectId],
+  );
+  const { rows: replacements } = await tx.query<FacadeReplacement>(
+    `SELECT r.id,r.question_id AS "questionId",r.catalog_version_id AS "catalogVersionId",r.receipt_ids AS "receiptIds",
+            r.replaced,r.replacements
+       FROM facade_source_replacements r
+       JOIN assessment_questions q ON q.id=r.question_id
+       JOIN assessment_series s ON s.scope_id=q.scope_id
+       WHERE s.project_id=$1 ORDER BY r.created_at,r.id`, [projectId],
+  );
+  const { rows: stages } = await tx.query<ConfirmedStage>(
+    `SELECT version_id AS "versionId", target, stage, evidence_id AS "evidenceId"
+     FROM document_stage_confirmations WHERE project_id=$1`, [projectId],
+  );
+  const stageByAddress = new Map(stages.map((stage) => [canonicalJson([stage.versionId, stage.target]), stage]));
+  const analysis = await readPackageAnalysis(tx, projectId);
+  const accepted = new Map(versions.map((version) => [version.id, version]));
+  const windows = analysis.windows.filter(({ place }) => accepted.get(place.source.versionId)?.sha256 === place.source.sha256);
+  const formats = new Map(windows.map(({ id, format }) => [id, format]));
+  const activeFacts = analysis.facts.filter(({ observation, windowId }) =>
+    accepted.get(observation.source.versionId)?.sha256 === observation.source.sha256 && formats.has(windowId));
+  const evidenceIds = [...new Set(activeFacts.flatMap(({ observation, basis }) =>
+    [observation.evidenceId, ...deliveryEvidenceIds(basis), ...(basis.revisionEvidence ? [basis.revisionEvidence.evidenceId] : []),
+      ...Object.values(basis.parts ?? {}).map(({ evidenceId }) => evidenceId)]))];
+  const evidenceRows = evidenceIds.length ? (await tx.query<{ id: string; payload: Evidence }>(
+    `SELECT id,payload FROM reader_evidence WHERE project_id=$1 AND id=ANY($2::uuid[])`, [projectId, evidenceIds],
+  )).rows : [];
+  const evidenceById = new Map(evidenceRows.map(({ id, payload }) => [id, payload]));
+  const statementIds = activeFacts.filter(({ observation }) =>
+    observation.deliveryStatement || observation.components?.length || typeInLine(observation.quote ?? "")).map(({ id }) => id);
+  const statementSet = new Set(statementIds);
+  const rowIds = activeFacts.filter(({ id, windowId, observation, attribute }) => statementSet.has(id) ||
+    (["pdf", "xlsx"].includes(formats.get(windowId) ?? "") && (attribute || observation.value))).map(({ id }) => id);
+  const { rows: statements } = rowIds.length ? await tx.query<IssuedComparisonEvidence>(
+    `SELECT o.evidence_id AS "evidenceId", o.run_id AS "runId", issued.content
+       FROM (SELECT DISTINCT evidence_id,run_id FROM reader_observations
+         WHERE project_id=$1 AND id=ANY($2::uuid[]) AND payload->>'grounding'='text') o
+       JOIN LATERAL (
+         SELECT event#>>'{reply,body,content}' AS content FROM harness_research_events
+         WHERE job_id=o.run_id AND event#>>'{reply,evidence,evidenceId}'=o.evidence_id::text
+         ORDER BY sequence LIMIT 1
+       ) issued ON true`, [projectId, rowIds],
+  ) : { rows: [] };
+  const statementsByEvidence = new Map(statements.map((event) => [event.evidenceId, event]));
+  const originalLines = new Map(activeFacts.flatMap(({ id, observation }) => {
+    const statement = statementSet.has(id) && statementsByEvidence.get(observation.evidenceId);
+    return statement && statement.runId === observation.runId ? [[id, deliveredLines(statement.content)] as const] : [];
+  }));
+  const discovery = facadeDiscovery(activeFacts, analysis.facadeProfiles, analysis.facadeMentions);
+  const observations = activeFacts.map((fact) => facadeObservation(
+    fact.binding.state === "identified" && !discovery.placed(fact) ? { ...fact, binding: { ...fact.binding, state: "unclear",
+      reason: "Адресное упоминание ещё не подтверждает принадлежность фасаду." } } : fact,
+    originalLines.get(fact.id)?.find(({ id }) => id === fact.observation.lineId)?.text));
+  const facts = activeFacts.flatMap((fact) => convertFact(fact, accepted, formats, stageByAddress, evidenceById,
+    originalLines.get(fact.id), discovery.placed(fact)) ?? []);
+  const coveredWindows = windows.flatMap((window) => {
+    const a = completedReaderJob(window, "A");
+    const b = completedReaderJob(window, "B");
+    return a && b && a !== b ? [[a, b]] : [];
+  });
+  const mappedVersionIds = [...new Set(windows.map(({ place }) => place.source.versionId))].sort();
+  const versionIds = versions.map(({ id }) => id);
+  const mapped = new Set(mappedVersionIds);
+  const semantic = indexSemanticInput(windows, analysis.semanticChecks, versionIds.filter((id) => !mapped.has(id)));
+  const reading = windows.length > 0 && coveredWindows.length === windows.length &&
+    canonicalJson(mappedVersionIds) === canonicalJson(versionIds) ?
+    { versionIds, basisIds: coveredWindows.flat().sort() } : null;
+  const evidence: FacadeReadout = {
+    facts,
+    facades: [...new Map(activeFacts.filter(discovery.placed)
+      .flatMap(({ binding }) => binding.candidates).map((item) => [item.id, item])).values()],
+    map: analysis.coverage.physicalProof,
+    subject: analysis.coverage.subjectProof,
+    pairs: analysis.verifiedPairs,
+    reading,
+  };
+  return { intake, versionIds, versions, evidence, impacts, replacements, holds, semantic, discovery, observations,
+    comparisonRows: comparisonRows(activeFacts, formats, evidenceById, statements, [...discovery.identity.values()],
+      await readCanonicalComparisonRows(tx, projectId, activeFacts, evidenceById)),
+    comparisonReads: await comparisonReads(tx, projectId, windows, activeFacts, analysis.comparisonFollowups),
+    activeWindows: windows.length,
+    structurallyReviewedWindows: windows.filter(({ structure }) => structure?.branches.A.complete && structure.branches.B.complete).length,
+    completedWindows: coveredWindows.length };
+}

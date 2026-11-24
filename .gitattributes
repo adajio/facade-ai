@@ -1,2 +1,5 @@
 # Auto detect text files and perform LF normalization
 * text=auto
+
+# Preserve the original CRLF bytes covered by the format fixture SHA-256 manifest.
+src/modules/formats/test/fixtures/notes.txt -text
