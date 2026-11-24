@@ -4,6 +4,7 @@ import type { FastifyInstance, FastifyRequest } from 'fastify';
 import type { Pool } from 'pg';
 import { authorize, readSession, touchSession } from '../access/auth.js';
 import { unavailable } from '../access/errors.js';
+import { transaction } from '../access/commands.js';
 import { createFormatAdapters, resolveFormat } from '../formats/index.js';
 import { getOriginal } from '../intake/content.js';
 import { createIntakeStorage, type IntakeStorage, type ObjectStore } from '../intake/blob.js';
@@ -155,7 +156,7 @@ export async function register(
     return evidence;
   }
 
-  app.get<UnitsRoute>('/api/v1/documents/:documentId/versions/:versionId/reader/units', async (request) => {
+  async function authorizedDocument(request: FastifyRequest<UnitsRoute>) {
     const { documentId, versionId } = request.params;
     const session = await readSession(app.db, request);
     if (!isReaderId(documentId) || !isReaderId(versionId)) throw unavailable();
@@ -166,9 +167,26 @@ export async function register(
     const document: DocumentKey = { projectId: rows[0].project_id, documentId, versionId };
     await authorize(app.db, session, { action: 'project:read', projectId: document.projectId });
     await touchSession(app.db, session);
+    return document;
+  }
+
+  const documentReader = '/api/v1/documents/:documentId/versions/:versionId/reader';
+  app.get<UnitsRoute>(documentReader + '/units', async (request) => {
+    const document = await authorizedDocument(request);
     const map = await reader().latestMap(document);
     if (!map) throw new ReaderError('reader_map_unavailable', 'Карта оригинала ещё недоступна', 404);
     return map;
+  });
+
+  app.get<{ Params: UnitsRoute['Params'] & { page: string } }>(documentReader + '/pages/:page', async (request, reply) => {
+    const document = await authorizedDocument(request);
+    if (!/^[1-9]\d{0,6}$/u.test(request.params.page)) throw unavailable();
+    const map = await reader().latestMap(document);
+    if (!map) throw unavailable();
+    const bytes = await transaction(app.db, (tx) => reader().previewPdfPage(map.source, Number(request.params.page), tx));
+    await authorize(app.db, await readSession(app.db, request), { action: 'project:read', projectId: document.projectId });
+    return reply.header('X-Content-Type-Options', 'nosniff').header('ETag', '"sha256-' + map.source.sha256 + '"')
+      .type('image/png').send(bytes);
   });
 
   app.get<EvidenceRoute>('/api/v1/evidence/:id', async (request) => {

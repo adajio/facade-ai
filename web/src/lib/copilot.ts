@@ -1,5 +1,14 @@
 import { id } from './http';
 
+export type CopilotBudget = { state: 'unavailable' | 'unconfigured' } |
+  { state: 'ready' | 'frozen'; limitUsdNanos: number; remainingUsdNanos: number };
+
+export function formatBudget(nanos: number) {
+  return new Intl.NumberFormat('ru-RU', {
+    style: 'currency', currency: 'USD', maximumFractionDigits: nanos > 0 && nanos < 10_000_000 ? 9 : 2,
+  }).format(nanos / 1_000_000_000);
+}
+
 export type SourceAddress = {
   unitId: string;
   locator?: Record<string, string | number>;

@@ -101,7 +101,7 @@
     try {
       const page = await api.json<InquiryPage>(query(listPath, { scopeId: context.scopeId, after: cursor }));
       if (page.sliceId !== expected || listSlice !== expected) {
-        error = 'Появился новый срез. Список перечитывается, выбранная карточка сохраняется.';
+        error = 'Пришли новые данные. Обновляем список и сохраняем выбранную карточку.';
         renew();
       } else {
         const known = new Set(list.map((item) => item.id));
@@ -185,7 +185,7 @@
         <div class="table-wrap">
           <table><thead><tr><th>Предмет</th><th>Поиск и сверка</th></tr></thead>
             <tbody>{#each visible as item (item.id)}
-              <tr><td><a class="row-link" href={route(item.id)} aria-current={selectedId === item.id ? 'true' : undefined}>{item.subject}</a></td>
+              <tr><td><a class="row-link" data-triage-row href={route(item.id)} aria-current={selectedId === item.id ? 'true' : undefined}>{item.subject}</a></td>
                 <td>{label(item.state)}{item.needsReview ? ' · пересмотр' : ''}</td></tr>
             {/each}</tbody>
           </table>

@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { copy as interfaceCopy } from '../lib/copy';
   import { onMount } from 'svelte';
   import { Commands } from '../lib/commands';
   import { conflictMessage } from '../lib/conflict';
@@ -6,6 +7,8 @@
   import { ApiError, describe, endpoint, id, interrupted, issue, query, type Api } from '../lib/http';
   import { V1, projectApi, projectV1, scopedUrl, type Assessment, type Citation, type OpenEvidence, type Page, type WorkspaceProps } from '../lib/workspace';
   import EvidenceButtons from '../lib/EvidenceButtons.svelte';
+  import ClarificationDetails from '../lib/ClarificationDetails.svelte';
+  import type { ClarificationBasis } from '../lib/workspace';
   import Notice from '../lib/Notice.svelte';
   import WordingReviewForm from '../lib/WordingReview.svelte';
   import { managedWording, wordingFields, type WordingReview, type WordingSource } from '../lib/wording';
@@ -14,7 +17,8 @@
   type Ground = Selection & {
     subject: string; action: string; recipient: string; wording: string;
     kind: string; alternativeWording?: string;
-    basis?: { scope?: { name: string }; requiredFormats?: string[]; citations?: Citation[]; machine?: { citations?: Citation[] } };
+    basis?: { scope?: { name: string }; requiredFormats?: string[]; citations?: Citation[]; machine?: { citations?: Citation[] };
+      clarification?: ClarificationBasis };
     sources?: WordingSource[];
   };
   type Item = Ground & {
@@ -425,7 +429,7 @@
     {:else if eligible && !eligible.items.length}
       <p>{assessmentOutcome === 'sufficient'
         ? 'Письмо не требуется. Комплект достаточен для выбранной области.'
-        : 'Внешних оснований пока нет. Для письма нужны подтверждённые нехватка или противоречие.'}</p>
+        : interfaceCopy.noLetterItems}</p>
       <a href={assessmentUrl()}>Проверить комплектность</a>
     {:else if eligible?.items.length}
       {#if context.canEdit}
@@ -486,7 +490,8 @@
             <p>{sentSnapshot.recipient} · {date(sentSnapshot.sentAt)}</p>
             <pre>{sentSnapshot.text}</pre>
             <ul class="plain-list">{#each sentSnapshot.items as item (item.id)}
-              <li>{item.subject}<EvidenceButtons citations={supports(item)} {open} />
+              <li>{item.subject} · {label(item.kind)}<EvidenceButtons citations={supports(item)} {open} />
+                {#if item.basis?.clarification}<ClarificationDetails basis={item.basis.clarification} />{/if}
                 {#if context.canEdit}
                   <a href={scopedUrl(context.project.id, 'receipts', { scope: context.scopeId, letter: current.id, sent: sentId, item: item.id, upload: 1 })}>Добавить досылку по пункту</a>
                 {/if}
@@ -532,6 +537,7 @@
             <ul class="plain-list">{#each currentRevision.items as item (item.id)}
               <li>
                 <a href={assessmentUrl(current, item.questionId)}>{item.subject}</a>
+                {#if item.basis?.clarification}<ClarificationDetails basis={item.basis.clarification} />{/if}
                 <EvidenceButtons citations={supports(item)} {open} />
               </li>
             {/each}</ul>
@@ -549,7 +555,11 @@
                 <option value="formal">Запрос исходных данных</option><option value="brief">Краткий запрос</option>
               </select></label>
               {#each currentRevision.items as item (item.id)}
-                <label>{item.subject}<textarea bind:value={wording[item.questionId]} required oninput={markDraft}></textarea></label>
+                {#if item.kind === 'clarification'}
+                  <p>{item.wording}</p>
+                {:else}
+                  <label>{item.subject}<textarea bind:value={wording[item.questionId]} required oninput={markDraft}></textarea></label>
+                {/if}
               {/each}
               {#if basedOn != null && basedOn !== current.version}
                 <p class="notice">Исходная версия {basedOn}, текущая {current.version}. Ввод сохранён.</p>

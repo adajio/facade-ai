@@ -11,6 +11,7 @@ import { deliveryEvidenceIds, fullDeliveryLine, type DeliveryEvidence } from "./
 import { nonDeliveryFromOriginal, type FacadeFact, type FacadeReadout } from "./facade-model.js";
 import { completedReaderJob, indexSemanticInput } from "./facade-semantic.js";
 import type { Gate } from "./store.js";
+import { acceptedOriginals } from "../intake/accepted-originals.js";
 
 type AcceptedVersion = { id: string; sha256: string; documentId: string; label: string };
 type Impact = { receiptId: string; questionId: string };
@@ -229,22 +230,7 @@ export async function readFacadeInput(tx: PoolClient, projectId: string) {
      coalesce((SELECT generation FROM intake_project_generations WHERE project_id=$1), 0)::text AS generation`,
     [projectId],
   );
-  const { rows: versions } = await tx.query<AcceptedVersion>(
-    `SELECT v.id, v.document_id AS "documentId", raw.sha256, occurrence.relative_path AS label
-      FROM intake_document_versions v
-      JOIN intake_originals raw ON raw.project_id=v.project_id AND raw.id=v.original_id
-      JOIN LATERAL (
-        SELECT relative_path FROM intake_occurrences o
-        WHERE o.project_id=v.project_id AND o.version_id=v.id AND o.state='accepted'
-        ORDER BY o.created_at, o.id LIMIT 1
-      ) occurrence ON true
-      WHERE v.project_id=$1 AND NOT EXISTS (
-        SELECT 1 FROM intake_document_versions replacement
-        WHERE replacement.project_id=$1 AND replacement.replaces_version_id=v.id
-          AND EXISTS (SELECT 1 FROM intake_occurrences o WHERE o.version_id=replacement.id AND o.state='accepted')
-      )
-      ORDER BY v.id`, [projectId],
-  );
+  const versions = await acceptedOriginals(tx, projectId);
   const { rows: holds } = await tx.query<Gate["holds"][number]>(
     `SELECT h.id,h.receipt_id AS "receiptId",h.source,h.source_id AS "sourceId",
       h.generation::float8 AS generation,h.version,h.scope_ids AS "scopeIds"
@@ -340,7 +326,7 @@ export async function readFacadeInput(tx: PoolClient, projectId: string) {
     pairs: analysis.verifiedPairs,
     reading,
   };
-  return { intake, versionIds, evidence, impacts, replacements, holds, semantic, discovery, observations,
+  return { intake, versionIds, versions, evidence, impacts, replacements, holds, semantic, discovery, observations,
     comparisonRows: comparisonRows(activeFacts, formats, evidenceById, statements, [...discovery.identity.values()],
       await readCanonicalComparisonRows(tx, projectId, activeFacts, evidenceById)),
     comparisonReads: await comparisonReads(tx, projectId, windows, activeFacts, analysis.comparisonFollowups),

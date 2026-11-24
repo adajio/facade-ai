@@ -1,5 +1,8 @@
 <script lang="ts">
   import { Commands } from '../lib/commands';
+  import { tick } from 'svelte';
+  import TriageBar from '../lib/TriageBar.svelte';
+  import { bucket, triageCounts, type Triage } from '../lib/triage';
   import { conflictMessage } from '../lib/conflict';
   import { date, label } from '../lib/format';
   import { describe, id, interrupted, type Api } from '../lib/http';
@@ -9,16 +12,22 @@
   import Notice from '../lib/Notice.svelte';
   import FacadeTypeControl from './FacadeTypeControl.svelte';
   import FacadeObservations from './FacadeObservations.svelte';
+  import ClarificationControl from '../lib/ClarificationControl.svelte';
 
-  let { api, context, open, renew, refreshProject, overview = false, overviewVersion }: {
+  let { api, context, open, renew, refreshProject, overview = false, overviewVersion, triage, chooseTriage, mode = 'matrix' }: {
     api: Api; context: WorkspaceProps; open: OpenEvidence; renew: () => void; refreshProject?: () => Promise<void>; overview?: boolean; overviewVersion?: number;
+    triage?: Triage; chooseTriage?: (value: Triage) => void;
+    mode?: 'matrix' | 'facts' | 'questions';
   } = $props();
   const commands = new Commands(() => api);
   let summary = $state<FacadeAssessment>();
   let problem = $state('');
   let contextId = $derived(context.params.get('context') ?? '');
   let view = $derived(summary?.contexts.find((item) => item.assessmentContextId === contextId));
-  let questions = $derived(view?.questions.filter((item) => !context.filter || item.outcome === context.filter) ?? []);
+  let counts = $derived(triageCounts(view?.questions ?? summary?.contexts.flatMap((item) => item.questions) ?? []));
+  let current = $derived(mode === 'questions' ? 'review' : triage ?? (counts.review ? 'review' : counts.letter ? 'letter' : 'done'));
+  let questions = $derived(view?.questions.filter((item) => context.filter ? item.outcome === context.filter
+    : item.id === context.objectId && !triage || bucket(item) === current) ?? []);
   let active = $derived(questions.find((item) => item.id === context.objectId));
   let reviewItems = $derived(summary?.comparisonReview?.items.filter((item) =>
     !view?.facadeId || !item.facadeId || item.facadeId === view.facadeId) ?? []);
@@ -31,6 +40,8 @@
   let requestExternal = $state(false);
   let decisionReason = $state('');
   let decisionVersion = $state<number>();
+  let decisionAction = $state<'confirm' | 'correct'>('confirm');
+  let decisionInput = $state<HTMLTextAreaElement>();
   let requestFocus = $derived(context.objectId || contextId);
   let historicalVersion = $derived(context.params.get('revision') ?? '');
 
@@ -62,6 +73,7 @@
     conclusionReason = '';
     conclusionVersion = undefined;
     requestExternal = false;
+    decisionAction = 'confirm';
     decisionReason = '';
     decisionVersion = undefined;
     commandError = '';
@@ -69,13 +81,15 @@
   });
 
   function url(ctx?: FacadeContext, question?: AssessmentQuestion, filter?: string) {
-    return scopedUrl(context.project.id, 'completeness', {
+    return scopedUrl(context.project.id, mode === 'questions' ? 'questions' : 'completeness', {
       context: ctx?.assessmentContextId, filter, revision: historicalVersion || (ctx ? overviewVersion : undefined), slice: context.params.get('slice'),
     }, question?.id);
   }
 
-  function observationLink(binding: Binding, facadeId?: string | null) {
-    return scopedUrl(context.project.id, 'completeness', { binding, facadeId, revision: summary?.version });
+  function observationLink(binding?: Binding, facadeId?: string | null) {
+    return scopedUrl(context.project.id, mode === 'facts' ? 'facts' : 'completeness', {
+      binding, facadeId, revision: summary?.version, context: mode === 'facts' ? contextId : undefined,
+    });
   }
 
   function receiptLink(receiptId: string) {
@@ -105,6 +119,21 @@
     return assessmentReasons[value] ?? label(value);
   }
 
+  function prepareDecision(question: AssessmentQuestion, confirmation: boolean) {
+    if (active?.id !== question.id || active.version !== question.version) {
+      commandError = 'Строка проверки изменилась. Откройте её актуальные основания.';
+      return;
+    }
+    decisionVersion ??= question.version;
+    decisionAction = confirmation ? 'confirm' : 'correct';
+    requestExternal = confirmation;
+    void tick().then(() => decisionInput?.focus());
+  }
+
+  function comparisonActions(question: AssessmentQuestion) {
+    return { confirm: () => prepareDecision(question, true), dismiss: () => prepareDecision(question, false) };
+  }
+
   async function save(event: SubmitEvent, kind: 'conclusion' | 'question') {
     event.preventDefault();
     if (!view || busy || historicalVersion) return;
@@ -118,10 +147,12 @@
     try {
       if (kind === 'question' && selectedQuestion) {
         await commands.send(V1 + '/questions/' + id(selectedQuestion.id) + '/decisions', 'POST', {
-          action: 'confirm', reason: decisionReason, requestExternal,
+          action: decisionAction, reason: decisionReason, requestExternal,
+          ...(decisionAction === 'correct' ? { outcome: 'needs_review' } : {}),
         }, version);
         decisionReason = '';
         decisionVersion = undefined;
+        decisionAction = 'confirm';
         requestExternal = false;
       } else {
         await commands.send(projectV1(context.project.id) + '/conclusions', 'POST', {
@@ -143,7 +174,24 @@
 
 <Notice kind="error" message={problem && 'Сводка оценки · ' + problem} />
 {#if !summary && !problem}<p class="card" role="status">Загружаем сводку оценки…</p>{/if}
-{#if summary}
+{#if summary && mode === 'facts'}
+  <section class="card">
+    <div class="card-header">
+      <h2>{view?.name ?? 'Сведения по комплекту'}</h2>
+      {#if historicalVersion}
+        <a href={scopedUrl(context.project.id, 'facts', { context: contextId, binding: context.params.get('binding') })}>Актуальные сведения</a>
+      {/if}
+    </div>
+    <nav class="actions" aria-label="Привязка сведений">
+      <a class="button quiet" href={observationLink(undefined, view?.facadeId)} aria-current={context.params.has('binding') ? undefined : 'page'}>Все</a>
+      {#each Object.entries(observationLabels) as [binding, label] (binding)}
+        <a class="button quiet" href={observationLink(binding as Binding, view?.facadeId)}
+          aria-current={context.params.get('binding') === binding ? 'page' : undefined}>{label}</a>
+      {/each}
+    </nav>
+    <FacadeObservations {api} {context} {summary} {open} facts preselectedFacade={view?.facadeId} />
+  </section>
+{:else if summary}
   <section class="card">
     <div class="card-header">
       <h2>{overview ? 'Оценка комплекта' : 'Граница оценки'}</h2>
@@ -258,7 +306,7 @@
               </li>
             {/each}
           </ul>
-          <EvidenceButtons citations={item.sources.map(({ citation }) => ({ ...citation, sourceLabel: citation.label }))} {open} />
+          <EvidenceButtons citations={item.sources.map(({ citation, sourceRole }) => ({ ...citation, sourceLabel: citation.label, sourceRole }))} {open} compare />
         </details>
       {/each}
       {#if summary.comparisonReview?.limited}<p>Проверена только часть сочетаний источников.</p>{/if}
@@ -281,6 +329,10 @@
     </section>
   {/if}
 
+  {#if !view && chooseTriage && !context.filter}
+    <TriageBar value={current} {counts} choose={chooseTriage}
+      letterUrl={scopedUrl(context.project.id, 'letters', { scope: context.scopeId })} />
+  {/if}
   <section class="card table-card">
     <div class="card-header"><h2>Выявленные фасады и общий уровень</h2></div>
     {#if !summary.contexts.some(({ kind }) => kind === 'facade')}<p class="meta">Фасады пока не выявлены.</p>{/if}
@@ -366,6 +418,10 @@
       {/if}
     </section>
 
+    {#if chooseTriage && !context.filter}
+      <TriageBar value={current} {counts} choose={chooseTriage}
+        letterUrl={scopedUrl(context.project.id, 'letters', { context: view.assessmentContextId, scope: context.scopeId })} />
+    {/if}
     <section class="card table-card">
       <div class="card-header"><h2>Обязательные части</h2></div>
       {#if questions.length}
@@ -374,13 +430,14 @@
           <tbody>
             {#each questions as question (question.id)}
               <tr>
-                <td><a href={url(view, question, context.filter)} aria-current={active?.id === question.id ? 'true' : undefined}>{question.requirement.subject} · {question.requirement.part}</a></td>
+                <td><a data-triage-row href={url(view, question, context.filter)} aria-current={active?.id === question.id ? 'true' : undefined}>{question.requirement.subject} · {question.requirement.part}</a></td>
                 <td>{label(question.machine.outcome)}</td>
                 <td>{question.semanticRemainder
                   ? question.semanticRemainder.verifiedWindows + ' из ' + question.semanticRemainder.totalWindows +
                     (question.semanticRemainder.state === 'open' ? ' · есть остаток' : '')
                   : 'Данные отсутствуют в этой ревизии'}</td>
-                <td>{label(question.decision?.outcome, 'Ожидает решения')}</td>
+                <td>{label(question.decision?.action === 'request_clarification' ? 'clarification' : question.decision?.outcome,
+                  'Ожидает решения')}</td>
               </tr>
             {/each}
           </tbody>
@@ -397,7 +454,8 @@
         {#if active.requirement.applicability === 'unknown'}
           <p>Применимость требования требует подтверждения.</p>
         {/if}
-        <EvidenceButtons citations={active.machine.citations} {open} />
+        <EvidenceButtons citations={active.machine.citations} {open} compare={active.machine.outcome === 'confirmed_conflict'}
+          actions={context.canEdit && !historicalVersion ? comparisonActions(active) : undefined} />
         {#each active.machine.citations as citation}
           {#if citation.components?.length}
             <ul class="plain-list">
@@ -440,16 +498,21 @@
         {#each view.questionHolds.find(({ questionId }) => questionId === active?.id)?.receiptIds ?? [] as receiptId (receiptId)}
           <p><a href={receiptLink(receiptId)}>Открыть досылку для пересмотра основания</a></p>
         {/each}
-        {#if active.decision}
+        {#if active.decision && active.decision.action !== 'request_clarification'}
           <p>Решение инженера · {label(active.decision.outcome)} · {active.decision.reason} · {date(active.decision.createdAt)}</p>
         {/if}
+        {#key active.id}
+          <ClarificationControl {api} question={active} editable={context.canEdit && !historicalVersion} refresh={renew} />
+        {/key}
         {#if context.canEdit && !historicalVersion && ['confirmed_missing', 'confirmed_conflict'].includes(active.machine.outcome)}
           <form onsubmit={(event) => save(event, 'question')}>
             <label>Основание подтверждения
-              <textarea required bind:value={decisionReason} oninput={() => decisionVersion ??= active?.version}></textarea>
+              <textarea required bind:this={decisionInput} bind:value={decisionReason} oninput={() => decisionVersion ??= active?.version}></textarea>
             </label>
-            <label class="check"><input type="checkbox" bind:checked={requestExternal} onchange={() => decisionVersion ??= active?.version} /> Добавить во внешние основания</label>
-            <div class="actions"><button class="primary" disabled={busy}>Подтвердить результат</button></div>
+            {#if decisionAction === 'confirm'}
+              <label class="check"><input type="checkbox" bind:checked={requestExternal} onchange={() => decisionVersion ??= active?.version} /> Добавить во внешние основания</label>
+            {/if}
+            <div class="actions"><button class="primary" disabled={busy}>{decisionAction === 'confirm' ? 'Подтвердить результат' : 'Вернуть на внутреннюю сверку'}</button></div>
           </form>
         {/if}
         <a class="button" href={scopedUrl(context.project.id, 'letters', { context: view.assessmentContextId })}>К письмам по контексту</a>

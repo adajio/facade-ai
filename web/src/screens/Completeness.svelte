@@ -1,5 +1,8 @@
 <script lang="ts">
   import { Commands } from '../lib/commands';
+  import { tick } from 'svelte';
+  import TriageBar from '../lib/TriageBar.svelte';
+  import { bucket, triageCounts, type Triage } from '../lib/triage';
   import { conflictMessage } from '../lib/conflict';
   import { date, label } from '../lib/format';
   import { describe, id, interrupted, query, type Api } from '../lib/http';
@@ -8,14 +11,20 @@
   import Notice from '../lib/Notice.svelte';
   import ScopeRequirements from './ScopeRequirements.svelte';
 
-  let { api, context, open, renew }: { api: Api; context: WorkspaceProps; open: OpenEvidence; renew: () => void } = $props();
+  let { api, context, open, renew, triage, chooseTriage }: {
+    api: Api; context: WorkspaceProps; open: OpenEvidence; renew: () => void;
+    triage?: Triage; chooseTriage: (value: Triage) => void;
+  } = $props();
   const commands = new Commands(() => api);
   let snapshot = $state<Assessment>();
   let loadError = $state('');
   let selected = $state('');
   let showHistory = $state(false);
   let historical = $derived(Boolean(context.revision));
-  let visible = $derived((snapshot?.questions ?? []).filter((row) => !context.filter || context.filter === row.outcome));
+  let counts = $derived(triageCounts(snapshot?.questions ?? []));
+  let current = $derived(triage ?? (counts.review ? 'review' : counts.letter ? 'letter' : 'done'));
+  let visible = $derived((snapshot?.questions ?? []).filter((item) =>
+    context.filter ? context.filter === item.outcome : item.id === context.objectId && !triage || bucket(item) === current));
   let row = $derived(visible.find((entry) => entry.id === (selected || context.objectId)) ?? visible[0]);
   let action = $state('confirm');
   let reason = $state('');
@@ -32,6 +41,23 @@
   let saving = $state(false);
   let operationStatus = $state('');
   let operationError = $state('');
+  let reasonInput = $state<HTMLTextAreaElement>();
+
+  function prepareDecision(question: AssessmentQuestion, confirmation: boolean) {
+    if (row?.id !== question.id || row.version !== question.version) {
+      operationError = 'Строка проверки изменилась. Откройте её актуальные основания.';
+      return;
+    }
+    basedOn ??= question.version;
+    action = confirmation ? 'confirm' : 'correct';
+    if (!confirmation) correction = 'needs_review';
+    requestExternal = confirmation;
+    void tick().then(() => reasonInput?.focus());
+  }
+
+  function comparisonActions(question: AssessmentQuestion) {
+    return { confirm: () => prepareDecision(question, true), dismiss: () => prepareDecision(question, false) };
+  }
 
   function openStoppedEvidence(stop: NonNullable<AssessmentQuestion['researchStops']>[number], index: number, event: MouseEvent) {
     const entries: Citation[] = (stop.evidence ?? []).map(({ evidenceId, place }) => ({
@@ -180,6 +206,10 @@
       {#if snapshot.holds?.length}<Notice message={'Ожидается разбор поступлений · ' + snapshot.holds.length} />{/if}
     </section>
 
+    {#if !context.filter}
+      <TriageBar value={current} {counts} choose={chooseTriage}
+        letterUrl={scopedUrl(context.project.id, 'letters', { scope: context.scopeId })} />
+    {/if}
     <div class="split">
       <section class="card table-card">
         <div class="card-header"><h2>Обязательные части</h2>{#if context.filter}<a href={scopedUrl(context.project.id, 'completeness', { scope: context.scopeId })}>Все состояния</a>{/if}</div>
@@ -190,7 +220,7 @@
               <tbody>
                 {#each visible as item (item.id)}
                   <tr>
-                    <td><button type="button" class="quiet" aria-pressed={row?.id === item.id}
+                    <td><button type="button" class="quiet" data-triage-row aria-pressed={row?.id === item.id}
                       onclick={() => { selected = item.id; basedOn = undefined; reason = ''; }}>{item.requirement.subject} · {item.requirement.part}</button></td>
                     <td>{item.requirement.formats.join(', ')}</td>
                     <td><span class="pill">{label(item.outcome)}</span></td>
@@ -258,7 +288,8 @@
               </ul>
             </details>
           {/if}
-          <EvidenceButtons citations={row.machine.citations} {open} />
+          <EvidenceButtons citations={row.machine.citations} {open} compare={row.machine.outcome === 'confirmed_conflict'}
+            actions={context.canEdit && !historical ? comparisonActions(row) : undefined} />
           {#if row.machine.receiptIds.length}
             <ul class="plain-list">{#each row.machine.receiptIds as receipt, i (receipt)}
               <li><a href={scopedUrl(context.project.id, 'receipts', { scope: context.scopeId }, receipt)}>Связанное поступление {i + 1}</a></li>
@@ -292,7 +323,7 @@
                 <label><input type="checkbox" bind:checked={requestExternal} onchange={edit} /> Подтвердить к внешнему запросу</label>
               {/if}
               <label><input type="checkbox" bind:checked={critical} onchange={edit} /> Для начала работ</label>
-              <label>Основание решения<textarea required bind:value={reason} oninput={edit}></textarea></label>
+              <label>Основание решения<textarea required bind:this={reasonInput} bind:value={reason} oninput={edit}></textarea></label>
               {#if basedOn != null && basedOn !== row.version}
                 <p class="notice">Ввод опирался на версию {basedOn}. Сейчас доступна версия {row.version}.</p>
                 <button type="button" onclick={() => basedOn = row?.version}>Использовать текущую версию</button>

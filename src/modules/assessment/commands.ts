@@ -3,7 +3,7 @@ import type { PoolClient } from "pg";
 import type { DocumentRevisionReader } from "./document-revision.js";
 import { facadeAssessmentHref, getLockedFacadeContext } from "./facade-store.js";
 import {
-  effectiveOutcome, evaluate, type Decision, type Exclusion, type Machine, type Outcome,
+  canonicalJson, effectiveOutcome, evaluate, type ClarificationBasis, type Decision, type Exclusion, type Machine, type Outcome,
 } from "./domain.js";
 import {
   AssessmentError, announceAssessment, assertAvailable, assessmentHref, getLockedGate, getQuestions, invalidInput,
@@ -51,6 +51,12 @@ export async function recordDecision(
 ) {
   const { question, gate, projectId, scopeId, revision } = context;
   if (!revision.catalog_version_id) invalidInput("Нет рабочего каталога.");
+  const clarification = input.action === "request_clarification" ? question.review?.clarification : undefined;
+  if (input.action === "request_clarification" && (!clarification || !input.requestExternal || !context.assessmentContextId ||
+      question.machine.outcome !== "needs_review" || !question.requirement.recipient)) {
+    throw new AssessmentError(422, "clarification_unavailable",
+      "Для запроса подтвердите проверку закрытых описей, относящихся мест и допустимых аналогов.");
+  }
   const confirmingConflict = (input.action === "confirm" || input.action === "correct") &&
     question.machine.outcome === "confirmed_conflict" && question.review !== null;
   const machine = confirmingConflict ? evaluate(question.requirement, question.review) : question.machine;
@@ -64,7 +70,7 @@ export async function recordDecision(
   }
   const outcome = input.action === "exclude" ? "excluded" : basis.outcome;
   const isExternal = outcome === "confirmed_missing" || outcome === "confirmed_conflict";
-  if (input.requestExternal && (!isExternal || !question.requirement.recipient ||
+  if (input.requestExternal && !clarification && (!isExternal || !question.requirement.recipient ||
       (input.action !== "confirm" && input.action !== "correct"))) {
     invalidInput("Для внешнего запроса требуется подтверждённый недостаток или противоречие и адресат каталога.");
   }
@@ -81,6 +87,7 @@ export async function recordDecision(
     startWorkCritical: input.action === "revoke" ? null :
       input.startWorkCritical ?? question.decision?.startWorkCritical ?? null,
     ...(input.exclusion ? { exclusion: input.exclusion } : {}),
+    ...(clarification ? { clarification } : {}),
   };
   const next = await writeRevision(tx, revision, revision.version + 1, gate, makeChange("engineer_decision", [question]));
   const version = question.version + 1;
@@ -111,7 +118,7 @@ export type Ground = {
   questionId: string;
   questionVersion: number;
   decisionId: string;
-  kind: "confirmed_missing" | "confirmed_conflict";
+  kind: "confirmed_missing" | "confirmed_conflict" | "clarification";
   scope: Revision["scope"];
   scopeId: string;
   assessmentContextId?: string;
@@ -122,6 +129,7 @@ export type Ground = {
   requiredFormats: string[];
   citations: Machine["citations"];
   inventory?: Machine["inventory"];
+  clarification?: ClarificationBasis;
   catalogVersionId: string;
 };
 
@@ -154,8 +162,10 @@ export async function selectConfirmedGrounds(tx: PoolClient, options: GroundsOpt
       const { decision, requirement } = question;
       if (question.review?.supplementReceiptIds?.length || !decision?.requestExternal || !requirement.recipient ||
           (recipient !== undefined && recipient !== requirement.recipient)) continue;
-      const kind = effectiveOutcome(question.machine, decision, now);
-      if (kind !== "confirmed_missing" && kind !== "confirmed_conflict") continue;
+      const clarification = decision.action === "request_clarification" && decision.clarification && question.review?.clarification &&
+        canonicalJson(decision.clarification) === canonicalJson(question.review.clarification) ? decision.clarification : undefined;
+      const kind = clarification ? "clarification" : effectiveOutcome(question.machine, decision, now);
+      if (kind !== "confirmed_missing" && kind !== "confirmed_conflict" && kind !== "clarification") continue;
       const citations = [];
       for (const citation of decision.basis.citations) {
         const documentRevision = citation.documentRevision ??
@@ -173,12 +183,13 @@ export async function selectConfirmedGrounds(tx: PoolClient, options: GroundsOpt
         subject: requirement.subject,
         part: requirement.part,
         recipient: requirement.recipient,
-        requestedAction: kind === "confirmed_conflict" ?
-          `Подтвердить значение для «${requirement.part}»` : requirement.requestedAction,
+        requestedAction: kind === "clarification" ? "Направить документ или указать, где приведены данные" :
+          kind === "confirmed_conflict" ? `Подтвердить значение для «${requirement.part}»` : requirement.requestedAction,
         requiredFormats: requirement.formats,
         citations,
         catalogVersionId: decision.catalogVersionId,
         ...(decision.basis.inventory ? { inventory: decision.basis.inventory } : {}),
+        ...(clarification ? { clarification } : {}),
       });
     }
   }

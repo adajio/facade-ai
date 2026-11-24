@@ -1,6 +1,7 @@
 import type { FastifyInstance } from 'fastify';
 import type { Pool, PoolClient } from 'pg';
 import { lockIntakeProject } from '../intake/gate.js';
+import { verifyOriginalBasis } from '../intake/accepted-originals.js';
 import { requireAccess, uuid } from './auth.js';
 import { executeCommand } from './commands.js';
 import { invalid, unavailable } from './errors.js';
@@ -46,9 +47,14 @@ export function registerStages(app: FastifyInstance, db: Pool) {
   app.put<{ Params: ProjectParams }>('/api/projects/:projectId/stage', async (request, reply) => {
     const projectId = uuid(request.params.projectId);
     const payload = object(request.body);
+    const manual = payload.provenanceKind === 'engineer_override';
+    if (payload.provenanceKind !== undefined && !manual && payload.provenanceKind !== 'machine_verified' ||
+        !manual && (payload.documentVersionId !== undefined || payload.pageOrAnchor !== undefined) ||
+        manual && payload.evidenceIds !== undefined) throw invalid('invalid_stage_evidence');
     const input = {
-      stage: text(payload.stage, 'stage'), reason: text(payload.reason, 'reason', 500),
+      stage: text(payload.stage, 'stage'), reason: text(payload.reason, 'reason', manual ? 2000 : 500),
       evidenceIds: evidenceIds(payload.evidenceIds),
+      ...(manual ? { documentVersionId: uuid(payload.documentVersionId), pageOrAnchor: text(payload.pageOrAnchor, 'адрес', 200) } : {}),
     };
     let locked: Awaited<ReturnType<typeof lockProjectApplicability>>;
     const result = await executeCommand(db, request, {
@@ -59,12 +65,15 @@ export function registerStages(app: FastifyInstance, db: Pool) {
       },
     }, async (tx, actor) => {
       const evidence = await evidenceFor(tx, projectId, input.evidenceIds);
+      const basis = input.documentVersionId && input.pageOrAnchor ?
+        await verifyOriginalBasis(tx, projectId, input.documentVersionId, input.pageOrAnchor) :
+        evidence.length ? { provenanceKind: 'machine_verified' as const, evidenceIds: evidence.map(({ id }) => id) } : undefined;
       const { project: previous, scopes } = locked;
-      const project = await setProjectStage(tx, previous, scopes, input.stage, actor);
+      const project = await setProjectStage(tx, previous, scopes, input.stage, actor, basis);
       const body = { ...project, stageStatus: stageStatus(project), reason: input.reason, evidence };
       return { body, audit: { objectId: projectId, version: project.version, details: {
         previous: previous.stage, previousStatus: stageStatus(previous), stage: project.stage, reason: input.reason,
-        evidence, expectedVersion: previous.version,
+        evidence, ...(basis ? { basis } : {}), expectedVersion: previous.version,
       } } };
     });
     return reply.code(result.status).header('ETag', `"${result.body.version}"`).send(result.body);

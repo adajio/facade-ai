@@ -116,6 +116,15 @@ export type Review = {
   requireVerifiedPairs?: boolean;
   supplementReceiptIds?: string[];
   packageCoverageIds?: string[];
+  clarification?: ClarificationBasis;
+};
+
+export type ClarificationBasis = {
+  inventories: { receiptId: string; number: string; revision: string }[];
+  places: { documentId: string; versionId: string; sha256: string; label: string;
+    address: { unitId: string; box?: { x: number; y: number; width: number; height: number } } }[];
+  alternatives: string[];
+  semanticBasisIds: string[];
 };
 
 export type Machine = {
@@ -135,7 +144,7 @@ export type Exclusion = {
 
 export type Decision = {
   id: string;
-  action: "confirm" | "correct" | "exclude" | "revoke";
+  action: "confirm" | "correct" | "exclude" | "revoke" | "request_clarification";
   outcome: Outcome;
   reason: string;
   requestExternal: boolean;
@@ -145,6 +154,7 @@ export type Decision = {
   basis: Machine;
   startWorkCritical: boolean | null;
   exclusion?: Exclusion;
+  clarification?: ClarificationBasis;
 };
 
 type Value = { magnitude: bigint; exponent: number; dimension: string };

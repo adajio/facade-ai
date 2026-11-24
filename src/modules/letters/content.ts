@@ -14,7 +14,7 @@ export interface Selection {
 }
 
 export interface Ground extends Selection {
-  kind: 'confirmed_missing' | 'confirmed_conflict';
+  kind: AssessmentGround['kind'];
   scopeId: string;
   recipient: string;
   subject: string;

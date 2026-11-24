@@ -5,7 +5,7 @@ import { AccessError, invalid, sendAccessError, unavailable } from '../access/er
 import { getInventory } from '../intake/receipts.js';
 import { inProjectionSnapshot } from '../supplements/events.js';
 import { optionalIdentifier, pageLimit } from '../supplements/inputs.js';
-import { currentWorkSlice, inventoryRevision, inventoryUnavailable, loadWorkSlice, parseFilter, receiptPage, snapshotRequired } from './store.js';
+import { currentWorkSlice, inventoryRevision, inventoryUnavailable, loadWorkSlice, parseFilter, receiptPage, snapshotRequired, summarizeWorkSlice } from './store.js';
 
 const base = '/api/projects/:projectId/work-slices';
 type Current = { Params: { projectId: string }; Querystring: { scopeId?: string } };
@@ -41,6 +41,20 @@ export async function register(app: FastifyInstance) {
       }
     }
     throw snapshotRequired();
+  });
+
+  app.get<{ Params: SliceParams }>(base + '/:workSliceId', async (request) => {
+    const projectId = uuid(request.params.projectId);
+    const workSliceId = uuid(request.params.workSliceId);
+    const { result, session } = await inProjectionSnapshot(db, async (tx) => {
+      const session = await readSession(tx, request);
+      await authorize(tx, session, { action: 'project:read', projectId });
+      const slice = await loadWorkSlice(tx, projectId, workSliceId);
+      if (slice.scopeId) await authorize(tx, session, { action: 'project:read', projectId, scopeId: slice.scopeId });
+      return { result: summarizeWorkSlice(slice, workSliceId), session };
+    });
+    await touchSession(db, session);
+    return result;
   });
 
   app.get<Listing>(base + '/:workSliceId/receipts', async (request) => {

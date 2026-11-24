@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onDestroy, tick } from 'svelte';
+  import { onDestroy, tick, untrack } from 'svelte';
   import { Commands } from '../lib/commands';
   import { ApiError, describe, id, interrupted, query, type Api } from '../lib/http';
   import { date, bytes, count, label } from '../lib/format';
@@ -8,7 +8,8 @@
     type Capabilities, type Inventory, type ManifestItem, type NewInput, type Occurrence, type Receipt, type Upload, type UploadProgress,
   } from '../lib/intake';
   import { projectApi, scopedUrl, type OpenEvidence, type Page, type Projection, type WorkspaceProps } from '../lib/workspace';
-  import { workReceiptFilters, workSliceApi, type WorkReceiptFilter } from '../lib/work-slice';
+  import { workReceiptFilters, workSliceApi, type WorkReceiptFilter, type WorkSlice } from '../lib/work-slice';
+  import WorkProgress from '../lib/WorkProgress.svelte';
   import Notice from '../lib/Notice.svelte';
   import Document from './Document.svelte';
   import IntakeHolds from './IntakeHolds.svelte';
@@ -129,6 +130,8 @@
   let workScope = $derived(context.project.intakeMode && !context.project.scopeId ? undefined : context.scopeId);
   let requestedWorkSlice = $derived(context.params.get('workSlice') ?? '');
   let usesWorkSlice = $derived(Boolean(requestedWorkSlice) || filter === 'processing');
+  let progressSlice = $state<WorkSlice>();
+  let progressKey = $derived(usesWorkSlice ? resolvedWorkSlice || requestedWorkSlice : 'current');
   let receiptSelection = $derived(usesWorkSlice ? context.objectId : undefined);
   let listRefresh = $derived(usesWorkSlice ? 0 : context.refreshKey);
   let listContext = $derived(JSON.stringify([
@@ -144,6 +147,19 @@
   let inventoryRefresh = $derived(detailWorkSlice ? 0 : context.refreshKey);
   let previousListContext = '';
   let retainedWorkSlice = '';
+
+  $effect(() => {
+    const key = progressKey;
+    if (!key || context.project.scopeId) return;
+    const stop = new AbortController();
+    if (key === 'current') void context.refreshKey;
+    const path = query(workSliceApi(context.project.id, key), { scopeId: key === 'current' ? workScope : undefined });
+    if (key !== 'current' && untrack(() => progressSlice?.workSliceId) !== key) progressSlice = undefined;
+    void api.json<WorkSlice>(path, { signal: stop.signal }).then((value) => {
+      if (!stop.signal.aborted) progressSlice = value;
+    }).catch(() => {});
+    return () => stop.abort();
+  });
   let listRequest: AbortController | undefined;
   let linkedLetter = $derived(context.params.get('letter') ?? '');
   let linkedSent = $derived(context.params.get('sent') ?? '');
@@ -328,8 +344,8 @@
       if (listContext !== location) return;
       if (fresh === resolvedWorkSlice) {
         detailError = selection === 'missing'
-          ? 'Поступление отсутствует и в актуальном срезе.'
-          : 'Актуальный срез пока не подтвердил опись.';
+          ? 'Поступления пока нет в текущем списке.'
+          : 'Текущие данные пока не подтверждают опись.';
         return;
       }
       const params = Object.fromEntries(context.params);
@@ -363,7 +379,7 @@
     const path = query(workSliceApi(project, slice) + '/receipts', { filter: selectedFilter, ...after });
     const page = await api.json<WorkReceiptList>(path, { signal });
     if (page.workSliceId !== slice || page.filter !== selectedFilter) {
-      throw new ApiError(502, 'work_slice_mismatch', 'Сервер вернул список другого среза или фильтра.');
+      throw new ApiError(502, 'work_slice_mismatch', 'Сервер вернул список для другой проверки или фильтра.');
     }
     return page;
   }
@@ -711,6 +727,7 @@
 </script>
 
 <a href={openInventoryLink} bind:this={navigationLink} hidden>К описи</a>
+<WorkProgress slice={progressSlice} />
 <div class="actions receipt-actions">
   {#if context.canEdit}<button type="button" class="primary" disabled={pending} onclick={() => startNew()}>Загрузить комплект</button>{/if}
   {#if continuation && continuation !== activeReceipt}
@@ -790,15 +807,15 @@
 <Notice kind="success" message={success} />
 <Notice kind="error" message={error} />
 {#if sliceRefreshed}
-  <p class="notice" role="status">Срез устарел. Список перечитан с актуального среза.
-    <a href={url(context.objectId, { ...Object.fromEntries(context.params), workSlice: resolvedWorkSlice, filter })}>Ссылка на актуальный срез</a>
+  <p class="notice" role="status">Список обновлён по текущим данным.
+    <a href={url(context.objectId, { ...Object.fromEntries(context.params), workSlice: resolvedWorkSlice, filter })}>Ссылка на текущий список</a>
   </p>
 {/if}
 
 {#if selection === 'filtered'}
   <Notice message="Выбранное поступление не входит в этот фильтр." />
 {:else if selection === 'missing'}
-  <Notice message="Выбранное поступление отсутствует в этом срезе." />
+  <Notice message="Выбранное поступление отсутствует в этой проверке." />
 {/if}
 
 {#if loading && !list.length}<p role="status">Открываем список поступлений…</p>{/if}

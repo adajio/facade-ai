@@ -1,6 +1,6 @@
 import { expect, test } from '@playwright/test';
 import { addressedFixture, type Publication } from './addressed-fixture';
-import { accepted, account, admin, command, pdf, signIn } from './synthetic';
+import { accepted, account, admin, applyFixtureReview, command, pdf, signIn } from './synthetic';
 
 test('Досылка N06 заменяет выбранные места одного вопроса и сохраняет историю', async ({ page, browser, baseURL }) => {
   const build = process.env.FACADE_E2E_BUILD_DIR;
@@ -25,16 +25,18 @@ test('Досылка N06 заменяет выбранные места одно
   }
 
   async function apply(file: Publication, entries: { questionId: string; refs: Ref[] }[]) {
-    const assessment = await fixture.getAssessment();
-    await fixture.resolveHold(file, entries.map(({ questionId, refs }) => ({
-      questionId, expectedDependencyVersion: assessment.questions.find((row) => row.id === questionId)?.dependencyVersion,
-      review: {
-        inputGeneration: String(assessment.inputGeneration), remaining: [], completenessChecked: true,
-        findings: refs.map(({ observationId }) => ({
-          kind: 'value', observationId, sourceRole: 'design', comparisonKey: questionId, applicability: 'active',
-        })),
-      },
-    })));
+    await applyFixtureReview(async () => {
+      const assessment = await fixture.getAssessment();
+      await fixture.resolveHold(file, entries.map(({ questionId, refs }) => ({
+        questionId, expectedDependencyVersion: assessment.questions.find((row) => row.id === questionId)?.dependencyVersion,
+        review: {
+          inputGeneration: String(assessment.inputGeneration), remaining: [], completenessChecked: true,
+          findings: refs.map(({ observationId }) => ({
+            kind: 'value', observationId, sourceRole: 'design', comparisonKey: questionId, applicability: 'active',
+          })),
+        },
+      })));
+    });
   }
 
   try {

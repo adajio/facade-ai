@@ -4,9 +4,10 @@ import type { FacadeMention } from "../harness/facade-discovery.js";
 import { catalogOptions, getCatalog, getProject, invariantProfileRequirements, matchesDefaultProfile } from "../access/project-state.js";
 import { lockIntakeProject } from "../intake/gate.js";
 import { publishProjectEvent } from "../supplements/events.js";
-import { canonicalJson, evaluate, requirementSubjectKey } from "./domain.js";
+import { canonicalJson, evaluate, requirementSubjectKey, type ClarificationBasis } from "./domain.js";
 import { comparisonReview, type ComparisonReview } from "./facade-comparison.js";
 import { readFacadeInput, type FacadeObservation } from "./facade-input.js";
+import { approvedEvidenceSubjects } from "./facade-rule.js";
 import { assessSemanticRemainder, facadeVerdict, type SemanticRemainder } from "./facade-semantic.js";
 import { conflictingFacadeTypes, facadeTypeView, readFacadeTypes, type FacadeType } from "./facade-types.js";
 import {
@@ -21,6 +22,10 @@ import {
 type FacadeInput = Awaited<ReturnType<typeof readFacadeInput>>;
 type Catalog = Awaited<ReturnType<typeof getCatalog>>;
 type ActiveContext = Awaited<ReturnType<typeof synchronizeContext>>;
+type CheckedInventory = {
+  inventories: ClarificationBasis["inventories"];
+  originals: ReadonlyMap<string, FacadeInput["versions"][number]>;
+};
 
 function mentionSource(mention: FacadeMention, observations: Map<string, FacadeObservation>) {
   const { factId, evidenceId, versionId, branch, quote, address, kind, label, context } = mention;
@@ -78,7 +83,7 @@ async function registerContexts(tx: PoolClient, projectId: string, candidates: F
 
 async function synchronizeContext(tx: PoolClient, projectId: string, context: FacadeContext, stage: string | null,
   catalog: Catalog | null, input: FacadeInput, coverage: FacadeCoverage, gate: Gate, limitations: string[],
-  knownSubjectKeys?: ReadonlySet<string>) {
+  knownSubjectKeys?: ReadonlySet<string>, checkedInventory?: CheckedInventory) {
   const existing = await getRevision(tx, projectId, context.id);
   await tx.query(`INSERT INTO assessment_series(project_id,scope_id,assessment_context_id) VALUES($1,$2,$2)
     ON CONFLICT (scope_id) DO NOTHING`, [projectId, context.id]);
@@ -123,9 +128,17 @@ async function synchronizeContext(tx: PoolClient, projectId: string, context: Fa
       !retired.has(canonicalJson([citation.versionId, citation.address]))) : input.evidence.facts;
     const semantic = assessSemanticRemainder({ index: input.semantic, requirement, context, stage, catalogVersionId: catalog?.id ?? null });
     semanticByQuestion.set(id, semantic.remainder);
+    const clarification = checkedInventory?.inventories.length && semantic.basisIds.length && requirement.recipient ? {
+      inventories: checkedInventory.inventories, semanticBasisIds: semantic.basisIds,
+      alternatives: [...new Set([...requirement.formats, ...approvedEvidenceSubjects(requirement)])].sort(),
+      places: semantic.verifiedWindows.map(({ place }) => ({
+        ...place.source, label: checkedInventory.originals.get(place.source.versionId)!.label,
+        address: { unitId: place.unitId, ...(place.box ? { box: place.box } : {}) },
+      })),
+    } : undefined;
     const review = facadeReview({ questionId: id, context, stage, requirement, facts,
       pairs: input.evidence.pairs, coverage, versionIds: input.versionIds, supplementReceiptIds,
-      knownSubjectKeys, semanticBasisIds: semantic.basisIds });
+      knownSubjectKeys, semanticBasisIds: semantic.basisIds, clarification });
     const machine = evaluate(requirement, review);
     const expired = old?.decision?.exclusion?.until && Date.parse(old.decision.exclusion.until) <= now;
     if (old?.active && !expired && existing?.catalog_version_id === catalog?.id &&
@@ -222,6 +235,7 @@ export async function synchronizeFacadeAssessment(tx: PoolClient, projectId: str
   const gate: Gate = { generation: input.intake.generation, holds: input.holds };
   const contexts = await registerContexts(tx, projectId, input.evidence.facades);
   const assignments = await readFacadeTypes(tx, projectId);
+  const currentVersions = new Set(input.versionIds);
   const observationsById = new Map(input.observations.map((fact) => [fact.id, fact]));
   const typesByFacade = Map.groupBy(input.observations.filter(({ facadeKindSourceVerified, binding }) =>
     facadeKindSourceVerified && binding.candidates.length === 1), ({ binding }) => binding.candidates[0].id);
@@ -231,8 +245,9 @@ export async function synchronizeFacadeAssessment(tx: PoolClient, projectId: str
     const assignment = assignments.get(context.id);
     const conflicts = conflictingFacadeTypes(typesByFacade.get(context.facadeId) ?? [], context.facadeId, project.stage);
     if (conflicts.length) conflicted.set(context.facadeId, conflicts);
-    context.facadeType = facadeTypeView(assignment, assignment && observationsById.get(assignment.basis.id),
-      context.facadeId, project.stage, Boolean(conflicts.length));
+    const basis = assignment?.basis;
+    context.facadeType = facadeTypeView(assignment, basis && "id" in basis ? observationsById.get(basis.id) : undefined,
+      context.facadeId, project.stage, Boolean(conflicts.length), basis && currentVersions.has(basis.versionId));
   }
   const types = contexts.flatMap(({ facadeId, facadeType }) => facadeId ? [facadeType?.state === "confirmed" ? facadeType.kind : null] : []);
   const knownKinds = [...new Set(types.filter((type): type is string => type !== null))].sort();
@@ -241,6 +256,14 @@ export async function synchronizeFacadeAssessment(tx: PoolClient, projectId: str
   const retained = staleProfile && pinned ? await invariantProfileRequirements(tx, project, pinned, knownKinds) : [];
   const catalog = pinned && (!project.intakeMode || !staleProfile && matchesDefaultProfile(project, pinned)) ? pinned :
     pinned && retained.length ? { ...pinned, requirements: retained } : null;
+  const checkedInventory: CheckedInventory | undefined = catalog && !gate.holds.length &&
+    Object.values(coverage).every(({ complete }) => complete) ? {
+      inventories: (await tx.query<ClarificationBasis["inventories"][number]>(`
+        SELECT r.id AS "receiptId",r.number::text AS number,
+               (SELECT concat(coalesce(max(e.id),0),':',count(*)) FROM intake_events e WHERE e.receipt_id=r.id) AS revision
+          FROM intake_receipts r WHERE r.project_id=$1 AND r.sealed_at IS NOT NULL ORDER BY r.number,r.id`, [projectId])).rows,
+      originals: new Map(input.versions.map((version) => [version.id, version])),
+    } : undefined;
   const profileState = !project.stage ? "stage_unknown" : staleProfile ? "facade_profile_basis_stale" :
     catalog?.requirements.length ? "active" : catalog ? "catalog_empty" : pinned ? "catalog_not_applicable" :
       (await catalogOptions(tx, project)).reason;
@@ -266,7 +289,7 @@ export async function synchronizeFacadeAssessment(tx: PoolClient, projectId: str
   ]).map(requirementSubjectKey));
   for (const context of contexts) {
     const result = await synchronizeContext(tx, projectId, context, project.stage, catalog, input, coverage, gate,
-      catalogLimitations, knownSubjectKeys);
+      catalogLimitations, knownSubjectKeys, checkedInventory);
     active.push(result);
     const summary = await summarize(tx, result, gate);
     const identity = context.facadeId ? input.discovery.identity.get(context.facadeId) : undefined;

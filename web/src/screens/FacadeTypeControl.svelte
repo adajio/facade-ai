@@ -2,10 +2,12 @@
   import { Commands } from '../lib/commands';
   import { conflictMessage } from '../lib/conflict';
   import { describe, id, query, type Api } from '../lib/http';
-  import { renderAddress, type SourceAddress } from '../lib/copilot';
+  import { originalUrl, renderAddress, type SourceAddress } from '../lib/copilot';
   import type { FacadeContext, FacadeObservation } from '../lib/facade-assessment';
   import { projectV1, type OpenEvidence, type WorkspaceProps } from '../lib/workspace';
   import Notice from '../lib/Notice.svelte';
+  import { copy } from '../lib/copy';
+  import OriginalBasisFields from '../lib/OriginalBasisFields.svelte';
 
   type Page = { version: number; items: FacadeObservation[]; nextCursor: string | null };
   let { api, context, facade, assessmentVersion, historical, open, refreshProject }: {
@@ -24,6 +26,12 @@
   let opened = $state(false);
   let loading = $state(false);
   let expectedVersion = $state<number>();
+  let mode = $state<'machine' | 'manual'>();
+  let kind = $state('');
+  let documentVersionId = $state('');
+  let pageOrAnchor = $state('');
+  let approvedKinds = $state<string[]>([]);
+  let currentMode = $derived(mode ?? (loading || candidates.length ? 'machine' : 'manual'));
   let facadeType = $derived(facade.facadeType);
   let selected = $derived(candidates.find(({ id }) => id === observationId));
 
@@ -60,16 +68,24 @@
 
   async function save(event: SubmitEvent) {
     event.preventDefault();
-    if (!selected?.proposedFacadeKind || !facade.facadeId || pending || historical) return;
+    const body = currentMode === 'manual' ?
+      (kind && documentVersionId && pageOrAnchor.trim() ? { kind, documentVersionId, pageOrAnchor: pageOrAnchor.trim(),
+        provenanceKind: 'engineer_override', reason } : undefined) :
+      (selected?.proposedFacadeKind ? { kind: selected.proposedFacadeKind, observationId: selected.id, reason } : undefined);
+    if (!body || !facade.facadeId || pending || historical) return;
     const version = expectedVersion ?? context.project.version;
     pending = true;
     problem = '';
     saved = false;
     try {
       await commands.send(projectV1(context.project.id) + '/facade-assessment/facades/' + id(facade.facadeId) + '/kind',
-        'PUT', { kind: selected.proposedFacadeKind, observationId: selected.id, reason }, version);
+        'PUT', body, version);
       reason = '';
       observationId = '';
+      mode = undefined;
+      kind = '';
+      documentVersionId = '';
+      pageOrAnchor = '';
       expectedVersion = undefined;
       opened = false;
       saved = true;
@@ -80,6 +96,8 @@
       pending = false;
     }
   }
+
+  function edit() { expectedVersion ??= context.project.version; }
 </script>
 
 {#if facadeType}
@@ -87,18 +105,43 @@
   <p>{facadeType.kind ? facadeType.kind + ' · ' : ''}{stateLabels[facadeType.state]}</p>
   {#if facadeType.basis}
     {@const basis = facadeType.basis}
-    <p>Редакция {basis.revision} · {renderAddress(basis.address)}</p>
-    {#if basis.quote}<blockquote>{basis.quote}</blockquote>{/if}
-    <button type="button" onclick={(event) => open([{ evidenceId: basis.evidenceId, observationId: basis.id,
-      versionId: basis.versionId, quote: basis.quote ?? undefined }], 0, event.currentTarget)}>Открыть опору типа</button>
+    {#if basis.provenanceKind === 'engineer_override'}
+      <span class="pill good">Установлено инженером</span>
+      <p>{basis.label} · {renderAddress(basis.address)}</p>
+      <a class="button quiet" href={originalUrl(basis.documentId, basis.versionId, basis.address.locator?.page)}
+        target="_blank" rel="noopener noreferrer">Открыть оригинал</a>
+    {:else}
+      <span class="pill">Подтверждено по цитате</span>
+      <p>Редакция {basis.revision} · {renderAddress(basis.address)}</p>
+      {#if basis.quote}<blockquote>{basis.quote}</blockquote>{/if}
+      <button type="button" onclick={(event) => open([{ evidenceId: basis.evidenceId, observationId: basis.id,
+        versionId: basis.versionId, quote: basis.quote ?? undefined }], 0, event.currentTarget)}>{copy.facadeTypeBasis}</button>
+    {/if}
   {/if}
   {#if context.canEdit && !historical}
     {#if opened}
       <form onsubmit={save}>
+        <div class="actions" role="group" aria-label="Способ подтверждения типа">
+          <button type="button" aria-pressed={currentMode === 'machine'} onclick={() => mode = 'machine'}>Из найденных опор</button>
+          <button type="button" aria-pressed={currentMode === 'manual'} onclick={() => mode = 'manual'}>Указать вручную по оригиналу</button>
+        </div>
         <Notice kind="error" message={loadProblem} />
-        {#if loading}<p role="status">Загружаем адресные опоры типа…</p>{/if}
-        {#if !loading && !candidates.length && !loadProblem}
-          <p>Для этого фасада ещё нет проверенной опоры типа в действующей редакции.</p>
+        {#if currentMode === 'manual'}
+          <OriginalBasisFields {api} projectId={context.project.id} bind:versionId={documentVersionId}
+            bind:anchor={pageOrAnchor} bind:kinds={approvedKinds} {edit} />
+          <label>Тип фасада
+            <select required bind:value={kind} onchange={edit}>
+              <option value="">Выберите утверждённый тип</option>
+              {#each approvedKinds as choice (choice)}<option value={choice}>{choice}</option>{/each}
+            </select>
+          </label>
+          {#if !approvedKinds.length && documentVersionId}
+            <p class="meta">Для выбора типа нужен утверждённый рабочий профиль каталога.</p>
+          {/if}
+        {:else if loading}
+          <p role="status">Загружаем адресные опоры типа…</p>
+        {:else if !candidates.length && !loadProblem}
+          <p>Тип фасада не найден автоматически. Выберите его вручную и укажите лист чертежа.</p>
         {:else if candidates.length}
           <label>Тип и адресная опора
             <select bind:value={observationId} required onchange={() => expectedVersion ??= context.project.version}>
@@ -112,13 +155,12 @@
             <button type="button" onclick={(event) => open([{ evidenceId: selected!.evidenceId!, observationId: selected!.id,
               versionId: selected!.versionId, quote: selected!.quote ?? undefined }], 0, event.currentTarget)}>Проверить выбранную опору</button>
           {/if}
-          <label>Основание назначения типа
-            <textarea required maxlength="2000" bind:value={reason} oninput={() => expectedVersion ??= context.project.version}></textarea>
-          </label>
-          <button class="primary" type="submit" disabled={pending || loading || !selected}>Сохранить тип фасада</button>
-          {#if problem}
-            <button type="button" disabled={pending} onclick={async () => { await refreshProject(); expectedVersion = undefined; problem = ''; }}>Сверить версию проекта</button>
-          {/if}
+        {/if}
+        <label>Комментарий инженера<textarea required maxlength="2000" bind:value={reason} oninput={edit}></textarea></label>
+        <button class="primary" type="submit" disabled={pending || (currentMode === 'manual'
+          ? !kind || !documentVersionId || !pageOrAnchor.trim() : loading || !selected)}>Сохранить тип фасада</button>
+        {#if problem}
+          <button type="button" disabled={pending} onclick={async () => { await refreshProject(); expectedVersion = undefined; problem = ''; }}>{copy.refreshAndCompare}</button>
         {/if}
         <button type="button" class="quiet" onclick={() => opened = false}>Закрыть выбор</button>
       </form>

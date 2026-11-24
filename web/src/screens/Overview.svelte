@@ -1,9 +1,10 @@
 <script lang="ts">
   import { denied, describe, query, type Api } from '../lib/http';
-  import { bytes, count, date, label } from '../lib/format';
+  import { count, date, label } from '../lib/format';
   import { projectV1, scopedUrl, type Assessment, type OpenEvidence, type Projection, type WorkspaceProps } from '../lib/workspace';
   import { workReceiptFilters, workSliceApi, type WorkReceiptFilter, type WorkSlice } from '../lib/work-slice';
   import Notice from '../lib/Notice.svelte';
+  import WorkProgress from '../lib/WorkProgress.svelte';
   import FacadeAssessment from './FacadeAssessment.svelte';
 
   let { api, context, projection, open, renew }: {
@@ -79,10 +80,9 @@
     return scopedUrl(context.project.id, 'completeness', { scope: context.scopeId, revision: workSlice?.assessment?.version });
   }
 
-  function readingLabel(state: WorkSlice['readings'][number]['state']) {
-    return ({ ready: 'В очереди', leased: 'В работе', done: 'Завершено', held: 'На удержании' })[state];
-  }
 </script>
+
+<WorkProgress slice={workSlice} />
 
 <section class="card" aria-labelledby="collection-title">
   <div class="card-header"><h2 id="collection-title">Сбор исходных данных</h2>
@@ -105,12 +105,12 @@
     <p>{active.filter === 'processing' ? 'Обрабатывается' : 'Опись формируется'} ·
       <a href={receiptUrl(active.filter, active.receiptId)}>Поступление №{active.number}</a></p>
   {/if}
-  {#if !workSlice && !error && !context.project.scopeId}<p role="status">Загружаем срез проекта…</p>{/if}
+  {#if !workSlice && !error && !context.project.scopeId}<p role="status">Загружаем данные проекта…</p>{/if}
   <Notice message={error && 'Состояние проекта · ' + error} />
 </section>
 
 {#if workSlice}
-  <div class="metrics" aria-label="Поступления в срезе">
+  <div class="metrics" aria-label="Поступления в текущей проверке">
     {#each workSlice.filters as item (item.filter)}
       <a class="metric" href={receiptUrl(item.filter)}>
         <span>{workReceiptFilters[item.filter]}</span>
@@ -118,18 +118,6 @@
       </a>
     {/each}
   </div>
-  <section class="card">
-    <h2>Опись и чтение</h2>
-    <dl class="details">
-      <dt>Подтверждённые байты</dt><dd>{bytes(workSlice.confirmedBytes)}</dd>
-      <dt>Принятые вхождения</dt><dd>{count(workSlice.acceptedOccurrences)}</dd>
-      {#each workSlice.readings as reading (`${reading.branch ?? "review"}:${reading.state}`)}
-        <dt>{reading.branch ? 'Ветвь ' + reading.branch : 'Сверка'} · {readingLabel(reading.state)}</dt><dd>{count(reading.total)}</dd>
-      {:else}
-        <dt>Чтение</dt><dd>Задания чтения пока отсутствуют</dd>
-      {/each}
-    </dl>
-  </section>
 {/if}
 
 {#if facadeMode && workSlice?.assessment?.kind === 'facade'}

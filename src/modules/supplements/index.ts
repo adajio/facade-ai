@@ -21,12 +21,12 @@ type HoldParams = ProjectParams & { holdId: string };
 type ScopeQuery = { scopeId?: string };
 
 async function projectRead<T>(db: Pool, request: FastifyRequest, projectId: string, scopeId: string | undefined,
-  read: (tx: PoolClient, restricted: boolean) => Promise<T>,
+  read: (tx: PoolClient, restricted: boolean, manages: boolean) => Promise<T>,
 ): Promise<T> {
   const { result, session } = await inProjectionSnapshot(db, async (tx) => {
     const session = await readSession(tx, request);
     const actor = await authorize(tx, session, { action: 'project:read', projectId, scopeId });
-    return { session, result: await read(tx, Boolean(scopeId && actor.role === 'viewer')) };
+    return { session, result: await read(tx, Boolean(scopeId && actor.role === 'viewer'), actor.role === 'project_manager') };
   });
   await touchSession(db, session);
   return result;
@@ -49,7 +49,8 @@ export async function register(app: FastifyInstance): Promise<void> {
     app.get<{ Params: ProjectParams; Querystring: ScopeQuery }>(`${projectPath}/snapshot`, async (request) => {
       const projectId = identifier(request.params.projectId);
       const scopeId = optionalIdentifier(request.query.scopeId);
-      return projectRead(app.db, request, projectId, scopeId, (tx, restricted) => readProjectSnapshot(tx, projectId, scopeId, restricted));
+      return projectRead(app.db, request, projectId, scopeId, (tx, restricted, manages) =>
+        readProjectSnapshot(tx, projectId, scopeId, restricted, manages));
     });
 
     app.get<{ Params: ProjectParams; Querystring: ScopeQuery & { after?: string; limit?: string } }>(`${projectPath}/events`, async (request) => {

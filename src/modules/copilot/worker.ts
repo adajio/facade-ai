@@ -3,7 +3,7 @@ import { AccessError, transaction } from '../access/index.js';
 import { accountColumns, accessConfig, authorize, type SessionAccount } from '../access/auth.js';
 import { lockOrganization, lockSession } from '../access/commands.js';
 import { GatewayError, type Gateway, type LeasedJob } from '../gateway/index.js';
-import { hash } from '../gateway/types.js';
+import { hash, sameBudget, type BudgetAttribution } from '../gateway/types.js';
 import type { ResearchAdmission } from '../gateway/gateway.js';
 import {
   copilotJournalLimit, copilotOcrLimit, copilotReadsPerSlice, copilotSearchResultLimit, copilotTurnLimit,
@@ -77,6 +77,15 @@ async function withOwner<T>(db: Pool, question: Question, work: (session: Sessio
   return owner ? work(owner) : null;
 }
 
+function copilotBudget({ projectId, scopeId, cursor }: LeasedJob): BudgetAttribution {
+  // The package target keeps the project UUID across changes in receipts and generation.
+  const addressed = Boolean((cursor as Progress | null)?.research);
+  return {
+    initiatedBy: 'copilot',
+    ...(scopeId === null || addressed ? { packageId: projectId } : {}),
+  };
+}
+
 const identity = ({ id, documentId, versionId, sha256, proof }: MemorySource): SourceIdentity =>
   ({ id, documentId, versionId, sha256, proof });
 function unchanged(pin: SourceIdentity, source: MemorySource | null): source is MemorySource {
@@ -88,6 +97,7 @@ function unchanged(pin: SourceIdentity, source: MemorySource | null): source is 
 export function copilotModelAdmission(): ResearchAdmission {
   return async (tx, work, route, input) => {
     if (work.kind !== copilotKind) return {};
+    if (!sameBudget(input.budget, copilotBudget(work))) return { deny: 'invalid_budget_attribution' };
     const { rows: [question] } = await tx.query<Question>(
       `SELECT ${questionFields} FROM copilot_questions WHERE job_id=$1 AND project_id=$2 AND id::text=$3`,
       [work.lease.jobId, work.projectId, work.subjectId],
@@ -211,6 +221,7 @@ async function run(work: LeasedJob, runtime: CopilotRuntime, signal: AbortSignal
   const progress: Progress = (work.cursor as Progress | null) ?? {
     turn: 0, messages: messagesFor(question.question), found: [], opened: [], limitations: [],
   };
+  const budget = copilotBudget(work);
   const controller = new AbortController();
   const active = AbortSignal.any([signal, controller.signal]);
   const heartbeat = setInterval(() => {
@@ -349,6 +360,7 @@ async function run(work: LeasedJob, runtime: CopilotRuntime, signal: AbortSignal
       const outcome = await gateway.call({
         lease, effectKey: `copilot/turn/${progress.turn}`, routeId: route.routeId, dataClass: route.dataClass,
         request: requestFor(route, recentTranscript(progress.messages, (turnsPerLease - 1) * 2), Boolean(runtime.research)), inputRefs: progress.found.map(({ id }) => id),
+        budget,
       });
       if (active.aborted) return;
       if (outcome.status === 'held') {

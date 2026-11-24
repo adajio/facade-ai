@@ -34,7 +34,7 @@
 | DELETE /projects/:projectId/members/:userId | Снимает право, проверяет версию проекта |
 | PUT /projects/:projectId/catalog | `{ catalogVersionId }`. Версия проекта через If-Match |
 | GET /projects/:projectId/catalog-options | Варианты назначения и причина для владельца проекта |
-| PUT /projects/:projectId/stage | `{ stage, reason, evidenceIds? }`. Владелец проекта, If-Match проекта |
+| PUT /projects/:projectId/stage | `{ stage, reason, evidenceIds? }` или `{ stage, reason, provenanceKind: "engineer_override", documentVersionId, pageOrAnchor }`. Владелец проекта, If-Match проекта. Ручное основание сохраняет адрес принятой действующей редакции. |
 | GET /projects/:projectId/versions/:versionId/stage | Стадия редакции или адреса из `?evidenceId=` |
 | PUT /projects/:projectId/versions/:versionId/stage | `{ target: "document" \| "place", stage, reason, evidenceId }`. Инженер, If-Match цели |
 | POST /projects/:projectId/scopes | `{ stage, name }` → область |

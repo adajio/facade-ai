@@ -1,3 +1,5 @@
+import { copy } from './copy';
+
 export type RecordData = Record<string, unknown>;
 
 export class ApiError extends Error {
@@ -106,10 +108,11 @@ export function describe(error: unknown): string {
     if (error.code === 'scope_held') return 'Актуальная выдача удержана до разбора поступивших материалов.';
     if (error.code === 'hold_material_pending') return 'Материалы ещё не приняты или состав импорта продолжает формироваться.';
     if (error.code === 'letter_unconfirmed') return 'Редакция ещё не подтверждена.';
+    if (error.code === 'snapshot_required') return copy.snapshotRequired;
     if (error.status === 409) return 'Команда конфликтует с текущим состоянием. Сверьте сохранённые данные.';
     if (error.status === 412) return 'Сервер уже сохранил другую версию. Ваш ввод сохранён.';
     if (error.status === 429) return 'Достигнут временный предел. Повторите после паузы.';
-    if (error.code === 'no_eligible_items') return 'Внешних оснований пока нет.';
+    if (error.code === 'no_eligible_items') return copy.noLetterItems;
     if (denied(error)) return 'Ресурс недоступен.';
     return error.message || 'Сервер отклонил запрос.';
   }

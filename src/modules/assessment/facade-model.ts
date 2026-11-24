@@ -96,6 +96,7 @@ export function facadeReview(options: {
   supplementReceiptIds: string[];
   knownSubjectKeys?: ReadonlySet<string>;
   semanticBasisIds?: readonly string[];
+  clarification?: Review["clarification"];
 }): Review {
   const { questionId, context, stage, requirement, facts, pairs, coverage, versionIds, supplementReceiptIds } = options;
   const sameStage = facts.filter((fact) => !(stage && fact.stage && normalize(stage) !== normalize(fact.stage)));
@@ -219,6 +220,11 @@ export function facadeReview(options: {
   // Missing data, in contrast, needs a current negative proof over the package.
   const packageCoverageIds = proveFacadeRule(requirement, byId, findings);
   const localChecked = Boolean(inventory) || packageCoverageIds.length > 0;
+  // This ground is for silence in a completely checked package. A possible
+  // match, unread area, or competing statement still requires internal review.
+  const clarification = options.clarification && complete && !localChecked && !alternativesOpen &&
+    !confirmedPairs.length && !scoped.some(({ finding }) => finding.applicability !== "superseded") ?
+    options.clarification : undefined;
   return {
     findings,
     completenessChecked: localChecked,
@@ -226,6 +232,7 @@ export function facadeReview(options: {
       findings.some(({ citation }) => citation.deliveryUncertainty === "contradictory_original") ? "delivery_statement_conflict" :
       verifiedAbsences.length && (alternativesOpen || !options.semanticBasisIds?.length) ? "alternatives_unverified" : "required_evidence_incomplete"],
     ...(inventory ? { inventory } : {}),
+    ...(clarification ? { clarification } : {}),
     confirmedPairs,
     requireVerifiedPairs: true,
     packageCoverageIds,

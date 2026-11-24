@@ -7,6 +7,7 @@ import type { ProjectScope } from './commands.js';
 import { AccessError, forbidden, invalid, unavailable } from './errors.js';
 import { object, text } from './input.js';
 import type { CatalogRequirement } from './input.js';
+import type { OriginalBasis } from '../intake/accepted-originals.js';
 
 export interface Project {
   id: string;
@@ -15,10 +16,13 @@ export interface Project {
   catalogVersionId: string | null;
   intakeMode: boolean;
   stage: string | null;
+  stageBasis?: StageBasis | null;
   confirmedFacadeKinds: string[];
   facadeKindsFromAssignments: boolean;
   version: number;
 }
+
+type StageBasis = OriginalBasis | { provenanceKind: 'machine_verified'; evidenceIds: string[] };
 
 export interface DefaultProfile {
   stage: string;
@@ -37,7 +41,7 @@ export interface Catalog {
 
 export const projectColumns = [
   'id', 'organization_id AS "organizationId"', 'name', 'catalog_version_id AS "catalogVersionId"',
-  'intake_mode AS "intakeMode"', 'project_stage AS stage', 'confirmed_facade_kinds AS "confirmedFacadeKinds"',
+  'intake_mode AS "intakeMode"', 'project_stage AS stage', 'project_stage_basis AS "stageBasis"', 'confirmed_facade_kinds AS "confirmedFacadeKinds"',
   'facade_kinds_from_assignments AS "facadeKindsFromAssignments"', 'version',
 ];
 export const catalogColumns = 'id, catalog_key AS key, name, revision, requirements';
@@ -171,10 +175,11 @@ async function resolveDefault(tx: PoolClient, project: Project, scopes: ProjectS
 
 export async function setProjectStage(
   tx: PoolClient, project: Project, scopes: ProjectScope[], stage: string, actor: AccessActor,
+  basis?: StageBasis,
 ) {
   const { rows: [saved] } = await tx.query<Project>(
-    `UPDATE projects SET project_stage = $2, version = version + 1
-     WHERE id = $1 RETURNING ${projectColumns.join(', ')}`, [project.id, stage],
+    `UPDATE projects SET project_stage = $2, project_stage_basis = $3, version = version + 1
+     WHERE id = $1 RETURNING ${projectColumns.join(', ')}`, [project.id, stage, basis ?? null],
   );
   return resolveDefault(tx, saved, scopes, actor);
 }

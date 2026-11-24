@@ -197,7 +197,7 @@
           {/each}
           <label>Основание проверки<textarea bind:value={reason} maxlength="2000" required></textarea></label>
         {/if}
-        {#if needsReview}<button type="button" disabled={busy} onclick={refreshInput}>Сверить с актуальным срезом</button>{/if}
+        {#if needsReview}<button type="button" disabled={busy} onclick={refreshInput}>Сверить с текущими данными</button>{/if}
         <div class="actions">
           <button class="primary" disabled={busy || (mode === 'classify' ? !checked.length : !impacts.length || impacts.some((item) => !item.reviewed))}>
             {mode === 'classify' ? 'Сохранить применимость' : 'Сохранить проверку влияния'}

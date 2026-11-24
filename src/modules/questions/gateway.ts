@@ -1,10 +1,10 @@
-import type { CallInput, CallResult, Lease } from "../gateway/types.js";
+import type { BudgetAttribution, CallInput, CallResult, Lease } from "../gateway/types.js";
 import type { InquirySearchContext, QuestionSearchPorts } from "./domain.js";
 
 type ReviewAssignment = { lease: Lease; routeId: string; dataClass: string; model: string };
 
 export function createGatewayMeaningChecker(
-  gateway: { call(input: CallInput): Promise<CallResult> },
+  gateway: { call(input: CallInput): Promise<CallResult>; backgroundBudget?(projectId: string): Promise<BudgetAttribution | undefined> },
   reviewAssignment: (context: InquirySearchContext) => Promise<ReviewAssignment | null>,
 ): QuestionSearchPorts["checkMeaning"] {
   return async (question, candidate, support, signal, context) => {
@@ -30,6 +30,7 @@ export function createGatewayMeaningChecker(
     signal.throwIfAborted();
     const result = await gateway.call({
       lease: review.lease, routeId: review.routeId, dataClass: review.dataClass,
+      budget: await gateway.backgroundBudget?.(context.projectId),
       effectKey: `inquiry:${context.inquiryId}:${context.searchVersion}:${candidate.observationId}`,
       inputRefs: [candidate.evidenceId],
       request: {

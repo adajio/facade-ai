@@ -29,6 +29,11 @@ test('Тип фасада, непроверенное место и опора �
     }],
   };
   const written: { body: unknown; version: string | undefined }[] = [];
+  const decisions: { body: unknown; version: string | undefined }[] = [];
+  let checked = false;
+  const clarification = { inventories: [{ receiptId: 'receipt', number: '1', revision: '7:7' }],
+    alternatives: ['pdf', 'эквивалентная схема'], semanticBasisIds: ['a', 'b'],
+    places: [{ documentId, versionId, sha256: 'synthetic', label: 'РД-2.pdf', address }] };
   await page.route('**/api/**', async (route) => {
     const request = route.request();
     const { pathname } = new URL(request.url());
@@ -40,7 +45,10 @@ test('Тип фасада, непроверенное место и опора �
       projectId, version: written.length + 2, stage: 'РД', activeWindows: 4, completedWindows: 3, structurallyReviewedWindows: 2,
       limitations: ['semantic_remainder_open'], outcome: 'needs_review',
       coverage: { inventory: boundary, map: boundary, reading: boundary, subject: boundary },
-      contexts: [{ ...building, facadeType: written.length
+      contexts: [{ ...building, questions: checked ? [{ ...building.questions[0], version: decisions.length ? 3 : 2,
+        clarification, decision: decisions.length ? { id: 'd8', outcome: 'needs_review', action: 'request_clarification',
+          reason: 'Проверены листы и аналоги', createdAt: '2026-11-24T12:00:00Z', requestExternal: true, clarification } : undefined,
+      }] : building.questions, facadeType: written.length
         ? { state: 'confirmed', kind: 'кассетный', basis, version: 1 }
         : { state: 'unconfirmed', kind: null, basis: null, version: null } }],
     } });
@@ -51,6 +59,10 @@ test('Тип фасада, непроверенное место и опора �
     if (pathname.endsWith('/facades/' + facadeId + '/kind')) {
       written.push({ body: request.postDataJSON(), version: request.headers()['if-match'] });
       return route.fulfill({ json: { version: 8 } });
+    }
+    if (pathname.endsWith('/questions/' + questionId + '/decisions')) {
+      decisions.push({ body: request.postDataJSON(), version: request.headers()['if-match'] });
+      return route.fulfill({ status: 201, json: { id: 'd8', version: 3 } });
     }
     if (pathname.endsWith('/copilot/versions/' + versionId)) return route.fulfill({ json: {
       versionId, documentId, label: 'РД-2.pdf', version: 'current', mediaType: 'application/pdf',
@@ -67,7 +79,7 @@ test('Тип фасада, непроверенное место и опора �
   await expect(page.getByText('Применимость требования требует подтверждения.')).toBeVisible();
   await page.getByRole('button', { name: 'Подтвердить тип фасада' }).click();
   await page.getByLabel('Тип и адресная опора').selectOption(observationId);
-  await page.getByLabel('Основание назначения типа').fill('Проверен адрес и редакция Р2');
+  await page.getByLabel('Комментарий инженера').fill('Проверен адрес и редакция Р2');
   await page.getByRole('button', { name: 'Сохранить тип фасада' }).click();
   await expect(page.getByText('кассетный · Подтверждён')).toBeVisible();
   expect(written).toEqual([{ body: { kind: 'кассетный', observationId, reason: 'Проверен адрес и редакция Р2' }, version: '"7"' }]);
@@ -75,6 +87,21 @@ test('Тип фасада, непроверенное место и опора �
   await expect(page.getByText('РД-2.pdf')).toBeVisible();
   await expect(page.getByRole('link', { name: 'Открыть оригинал этой версии' }))
     .toHaveAttribute('href', '/api/documents/' + documentId + '/versions/' + versionId + '/content#page=3');
+  await expect(page.getByRole('heading', { name: 'Запрос на уточнение' })).toHaveCount(0);
+
+  checked = true;
+  await page.goto('/projects/' + projectId + '/completeness/' + questionId + '?context=' + context);
+  await page.getByText('Проверенные описи и места', { exact: true }).click();
+  await expect(page.getByRole('link', { name: 'РД-2.pdf · с. 3' })).toBeVisible();
+  const confirm = page.getByRole('button', { name: 'Подтвердить запрос на уточнение' });
+  await page.getByLabel('Комментарий к запросу').fill('Проверены листы и аналоги');
+  await expect(confirm).toBeDisabled();
+  await page.getByRole('checkbox', { name: /Подтверждаю проверку закрытых описей/ }).check();
+  await confirm.click();
+  expect(decisions).toEqual([{ body: { action: 'request_clarification', requestExternal: true, reason: 'Проверены листы и аналоги' },
+    version: '"2"' }]);
+  await expect(page.getByText(/Инженер подтвердил запрос для письма/)).toBeVisible();
+  await expect(page.getByRole('cell', { name: 'Запрос на уточнение' })).toBeVisible();
 });
 
 test('Каталог сохраняет применимость по типу и роли сравнения', async ({ page }) => {

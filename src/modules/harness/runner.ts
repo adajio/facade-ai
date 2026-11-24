@@ -1,6 +1,7 @@
 import { setTimeout as delay } from 'node:timers/promises';
 import type { Pool, PoolClient } from 'pg';
 import { type LeasedJob, WorkQueue } from '../gateway/queue.js';
+import type { Gateway } from '../gateway/gateway.js';
 import { GatewayError, transaction, type CallInput, type CallResult, type PrimaryResult } from '../gateway/types.js';
 import { lockIntakeProject } from '../intake/gate.js';
 import { publishProjectEvent } from '../supplements/events.js';
@@ -18,7 +19,8 @@ const temporaryHolds = new Set(['primary_barrier', 'route_busy', 'route_rate_lim
 
 class LostLease extends Error {}
 
-export type ResearchGateway = Pick<WorkQueue, 'claim' | 'heartbeat' | 'checkpoint' | 'finish' | 'suspend'> & {
+export type ResearchGateway = Pick<WorkQueue, 'claim' | 'heartbeat' | 'checkpoint' | 'finish' | 'suspend'> &
+  Partial<Pick<Gateway, 'backgroundBudget'>> & {
   call(input: CallInput): Promise<CallResult>;
 };
 
@@ -129,6 +131,7 @@ function sessionPorts(
       if (hold) return { status: 'held', code: hold.reason, nextAction: hold.nextAction };
       const result = await gateway.call({
         ...input, lease, routeId: task.job.settings.routeId, dataClass: task.job.settings.dataClass,
+        budget: await gateway.backgroundBudget?.(task.projectId, task.scopeId === null ? task.projectId : undefined),
       });
       if (result.status === 'rejected') {
         const retryable = /^(429|http_429|rate_limited|provider_rate_limit|provider_429)$/.test(result.receipt.code);

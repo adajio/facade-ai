@@ -25,6 +25,7 @@ export type Citation = {
   label?: string;
   documentRevision?: { label: string; evidenceId?: string };
   sourceLabel?: string;
+  sourceRole?: string;
   quote?: string;
   branch?: 'A' | 'B';
   value?: string | null;
@@ -45,7 +46,10 @@ export type CitationComponent = {
   source: { documentId: string; versionId: string; sha256: string };
 };
 
-export type OpenEvidence = (refs: Citation[], index: number, trigger: HTMLElement) => void;
+export type EvidenceActions = { confirm?: () => void; dismiss?: () => void };
+export type OpenEvidence = (
+  refs: Citation[], index: number, trigger: HTMLElement, comparison?: { actions?: EvidenceActions },
+) => void;
 
 export type Position = { sliceId: string; cursor: string; projectionVersion: string };
 export type ProjectEvent = Position & { type: string; createdAt: string; payload: RecordData };
@@ -60,6 +64,7 @@ export type ScopeProjection = {
   catalogVersionId: string; inputGeneration: number; holds: IntakeHold[];
 };
 export type Projection = Position & {
+  navCounts?: { activeUploads?: number; needsReview?: number; readyForLetter?: number; members?: number };
   holds?: IntakeHold[];
   scopes?: ScopeProjection[];
   metrics?: Record<string, Metric>;
@@ -80,6 +85,13 @@ export type Assessment = {
     id?: string; startWork: string; reason: string; authorId?: string; createdAt?: string; outcome?: string;
   };
   change?: { reason?: string; questionIds?: string[] };
+};
+
+export type ClarificationBasis = {
+  inventories: { receiptId: string; number: string; revision: string }[];
+  places: { documentId: string; versionId: string; sha256: string; label: string;
+    address: { unitId: string; box?: { x: number; y: number; width: number; height: number } } }[];
+  alternatives: string[];
 };
 
 export type AssessmentQuestion = {
@@ -114,8 +126,9 @@ export type AssessmentQuestion = {
   };
   decision?: {
     id: string; action: string; outcome: string; reason: string; authorId: string; createdAt: string;
-    startWorkCritical?: boolean;
+    startWorkCritical?: boolean; requestExternal?: boolean; clarification?: ClarificationBasis;
   };
+  clarification?: ClarificationBasis;
   history?: AssessmentQuestion['decision'][];
 };
 
@@ -128,6 +141,7 @@ export type WorkspaceProps = {
   objectId?: string;
   revision?: string;
   canEdit: boolean;
+  masked?: boolean;
   refreshKey: number;
   setDocumentPage: (page?: number) => void;
   params: URLSearchParams;

@@ -1,21 +1,12 @@
+@import './styles/tokens.css';
+
 :root {
   font-family: "Instrument Sans", "Segoe UI", system-ui, -apple-system, sans-serif;
-  color: #172a32;
-  background: #f4f6f6;
+  color: var(--ink);
+  background: var(--bg);
   font-synthesis: none;
   font-size: 15px;
   line-height: 1.52;
-  --ink: #172a32;
-  --muted: #50626a;
-  --line: #d6dfe1;
-  --paper: #fff;
-  --field: #f5f8f8;
-  --accent: #11645e;
-  --accent-dark: #0d4d49;
-  --rail: #172b35;
-  --rail-text: #dce6e9;
-  --warning: #8a5316;
-  --danger: #9b332d;
 }
 * { box-sizing: border-box; }
 [hidden] { display: none !important; }
@@ -46,6 +37,9 @@ button.primary, .button.primary { color: white; background: var(--accent); borde
 button.primary:hover, .button.primary:hover { background: var(--accent-dark); }
 button.quiet, .button.quiet { background: transparent; border-color: transparent; color: var(--accent-dark); }
 button.quiet:hover, .button.quiet:hover { background: #ecf4f2; }
+button[aria-pressed="true"] { border-color: var(--accent); color: var(--accent-text); background: #e5f2ef; }
+button.danger, .button.danger { color: var(--danger); border-color: currentColor; }
+.numeric, code { font-family: var(--font-mono); font-variant-numeric: tabular-nums; }
 button:disabled { opacity: .58; cursor: default; }
 :focus-visible { outline: 3px solid #9a5211; outline-offset: 3px; }
 input:not([type="checkbox"]):not([type="radio"]), select, textarea {
@@ -86,12 +80,6 @@ legend { font-weight: 650; }
 .auth-card .primary { justify-self: start; }
 .standalone { width: min(100% - 2rem, 1180px); margin: 2rem auto; }
 .workspace { min-height: calc(100dvh - 65px); display: grid; grid-template-columns: 232px minmax(0, 1fr); }
-.project-nav { padding: 1.4rem 1rem; color: var(--rail-text); background: var(--rail); }
-.project-nav h2 { font-size: 1.04rem; color: white; padding: .6rem .6rem .15rem; overflow-wrap: anywhere; }
-.project-nav a { display: block; text-decoration: none; color: inherit; padding: .63rem .75rem; border-radius: .4rem; }
-.project-nav a:hover { background: #284653; }
-.project-nav a[aria-current] { background: #dcefeb; color: #173d3a; font-weight: 700; }
-.project-nav .subtle { color: #beced4; font-size: .85rem; }
 .work-main { width: 100%; min-width: 0; max-width: 1560px; margin-inline: auto; padding: clamp(.9rem, 3.3vw, 2.25rem); }
 .heading { display: flex; align-items: flex-start; justify-content: space-between; flex-wrap: wrap; gap: .75rem 1rem; margin-bottom: 1.25rem; }
 .heading p { color: var(--muted); margin: 0; }
@@ -141,10 +129,6 @@ progress { width: min(100%, 25rem); accent-color: var(--accent); }
 details > summary { cursor: pointer; font-weight: 640; }
 @media (max-width: 850px) {
   .workspace { display: block; }
-  .project-nav { padding: .45rem .7rem .65rem; }
-  .project-nav h2 { margin: 0; padding-block: .28rem; }
-  .project-nav nav { display: flex; gap: .3rem; flex-wrap: wrap; }
-  .project-nav a { display: inline-block; padding: .35rem .52rem; }
   .split { grid-template-columns: minmax(0, 1fr); }
 }
 @media (max-width: 480px) {

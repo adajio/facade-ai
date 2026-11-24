@@ -23,6 +23,8 @@ type AssessmentStatus = {
   version: number;
   outcome: string;
   covered: number;
+  checked: number;
+  conflicts: number;
   total: number;
 };
 type ReadingStatus = { state: string; branch: 'A' | 'B' | null; total: number };
@@ -42,18 +44,24 @@ function includes(row: Pick<ReceiptRow, 'inventoryOpen' | 'processing'>, filter:
 }
 
 async function captureAssessment(tx: PoolClient, projectId: string, intakeMode: boolean, scopeId?: string): Promise<AssessmentStatus | null> {
+  function counts(questions: { outcome: string; machine: { outcome: string } }[]) {
+    return {
+      covered: questions.filter(({ outcome }) => outcome === 'covered').length,
+      checked: questions.filter(({ outcome }) => outcome !== 'needs_review').length,
+      conflicts: questions.filter(({ machine }) => machine.outcome === 'confirmed_conflict').length,
+      total: questions.length,
+    };
+  }
   if (intakeMode && !scopeId) {
     const { version, payload } = await synchronizeFacadeAssessment(tx, projectId);
     const questions = payload.contexts.flatMap((context) => context.questions);
-    return { kind: 'facade', version, outcome: payload.outcome,
-      covered: questions.filter(({ outcome }) => outcome === 'covered').length, total: questions.length };
+    return { kind: 'facade', version, outcome: payload.outcome, ...counts(questions) };
   }
   if (!scopeId) return null;
   const revision = await getRevision(tx, projectId, scopeId);
   if (!revision) return null;
   const { version, outcome, questions } = await snapshot(tx, revision);
-  return { kind: 'scope', version, outcome,
-    covered: questions.filter((row) => row.outcome === 'covered').length, total: questions.length };
+  return { kind: 'scope', version, outcome, ...counts(questions) };
 }
 
 // The count also changes if a concurrently allocated lower event ID commits
@@ -130,10 +138,17 @@ async function capture(tx: PoolClient, projectId: string, scopeId?: string) {
     open: rows.filter((row) => includes(row, 'open')).length,
     processing: rows.filter((row) => includes(row, 'processing')).length,
   };
+  const { rows: [files] } = await tx.query<{ accepted: number; prepared: number }>(
+    `SELECT count(DISTINCT o.version_id)::int AS accepted,
+            count(DISTINCT m.version_id)::int AS prepared
+       FROM intake_occurrences o
+       LEFT JOIN reader_maps m ON m.version_id=o.version_id AND m.project_id=o.project_id
+       WHERE o.project_id=$1 AND o.state='accepted'`, [projectId],
+  );
   const active = rows.find((row) => row.processing) ?? rows.find((row) => row.inventoryOpen);
   return {
     ...position, projectId, scopeId: scopeId ?? null, catalogAssigned: project.catalogAssigned,
-    assessment, totals, readings,
+    assessment, totals, readings, files,
     confirmedBytes: rows.reduce((sum, row) => sum + Number(row.confirmedBytes), 0),
     acceptedOccurrences: rows.reduce((sum, row) => sum + row.originals, 0),
     activeReceipt: active ? { receiptId: active.receiptId, number: active.number,
@@ -166,7 +181,11 @@ export async function currentWorkSlice(tx: PoolClient, projectId: string, scopeI
       SELECT id FROM work_slices WHERE project_id=$1 ORDER BY created_at DESC,id OFFSET 128
     ) AND id<>$2`, [projectId, workSliceId]);
   }
-  const { receipts: _receipts, ...summary } = payload;
+  return summarizeWorkSlice(payload, workSliceId);
+}
+
+export function summarizeWorkSlice(slice: WorkSlice, workSliceId: string) {
+  const { receipts: _receipts, ...summary } = slice;
   return { ...summary, workSliceId, filters: filters.map((filter) => ({ filter, total: summary.totals[filter] })) };
 }
 

@@ -51,6 +51,7 @@ const labels: Record<string, string> = {
   operator: 'Оператор',
   technical_operator: 'Технический оператор',
   confirmed_missing: 'Подтверждена нехватка',
+  clarification: 'Запрос на уточнение',
   confirmed_conflict: 'Подтверждённое противоречие',
   confirmed_problems: 'Есть подтверждённые проблемы',
   excluded: 'Исключено решением инженера',

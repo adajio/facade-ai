@@ -8,6 +8,7 @@ import { accessConfig, authorize, checkCsrf, checkOrigin, readCookie, readSessio
 import { facadeKindSet, getProject, updateConfirmedFacadeKinds } from "../access/project-state.js";
 import { object } from "../access/input.js";
 import { lockIntakeProject } from "../intake/gate.js";
+import { acceptedOriginals, verifyOriginalBasis } from "../intake/accepted-originals.js";
 import { recordDecision } from "./commands.js";
 import { facadeAssessmentHref, getLockedFacadeContext, readFacadeObservationPage, readFacadeSnapshot, synchronizeFacadeAssessment } from "./facade-store.js";
 import { recordFacadeType } from "./facade-types.js";
@@ -70,6 +71,27 @@ export async function register(app: FastifyInstance): Promise<void> {
 function registerRoutes(app: FastifyInstance, prefix: string) {
   const db = app.db;
   const facadePath = `${prefix}/projects/:projectId/facade-assessment`;
+  async function approvedKinds(tx: PoolClient, project: Awaited<ReturnType<typeof getProject>>) {
+    const { rows } = await tx.query<{ kind: string }>(`
+      SELECT DISTINCT unnest(default_facade_kinds) AS kind FROM catalog_versions
+      WHERE organization_id=$1 AND approval_reference IS NOT NULL AND jsonb_array_length(requirements)>0
+        AND ($2::text IS NULL OR default_stage=$2) ORDER BY kind`, [project.organizationId, project.stage]);
+    return rows.map(({ kind }) => kind);
+  }
+
+  app.get<{ Params: Project; Querystring: { after?: string } }>(`${prefix}/projects/:projectId/confirmation-originals`, async (request) => {
+    const projectId = identifier(request.params.projectId);
+    const after = request.query.after === undefined ? undefined : identifier(request.query.after);
+    return transaction(db, async (tx) => {
+      const session = await readSession(tx, request);
+      await authorize(tx, session, { action: "project:engineer", projectId });
+      const project = await getProject(tx, projectId);
+      const originals = await acceptedOriginals(tx, projectId, { after, limit: 101 });
+      const kinds = after ? undefined : await approvedKinds(tx, project);
+      await touchSession(tx, session);
+      return { originals: originals.slice(0, 100), nextCursor: originals.length > 100 ? originals[99].id : null, kinds };
+    });
+  });
   type FacadeParams = Project & { version?: string };
   async function readFacade(request: FastifyRequest<{ Params: FacadeParams }>, reply: FastifyReply) {
       const projectId = identifier(request.params.projectId);
@@ -160,15 +182,22 @@ function registerRoutes(app: FastifyInstance, prefix: string) {
     const projectId = identifier(request.params.projectId);
     const facadeId = identifier(request.params.facadeId);
     const input = object(request.body);
-    if (Object.keys(input).some((key) => !["kind", "observationId", "reason"].includes(key))) invalidInput("Передано неизвестное поле.");
+    const manual = input.provenanceKind === "engineer_override";
+    const fields = ["kind", "provenanceKind", "reason", ...(manual ? ["documentVersionId", "pageOrAnchor"] : ["observationId"])];
+    if (Object.keys(input).some((key) => !fields.includes(key)) ||
+        input.provenanceKind !== undefined && !manual && input.provenanceKind !== "machine_verified") {
+      invalidInput("Передано неизвестное поле.");
+    }
     const kind = shortText(input.kind, 100);
-    const observationId = identifier(input.observationId);
+    const observationId = manual ? undefined : identifier(input.observationId);
+    const documentVersionId = manual ? identifier(input.documentVersionId) : undefined;
+    const pageOrAnchor = manual ? shortText(input.pageOrAnchor, 200) : undefined;
     const reason = shortText(input.reason, 2000);
     let project: Awaited<ReturnType<typeof getProject>>;
     const result = await executeCommand(db, request, {
       operation: "assessment.confirm_facade_type",
       requirement: { action: "project:engineer", projectId },
-      input: { facadeId, kind, observationId, reason },
+      input: { facadeId, kind, reason, ...(manual ? { documentVersionId, pageOrAnchor } : { observationId }) },
       async version(tx) {
         await lockIntakeProject(tx, projectId);
         project = await getProject(tx, projectId);
@@ -178,10 +207,14 @@ function registerRoutes(app: FastifyInstance, prefix: string) {
       const current = await synchronizeFacadeAssessment(tx, projectId);
       const facade = current.active.find(({ context }) => context.facadeId === facadeId)?.context;
       if (!facade) throw new AssessmentError(404, "facade_not_found", "Фасад недоступен в текущей оценке.");
-      if (current.conflicted.has(facadeId)) throw new AssessmentError(422, "facade_type_conflicting_evidence",
+      if (!manual && current.conflicted.has(facadeId)) throw new AssessmentError(422, "facade_type_conflicting_evidence",
         "В действующих оригиналах указаны разные типы. Сверьте редакции и принадлежность опор.");
+      if (manual && !(await approvedKinds(tx, project)).includes(kind)) {
+        throw new AssessmentError(422, "facade_type_not_approved", "Выберите тип из утверждённого каталога.");
+      }
+      const original = documentVersionId && pageOrAnchor ? await verifyOriginalBasis(tx, projectId, documentVersionId, pageOrAnchor) : undefined;
       await recordFacadeType(tx, { projectId, contextId: facade.id, facadeId, kind, reason, actorId: actor.userId,
-        stage: project.stage, fact: current.input.observations.find(({ id }) => id === observationId) });
+        stage: project.stage, original, fact: current.input.observations.find(({ id }) => id === observationId) });
 
       const types = current.active.filter(({ context }) => context.facadeId).map(({ context }) =>
         context.facadeId === facadeId ? kind : context.facadeType?.state === "confirmed" ? context.facadeType.kind : null);
@@ -192,7 +225,9 @@ function registerRoutes(app: FastifyInstance, prefix: string) {
       const updated = await synchronizeFacadeAssessment(tx, projectId);
       const facadeType = updated.active.find(({ context }) => context.facadeId === facadeId)?.context.facadeType;
       const body = { facadeId, assessmentContextId: facade.id, facadeType, version: saved.version, assessmentVersion: updated.version };
-      return { body, audit: { objectId: facade.id, version: saved.version, details: { facadeId, kind, observationId, reason } } };
+      return { body, audit: { objectId: facade.id, version: saved.version, details: {
+        facadeId, kind, reason, ...(original ? { basis: original } : { observationId }),
+      } } };
     });
     if (result.replayed) reply.header("Idempotency-Replayed", "true");
     return reply.code(result.status).header("ETag", `"${result.body.version}"`).send(result.body);

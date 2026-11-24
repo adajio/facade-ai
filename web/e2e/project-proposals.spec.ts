@@ -83,12 +83,13 @@ test('Настройки показывают адресные предложе�
   await page.goto(projectPath + '/members');
   await expect(page.getByText('Стадия уточняется.')).toBeVisible();
   await expect(page.getByText('В прочитанных исходниках пока нет предложения по стадии.')).toBeVisible();
-  await expect(page.getByLabel('Код стадии')).toBeHidden();
+  await expect(page.getByLabel('Код стадии')).toBeVisible();
   expect(commands).toHaveLength(0);
 
   mode = 'single';
   await page.getByRole('button', { name: 'Обновить предложения' }).click();
   await expect(page.getByRole('heading', { name: 'Предложенная стадия' })).toBeVisible();
+  await expect(page.getByLabel('Код стадии')).toBeHidden();
   await page.getByRole('link', { name: 'Открыть основание для РД' }).click();
   const preview = page.getByRole('region', { name: 'Оригинал и основание' });
   await expect(preview.getByText(versionId)).toBeVisible();

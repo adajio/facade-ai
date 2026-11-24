@@ -3,8 +3,7 @@ import { readFile, writeFile } from 'node:fs/promises';
 import { expect, test, type Locator, type TestInfo } from '@playwright/test';
 import { accepted, admin, command, signIn, unique } from './synthetic';
 
-// Each physical page has a different visible marker. This checks the pixels
-// painted by Chrome's PDF viewer, independently of the frame URL and HTTP status.
+// Each physical page has a distinct marker to identify the actual rendered pixels.
 function markedPdf() {
   const stream = (color: string) => {
     const content = `${color} rg 30 440 180 160 re f\n`;
@@ -106,20 +105,53 @@ test('Комплект без стадии, оригинал PDF, адрес л�
 
   await page.getByRole('button', { name: 'Открыть оригинал' }).press('Enter');
   await expect(page.getByRole('heading', { name: 'Оригинал PDF' })).toBeFocused();
-  const firstPage = page.locator('iframe[title="Оригинал PDF, страница 1"]');
-  await expect(firstPage).toHaveAttribute('src', href + '#page=1');
-  await expectRenderedPage(firstPage, 'red', 'pdf-page-1', testInfo);
   const nextPage = page.getByRole('button', { name: 'Следующая страница' });
   await expect(nextPage).toBeEnabled();
+  const firstPage = page.getByRole('img', { name: 'Оригинал PDF, страница 1' });
+  await expect(firstPage).toHaveAttribute('src', /^blob:/u);
+  await expectRenderedPage(firstPage, 'red', 'pdf-page-1', testInfo);
+  const firstUrl = await firstPage.getAttribute('src');
+  const previews: string[] = [];
+  page.on('request', (request) => {
+    if (request.url().includes('/reader/pages/')) previews.push(request.url());
+  });
   await nextPage.press('Enter');
-  const secondPage = page.locator('iframe[title="Оригинал PDF, страница 2"]');
-  await expect(secondPage).toHaveAttribute('src', href + '#page=2');
+  const secondPage = page.getByRole('img', { name: 'Оригинал PDF, страница 2' });
+  await expect(secondPage).toHaveAttribute('src', /^blob:/u);
   await expectRenderedPage(secondPage, 'green', 'pdf-page-2-before-event', testInfo);
+  const cacheMs = await page.evaluate(async (expectedUrl) => {
+    const button = Array.from(document.querySelectorAll('button')).find((item) => item.textContent === 'Предыдущая страница');
+    if (!button) throw new Error('Кнопка перехода недоступна');
+    const installed = new Promise<HTMLImageElement>((resolve, reject) => {
+      const observer = new MutationObserver(() => {
+        const shown = document.querySelector<HTMLImageElement>('img[alt="Оригинал PDF, страница 1"]');
+        if (shown?.getAttribute('src') !== expectedUrl) return;
+        observer.disconnect();
+        clearTimeout(timeout);
+        resolve(shown);
+      });
+      const timeout = setTimeout(() => {
+        observer.disconnect();
+        reject(new Error('Кэшированная страница не установлена'));
+      }, 500);
+      observer.observe(document.body, { subtree: true, childList: true, attributes: true });
+    });
+    const start = performance.now();
+    button.click();
+    const shown = await installed;
+    await shown.decode();
+    return performance.now() - start;
+  }, firstUrl);
+  testInfo.annotations.push({ type: 'page-cache', description: cacheMs.toFixed(1) + ' ms to decoded image' });
+  expect(cacheMs).toBeLessThan(50);
+  expect(previews).toHaveLength(1);
+  await nextPage.press('Enter');
+  await expect(secondPage).toHaveAttribute('src', /^blob:/u);
   const displayedFrame = await secondPage.elementHandle();
 
   const projectId = new URL(page.url()).pathname.split('/')[2];
   const projectPath = '/api/projects/' + projectId;
-  const slice = page.getByText(/^Срез \d+$/);
+  const sync = page.getByText('Синхр. OK', { exact: true });
   await page.waitForResponse((response) => new URL(response.url()).pathname === projectPath + '/events' && response.ok());
   const receiptId = randomUUID();
   const publication = page.waitForResponse(async (response) => {
@@ -133,13 +165,18 @@ test('Комплект без стадии, оригинал PDF, адрес л�
         size: fixture.length, sha256: hash(fixture), mediaType: 'application/pdf' }] }),
     'Публикация события по соседнему поступлению');
   const { cursor } = await (await publication).json() as { cursor: string };
-  await expect.poll(async () => Number((await slice.innerText()).split(' ')[1])).toBeGreaterThanOrEqual(Number(cursor));
+  await sync.click();
+  const revision = page.getByText(/^Проверка №\d+$/);
+  await expect.poll(async () => Number((await revision.innerText()).split('№')[1])).toBeGreaterThanOrEqual(Number(cursor));
+  await sync.click();
   expect(await displayedFrame.evaluate((element) => element.isConnected)).toBe(true);
   await expectRenderedPage(secondPage, 'green', 'pdf-page-2-after-event', testInfo);
 
   await page.reload();
-  await expect(secondPage).toHaveAttribute('src', href + '#page=2');
+  await expect(secondPage).toHaveAttribute('src', /^blob:/u);
   await expectRenderedPage(secondPage, 'green', 'pdf-page-2-after-reload', testInfo);
+  await page.getByRole('button', { name: 'Полный просмотр PDF' }).click();
+  await expect(page.locator('iframe[title="Оригинал PDF, страница 2"]')).toHaveAttribute('src', href + '#page=2');
   await page.getByRole('link', { name: 'К описи' }).press('Enter');
   await expect(page.locator('[id="' + rowId + '"]')).toBeFocused();
   await expect(page).not.toHaveURL(/[?&]document=/);

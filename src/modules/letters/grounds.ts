@@ -72,7 +72,11 @@ export function renderGround(ground: AssessmentGround): Ground {
   const action = externalLine(requestedAction).replace(/[.!?]+$/u, '');
   const direction = `Просим ${action.slice(0, 1).toLocaleLowerCase('ru')}${action.slice(1)}.`;
   let facts: string[];
-  if (kind === 'confirmed_conflict') {
+  if (kind === 'clarification' && ground.clarification) {
+    const inventories = ground.clarification.inventories.map(({ number }) => '№' + externalLine(number));
+    const reference = inventories.length === 1 ? 'описи ' + inventories[0] : 'описям ' + inventories.join(', ');
+    facts = [`В проверенном комплекте по ${reference} сведения о «${externalLine(item)}» найти не удалось.`];
+  } else if (kind === 'confirmed_conflict') {
     facts = [conflictFact(sources)];
   } else {
     const formats = ground.requiredFormats.map(externalLine);
@@ -93,7 +97,7 @@ export function renderGround(ground: AssessmentGround): Ground {
     sources,
     basis: ground,
     wording: [intro, ...facts, direction].join(' '),
-    alternativeWording: [intro, direction, ...facts].join(' '),
+    alternativeWording: kind === 'clarification' ? [intro, ...facts, direction].join(' ') : [intro, direction, ...facts].join(' '),
   };
 }
 

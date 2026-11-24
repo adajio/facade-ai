@@ -56,6 +56,19 @@ export async function accepted<T = unknown>(response: Awaited<ReturnType<APIRequ
   return (response.status() === 204 ? undefined : await response.json()) as T;
 }
 
+export async function applyFixtureReview(apply: () => Promise<void>) {
+  // The fixture controls the observations. The worker can still publish an
+  // assessment between the fixture's read and the transactional update.
+  for (let attempt = 0; ; attempt++) {
+    try {
+      await apply();
+      return;
+    } catch (error) {
+      if (attempt >= 2 || !(error instanceof Error) || !('code' in error) || error.code !== 'assessment_input_stale') throw error;
+    }
+  }
+}
+
 export async function account(owner: BrowserContext, invitee: BrowserContext, origin: string, prefix: string, operator = false): Promise<ReadyAccount> {
   const login = unique(prefix);
   const password = 'Synthetic-' + randomUUID();

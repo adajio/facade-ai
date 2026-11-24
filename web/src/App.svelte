@@ -5,18 +5,20 @@
   import { Api, denied, describe, id, interrupted } from './lib/http';
   import { projectOf, type Session, type Project, type ProjectRead, type Scope } from './lib/contracts';
   import { readRoute, returnPath } from './lib/routes';
+  import { pageCache } from './lib/page-cache';
   import Projects from './screens/Projects.svelte';
   import Workspace from './screens/Workspace.svelte';
   import Administration from './screens/Administration.svelte';
   import Operator from './screens/Operator.svelte';
 
   const VIEW_LEASE = 30_000;
-  const HEARTBEAT = 10_000;
+  const HEARTBEAT = 20_000;
   let route = $state(readRoute(window.location));
   let session = $state<Session>();
   let project = $state<Project>();
   let screenState = $state<'checking' | 'ready' | 'denied' | 'offline' | 'login'>('checking');
   let masked = $state(false);
+  let signingOut = $state(false);
   let sessionEpoch = $state(0);
   let notice = $state('');
   let lastVerified = 0;
@@ -27,6 +29,7 @@
   const api = new Api(expired);
 
   function clear() {
+    pageCache.clear();
     check?.abort();
     clearTimeout(lease);
     api.reset();
@@ -69,9 +72,11 @@
   }
 
   async function verify(foreground = false) {
-    if (['login', 'reset', 'invite', 'missing'].includes(route.page)) return;
+    if (signingOut || ['login', 'reset', 'invite', 'missing'].includes(route.page)) return;
     const projectId = route.projectId;
     const page = route.page;
+    const section = route.section;
+    const scopeParam = route.params.get('scope');
     check?.abort();
     const controller = new AbortController();
     check = controller;
@@ -89,7 +94,7 @@
       let next: Project | undefined;
       if (projectId) {
         const path = '/api/projects/' + id(projectId);
-        const scopedSection = route.section === 'fragments' || route.section === 'copilot';
+        const scopedSection = section === 'fragments' || section === 'copilot';
         if (!entry?.scopeId || !scopedSection) {
           try {
             next = projectOf(await api.json<ProjectRead>(path, { signal }));
@@ -98,7 +103,7 @@
           }
         }
         if (!next) {
-          const scopeId = entry?.scopeId ?? route.params.get('scope');
+          const scopeId = entry?.scopeId ?? scopeParam;
           if (!scopeId) { lockScreen('denied'); return; }
           const scope = await api.json<Scope & { role: string; actions: string[] }>(path + '/scopes/' + id(scopeId), { signal });
           next = {
@@ -112,6 +117,7 @@
       if (project && next && project.id === next.id &&
           (project.scopeId !== next.scopeId || JSON.stringify(project.actions) !== JSON.stringify(next.actions))) {
         // Drop the mounted workspace and pending responses when role permissions change.
+        pageCache.clear();
         api.reset();
         api.setCsrf(fresh.csrfToken);
         sessionEpoch += 1;
@@ -119,7 +125,7 @@
       session = fresh;
       project = next;
       screenState = 'ready';
-      masked = document.visibilityState === 'hidden';
+      masked = false;
       lastVerified = Date.now();
       clearTimeout(lease);
       lease = setTimeout(() => {
@@ -151,6 +157,11 @@
   }
 
   async function signOut() {
+    if (signingOut) return;
+    signingOut = true;
+    check?.abort();
+    pageCache.clear();
+    masked = true;
     try {
       await api.json('/api/sessions/current', { method: 'DELETE' });
       channel?.postMessage('changed');
@@ -158,6 +169,9 @@
       replace('/login');
     } catch (error) {
       notice = describe(error);
+    } finally {
+      signingOut = false;
+      if (route.page !== 'login') void verify(true);
     }
   }
 
@@ -166,12 +180,21 @@
     activeLocation = window.location.pathname + window.location.search;
     route = readRoute(window.location);
     if (route.projectId !== last.projectId || route.page !== last.page ||
-        (project?.scopeId && route.section !== last.section)) {
+        (project?.scopeId && (route.section !== last.section || route.params.get('scope') !== last.params.get('scope')))) {
       lockScreen('checking');
       void verify(true);
     } else if (foreground) {
-      void verify(true);
+      void verify();
     }
+  }
+
+  function navigate(path: string) {
+    if (path === window.location.pathname + window.location.search) return true;
+    if (!window.dispatchEvent(new Event('facade:navigate', { cancelable: true }))) return false;
+    history.pushState(null, '', path);
+    routeChanged();
+    window.scrollTo(0, 0);
+    return true;
   }
 
   function navigation(event: MouseEvent) {
@@ -181,12 +204,7 @@
     const url = new URL(target.href);
     if (url.origin !== window.location.origin || url.pathname.startsWith('/api/') || url.hash) return;
     event.preventDefault();
-    if (url.pathname === window.location.pathname && url.search === window.location.search) return;
-    if (window.dispatchEvent(new Event('facade:navigate', { cancelable: true }))) {
-      history.pushState(null, '', url.pathname + url.search);
-      routeChanged();
-      window.scrollTo(0, 0);
-    }
+    navigate(url.pathname + url.search);
   }
 
   onMount(() => {
@@ -197,14 +215,14 @@
     };
     if (channel) channel.onmessage = authChanged;
     const regain = () => {
-      if (document.visibilityState === 'hidden') {
-        masked = true;
-        return;
-      }
-      void verify(true);
+      if (document.visibilityState === 'hidden') return;
+      if (lastVerified && Date.now() - lastVerified >= VIEW_LEASE) lockScreen('checking');
+      void verify(masked || screenState !== 'ready');
     };
     const pageHide = () => {
       masked = true;
+      pageCache.clear();
+      check?.abort();
       // Conceal the cached DOM synchronously before bfcache takes its snapshot.
       const content = document.getElementById('protected-content');
       if (content) content.hidden = true;
@@ -253,6 +271,7 @@
 {:else if route.page === 'missing'}
   <main class="standalone" id="main"><h1>Страница недоступна</h1><a href="/projects">К проектам</a></main>
 {:else}
+  {#if route.page !== 'project' || !project || screenState !== 'ready' || masked}
   <header class="app-header">
     <a class="brand" href="/projects"><span class="brand-mark" aria-hidden="true"></span> Facade AI</a>
     <nav aria-label="Основная навигация">
@@ -267,6 +286,7 @@
       </div>
     {/if}
   </header>
+  {/if}
 
   <Notice kind="error" message={notice} />
   {#if masked || screenState === 'checking'}
@@ -287,7 +307,7 @@
           <Projects {api} {session} refresh={verify} />
         {:else if route.page === 'project' && project}
           {#key project.id}
-            <Workspace {api} {project} {route} {masked} {setDocumentPage} refresh={verify}
+            <Workspace {api} {project} {route} {masked} {session} {signOut} {navigate} {setDocumentPage} refresh={verify}
               onDenied={() => lockScreen('denied')} />
           {/key}
         {:else if route.page === 'admin' && session.actions?.includes('organization:admin')}

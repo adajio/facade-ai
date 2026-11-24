@@ -1,3 +1,5 @@
+import type { OriginalBasis } from './facade-assessment';
+
 export type Actor = {
   id: string;
   organizationId: string;
@@ -37,6 +39,7 @@ export type Project = {
   intakeMode?: boolean;
   stage?: string | null;
   stageStatus?: 'unknown' | 'legacy_unconfirmed' | 'confirmed';
+  stageBasis?: OriginalBasis | { provenanceKind: 'machine_verified'; evidenceIds: string[] } | null;
   confirmedFacadeKinds?: string[];
   updatedAt?: string;
 };

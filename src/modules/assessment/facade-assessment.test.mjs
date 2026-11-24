@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { test } from "node:test";
 import Fastify from "fastify";
@@ -551,6 +552,9 @@ test("ordinary intake publishes a local conflict, then keeps sent history after 
     const questionAt = (summary, key) => summary.contexts.find(({ facadeId }) => facadeId === context.facadeId)
       .questions.find(({ requirement }) => requirement.positionId === key);
     assert.equal(questionAt(open, "anchor").machine.outcome, "needs_review");
+    const notYet = questionAt(open, "variable");
+    const clarificationCommand = { action: "request_clarification", requestExternal: true, reason: "Engineer verified the package" };
+    await request("POST", `/api/v1/questions/${notYet.id}/decisions`, clarificationCommand, { status: 422, version: notYet.version });
     for (let attempt = 0; attempt < 12; attempt++) {
       if (!await dispatchPackageFollowup(db, gateway)) break;
       const work = await gateway.claim({ workerId: `proof-${randomUUID()}`, kinds: [packageFollowupKind], leaseMs: 60000 });
@@ -580,6 +584,28 @@ test("ordinary intake publishes a local conflict, then keeps sent history after 
     const external = await request("POST", target + "/letters", { assessmentContextId: context.assessmentContextId,
       recipient, items: [{ questionId: q.id, questionVersion: signed.version, decisionId: signed.id }] }, { status: 201 });
     assert.ok(external.json().id);
+    const silence = questionAt(proven, "variable");
+    assert.equal(silence.machine.outcome, "needs_review");
+    assert.equal(silence.clarification.inventories[0].receiptId, docs);
+    assert.ok(silence.clarification.places.length >= 2);
+    const clarification = (await request("POST", `/api/v1/questions/${silence.id}/decisions`, clarificationCommand,
+      { version: silence.version, status: 201 })).json();
+    const candidates = (await request("GET", target + "/letters/eligible?assessmentContextId=" + context.assessmentContextId)).json();
+    const clarified = candidates.items.find(({ questionId }) => questionId === silence.id);
+    assert.equal(clarified.kind, "clarification");
+    assert.match(clarified.wording, /В проверенном комплекте по описи №\d+ сведения о «Variable profile clearance» найти не удалось\. Просим направить документ или указать, где приведены данные\./u);
+    const clarificationLetter = (await request("POST", target + "/letters", { assessmentContextId: context.assessmentContextId,
+      recipient, items: [{ questionId: silence.id, questionVersion: clarification.version, decisionId: clarification.id }] },
+    { status: 201 })).json();
+    const clarificationPath = "/api/v1/letters/" + clarificationLetter.id;
+    const textExport = (await request("POST", clarificationPath + "/exports", { format: "txt" }, { status: 201, version: clarificationLetter.version })).json();
+    const wordExport = (await request("POST", clarificationPath + "/exports", { format: "docx" }, { status: 201, version: clarificationLetter.version })).json();
+    assert.match((await request("GET", textExport.url)).body, /Просим направить документ или указать, где приведены данные/u);
+    const word = await request("GET", wordExport.url);
+    assert.match(word.headers["content-type"], /officedocument/u);
+    const xml = execFileSync("python3", ["-c", "import io,sys,zipfile; print(zipfile.ZipFile(io.BytesIO(sys.stdin.buffer.read())).read('word/document.xml').decode())"],
+      { input: word.rawPayload, encoding: "utf8" });
+    assert.match(xml, /Просим направить документ или указать, где приведены данные/u);
     const inventoryQuestion = questionAt(proven, "inventory");
     assert.equal(inventoryQuestion.machine.outcome, "covered");
     const inventoryDecision = await decision(inventoryQuestion);
@@ -592,11 +618,41 @@ test("ordinary intake publishes a local conflict, then keeps sent history after 
     assert.equal(questionAt(partial, "inventory").version, inventoryDecision.version);
     assert.equal(questionAt(partial, "inventory").decision.id, inventoryDecision.id);
     assert.equal(questionAt(partial, "variable"), undefined);
+    const heldExport = await request("GET", textExport.url, undefined, { status: 409 });
+    assert.equal(heldExport.json().code, "scope_held");
+    assert.match((await request("GET", textExport.historicalUrl)).body, /по описи №\d+/u);
     assert.equal(questionAt(partial, "anchor").machine.outcome, "needs_review");
     const savedLetter = external.json();
     await request("GET", `/api/v1/letters/${savedLetter.id}/revisions/${savedLetter.revisionId}`);
     const { rows: [ledger] } = await db.query("SELECT count(*)::int AS attempts FROM gateway_attempts WHERE project_id=$1", [next.id]);
     assert.equal(ledger.attempts, 0);
+  });
+
+  await t.test("manual stage and facade type are pinned to an accepted address without a machine proposal", async () => {
+    const now = (await request("GET", `/api/projects/${projectId}`)).json();
+    const list = (await request("GET", base + "/confirmation-originals")).json();
+    const original = list.originals.find(({ label }) => label === "south.pdf");
+    assert.ok(original && list.kinds.includes("panel"));
+    const snapshot = await assessment();
+    const proposals = (await request("GET", snapshot.observations.href + `?proposal=facadeKind&facadeId=${secondFacade.facadeId}`)).json();
+    assert.equal(proposals.items.length, 0);
+    const manual = { provenanceKind: "engineer_override", documentVersionId: original.id, pageOrAnchor: "1",
+      reason: "Verified on the synthetic original" };
+    const stagePath = `/api/projects/${projectId}/stage`;
+    await request("PUT", stagePath, { ...manual, stage: "P", pageOrAnchor: "999" }, { version: now.version, status: 422 });
+    const confirmed = (await request("PUT", stagePath, { ...manual, stage: "P" }, { version: now.version })).json();
+    assert.equal(confirmed.stageBasis.provenanceKind, "engineer_override");
+    assert.equal(confirmed.stageBasis.address.locator.page, 1);
+    const typePath = base + `/facade-assessment/facades/${secondFacade.facadeId}/kind`;
+    await request("PUT", typePath, { ...manual, kind: "panel" }, { version: now.version, status: 412 });
+    await request("PUT", typePath, { ...manual, documentVersionId: randomUUID(), kind: "panel" },
+      { version: confirmed.version, status: 404 });
+    const type = (await request("PUT", typePath, { ...manual, kind: "panel" }, { version: confirmed.version })).json();
+    assert.equal(type.facadeType.state, "confirmed");
+    assert.equal(type.facadeType.basis.provenanceKind, "engineer_override");
+    assert.equal(type.facadeType.basis.versionId, original.id);
+    const reloaded = await assessment();
+    assert.equal(reloaded.contexts.find(({ facadeId }) => facadeId === secondFacade.facadeId).facadeType.basis.versionId, original.id);
   });
 
   const { rows: [scopeViewer] } = await db.query(
@@ -612,4 +668,5 @@ test("ordinary intake publishes a local conflict, then keeps sent history after 
   await request("GET", base + `/facade-assessment/${unclear.version}`, undefined, { status: 404 });
   await request("GET", gap.sources[0].citation.href, undefined, { status: 404 });
   await request("GET", early.observations.href, undefined, { status: 404 });
+  await request("GET", base + "/confirmation-originals", undefined, { status: 404 });
 });

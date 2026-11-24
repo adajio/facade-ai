@@ -45,14 +45,15 @@ test.describe('Рабочее место на штатном API', () => {
       ), 'Проект прежнего формата');
       const projectPath = '/projects/' + projectId;
       await page.goto(projectPath + '/overview');
-      await expect(page.getByRole('heading', { name: project })).toBeVisible();
+      await expect(page.getByRole('navigation', { name: 'Путь к проекту' }).getByText(project)).toBeVisible();
 
       await page.getByRole('button', { name: 'Добавить область' }).click();
       await page.getByLabel('Название области').fill('Фасад А');
       await page.getByLabel('Стадия', { exact: true }).fill('РД');
       await page.getByRole('button', { name: 'Сохранить область' }).click();
-      await expect(page.getByLabel('Стадия и область')).toContainText('Фасад А');
-      const scopeId = await page.getByLabel('Стадия и область').inputValue();
+      const scopeSelect = page.getByLabel('Стадия и область');
+      await scopeSelect.selectOption({ label: 'Фасад А · РД' });
+      const scopeId = await scopeSelect.inputValue();
 
       await page.getByRole('link', { name: 'Участники' }).click();
       const userId = page.getByLabel('ID учётной записи');
@@ -65,16 +66,16 @@ test.describe('Рабочее место на штатном API', () => {
       await expect(page.getByRole('cell', { name: viewer.login, exact: true })).toBeVisible();
 
       let engineering = await engineerContext.newPage();
-      await signIn(engineering, engineer.login, engineer.password, projectPath + '/receipts');
+      await signIn(engineering, engineer.login, engineer.password, projectPath + '/receipts?scope=' + scopeId);
       await expect(engineering.getByRole('heading', { name: 'Поступления', exact: true })).toBeVisible();
       await expect(engineering.getByRole('link', { name: 'Участники' })).toHaveCount(0);
       await engineering.getByRole('link', { name: 'Письма' }).click();
-      await expect(engineering.getByText('Внешних оснований пока нет.', { exact: false })).toBeVisible();
+      await expect(engineering.getByText('Пока нет подтверждённых замечаний для письма.', { exact: false })).toBeVisible();
       expect((await command(engineerContext, origin, '/api/v1/projects/' + projectId + '/letters', 'POST', {
         scopeId, recipient: 'Синтетический адресат', items: [],
       })).status()).toBe(422);
       await expect(engineering.getByRole('link', { name: /^Письмо №/ })).toHaveCount(0);
-      await engineering.goto(projectPath + '/receipts?upload=1');
+      await engineering.goto(projectPath + '/receipts?upload=1&scope=' + scopeId);
       const later = { ...pdf(), name: 'второй-лист.pdf' };
       await engineering.getByLabel('Файлы или архивы', { exact: true }).setInputFiles([pdf(), later]);
       await engineering.route('**/api/uploads/*/complete', async (route) => {
@@ -92,7 +93,7 @@ test.describe('Рабочее место на штатном API', () => {
 
       await engineering.close();
       engineering = await engineerContext.newPage();
-      await engineering.goto(receiptPage);
+      await engineering.goto(receiptPage + '?scope=' + scopeId);
       await engineering.getByRole('button', { name: 'Продолжить передачу', exact: true }).click();
       await engineering.getByLabel('Файлы или архивы', { exact: true }).setInputFiles(later);
       await engineering.route('**/api/uploads/*/complete', async (route) => {
@@ -208,7 +209,7 @@ test.describe('Рабочее место на штатном API', () => {
     await page.getByRole('button', { name: 'Начать передачу' }).click();
     await expect(page.getByRole('link', { name: 'Карточка документа' })).toHaveCount(2);
     await page.getByRole('button', { name: 'Завершить приём', exact: true }).click();
-    await expect(page.getByText('Приём завершён', { exact: false })).toBeVisible();
+    await expect(page.getByRole('status').filter({ hasText: 'Приём завершён.' })).toBeVisible();
     await expect(page.getByText('Опись открыта', { exact: true })).toBeVisible();
     await expect(page.getByText('Принят · раскрывается', { exact: true })).toBeVisible();
   });

@@ -71,7 +71,10 @@ async function isolated(t: TestContext, url: string, file?: string): Promise<pg.
     await admin.end();
   });
   if (file) await pool.query(await readFile(file, 'utf8'));
-  if (file === appSql) await pool.query(await readFile('db/migrations/08_gateway_z_route_isolation.sql', 'utf8'));
+  if (file === appSql) {
+    await pool.query(await readFile('db/migrations/08_gateway_z_route_isolation.sql', 'utf8'));
+    await pool.query(await readFile('db/migrations/25_gateway_budget_attribution.sql', 'utf8'));
+  }
   return pool;
 }
 
@@ -933,7 +936,10 @@ test('a persisted $5 cap blocks dispatch and counts unknown effects after a gate
 
 test('a journal created before the cap column keeps $10 and rejects a pinned $5 expectation', sqlCase, async t => {
   const s = await setup(t);
-  await s.outside.query(`DROP FUNCTION gateway_enforce_reduced_budget() CASCADE;
+  await s.outside.query(`DROP FUNCTION gateway_guard_budget() CASCADE;
+                         DROP FUNCTION gateway_budget_block(uuid,jsonb,bigint,bigint);
+                         DROP FUNCTION gateway_budget_balances(uuid,jsonb);
+                         DROP TABLE gateway_external_project_budgets;
                          ALTER TABLE gateway_external_ledger DROP COLUMN limit_usd_nanos`);
   const expectedFive = new PostgresIntentJournal(s.outside, s.journal.ledgerId, 5_000_000_000);
   await assert.rejects(expectedFive.balance(), /journal_limit_mismatch/);
@@ -1359,4 +1365,191 @@ test('OpenRouter 404 diagnostics distinguish a pre-provider refusal from an unpr
   assert.ok(final.reserveUsdNanos < logs.budget.reserveUsdNanos && final.reserveUsdNanos > 0);
   assert.equal(fetchSpy.mock.callCount(), 2);
   t.diagnostic('documented 404 and generic 404 retained reserves; the operator settled only the correlated fixture');
+});
+
+test('one journal admission enforces project, shared package and copilot budgets under concurrent work', sqlCase, async t => {
+  const policy = { ...baseRoute, ceilingUsdNanos: 400_000_000 };
+  const secondRoute = { ...policy, id: 'controlled-b' };
+  const thirdRoute = { ...policy, id: 'controlled-c' };
+  const s = await setup(t, policy);
+  const first = project();
+  const supplement = { ...project(), projectId: first.projectId };
+  const other = project();
+  const packageId = randomUUID();
+  const copilot = { packageId, initiatedBy: 'copilot' } as const;
+  const background = { packageId, initiatedBy: 'background' } as const;
+  const independent = { ...copilot, packageId: randomUUID() };
+
+  await s.outside.query('INSERT INTO gateway_external_project_budgets VALUES ($1,4000000000),($2,5000000000)',
+    [first.projectId, other.projectId]);
+  assert.equal(await s.journal.copilotBudget(randomUUID()), null);
+  assert.equal(await s.journal.hasProjectBudget(first.projectId), true);
+  await s.gateway.configureRoute(secondRoute);
+  await s.gateway.configureRoute(thirdRoute);
+  for (const ref of [first, supplement, other]) {
+    await s.gateway.openGeneration(ref);
+    await s.gateway.sealGeneration(ref, manifest);
+    for (const route of [policy, secondRoute, thirdRoute]) await grant(s.gateway, ref, true, route);
+  }
+  const work = await lease(s.gateway, first, 'copilot-first', obligationA);
+  const extraCopilot = await lease(s.gateway, supplement, 'copilot-extra', obligationA);
+  const addendum = await lease(s.gateway, supplement, 'background-addendum', obligationB);
+  const otherWork = await lease(s.gateway, other, 'copilot-other-project', obligationA);
+  const entered = gate();
+  const respond = gate();
+  t.after(respond.release);
+  s.setBehavior(async attempt => {
+    if (attempt.jobId === work.jobId) { entered.release(); await respond.promise; }
+    return 'paid';
+  });
+
+  isHeld(await s.gateway.call(call(work)), 'budget_attribution_required');
+  const primary = { ...call(work), budget: copilot };
+  const inFlight = s.gateway.call(primary);
+  await reached(entered, inFlight);
+  assert.deepEqual(await s.journal.copilotBudget(first.projectId),
+    { limitUsdNanos: 400_000_000, remainingUsdNanos: 0, frozen: false });
+  const additional = { ...call(extraCopilot, secondRoute.id), budget: copilot };
+  const waiting = isHeld(await s.gateway.call(additional), 'budget_reserve_wait');
+  assert.ok(waiting.retryAt);
+  assert.equal((await s.gateway.call({ ...call(addendum, secondRoute.id), budget: background })).status, 'paid');
+  assert.equal((await s.gateway.call({ ...call(otherWork, thirdRoute.id), budget: independent })).status, 'paid');
+  respond.release();
+  assert.equal((await inFlight).status, 'paid');
+  const exhausted = isHeld(await s.gateway.call(additional), 'copilot_budget_exhausted');
+  assert.equal(exhausted.nextAction, 'use_saved_project_evidence');
+  isHeld(await s.gateway.call({ ...primary, budget: background }), 'effect_conflict');
+  assert.equal((await s.gateway.call(primary)).status, 'paid');
+
+  assert.deepEqual(await s.journal.budgetBalances(first.projectId, copilot), [
+    { scope: 'copilot', limitUsdNanos: 400_000_000, spentUsdNanos: 300_000_000, reserveUsdNanos: 0 },
+    { scope: 'installation', limitUsdNanos: 10_000_000_000, spentUsdNanos: 900_000_000, reserveUsdNanos: 0 },
+    { scope: 'package', limitUsdNanos: 10_000_000_000, spentUsdNanos: 600_000_000, reserveUsdNanos: 0 },
+    { scope: 'project', limitUsdNanos: 4_000_000_000, spentUsdNanos: 600_000_000, reserveUsdNanos: 0 },
+  ]);
+  const unrelated = await s.journal.budgetBalances(first.projectId, independent);
+  assert.deepEqual(await s.journal.copilotBudget(first.projectId),
+    { limitUsdNanos: 400_000_000, remainingUsdNanos: 100_000_000, frozen: false });
+  assert.equal(unrelated.find(row => row.scope === 'package')?.spentUsdNanos, 0);
+  assert.equal((await s.read()).provider.length, 3);
+
+  // Recheck a reduced project budget at claim, even when space remains in the installation.
+  const template = (await s.read()).external[0].metadata as Attempt;
+  const reserve = { ...template, id: randomUUID(), effectKey: 'claim-rechecks', ceilingUsdNanos: 400_000_000, budget: background };
+  assert.equal(typeof await s.journal.prepare(reserve), 'object');
+  await s.outside.query('UPDATE gateway_external_project_budgets SET limit_usd_nanos=999999999 WHERE project_id=$1', [first.projectId]);
+  assert.equal(await s.journal.claim(reserve.id, policy), 'budget_exhausted');
+  assert.equal((await s.journal.cancelPrepared(reserve.id)).state, 'cancelled');
+});
+
+test('external SQL guard serializes previous-binary writers and preserves historical reserves', sqlCase, async t => {
+  const s = await setup(t);
+  const ref = project();
+  const packageId = randomUUID();
+  const legacy: Attempt = { ...ref, id: randomUUID(), jobId: randomUUID(), purpose: 'primary_a',
+    routeId: baseRoute.id, revision: baseRoute.revision, effectKey: 'legacy', requestHash: 'legacy',
+    previousRejectedId: null, ceilingUsdNanos: 200_000_000 };
+  assert.equal(typeof await s.journal.prepare(legacy), 'object');
+  assert.equal(await s.journal.claim(legacy.id, baseRoute), 'claimed');
+  await s.journal.settle(legacy.id, { state: 'unknown', code: 'lost-before-id' });
+  await s.outside.query('INSERT INTO gateway_external_project_budgets VALUES ($1,5000000000)', [ref.projectId]);
+  const budget = { packageId, initiatedBy: 'copilot' } as const;
+
+  const oldInsert = (sql: Pick<pg.Pool, 'query'> | pg.PoolClient, attempt: Attempt) => sql.query(
+    `INSERT INTO gateway_external_attempts(id,effect_key,project_id,generation_id,route_id,purpose,ceiling_usd_nanos,metadata,state)
+     VALUES($1,$2,$3,$4,$5,$6,$7,$8,'prepared')`,
+    [attempt.id, attempt.effectKey, attempt.projectId, attempt.generationId, attempt.routeId, attempt.purpose,
+      attempt.ceilingUsdNanos, JSON.stringify(attempt)],
+  );
+  await assert.rejects(oldInsert(s.outside, { ...legacy, id: randomUUID(), effectKey: 'unattributed' }), /budget_attribution_required/);
+  const attempt = { ...legacy, id: randomUUID(), effectKey: 'first-reserve', budget, ceilingUsdNanos: 300_000_000 };
+  const writer = await s.outside.connect();
+  try {
+    await writer.query('BEGIN');
+    await oldInsert(writer, attempt);
+    const concurrent = assert.rejects(
+      oldInsert(s.outside, { ...attempt, id: randomUUID(), effectKey: 'competing-reserve' }), /budget_reserve_wait/,
+    );
+    await writer.query('COMMIT');
+    await concurrent;
+  } finally {
+    await writer.query('ROLLBACK');
+    writer.release();
+  }
+  const restarted = new PostgresIntentJournal(s.outside, s.journal.ledgerId);
+  assert.equal((await restarted.attempt(legacy.id)).receipt?.state, 'unknown');
+  await assert.rejects(s.outside.query(
+    "UPDATE gateway_external_attempts SET metadata=metadata-'budget' WHERE id=$1", [attempt.id],
+  ), /attribution is immutable/);
+  assert.equal((await restarted.budgetBalances(ref.projectId, budget)).find(row => row.scope === 'copilot')?.reserveUsdNanos, 500_000_000);
+  await assert.rejects(oldInsert(s.outside, {
+    ...attempt, id: randomUUID(), effectKey: 'overspend-even-after-active', ceilingUsdNanos: 300_000_001,
+  }), /copilot_budget_exhausted/);
+  const rolledBack = { ...attempt, id: randomUUID(), effectKey: 'rolled-back' };
+  await restarted.cancelPrepared(attempt.id);
+  const tx = await s.outside.connect();
+  try {
+    await tx.query('BEGIN');
+    await oldInsert(tx, rolledBack);
+    await tx.query('ROLLBACK');
+  } finally {
+    tx.release();
+  }
+  assert.equal((await restarted.balance()).reserveUsdNanos, legacy.ceilingUsdNanos);
+  await assert.rejects(restarted.attempt(rolledBack.id), /attempt_not_found/);
+});
+
+test('receipt lookup waits for identity and settles a charge without declaring its missing body delivered', sqlCase, async t => {
+  const s = await setup(t);
+  const ref = project();
+  await s.gateway.openGeneration(ref);
+  await s.gateway.sealGeneration(ref, manifest);
+  await grant(s.gateway, ref);
+  await s.outside.query('INSERT INTO gateway_external_project_budgets VALUES ($1,10000000000)', [ref.projectId]);
+  const work = await lease(s.gateway, ref, 'late-verified-receipt', obligationA);
+  const budget = { packageId: randomUUID(), initiatedBy: 'copilot' } as const;
+  const input = { ...call(work), budget };
+  s.setBehavior(async () => 'disconnect');
+  const lost = isHeld(await s.gateway.call(input), 'unknown_charge');
+  assert.ok(lost.attemptId);
+  const providerId = 'controlled:' + lost.attemptId;
+  await s.journal.settle(lost.attemptId, { state: 'unknown', code: 'pending', providerId });
+  let lookupId: string | undefined;
+  let providerReply: 'pending' | 'mismatch' | 'paid' | 'body' = 'pending';
+  const transport: ModelTransport = {
+    ...s.transport,
+    async send() { assert.fail('duplicate paid send'); },
+    async lookup(attempt, observed) {
+      assert.equal(attempt.id, lost.attemptId);
+      lookupId = observed.providerId;
+      if (providerReply === 'pending') return null;
+      return {
+        receipt: { state: 'paid', providerId: providerReply === 'mismatch' ? 'different-generation' : providerId,
+          costUsdNanos: 100_000_000, evidenceRef: 'controlled-statement:' + lost.attemptId },
+        ...(providerReply === 'body' ? { output: { content: 'durable controlled result' } } : {}),
+      };
+    },
+  };
+  const restarted = new Gateway(s.db, s.journal, transport);
+  assert.equal((await restarted.recover()).unresolved, 1);
+  assert.equal(lookupId, providerId);
+  providerReply = 'mismatch';
+  assert.equal((await restarted.recover()).reserveUsdNanos, baseRoute.ceilingUsdNanos);
+  assert.equal((await restarted.call(input)).attemptId, lost.attemptId);
+  providerReply = 'paid';
+  const reconciled = await Promise.all([restarted.recover(), new Gateway(s.db, s.journal, transport).recover()]);
+  for (const result of reconciled) {
+    assert.equal(result.unresolved, 0);
+    assert.equal(result.spentUsdNanos, 100_000_000);
+    assert.equal(result.reserveUsdNanos, 0);
+  }
+  isHeld(await restarted.call(input), 'result_missing');
+  providerReply = 'body';
+  await restarted.recover();
+  const result = await restarted.call(input);
+  assert.equal(result.status, 'paid');
+  assert.equal(result.status === 'paid' && result.replay, true);
+  assert.equal((await s.read()).provider.length, 1);
+  const app = await s.db.query('SELECT budget FROM gateway_attempts WHERE id=$1', [lost.attemptId]);
+  assert.deepEqual(app.rows[0].budget, budget);
 });

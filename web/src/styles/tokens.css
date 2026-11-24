@@ -1,0 +1,17 @@
+:root {
+  --ink: #0f172a;
+  --muted: #3e505b;
+  --accent: #0b6058;
+  --accent-text: #0a4d47;
+  --warn: #c25e00;
+  --warn-text: #853d00;
+  --danger: #9b2c2c;
+  --surface: #fff;
+  --bg: #f4f6f7;
+  --font-mono: "JetBrains Mono", ui-monospace, monospace;
+  --accent-dark: var(--accent-text);
+  --warning: var(--warn-text);
+  --paper: var(--surface);
+  --line: #d6dfe1;
+  --field: #f5f8f8;
+}

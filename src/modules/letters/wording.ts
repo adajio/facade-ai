@@ -130,6 +130,11 @@ export function approveWording(
   item: LetterItem, ground: Ground, review: WordingReview | undefined, actorId: string,
 ): WordingApproval | undefined {
   const wording = item.editedWording;
+  if (ground.kind === 'clarification') {
+    if (!review && (wording === null || managedWording(wording, ground))) return undefined;
+    throw new LetterError(422, 'letter_clarification_wording_fixed',
+      'Для запроса на уточнение используйте формулировку с номером проверенной описи.', { questionId: ground.questionId });
+  }
   if (review) {
     if (wording === null) {
       throw new LetterError(422, 'letter_wording_review_unexpected', 'У этого пункта нет авторской формулировки.', {

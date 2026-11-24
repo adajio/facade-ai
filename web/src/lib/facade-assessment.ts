@@ -25,7 +25,12 @@ export type FacadeObservation = Pick<Citation, 'branch' | 'versionId' | 'documen
 
 export type FacadeType = {
   state: 'confirmed' | 'unconfirmed' | 'stale'; kind: string | null;
-  basis: { id: string; evidenceId: string; versionId: string; address: SourceAddress; quote?: string | null; revision: string } | null;
+  basis: { provenanceKind?: 'machine_verified'; id: string; evidenceId: string; versionId: string;
+    address: SourceAddress; quote?: string | null; revision: string } | OriginalBasis | null;
+};
+
+export type OriginalBasis = {
+  provenanceKind: 'engineer_override'; label: string; documentId: string; versionId: string; address: SourceAddress;
 };
 
 export type Boundary = { complete: boolean; reason: string | null; basisIds: string[] };

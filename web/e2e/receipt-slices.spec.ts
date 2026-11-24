@@ -93,7 +93,7 @@ test('Читает первую страницу нового среза и во
   await page.goto(receipts + '?workSlice=' + oldSlice + '&filter=processing');
   await expect(page.getByRole('link', { name: 'Поступление №5' })).toBeVisible();
   await page.getByRole('button', { name: 'Ещё поступления' }).click();
-  await expect(page.getByText('Срез устарел.', { exact: false })).toBeVisible();
+  await expect(page.getByText('Список обновлён по текущим данным.', { exact: false })).toBeVisible();
   await expect(page.getByRole('link', { name: 'Поступление №5' })).toHaveCount(0);
 
   const receiptPage = page.waitForRequest(request => {

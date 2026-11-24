@@ -2,6 +2,8 @@ import type { FastifyInstance, FastifyRequest } from 'fastify';
 import { AccessError, executeCommand, sendAccessError } from '../access/index.js';
 import { authorize, readSession, touchSession, uuid, type AccessActor, type SessionAccount } from '../access/auth.js';
 import { invalid, unavailable } from '../access/errors.js';
+import { journalFromEnv } from '../gateway/index.js';
+import type { PostgresIntentJournal } from '../gateway/journal.js';
 import type { CopilotMemory, MemorySource, SourceIdentity, StoredAnswer } from './contracts.js';
 import { createRuntimePdfService } from '../pdf/index.js';
 import { recordedReadAddresses, type Message, type ReadBatch } from './protocol.js';
@@ -31,12 +33,18 @@ export function publicSource(source: MemorySource) {
 
 export async function register(app: FastifyInstance) {
   let service: ReturnType<typeof createRuntimePdfService> | undefined;
+  let journal: ReturnType<typeof journalFromEnv> | undefined;
   const reader = () => service ??= createRuntimePdfService(app.db, app.config);
-  app.addHook('onClose', async () => { service?.close(); });
-  registerCopilot(app, createCopilotMemory(app.db, reader));
+  app.addHook('onClose', async () => { service?.close(); await journal?.close(); });
+  registerCopilot(app, createCopilotMemory(app.db, reader), async (projectId) => {
+    if (journal === undefined) journal = journalFromEnv();
+    return await journal?.journal.copilotBudget(projectId) ?? null;
+  });
 }
 
-export function registerCopilot(app: FastifyInstance, memory: CopilotMemory) {
+export function registerCopilot(app: FastifyInstance, memory: CopilotMemory,
+  readBudget?: PostgresIntentJournal['copilotBudget'],
+) {
   const { db } = app;
   const path = '/api/projects/:projectId/copilot';
 
@@ -57,6 +65,21 @@ export function registerCopilot(app: FastifyInstance, memory: CopilotMemory) {
     await touchSession(db, current);
     return result;
   }
+
+  app.get<{ Params: Project }>(path + '/budget', (request, reply) => {
+    reply.header('Cache-Control', 'no-store');
+    const projectId = uuid(request.params.projectId);
+    return read(request, projectId, async () => {
+      try {
+        const balance = await readBudget?.(projectId);
+        if (!balance) return { state: 'unconfigured' };
+        const { limitUsdNanos, remainingUsdNanos, frozen } = balance;
+        return { state: frozen ? 'frozen' : 'ready', limitUsdNanos, remainingUsdNanos: frozen ? 0 : remainingUsdNanos };
+      } catch {
+        return { state: 'unavailable' };
+      }
+    }, undefined, true);
+  });
 
   app.get<Search>(path + '/search', (request) => {
     const projectId = uuid(request.params.projectId);

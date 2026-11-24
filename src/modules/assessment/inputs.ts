@@ -59,7 +59,7 @@ function exclusionDate(value: unknown): string | null {
 export function parseDecision(value: unknown) {
   const input = fields(value, ["action", "reason", "requestExternal", "outcome", "observationIds", "exclusion",
     "startWorkCritical"]);
-  const action = choice(input.action, ["confirm", "correct", "exclude", "revoke"] as const);
+  const action = choice(input.action, ["confirm", "correct", "exclude", "revoke", "request_clarification"] as const);
   const base = {
     action,
     reason: shortText(input.reason, 2000),

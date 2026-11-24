@@ -1,11 +1,14 @@
 <script lang="ts">
+  import OriginalBasisFields from '../lib/OriginalBasisFields.svelte';
+  import { originalUrl, renderAddress } from '../lib/copilot';
+  import { copy } from '../lib/copy';
   import { onMount } from 'svelte';
   import { Commands } from '../lib/commands';
   import { conflictMessage, conflictVersion } from '../lib/conflict';
   import { type Catalog, type Project } from '../lib/contracts';
   import { describe, id, query, type Api } from '../lib/http';
   import { date, label } from '../lib/format';
-  import { projectApi } from '../lib/workspace';
+  import { projectApi, scopedUrl } from '../lib/workspace';
   import Notice from '../lib/Notice.svelte';
   import ProjectProposals from '../lib/ProjectProposals.svelte';
 
@@ -36,6 +39,13 @@
   let catalogVersionId = $state('');
   let stage = $state('');
   let stageReason = $state('');
+  let stageOriginal = $state('');
+  let stageAnchor = $state('');
+  let stageVersion = $state<number>();
+  let stageMode = $state<'machine' | 'manual'>();
+  let stageOptions = $state<boolean>();
+  let currentStageMode = $derived(stageMode ?? (stageOptions === false ? 'manual' : 'machine'));
+  const editStage = () => { stageVersion ??= version; };
   let busy = $state(false);
   let error = $state('');
   let status = $state('');
@@ -90,7 +100,12 @@
       await commands.send(base + path, method, body, expected);
       status = message;
       await Promise.all([refresh(), reload()]);
-      if (path === '/stage') stageReason = '';
+      if (path === '/stage') {
+        stageReason = '';
+        stageOriginal = '';
+        stageAnchor = '';
+        stageVersion = undefined;
+      }
     } catch (problem) {
       error = conflictMessage(problem, expected);
       if (conflictVersion(problem, expected)) await Promise.all([refresh(), reload()]);
@@ -172,6 +187,17 @@
     <h2>Стадия проекта</h2>
     {#if project.stage}
       <p>Подтверждённая стадия: {project.stage}</p>
+      {#if project.stageBasis?.provenanceKind === 'engineer_override'}
+        {@const basis = project.stageBasis}
+        <span class="pill good">Установлено инженером</span>
+        <a href={originalUrl(basis.documentId, basis.versionId, basis.address.locator?.page)}
+          target="_blank" rel="noopener noreferrer">{basis.label} · {renderAddress(basis.address)}</a>
+      {:else if project.stageBasis?.provenanceKind === 'machine_verified'}
+        <span class="pill">Подтверждено по цитате</span>
+        {#each project.stageBasis.evidenceIds as evidence, index (evidence)}
+          <a href={scopedUrl(project.id, 'members', { evidence })}>Открыть подтверждение {index + 1}</a>
+        {/each}
+      {/if}
     {:else if project.stageStatus === 'legacy_unconfirmed'}
       <p>Стадия проекта не подтверждена. Исторические стадии указаны в областях.</p>
     {:else}
@@ -179,7 +205,12 @@
     {/if}
     {#if project.confirmedFacadeKinds?.length}<p>Подтверждённые типы фасадов: {project.confirmedFacadeKinds.join(', ')}</p>{/if}
     {#if project.intakeMode}
-      <ProjectProposals {api} {project} disabled={busy || version == null}
+      <div class="actions" role="group" aria-label="Способ подтверждения стадии">
+        <button type="button" aria-pressed={currentStageMode === 'machine'} onclick={() => stageMode = 'machine'}>Из найденных опор</button>
+        <button type="button" aria-pressed={currentStageMode === 'manual'} onclick={() => stageMode = 'manual'}>Указать вручную по оригиналу</button>
+      </div>
+      <ProjectProposals {api} {project} disabled={busy || version == null} showStage={currentStageMode === 'machine'}
+        onStageAvailability={(available) => stageOptions = available}
         confirmStage={(stage, evidenceId) => modify('/stage', 'PUT', {
           stage, reason: 'Подтверждено по исходному документу.', evidenceIds: [evidenceId],
         }, 'Стадия проекта сохранена.')}
@@ -187,16 +218,33 @@
           facadeKinds, reason: 'Подтверждено по исходным документам.', evidenceIds,
         }, 'Типы фасадов сохранены.')} />
     {/if}
-    <details>
-      <summary>Указать стадию вручную</summary>
+    {#snippet stageForm()}
       <form onsubmit={(event) => {
         event.preventDefault();
-        void modify('/stage', 'PUT', { stage, reason: stageReason }, 'Стадия проекта сохранена.');
+        if (project.intakeMode && (!stageOriginal || !stageAnchor.trim())) return;
+        void modify('/stage', 'PUT', { stage, reason: stageReason,
+          ...(project.intakeMode ? { provenanceKind: 'engineer_override', documentVersionId: stageOriginal, pageOrAnchor: stageAnchor.trim() } : {}),
+        }, 'Стадия проекта сохранена.', stageVersion ?? version);
       }}>
-        <label>Код стадии<input required maxlength="200" bind:value={stage} /></label>
-        <label>Основание подтверждения<input required maxlength="500" bind:value={stageReason} /></label>
-        <div class="actions"><button class="primary" disabled={busy || version == null || !stage.trim() || !stageReason.trim()}>Подтвердить стадию проекта</button></div>
+        <label>Код стадии<input required maxlength="200" bind:value={stage} oninput={editStage} /></label>
+        {#if project.intakeMode}
+          <OriginalBasisFields {api} projectId={project.id} bind:versionId={stageOriginal} bind:anchor={stageAnchor} edit={editStage} />
+        {/if}
+        <label>Комментарий инженера<textarea required maxlength={project.intakeMode ? 2000 : 500}
+          bind:value={stageReason} oninput={editStage}></textarea></label>
+        <div class="actions">
+          <button class="primary" disabled={busy || version == null || !stage.trim() || !stageReason.trim() ||
+            (project.intakeMode && (!stageOriginal || !stageAnchor.trim()))}>Подтвердить стадию проекта</button>
+          {#if stageVersion !== undefined && stageVersion !== version}
+            <button type="button" onclick={() => { stageVersion = version; }}>{copy.refreshAndCompare}</button>
+          {/if}
+        </div>
       </form>
-    </details>
+    {/snippet}
+    {#if project.intakeMode}
+      {#if currentStageMode === 'manual'}{@render stageForm()}{/if}
+    {:else}
+      <details><summary>Указать стадию вручную</summary>{@render stageForm()}</details>
+    {/if}
   </section>
 </div>

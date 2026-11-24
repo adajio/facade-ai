@@ -1,14 +1,16 @@
 <script lang="ts">
-  import { onDestroy } from 'svelte';
+  import { onDestroy, tick } from 'svelte';
   import { Commands } from '../lib/commands';
   import { describe, id, query, type Api } from '../lib/http';
   import { date, label } from '../lib/format';
-  import { originalUrl, renderAddress, representations, sourceVersions,
-    type CopilotQuestion, type OriginalSource, type SearchResult, type SourceDetail, type VersionDetail } from '../lib/copilot';
+  import { formatBudget, originalUrl, renderAddress, representations, sourceVersions,
+    type CopilotBudget, type CopilotQuestion, type OriginalSource, type SearchResult, type SourceDetail, type VersionDetail } from '../lib/copilot';
   import { projectApi, scopedUrl, type WorkspaceProps } from '../lib/workspace';
   import Notice from '../lib/Notice.svelte';
 
-  let { api, context }: { api: Api; context: WorkspaceProps } = $props();
+  let { api, context, navigate, budget }: {
+    api: Api; context: WorkspaceProps; navigate: (path: string) => boolean; budget?: CopilotBudget;
+  } = $props();
   const commands = new Commands(() => api);
   const mounted = new AbortController();
   onDestroy(() => mounted.abort());
@@ -22,7 +24,8 @@
     route_denied: 'Для этого проекта модельный маршрут недоступен. Поиск по источникам работает.',
     route_data_unapproved: 'Для этого состава оригиналов требуется допуск маршрута.',
     analysis_replay_only: 'Шлюз может воспроизвести только ранее учтённые ходы.',
-    budget_exhausted: 'Свободная сумма в журнале шлюза исчерпана.',
+    budget_exhausted: 'Лимит обработки исчерпан. Сохранённые ответы и поиск по источникам доступны.',
+    copilot_budget_exhausted: 'Лимит Помощника исчерпан. Сохранённые ответы и поиск по источникам доступны.',
     budget_frozen: 'Технический оператор сверяет журнал шлюза.',
     unknown_charge: 'Техническому оператору нужно сверить исход отправки.',
     journal_unavailable: 'Журнал шлюза недоступен.',
@@ -59,14 +62,38 @@
   let sourceProblem = $state('');
   let base = $derived(projectApi(context.project.id) + '/copilot');
   let sourceId = $derived(context.params.get('source'));
+  let questionId = $derived(context.objectId);
+  let scopeId = $derived(context.scopeId);
+  let refreshKey = $derived(context.refreshKey);
+  let canEdit = $derived(context.canEdit);
   let versionId = $derived(context.params.get('version'));
   let unitId = $derived(context.params.get('unit'));
   let boxText = $derived(context.params.get('box'));
   let address = $derived(unitId ? (boxText ? unitId + ' · область ' + boxText + ' пт' : unitId) : 'Карта готовится');
   let page = $derived(version?.mediaType === 'application/pdf' && unitId && /^[1-9][0-9]{0,7}$/.test(unitId) ? Number(unitId) : undefined);
+  let sourceFocus: HTMLElement | undefined;
+  let budgetHeld = $derived(budget?.state === 'frozen' || (budget?.state === 'ready' && budget.remainingUsdNanos === 0));
+  let closeSourceButton = $state<HTMLButtonElement>();
 
   function projectLink(source?: string | null, questionId = context.objectId) {
     return scopedUrl(context.project.id, 'copilot', { scope: context.scopeId, source }, questionId);
+  }
+
+  function openSource(event: MouseEvent, key: string) {
+    if (event.button !== 0 || event.ctrlKey || event.metaKey || event.shiftKey || event.altKey) return;
+    event.preventDefault();
+    sourceFocus = event.currentTarget as HTMLElement;
+    if (navigate(projectLink(key))) void tick().then(() => closeSourceButton?.focus({ preventScroll: true }));
+  }
+
+  function closeSource() {
+    if (navigate(projectLink())) void tick().then(() => sourceFocus?.focus());
+  }
+
+  function keyboard(event: KeyboardEvent) {
+    if (event.key !== 'Escape' || event.defaultPrevented || !sourceId) return;
+    event.preventDefault();
+    closeSource();
   }
 
   function requestSearch(event: SubmitEvent) {
@@ -79,9 +106,9 @@
   let reload = $state(0);
   $effect(() => {
     void reload;
-    void context.refreshKey;
+    void refreshKey;
     const q = submittedSearch;
-    const path = query(base + '/search', { q, scopeId: context.scopeId });
+    const path = query(base + '/search', { q, scopeId });
     if (!q) return;
     return poll((signal) => api.json<SearchResult>(path, { signal }), (value, problem) => {
       search = value;
@@ -90,12 +117,12 @@
   });
 
   $effect(() => {
-    void context.refreshKey;
-    const key = context.objectId;
+    void refreshKey;
+    const key = questionId;
     const path = base;
     question = undefined;
     questionProblem = '';
-    if (!context.canEdit || !key) return;
+    if (!canEdit || !key) return;
     return poll((signal) => api.json<CopilotQuestion>(path + '/questions/' + id(key), { signal }), (value, problem) => {
       question = value;
       questionProblem = problem;
@@ -103,13 +130,13 @@
   });
 
   $effect(() => {
-    void context.refreshKey;
+    void refreshKey;
     const key = sourceId;
     const path = base;
     source = undefined;
     sourceProblem = '';
     if (!key) return;
-    return poll((signal) => api.json<SourceDetail>(query(path + '/sources', { id: key, scopeId: context.scopeId }), { signal }), (value, problem) => {
+    return poll((signal) => api.json<SourceDetail>(query(path + '/sources', { id: key, scopeId }), { signal }), (value, problem) => {
       source = value;
       sourceProblem = problem;
     });
@@ -147,13 +174,13 @@
 
   async function ask(event: SubmitEvent) {
     event.preventDefault();
-    if (busy || !questionText.trim()) return;
+    if (busy || budgetHeld || !questionText.trim()) return;
     busy = true;
     submissionProblem = '';
     try {
       const created = await commands.send<{ id: string }>(base + '/questions', 'POST',
         { question: questionText.trim() }, undefined, mounted.signal);
-      if (!mounted.signal.aborted) window.location.assign(projectLink(null, created.id));
+      if (!mounted.signal.aborted && navigate(projectLink(null, created.id))) questionText = '';
     } catch (error) {
       if (!mounted.signal.aborted) submissionProblem = describe(error);
     } finally {
@@ -161,6 +188,8 @@
     }
   }
 </script>
+
+<svelte:window onkeydown={keyboard} />
 
 {#snippet limits(items: string[])}
   {#if items.length}
@@ -174,7 +203,7 @@
   <ul class="plain-list copilot-sources">
     {#each items as item (item.id)}
       <li>
-        <a href={projectLink(item.id)}>{item.label} · {renderAddress(item.address)}</a>
+        <a class="source-chip" href={projectLink(item.id)} onclick={(event) => openSource(event, item.id)}>{item.label} · {renderAddress(item.address)}</a>
         <p class="meta">{sourceVersions[item.version]} · {item.window ? 'Осталось проверить' : representations[item.representation]}</p>
         {#if item.text}<blockquote>{item.text}</blockquote>{/if}
         {@render limits(item.limitations)}
@@ -183,12 +212,23 @@
   </ul>
 {/snippet}
 
+<div class="copilot-layout">
 {#if context.canEdit}
   <section class="card">
     <h2>Задать вопрос по комплекту</h2>
+    {#if budget?.state === 'ready'}
+      <p class="meta">Остаток лимита помощника <strong class="numeric">{formatBudget(budget.remainingUsdNanos)}</strong></p>
+      {#if budgetHeld}<Notice message={reasons.copilot_budget_exhausted} />{/if}
+    {:else if budget?.state === 'frozen'}
+      <Notice message={reasons.budget_frozen} />
+    {:else if budget?.state === 'unconfigured'}
+      <p class="meta">Лимит Помощника для проекта ещё не установлен.</p>
+    {:else if budget?.state === 'unavailable'}
+      <p class="meta">Остаток лимита пока недоступен.</p>
+    {/if}
     <form onsubmit={ask}>
       <label>Вопрос инженера<textarea required maxlength="2000" bind:value={questionText}></textarea></label>
-      <button type="submit" class="primary" disabled={busy}>Спросить помощника</button>
+      <button type="submit" class="primary" disabled={busy || budgetHeld}>Спросить помощника</button>
     </form>
     <Notice kind="error" message={submissionProblem} />
     {#if context.objectId}
@@ -198,7 +238,7 @@
         <h3>{question.question}</h3>
         <p role="status"><strong>{statuses[question.state]}</strong>{#if question.reason} · {reasons[question.reason] ?? label(question.reason)}{/if}</p>
         {#if question.state === 'historical'}
-          <p>Ответ сохранён по срезу от {date(question.asOf)}.</p>
+          <p>Ответ сохранён по данным от {date(question.asOf)}.</p>
           <Notice message="Чтобы проверить действующие материалы, отправьте новый вопрос. Действует общий лимит шлюза." />
           <button type="button" onclick={() => questionText = question?.question ?? ''}>Подставить вопрос</button>
         {/if}
@@ -211,7 +251,8 @@
           <p class="answer">{claim.text}</p>
           <ul class="plain-list">
             {#each (question.citations ?? []).filter(({ id }) => claim.sources.includes(id)) as citation (citation.id)}
-              <li><a href={projectLink(citation.id)}>{citation.label} · {renderAddress(citation.address)}</a></li>
+              <li><a class="source-chip" href={projectLink(citation.id)} onclick={(event) => openSource(event, citation.id)}>
+                {citation.label} · {renderAddress(citation.address)}</a></li>
             {/each}
           </ul>
         {/each}
@@ -254,8 +295,10 @@
 {/if}
 
 {#if sourceId}
-  <section class="card">
-    <div class="card-header"><h2>{context.canEdit ? 'Адрес в оригинале' : 'Опубликованный фрагмент'}</h2><a href={projectLink()}>Закрыть</a></div>
+  <aside class="card source-panel" aria-label="Источник помощника">
+    <div class="card-header"><h2>{context.canEdit ? 'Адрес в оригинале' : 'Опубликованный фрагмент'}</h2>
+      <button class="quiet" type="button" bind:this={closeSourceButton} onclick={closeSource}>Закрыть</button>
+    </div>
     <Notice kind="error" message={sourceProblem} />
     {#if source?.mode === 'originals'}
       {@const item = source.source}
@@ -274,6 +317,9 @@
         </details>
       {/if}
       {@render limits(item.limitations)}
+      {#if typeof item.address.locator?.page === 'number' && item.address.locator.page > 0}
+        <iframe title={'Страница оригинала · ' + item.label} src={originalUrl(item.documentId, item.versionId, item.address.locator.page)}></iframe>
+      {/if}
       <a href={originalUrl(item.documentId, item.versionId, item.address.locator?.page)} target="_blank" rel="noopener noreferrer">Открыть оригинал этой версии</a>
     {:else if source?.mode === 'publications'}
       <p>Страница {source.source.page}</p>
@@ -281,7 +327,7 @@
     {:else if !sourceProblem}
       <p role="status">Проверяем доступ к источнику…</p>
     {/if}
-  </section>
+  </aside>
 {/if}
 
 {#if versionId && context.canEdit}
@@ -335,9 +381,21 @@
     <p role="status">Ищем совпадения…</p>
   {/if}
 </section>
+</div>
 
 <style>
   .copilot-sources li { border-top: 1px solid var(--line, #d7dce0); padding-block: .5rem; }
   .copilot-sources p { margin-block: .3rem; }
   blockquote, .answer { white-space: pre-wrap; overflow-wrap: anywhere; }
+  .source-chip { display: inline-flex; align-items: center; min-height: 40px; padding: 4px 10px;
+    border: 1px solid var(--line); background: var(--field); border-radius: 6px; }
+  .source-panel { min-width: 0; overflow-wrap: anywhere; }
+  .source-panel iframe { display: block; width: 100%; min-height: 45dvh; border: 1px solid var(--line); margin-block: 8px; }
+  @media (min-width: 1141px) {
+    .copilot-layout:has(.source-panel) { display: grid; grid-template-columns: minmax(0, 45fr) minmax(0, 55fr); gap: 12px; align-items: start; }
+    .source-panel { position: sticky; top: 64px; grid-column: 2; grid-row: 1 / span 4; max-height: calc(100dvh - 76px); overflow: auto; }
+  }
+  @media (max-width: 850px) {
+    .source-panel { position: fixed; inset: 0; z-index: 10; border-radius: 0; margin: 0; overflow: auto; }
+  }
 </style>

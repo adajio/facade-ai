@@ -7,6 +7,7 @@
   import { V1, scopedUrl, type OpenEvidence, type WorkspaceProps } from '../lib/workspace';
   import Notice from '../lib/Notice.svelte';
   import WorkJob, { type Job } from './DocumentJob.svelte';
+  import { pageCache } from '../lib/page-cache';
 
   type Unit = { id: string; label?: string; locator?: Record<string, string | number> };
   type ReaderMap = { source: { documentId: string; versionId: string; sha256: string }; units: Unit[] };
@@ -31,6 +32,8 @@
   let heading: HTMLHeadingElement;
   let viewer = $state<HTMLHeadingElement>();
   let refreshWork = $state(0);
+  let fullPdf = $state(false);
+  let preview = $state<{ key: string; url?: string }>();
 
   const documentId = $derived(occurrence.documentId);
   const versionId = $derived(occurrence.versionId);
@@ -48,9 +51,45 @@
   const page = $derived(selectedPage !== undefined && (!pages.length || pages.includes(selectedPage))
     ? selectedPage : pages[0] ?? 1);
   const pdfUrl = $derived(original + '#page=' + page);
+  const previewKey = $derived(ready && isPdf && !fullPdf && !context.masked && originalHash &&
+    selectedPage !== undefined && pages.includes(page) ? [context.project.id, versionId, originalHash, page].join('/') : undefined);
+
+  $effect(() => {
+    const key = previewKey;
+    if (!key) return;
+    const stop = new AbortController();
+    const generation = pageCache.generation;
+    const expected = '"sha256-' + originalHash + '"';
+    const url = V1 + path.slice(4) + '/reader/pages/' + page;
+    const cached = pageCache.get(key);
+    if (cached) {
+      preview = { key, url: cached };
+      return () => { preview = undefined; };
+    }
+    const { signal } = stop;
+    const fetchPage = async () => {
+      const response = await api.response(url, { signal }).catch(async (error) => {
+        if (!(error instanceof ApiError) || error.code !== 'reader_resource_wait') throw error;
+        await new Promise<void>((resolve) => setTimeout(resolve, 350));
+        signal.throwIfAborted();
+        return api.response(url, { signal });
+      });
+      if (response.headers.get('ETag') !== expected || response.headers.get('Content-Type')?.split(';')[0] !== 'image/png') {
+        throw new Error('Неверная версия страницы');
+      }
+      const body = await response.blob();
+      signal.throwIfAborted();
+      if (generation === pageCache.generation) preview = { key, url: pageCache.add(key, body, generation) };
+    };
+    void fetchPage().catch(() => {
+      if (!signal.aborted) preview = { key };
+    });
+    return () => { stop.abort(); preview = undefined; };
+  });
 
   $effect(() => {
     void versionId;
+    fullPdf = false;
     void tick().then(() => heading?.focus());
   });
 
@@ -171,7 +210,7 @@
   </div>
   <Notice kind="error" message={originalError} />
   {#if !ready && !originalError && !workError}<p role="status">Проверяем доступ к оригиналу…</p>{/if}
-  {#if selectedPage !== undefined && ready && isPdf}
+  {#if selectedPage !== undefined && ready && isPdf && !context.masked}
     <section class="original" aria-labelledby="document-viewer">
       <div class="card-header">
         <h3 id="document-viewer" tabindex="-1" bind:this={viewer}>Оригинал PDF</h3>
@@ -182,15 +221,26 @@
         <span aria-live="polite">Страница {page}{pages.length ? ' из ' + pages.length : ''}</span>
         <button type="button" disabled={!pages.length || page >= pages.at(-1)!} onclick={() => setPage(page + 1)}>Следующая страница</button>
         <a href={pdfUrl} target="_blank" rel="noopener">Открыть PDF в новой вкладке</a>
+        {#if previewKey || fullPdf}
+          <button type="button" class="quiet" onclick={() => fullPdf = !fullPdf}>
+            {fullPdf ? 'Быстрый просмотр страницы' : 'Полный просмотр PDF'}
+          </button>
+        {/if}
       </div>
-      {#key pdfUrl}
-        <iframe title={'Оригинал PDF, страница ' + page} src={pdfUrl}></iframe>
-      {/key}
+      {#if previewKey && preview?.key !== previewKey}
+        <p role="status">Готовим страницу {page}…</p>
+      {:else if previewKey && preview?.url}
+        <img class="page-preview" alt={'Оригинал PDF, страница ' + page} src={preview.url} />
+      {:else}
+        {#key pdfUrl}
+          <iframe title={'Оригинал PDF, страница ' + page} src={pdfUrl}></iframe>
+        {/key}
+      {/if}
     </section>
   {/if}
   <dl class="details">
-    <dt>Версия оригинала</dt><dd>{occurrence.versionId}</dd>
-    <dt>SHA-256</dt><dd>{occurrence.sha256 ?? '—'}</dd>
+    <dt>Версия оригинала</dt><dd class="numeric">{occurrence.versionId}</dd>
+    <dt>SHA-256</dt><dd class="numeric">{occurrence.sha256 ?? '—'}</dd>
     <dt>Фактический тип</dt><dd>{occurrence.mediaType ?? '—'}</dd>
     {#if occurrence.restriction}<dt>Ограничение</dt><dd>{label(occurrence.restriction)}</dd>{/if}
   </dl>
@@ -248,5 +298,7 @@
 <style>
   .original { margin-block: 1rem; }
   iframe { width: 100%; height: max(24rem, 64dvh); border: 1px solid var(--line); margin-top: .6rem; }
+  .page-preview { display: block; width: auto; max-width: 100%; max-height: max(24rem, 64dvh);
+    object-fit: contain; border: 1px solid var(--line); margin: .6rem auto 0; }
   .unit-list { display: flex; flex-wrap: wrap; align-items: center; gap: .4rem .7rem; }
 </style>

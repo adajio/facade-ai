@@ -5,11 +5,12 @@
   import { projectV1, scopedUrl, type OpenEvidence, type WorkspaceProps } from '../lib/workspace';
   import Notice from '../lib/Notice.svelte';
 
-  let { api, context, summary, open }: {
+  let { api, context, summary, open, facts = false, preselectedFacade }: {
     api: Api; context: WorkspaceProps; summary: FacadeAssessment; open: OpenEvidence;
+    facts?: boolean; preselectedFacade?: string | null;
   } = $props();
   let binding = $derived(context.params.get('binding') ?? '');
-  let facadeId = $derived(context.params.get('facadeId') ?? '');
+  let facadeId = $derived(context.params.get('facadeId') ?? preselectedFacade ?? '');
   let after = $derived(context.params.get('after') ?? '');
   type ObservationPage = { version: number; items: FacadeObservation[]; nextCursor: string | null };
   let observations = $state<ObservationPage>();
@@ -34,7 +35,8 @@
   });
 
   function href(cursor?: string | null) {
-    return scopedUrl(context.project.id, 'completeness', { binding, facadeId, revision: summary.version, after: cursor });
+    return scopedUrl(context.project.id, facts ? 'facts' : 'completeness',
+      { binding, facadeId, context: context.params.get('context'), revision: summary.version, after: cursor });
   }
 
   function evidenceId(href: string) {

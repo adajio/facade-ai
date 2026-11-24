@@ -3,6 +3,15 @@ import type { Pool, PoolClient } from 'pg';
 
 export const BUDGET_USD_NANOS = 10_000_000_000;
 
+export type BudgetAttribution = {
+  initiatedBy: 'background' | 'copilot';
+  packageId?: string;
+};
+
+export function sameBudget(left?: BudgetAttribution, right?: BudgetAttribution): boolean {
+  return left?.initiatedBy === right?.initiatedBy && left?.packageId === right?.packageId;
+}
+
 export type Purpose = 'local' | 'primary_a' | 'primary_b' | 'review';
 export type ModelPurpose = Exclude<Purpose, 'local'>;
 export type GenerationRef<S extends string | null = string> = { projectId: string; scopeId: S; generationId: string };
@@ -51,6 +60,7 @@ export type Attempt = QueueTarget & {
   revision: string;
   ceilingUsdNanos: number;
   previousRejectedId: string | null;
+  budget?: BudgetAttribution;
   pricingFingerprint?: string;
   dataClass?: string;
 };
@@ -88,6 +98,7 @@ export type CallInput = {
   request: unknown;
   inputRefs: readonly string[];
   retryRejectedAttemptId?: string;
+  budget?: BudgetAttribution;
 };
 
 export type CallResult =
@@ -111,7 +122,8 @@ export type ModelTransport = {
   requestBlock?(route: RoutePolicy, request: unknown): string | null;
   authorize?(tx: PoolClient, route: RoutePolicy, context: ModelAuthorization): Promise<boolean | string>;
   send(attempt: Attempt, route: RoutePolicy, request: unknown, signal: AbortSignal): Promise<ProviderOutcome>;
-  lookup?(attempt: Attempt): Promise<ProviderOutcome | null>;
+  // Return a known outcome only with evidence tied to this attempt or the observed provider ID.
+  lookup?(attempt: Attempt, observed: { providerId?: string }): Promise<ProviderOutcome | null>;
 };
 
 export function encode(value: unknown): string {

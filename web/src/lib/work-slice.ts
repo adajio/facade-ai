@@ -15,11 +15,13 @@ export type WorkSlice = Position & {
   catalogAssigned: boolean;
   confirmedBytes: number;
   acceptedOccurrences: number;
+  files?: { accepted: number; prepared: number };
   totals: Record<WorkReceiptFilter, number>;
   filters: { filter: WorkReceiptFilter; total: number }[];
   readings: { state: 'ready' | 'leased' | 'done' | 'held'; branch: 'A' | 'B' | null; total: number }[];
   activeReceipt: { receiptId: string; number: number; filter: WorkReceiptFilter } | null;
-  assessment: { kind: 'scope' | 'facade'; version: number; outcome: string; covered: number; total: number } | null;
+  assessment: { kind: 'scope' | 'facade'; version: number; outcome: string; covered: number;
+    checked?: number; conflicts?: number; total: number } | null;
 };
 
 export function workSliceApi(projectId: string, workSliceId = 'current') {

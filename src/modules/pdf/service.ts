@@ -320,6 +320,29 @@ export function createReaderService(db: Pool, deps: ReaderDependencies, adapters
     });
   }
 
+  async function previewPdfPage(sourceRef: SourceRef, page: number, tx: PoolClient) {
+    const source = checkedSource(sourceRef);
+    const { rows: [slot] } = await tx.query<{ acquired: boolean }>(
+      "SELECT pg_try_advisory_xact_lock(hashtextextended('facade/heavy-local-slot',0)) AS acquired",
+    );
+    if (!slot.acquired) throw new ReaderError('reader_resource_wait', 'Просмотрщик занят', 503);
+    const { original, adapter, version } = await describe(source, tx);
+    const unitId = String(page);
+    const unit = adapter.format === 'pdf' ? (await lookupMap(source, version, tx))?.units.find(({ id }) => id === unitId) : undefined;
+    if (!unit?.width || !unit.height) throw new ReaderError('reader_address_invalid', 'Страница пока недоступна для предпросмотра', 422);
+    const dpi = Math.floor(Math.min(144, 72 * 1600 / Math.max(unit.width, unit.height)));
+    if (original.size > 32 * 1024 ** 2 || dpi < 36) {
+      throw new ReaderError('pdf_preview_limit', 'Откройте страницу в полном просмотрщике PDF', 422);
+    }
+    return withOriginal(original, deps, async path => {
+      const output = await adapter.read(path, { representation: 'render', address: { unitId }, dpi }, unit);
+      if (output.address.unitId !== unitId || output.mediaType !== 'image/png' || output.bytes.length > 4 * 1024 ** 2) {
+        throw new ReaderError('pdf_preview_limit', 'Откройте страницу в полном просмотрщике PDF', 422);
+      }
+      return output.bytes;
+    });
+  }
+
   async function lookupMap(source: SourceRef, version: string, tx?: PoolClient): Promise<PageMap | undefined> {
     const { rows } = await (tx ?? db).query<MapRow>(
       `SELECT * FROM reader_maps
@@ -678,7 +701,7 @@ export function createReaderService(db: Pool, deps: ReaderDependencies, adapters
       );
       if (rows[0]) return mapFromRow(rows[0]);
     },
-    open, pin, findEvidence, content, readPdfFragment, materializeNative, readMaterializedNative, verifyNativeDeliveryLine,
+    open, pin, findEvidence, content, readPdfFragment, previewPdfPage, materializeNative, readMaterializedNative, verifyNativeDeliveryLine,
     async findObservation(projectId: string, id: string): Promise<Observation | undefined> {
       const { rows } = await db.query<{ payload: Observation }>(
         'SELECT payload FROM reader_observations WHERE project_id = $1 AND id = $2', [projectId, id],

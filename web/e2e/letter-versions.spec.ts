@@ -3,7 +3,7 @@ import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
-import { accepted, admin, command, pdf, signIn, unique } from './synthetic';
+import { accepted, admin, applyFixtureReview, command, pdf, signIn, unique } from './synthetic';
 
 test('Основания, клавиатура, письмо, досылка и конфликт вкладок', async ({ page, baseURL }) => {
   const build = process.env.FACADE_E2E_BUILD_DIR;
@@ -49,14 +49,16 @@ test('Основания, клавиатура, письмо, досылка и 
     })).ok()).toBe(true);
     const original = await accepted<{ documentId: string; versionId: string }>(await command(ctx, origin, uploadPath + '/complete', 'POST', {}), 'Финализация');
     expect((await command(ctx, origin, receiptPath + '/seal', 'POST', {})).ok()).toBe(true);
-    const assessment = await accepted<{ questions: { id: string }[] }>(await ctx.request.get(current), 'Оценка');
+    const hints = await tools.observations(db, { ...original, projectId: project.id, sha256: sourceHash }, scopeId, 'NOT INCLUDED');
     const snapshot = await accepted<{ holds: { id: string }[]; scopes?: { holds: { id: string }[] }[] }>(await ctx.request.get(base + '/snapshot?scopeId=' + scopeId), 'Срез');
     const hold = (snapshot.holds ?? snapshot.scopes?.[0]?.holds ?? []).find((item) => item.id === upload.holdId);
     expect(hold).toBeTruthy();
-    const hints = await tools.observations(db, { ...original, projectId: project.id, sha256: sourceHash }, scopeId, 'NOT INCLUDED');
-    await tools.applyImpact(db, project.id, hold, [{
-      scopeId, changes: assessment.questions.map((item) => tools.review(item, assessment, hints, 'absence', receipt.receiptId)),
-    }]);
+    await applyFixtureReview(async () => {
+      const assessment = await accepted<{ questions: { id: string }[] }>(await ctx.request.get(current), 'Оценка');
+      await tools.applyImpact(db, project.id, hold, [{
+        scopeId, changes: assessment.questions.map((item) => tools.review(item, assessment, hints, 'absence', receipt.receiptId)),
+      }]);
+    });
     const completeness = projectPath + '/completeness?scope=' + scopeId;
     await page.goto(completeness);
     await second.goto(completeness);
@@ -84,7 +86,8 @@ test('Основания, клавиатура, письмо, досылка и 
     await expect(second.getByText('Ваш ввод сохранён.', { exact: false })).toBeVisible();
     await expect(second.getByLabel('Основание решения')).toHaveValue('Ввод другой вкладки сохранён');
 
-    await page.getByRole('link', { name: 'Письма' }).click();
+    await page.getByRole('button', { name: 'Разделы · Комплектность' }).click();
+    await page.getByRole('navigation', { name: 'Разделы проекта' }).getByRole('link', { name: 'Письма' }).click();
     await page.getByRole('combobox', { name: 'Адресат', exact: true }).selectOption(recipient);
     await page.getByRole('checkbox', { name: /узел крепления/ }).check();
     await page.getByRole('button', { name: 'Сформировать черновик' }).click();

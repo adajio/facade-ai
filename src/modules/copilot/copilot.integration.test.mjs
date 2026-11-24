@@ -88,12 +88,13 @@ test('engineer question reopens originals through the gateway and restricted sea
     await rm(dataDir, { recursive: true, force: true });
   });
 
+  const ledgerId = id();
+  Object.assign(process.env, { FACADE_GATEWAY_JOURNAL_URL: journalUrl, FACADE_GATEWAY_LEDGER_ID: ledgerId });
+  await ledgerDb.query('INSERT INTO gateway_external_ledger(ledger_id) VALUES($1)', [ledgerId]);
   app = await createApi({ databaseUrl, dataDir, host: '127.0.0.1', port });
   const db = app.db;
   reader = createRuntimePdfService(db, { dataDir });
   const memory = createCopilotMemory(db, () => reader);
-  const ledgerId = id();
-  await ledgerDb.query('INSERT INTO gateway_external_ledger(ledger_id) VALUES($1)', [ledgerId]);
   const journal = new PostgresIntentJournal(ledgerDb, ledgerId);
   const organization = id(), project = id(), anotherProject = id(), scope = id();
   const engineer = id(), restricted = id();
@@ -160,6 +161,9 @@ test('engineer question reopens originals through the gateway and restricted sea
   }
   console.info('Copilot fixture: original XLSX and PDF indexed');
   const base = '/api/projects/' + project + '/copilot';
+  assert.deepEqual(await get(base + '/budget'), { state: 'unconfigured' });
+  assert.equal((await inject(base + '/budget', { token: participantToken })).statusCode, 404);
+  assert.equal((await inject('/api/projects/' + anotherProject + '/copilot/budget')).statusCode, 404);
   const pub = id();
   await db.query(`INSERT INTO fragment_publications(id,project_id,scope_id,document_id,original_version_id,original_sha256,reader_version,page,box,quote)
     VALUES($1,$2,$3,$4,$5,$6,'fixture',1,'{"x":10,"y":10,"height":5,"width":7}','Permitted synthetic quote')`,
@@ -195,21 +199,43 @@ test('engineer question reopens originals through the gateway and restricted sea
   const route = { routeId: 'fixture-copilot', model: 'managed/copilot', dataClass: 'synthetic', maxTokens: 850 };
   const policy = { id: route.routeId, revision: 'fixture-v1', transport: 'managed', enabled: true,
     maxRequestBytes: 1_000_000, ceilingUsdNanos: 1, timeoutMs: 4000 };
-  const gateway = createGateway(db, {
+  const historicCost = 1;
+  const fraction = 1_000_000_000;
+  const limitRoute = { ...route, routeId: 'fixture-copilot-limit' };
+  const limitPolicy = { ...policy, id: limitRoute.routeId, ceilingUsdNanos: fraction / 4 };
+  const gatewayOptions = {
     journal, researchAdmission: copilotModelAdmission(), reviewAdmission: async () => 'early',
     transport: {
       kind: 'managed',
       async send(attempt, _, request) {
-        const question = request.messages[1].content;
         sent.push({ attempt, request });
+        const paid = (output, costUsdNanos = 0) => ({
+          output,
+          receipt: { state: 'paid', costUsdNanos, providerId: 'fixture-' + attempt.id, evidenceRef: 'fixture:' + attempt.id },
+        });
+        if (attempt.purpose === 'primary_a') return paid({ result: 'background' }, attempt.ceilingUsdNanos);
+        const question = request.messages[1].content;
         assert.doesNotMatch(JSON.stringify(request), /OTHER_PROJECT_PRIVATE|Permitted synthetic quote/);
         if (question === 'UNKNOWN') return { receipt: { state: 'unknown', code: 'fixture_unknown' } };
         const toolReplies = request.messages.filter(({ role }) => role === 'tool').map(({ content }) => JSON.parse(content));
         const research = question === 'OCR';
-        const paid = (output) => ({
-          output,
-          receipt: { state: 'paid', costUsdNanos: 0, providerId: 'fixture-' + attempt.id, evidenceRef: 'fixture:' + attempt.id },
-        });
+        if (question === 'D11') {
+          const [found, openedSource, ocr] = toolReplies;
+          const quarter = limitPolicy.ceilingUsdNanos;
+          // The old paid receipt and the open unknown reserve already occupy part of the share.
+          if (!found) return paid(responseTool(attempt, 'search_sources', { query: 'Thickness' }),
+            quarter - historicCost - policy.ceilingUsdNanos);
+          if (!openedSource) return paid(responseTool(attempt, 'open_source', {
+            sourceId: found.sources.find(({ versionId }) => versionId === table.versionId).sourceId,
+          }), quarter);
+          if (!ocr) return paid(responseTool(attempt, 'research_source', {
+            sourceId: found.unresolvedWindows.find(({ versionId }) => versionId === drawing.versionId).sourceId,
+            reason: 'Сверить растровую надпись',
+          }), quarter);
+          assert.equal(ocr.source.representation, 'ocr');
+          assert.equal(ocr.source.versionId, drawing.versionId);
+          return paid(responseTool(attempt, 'search_sources', { query: 'Thickness' }), quarter);
+        }
         if (question === 'READ_BATCH_REPLAY') {
           const turn = sent.filter((item) => item.request.messages[1].content === question).length;
           if (turn <= 6) {
@@ -312,10 +338,11 @@ test('engineer question reopens originals through the gateway and restricted sea
               limitations: ['Применимость к другим фасадам требует сверки.'] };
           }
         }
-        return paid(responseTool(attempt, name, args));
+        return paid(responseTool(attempt, name, args), attempt.budget ? 0 : historicCost);
       },
     },
-  });
+  };
+  const gateway = createGateway(db, gatewayOptions);
   await gateway.configureRoute(policy);
   await gateway.grantRoute({ projectId: project, routeId: route.routeId, revision: policy.revision,
     purpose: 'review', dataClass: route.dataClass, allowed: true });
@@ -351,7 +378,10 @@ test('engineer question reopens originals through the gateway and restricted sea
   assert.equal(await gateway.checkpoint(activePrimary.lease, primaryCursor), true);
   assert.equal(await next({ route }), true);
   let failCheckpoint = true;
+  // Write the first paid response as an older worker did, before configuring the project budget.
+  const legacyGateway = createGateway(db, { ...gatewayOptions, researchAdmission: undefined });
   const interruptedGateway = new Proxy(gateway, { get(target, property) {
+    if (property === 'call') return ({ budget: _budget, ...input }) => legacyGateway.call(input);
     if (property === 'checkpoint' && failCheckpoint) return async () => {
       failCheckpoint = false;
       throw new Error('fixture stops after a paid response');
@@ -360,9 +390,19 @@ test('engineer question reopens originals through the gateway and restricted sea
     return typeof member === 'function' ? member.bind(target) : member;
   }});
   await assert.rejects(next({ route, gateway: interruptedGateway }), /fixture stops after a paid response/);
+  await ledgerDb.query('INSERT INTO gateway_external_project_budgets VALUES($1,$2)', [project, fraction * 10]);
   await db.query("UPDATE gateway_jobs SET lease_until=clock_timestamp() - interval '1 second' WHERE kind=$1 AND state='leased'", [copilotKind]);
   assert.equal(await next({ route, workerId: id() }), true);
   assert.equal(sent.length, 3);
+  assert.equal(sent[0].attempt.budget, undefined);
+  const { rows: [historicalAttempt] } = await db.query(
+    'SELECT budget,state,receipt FROM gateway_attempts WHERE id=$1', [sent[0].attempt.id]);
+  assert.equal(historicalAttempt.budget, null);
+  assert.equal(historicalAttempt.state, 'paid');
+  assert.equal(historicalAttempt.receipt.costUsdNanos, historicCost);
+  for (const { attempt } of sent.slice(1)) {
+    assert.deepEqual(attempt.budget, { initiatedBy: 'copilot', packageId: project });
+  }
   const answer = await get(questionPath);
   assert.equal(answer.state, 'answered');
   assert.equal(answer.claims[0].text, 'Единица толщины в ведомости — миллиметры.');
@@ -494,6 +534,7 @@ test('engineer question reopens originals through the gateway and restricted sea
   assert.equal(stalled.researchSourceId, ninth.cursor.research.sourceId);
   const sentEffects = sendsForQuantum().map(({ attempt }) => attempt.effectKey);
   assert.equal(new Set(sentEffects).size, sentEffects.length);
+  assert.ok(sendsForQuantum().every(({ attempt }) => attempt.budget?.packageId === project));
   assert.equal((await db.query('SELECT count(*)::int AS count FROM gateway_attempts WHERE job_id=$1', [quantumJob])).rows[0].count,
     sentEffects.length);
   assert.equal(await next({ route }), false);
@@ -656,6 +697,84 @@ test('engineer question reopens originals through the gateway and restricted sea
   assert.equal(sent.length, beforeRetry);
 
   console.info('Copilot fixture: unknown outcome retained');
+  await t.test('D11 stops at 10% after addressed research and keeps local reads and background capacity', async () => {
+    await gateway.configureRoute(limitPolicy);
+    for (const purpose of ['review', 'primary_a']) {
+      await gateway.grantRoute({ projectId: project, routeId: limitRoute.routeId, revision: limitPolicy.revision,
+        purpose, dataClass: limitRoute.dataClass, allowed: true });
+    }
+    const budgetId = (await ask('D11')).json().id;
+    const budgetPath = base + '/questions/' + budgetId;
+    assert.equal(await next({ route: limitRoute }), true);
+    assert.equal(await next({ route: limitRoute }), true);
+    const pending = await get(budgetPath);
+    assert.equal(pending.state, 'research_queued');
+    const { rows: [{ job_id: budgetJob }] } = await db.query('SELECT job_id FROM copilot_questions WHERE id=$1', [budgetId]);
+    const sentForBudget = () => sent.filter(({ attempt }) => attempt.jobId === budgetJob);
+    // Lose the checkpoint after the post-OCR provider response. Restart with a new gateway and lease.
+    const interrupted = new Proxy(gateway, { get(target, property) {
+      if (property === 'call') return async (input) => {
+        const wrongOrigin = await target.call({ ...input, budget: { initiatedBy: 'background', packageId: project } });
+        assert.equal(wrongOrigin.code, 'invalid_budget_attribution');
+        return target.call(input);
+      };
+      if (property === 'checkpoint' && sentForBudget().length === 4) {
+        return async () => { throw new Error('fixture stops after paid addressed research turn'); };
+      }
+      const member = target[property];
+      return typeof member === 'function' ? member.bind(target) : member;
+    }});
+    await assert.rejects(next({ route: limitRoute, gateway: interrupted }), /fixture stops after paid addressed research turn/);
+    await db.query("UPDATE gateway_jobs SET lease_until=clock_timestamp()-interval '1 second' WHERE id=$1", [budgetJob]);
+    const restarted = createGateway(db, gatewayOptions);
+    assert.equal(await next({ route: limitRoute, gateway: restarted, workerId: id() }), true);
+    const held = await get(budgetPath);
+    assert.equal(held.state, 'held');
+    assert.equal(held.reason, 'copilot_budget_exhausted');
+    assert.equal(held.researchSourceId, pending.researchSourceId);
+    const savedCell = held.partialSources.find(({ label, address }) =>
+      label === 'schedule.xlsx' && address.locator?.cell === 'B2');
+    assert.ok(savedCell);
+    const openedCell = (await get(base + '/sources?id=' + savedCell.id)).source;
+    assert.equal(openedCell.versionId, table.versionId);
+    assert.equal(openedCell.text, 'Thickness, mm');
+    assert.ok((await get(base + '/search?q=Thickness')).sources.some(({ id }) => id === savedCell.id));
+    assert.equal((await get(questionPath)).state, 'answered');
+
+    assert.equal(sentForBudget().length, 4);
+    const attributed = { initiatedBy: 'copilot', packageId: project };
+    const { rows: appAttempts } = await db.query(
+      'SELECT id,budget,state FROM gateway_attempts WHERE job_id=$1 ORDER BY created_at', [budgetJob]);
+    assert.deepEqual(appAttempts, sentForBudget().map(({ attempt }) => ({ id: attempt.id, budget: attributed, state: 'paid' })));
+    const { rows: journalAttempts } = await ledgerDb.query(
+      "SELECT id,metadata->'budget' AS budget,state FROM gateway_external_attempts WHERE metadata->>'jobId'=$1 ORDER BY created_order", [budgetJob]);
+    assert.deepEqual(journalAttempts, appAttempts);
+    const { rows: [balance] } = await ledgerDb.query(
+      "SELECT spent::bigint::text AS spent,reserved::bigint::text AS reserved FROM gateway_budget_balances($1,$2) WHERE scope='copilot'",
+      [project, attributed]);
+    assert.deepEqual(balance, { spent: String(fraction - policy.ceilingUsdNanos), reserved: String(policy.ceilingUsdNanos) });
+    const budget = await inject(base + '/budget');
+    assert.equal(budget.statusCode, 200, budget.body);
+    assert.equal(budget.headers['cache-control'], 'no-store');
+    assert.deepEqual(budget.json(), { state: 'ready', limitUsdNanos: fraction, remainingUsdNanos: 0 });
+
+    const backgroundCall = {
+      lease: activePrimary.lease, effectKey: 'd11-background', routeId: limitRoute.routeId, dataClass: limitRoute.dataClass,
+      request: { fixture: 'background' }, inputRefs: [],
+    };
+    assert.equal((await restarted.call(backgroundCall)).code, 'budget_attribution_required');
+    const primaryResult = await restarted.call({ ...backgroundCall, budget: { initiatedBy: 'background', packageId: project } });
+    assert.equal(primaryResult.status, 'paid', JSON.stringify(primaryResult));
+    assert.equal(primaryResult.receipt.costUsdNanos, limitPolicy.ceilingUsdNanos);
+    const newQuestion = (await ask('D11 after exhaustion')).json().id;
+    const sentBefore = sent.length;
+    assert.equal(await next({ route: limitRoute, gateway: restarted }), true);
+    assert.equal(await next({ route: limitRoute, gateway: restarted }), true);
+    assert.equal((await get(base + '/questions/' + newQuestion)).reason, 'copilot_budget_exhausted');
+    assert.equal(sent.length, sentBefore);
+    assert.equal(await next({ route: limitRoute, gateway: restarted }), false);
+  });
+
   if (process.env.FACADE_COPILOT_BROWSER === '1') {
     const require = createRequire(resolve('web/package.json'));
     const { chromium } = require('playwright');
@@ -680,8 +799,15 @@ test('engineer question reopens originals through the gateway and restricted sea
     const original = owner.getByRole('link', { name: 'Открыть оригинал этой версии' });
     assert.equal(await original.getAttribute('href'), originalPath);
     console.info('Copilot fixture: Chrome opened the addressed XLSX source');
+    await owner.getByText('Лимит Помощника исчерпан. Сохранённые ответы и поиск по источникам доступны.', { exact: true }).waitFor();
+    const submit = owner.getByRole('button', { name: 'Спросить помощника' });
+    assert.equal(await submit.isDisabled(), true);
+    await owner.route('**/copilot/budget', (route) => route.fulfill({ json: { state: 'unavailable' } }));
+    await owner.reload();
+    await owner.getByText('Остаток лимита пока недоступен.', { exact: true }).waitFor();
+    assert.equal(await submit.isEnabled(), true);
     await owner.getByLabel('Вопрос инженера').fill('Проверка режима с выключенной моделью');
-    await owner.getByRole('button', { name: 'Спросить помощника' }).click();
+    await submit.click();
     await owner.waitForURL((url) => url.pathname.startsWith('/projects/' + project + '/copilot/') && !url.pathname.endsWith(questionId));
     assert.equal(await next(), true);
     await owner.getByText('Модель недоступна. Поиск по источникам работает.', { exact: false }).waitFor();

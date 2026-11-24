@@ -69,7 +69,7 @@ export function assessSemanticRemainder(input: {
   context: FacadeContext;
   catalogVersionId: string | null;
   stage: string | null;
-}): { remainder: SemanticRemainder; basisIds: string[] } {
+}): { remainder: SemanticRemainder; basisIds: string[]; verifiedWindows: PackageWindow[] } {
   const { index, requirement, context, catalogVersionId, stage } = input;
   const formats = new Set([...requirement.formats, "unknown"]);
   const admitted = [...formats].flatMap((format) => index.byFormat.get(format) ? [index.byFormat.get(format)!] : []);
@@ -136,5 +136,6 @@ export function assessSemanticRemainder(input: {
     remainder: { state: reasons.length ? "open" : "complete", totalWindows, verifiedWindows: verified.size, alternativesVerified, reasons,
       items, omittedItems: Math.max(0, outstanding - items.length) },
     basisIds: alternativesVerified ? [...basisIds].sort() : [],
+    verifiedWindows: alternativesVerified ? [...verified].sort().map((id) => index.byWindow.get(id)!) : [],
   };
 }

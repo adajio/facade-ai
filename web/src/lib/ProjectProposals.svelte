@@ -18,10 +18,12 @@
   type Proposal = { value: string; quote: string; evidenceId: string; observationId: string; facades: string[] };
   type Summary = { version: number; observations: { href: string; proposalCounts: Record<ProposalKind, number> } };
   type Page = { version: number; items: Observation[]; nextCursor: string | null };
-  let { api, project, disabled, confirmStage, confirmFacadeKinds }: {
+  let { api, project, disabled, showStage = true, onStageAvailability, confirmStage, confirmFacadeKinds }: {
     api: Api;
     project: Project;
     disabled: boolean;
+    showStage?: boolean;
+    onStageAvailability?: (available: boolean) => void;
     confirmStage: (stage: string, evidenceId: string) => Promise<void>;
     confirmFacadeKinds: (kinds: string[], evidenceIds: string[]) => Promise<void>;
   } = $props();
@@ -72,6 +74,7 @@
       ]);
       if (signal.aborted) return;
       stages = stageOptions;
+      onStageAvailability?.(stageOptions.length > 0);
       types = typeOptions;
       selectedTypes = types.filter(({ value }) => project.confirmedFacadeKinds?.includes(value)).map(({ value }) => value);
     } catch (error) {
@@ -107,7 +110,7 @@
   <p role="status">Ищем предложения в прочитанных исходниках…</p>
 {:else}
   <Notice kind="error" message={problem} />
-  {#if stages.length}
+  {#if stages.length && showStage}
     <h3>{stages.length === 1 ? 'Предложенная стадия' : 'В исходниках указаны разные стадии'}</h3>
     <ul class="plain-list">
       {#each stages as proposal (proposal.value)}
@@ -124,7 +127,7 @@
         </li>
       {/each}
     </ul>
-  {:else if !problem}
+  {:else if !stages.length && !problem}
     <p>В прочитанных исходниках пока нет предложения по стадии.</p>
   {/if}
   {#if types.length}
