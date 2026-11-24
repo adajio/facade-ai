@@ -110,7 +110,7 @@ export function createRuntimePdfService(
       const format = formatFor(original.mediaType, original.relativePath);
       return {
         ...document, receiptId: assignment.receipt_id, sha256: original.sha256, size: original.size, format,
-        relativePath: original.relativePath, open: () => original.open(),
+        relativePath: original.relativePath, check: () => original.check(), open: () => original.open(),
       };
     },
   }, adapters);
@@ -155,7 +155,7 @@ export async function register(
     return evidence;
   }
 
-  app.get<UnitsRoute>('/api/v1/documents/:documentId/versions/:versionId/reader/units', async (request) => {
+  async function authorizedDocument(request: FastifyRequest<UnitsRoute>): Promise<DocumentKey> {
     const { documentId, versionId } = request.params;
     const session = await readSession(app.db, request);
     if (!isReaderId(documentId) || !isReaderId(versionId)) throw unavailable();
@@ -166,9 +166,33 @@ export async function register(
     const document: DocumentKey = { projectId: rows[0].project_id, documentId, versionId };
     await authorize(app.db, session, { action: 'project:read', projectId: document.projectId });
     await touchSession(app.db, session);
+    return document;
+  }
+
+  app.get<UnitsRoute>('/api/v1/documents/:documentId/versions/:versionId/reader/units', async (request) => {
+    const document = await authorizedDocument(request);
     const map = await reader().latestMap(document);
     if (!map) throw new ReaderError('reader_map_unavailable', 'Карта оригинала ещё недоступна', 404);
     return map;
+  });
+
+  type CadPreviewRoute = { Params: UnitsRoute['Params'] & { unitId: string }; Querystring: {
+    readerVersion?: string; representation?: string; entityOrdinal?: string; derivativeHandle?: string;
+  } };
+  app.get<CadPreviewRoute>('/api/v1/documents/:documentId/versions/:versionId/reader/units/:unitId', async (request, reply) => {
+    const document = await authorizedDocument(request);
+    const { readerVersion, representation = 'native', entityOrdinal, derivativeHandle } = request.query;
+    const ordinal = entityOrdinal === undefined ? undefined : Number(entityOrdinal);
+    if (!readerVersion || !['native', 'render'].includes(representation)
+      || (entityOrdinal !== undefined && (!/^[1-9]\d*$/.test(entityOrdinal) || !Number.isSafeInteger(ordinal)))
+      || (derivativeHandle !== undefined && !/^[0-9A-F]{1,16}$/.test(derivativeHandle))
+      || (ordinal !== undefined && derivativeHandle !== undefined)) {
+      throw new ReaderError('reader_address_invalid', 'Некорректный адрес части DWG', 422);
+    }
+    const locator: Record<string, string | number> | undefined = ordinal !== undefined ? { entityOrdinal: ordinal } : derivativeHandle ? { derivativeHandle } : undefined;
+    const result = await reader().previewDwg(document, { readerVersion, address: { unitId: request.params.unitId, locator },
+      representation: representation as 'native' | 'render' });
+    return reply.header('X-Content-Type-Options', 'nosniff').type(result.mediaType).send(result.bytes);
   });
 
   app.get<EvidenceRoute>('/api/v1/evidence/:id', async (request) => {

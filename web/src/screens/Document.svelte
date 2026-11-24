@@ -6,10 +6,11 @@
   import type { Occurrence } from '../lib/intake';
   import { V1, scopedUrl, type OpenEvidence, type WorkspaceProps } from '../lib/workspace';
   import Notice from '../lib/Notice.svelte';
+  import CadDocument from './CadDocument.svelte';
   import WorkJob, { type Job } from './DocumentJob.svelte';
 
   type Unit = { id: string; label?: string; locator?: Record<string, string | number> };
-  type ReaderMap = { source: { documentId: string; versionId: string; sha256: string }; units: Unit[] };
+  type ReaderMap = { format: string; readerVersion: string; source: { documentId: string; versionId: string; sha256: string }; units: Unit[] };
   type Work = {
     jobs: Job[]; jobCount: number;
     branches: { branch: string; completed: number; total: number; outcome: string }[];
@@ -23,6 +24,7 @@
   } = $props();
   const commands = new Commands(() => api);
   let units = $state<Unit[]>([]);
+  let cadVersion = $state<string>();
   let work = $state<Work>();
   let readerError = $state('');
   let workError = $state('');
@@ -81,6 +83,7 @@
     void mapReady;
     const controller = new AbortController();
     readerError = '';
+    cadVersion = undefined;
     void api.json<ReaderMap>(url, { signal: controller.signal }).then((value) => {
       if (value.source.documentId !== expected.documentId || value.source.versionId !== expected.versionId ||
           expected.sha256 && value.source.sha256 !== expected.sha256) {
@@ -89,6 +92,7 @@
         return;
       }
       units = value.units;
+      cadVersion = value.format === 'dwg' ? value.readerVersion : undefined;
     }).catch((error) => {
       if (controller.signal.aborted || interrupted(error)) return;
       units = [];
@@ -196,7 +200,9 @@
   </dl>
   <h3>Физические единицы</h3>
   <Notice message={readerError} />
-  {#if units.length}
+  {#if cadVersion && ready && units.some(unit => unit.locator?.partSha256)}
+    <CadDocument {api} {context} {units} readerVersion={cadVersion} endpoint={V1 + path.slice(4) + '/reader/units'} />
+  {:else if units.length}
     <ul class="plain-list unit-list">
       {#each units as unit (unit.id)}
         {@const number = unit.locator?.page}

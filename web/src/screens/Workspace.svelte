@@ -17,9 +17,9 @@
   import Fragments from './Fragments.svelte';
   import Copilot from './Copilot.svelte';
 
-  let { api, project, route, masked, refresh, onDenied, setDocumentPage }: {
+  let { api, project, route, masked, refresh, onDenied, setDocumentPage, setDocumentCad }: {
     api: Api; project: Project; route: Route; masked: boolean; refresh: (foreground?: boolean) => Promise<void>;
-    onDenied: () => void; setDocumentPage: (page?: number) => void;
+    onDenied: () => void; setDocumentPage: (page?: number) => void; setDocumentCad: (part?: string, entity?: string) => void;
   } = $props();
 
   let section = $derived(route.section ?? 'overview');
@@ -206,7 +206,7 @@
 
   let context = $derived({
     project, scopeId, sliceId: pinnedSlice ?? projection?.sliceId, filter, revision,
-    params: route.params, cursor: projection?.cursor, objectId, canEdit: isEngineer(project), refreshKey, setDocumentPage,
+    params: route.params, cursor: projection?.cursor, objectId, canEdit: isEngineer(project), refreshKey, setDocumentPage, setDocumentCad,
   });
 </script>
 

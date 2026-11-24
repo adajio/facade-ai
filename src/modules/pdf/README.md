@@ -20,6 +20,7 @@
 | GET под /api/v1 | Ответ |
 | --- | --- |
 | `/documents/:documentId/versions/:versionId/reader/units` | Сохранённая карта физического оригинала, либо явная недоступность карты |
+| `/documents/:documentId/versions/:versionId/reader/units/:unitId` | Чтение части DWG текущей версии карты. Query `readerVersion`, `representation=native\|render`, один из `derivativeHandle` или `entityOrdinal` для отдельной сущности. Сохранение evidence выполняется отдельным путём |
 | `/evidence/:id` | Версия, адрес, тип, преобразование, `contentUrl` и `originalHref`. При OCR также `inputImage.url` и `inputImage.transform` |
 | `/evidence/:id/content` | Сохранённое представление. PNG для визуального чтения, JSON со строками и рамками для текстового |
 | `/evidence/:id/ocr-input` | Точный PNG, переданный локальному OCR |

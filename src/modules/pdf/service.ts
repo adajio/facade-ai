@@ -11,7 +11,7 @@ import { verifiedNativeLineCrops, type NativeLineCrop, type VerifiedNativeDelive
 import {
   type ArtifactStore, type Box, type DocumentKey, type Evidence, type Observation, type ReaderComponentInput,
   type NativeArtifact, type NativeBlock, type NativePresentation, type ReaderOutput,
-  type Original, type PageMap, type PinInput, type ReaderAdapter, type ReaderAddress, type ReaderLine,
+  type Original, type PageMap, type PinInput, type ReaderAdapter, type ReaderAddress, type ReaderLine, type ReaderUnit,
   type ReadRequest, type ReadScope, type ResolveOriginal, type SourceRef, contains, ReaderError, validBox,
 } from './types.js';
 
@@ -335,7 +335,7 @@ export function createReaderService(db: Pool, deps: ReaderDependencies, adapters
   async function insertMap(
     source: SourceRef, original: Original, version: string, adapter: ReaderAdapter, path: string,
   ): Promise<PageMap> {
-    const units = await adapter.inspect(path);
+    const units = await adapter.inspect(path, source);
     if (new Set(units.map(({ id }) => id)).size !== units.length || units.some(({ id }) => !id || id.length > 200)) {
       throw new ReaderError('reader_inventory_invalid', 'Reader вернул недопустимую карту физических единиц', 422);
     }
@@ -351,6 +351,28 @@ export function createReaderService(db: Pool, deps: ReaderDependencies, adapters
     return stored;
   }
 
+  async function readMapped(source: SourceRef, original: Original, adapter: ReaderAdapter, request: ReadRequest, unit: ReaderUnit) {
+    if (original.check && adapter.readCached) {
+      await original.check();
+      const cached = await adapter.readCached(source, request, unit);
+      if (cached) return cached;
+    }
+    return withOriginal(original, deps, path => adapter.read(path, request, unit, undefined, source));
+  }
+
+  async function previewDwg(document: DocumentKey, input: ReadRequest) {
+    const request = checkedRead(input);
+    const map = await latestMap(document);
+    if (!map || map.format !== 'dwg') throw new ReaderError('reader_map_unavailable', 'Карта DWG ещё недоступна', 404);
+    const { original, adapter, version } = await describe(map.source);
+    if (map.readerVersion !== version || request.readerVersion !== version) {
+      throw new ReaderError('reader_profile_changed', 'Требуется текущая карта DWG', 409);
+    }
+    const unit = map.units.find(({ id }) => id === request.address.unitId);
+    if (!unit) throw new ReaderError('reader_address_invalid', 'Часть DWG отсутствует в карте', 422);
+    return readMapped(map.source, original, adapter, request, unit);
+  }
+
   async function materializeNative(sourceRef: SourceRef, readerVersion: string, start: number, count: number,
     publish: (block: NativeBlock) => Promise<void>): Promise<void> {
     const source = checkedSource(sourceRef);
@@ -364,18 +386,18 @@ export function createReaderService(db: Pool, deps: ReaderDependencies, adapters
       throw new ReaderError('reader_address_invalid', 'Пакет нативных окон отсутствует в карте', 422);
     }
     const selected = map.units.slice(start, start + count);
-    await withOriginal(original, deps, async (path) => {
-      async function* readUnits(): AsyncIterable<ReaderOutput | ReaderError> {
-        for (const unit of selected) {
-          try {
-            yield await adapter.read(path, { address: { unitId: unit.id }, representation: 'native' }, unit);
-          } catch (error) {
-            if (!(error instanceof ReaderError)) throw error;
-            yield error;
-          }
+    async function* readUnits(path: string): AsyncIterable<ReaderOutput | ReaderError> {
+      for (const unit of selected) {
+        const request = { address: { unitId: unit.id }, representation: 'native' as const };
+        try {
+          yield await adapter.read(path, request, unit, undefined, source);
+        } catch (error) {
+          if (!(error instanceof ReaderError)) throw error;
+          yield error;
         }
       }
-      const results = adapter.readNativeUnits?.(path, selected) ?? readUnits();
+    }
+    async function consume(results: AsyncIterable<ReaderOutput | ReaderError>) {
       let ordinal = start;
       for await (const output of results) {
         const unit = selected[ordinal - start];
@@ -393,7 +415,13 @@ export function createReaderService(db: Pool, deps: ReaderDependencies, adapters
         ordinal++;
       }
       if (ordinal !== start + selected.length) throw new Error('Adapter omitted native units');
-    });
+    }
+    if (original.check && adapter.readCachedNativeUnits) {
+      await original.check();
+      const cached = await adapter.readCachedNativeUnits(source, selected);
+      if (cached) return consume(cached);
+    }
+    await withOriginal(original, deps, path => consume(adapter.readNativeUnits?.(path, selected, source) ?? readUnits(path)));
   }
 
   async function readMaterializedNative(projectId: string, artifact: NativeArtifact) {
@@ -446,12 +474,21 @@ export function createReaderService(db: Pool, deps: ReaderDependencies, adapters
       throw new ReaderError('reader_profile_changed', 'Требуется исходный профиль reader', 409);
     }
     const cached = !job?.scope_id ? await indexedNative(source, version, adapter.format, request) : undefined;
-    let output = cached?.output ?? await withOriginal(original, deps, async (path) => {
-      const map = await lookupMap(source, version) ?? await insertMap(source, original, version, adapter, path);
+    if (cached && adapter.format === 'dwg') await original.check?.();
+    let output = cached?.output;
+    function selected(map: PageMap) {
       const unit = map.units.find(({ id }) => id === request.address.unitId);
       if (!unit) throw new ReaderError('reader_address_invalid', 'Физическая единица отсутствует в оригинале', 422);
-      return adapter.read(path, request, unit);
-    });
+      return unit;
+    }
+    if (!output) {
+      const map = await lookupMap(source, version);
+      output = map ? await readMapped(source, original, adapter, request, selected(map))
+        : await withOriginal(original, deps, async path => {
+          const fresh = await insertMap(source, original, version, adapter, path);
+          return adapter.read(path, request, selected(fresh), undefined, source);
+        });
+    }
     if (output.address.unitId !== request.address.unitId || (output.address.box && !validBox(output.address.box))) {
       throw new ReaderError('reader_address_invalid', 'Reader вернул неожиданный адрес', 422);
     }
@@ -662,6 +699,15 @@ export function createReaderService(db: Pool, deps: ReaderDependencies, adapters
     return winner;
   }
 
+  async function latestMap(document: DocumentKey): Promise<PageMap | undefined> {
+    const { rows } = await db.query<MapRow>(
+      `SELECT * FROM reader_maps WHERE project_id = $1 AND document_id = $2 AND version_id = $3
+       ORDER BY created_at DESC, reader_version DESC LIMIT 1`,
+      [document.projectId, document.documentId, document.versionId],
+    );
+    if (rows[0]) return mapFromRow(rows[0]);
+  }
+
   return {
     async readerVersion(format: string) { return await registry.get(format)?.version() ?? null; },
     async map(sourceRef: SourceRef): Promise<PageMap> {
@@ -670,14 +716,7 @@ export function createReaderService(db: Pool, deps: ReaderDependencies, adapters
       return await lookupMap(source, version)
         ?? await withOriginal(original, deps, (path) => insertMap(source, original, version, adapter, path));
     },
-    async latestMap(document: DocumentKey): Promise<PageMap | undefined> {
-      const { rows } = await db.query<MapRow>(
-        `SELECT * FROM reader_maps WHERE project_id = $1 AND document_id = $2 AND version_id = $3
-         ORDER BY created_at DESC, reader_version DESC LIMIT 1`,
-        [document.projectId, document.documentId, document.versionId],
-      );
-      if (rows[0]) return mapFromRow(rows[0]);
-    },
+    latestMap, previewDwg,
     open, pin, findEvidence, content, readPdfFragment, materializeNative, readMaterializedNative, verifyNativeDeliveryLine,
     async findObservation(projectId: string, id: string): Promise<Observation | undefined> {
       const { rows } = await db.query<{ payload: Observation }>(

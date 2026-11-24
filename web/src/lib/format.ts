@@ -16,6 +16,11 @@ const labels: Record<string, string> = {
   research_gateway_unconfigured: 'Ожидается настройка маршрута чтения',
   route_denied: 'Ожидается разрешение на маршрут',
   original_only: 'Доступен оригинал',
+  cad_external_reference: 'Содержимое внешних ссылок не раскрыто',
+  cad_font_substitution: 'Шрифты на схеме могут быть заменены',
+  cad_entity_type_unsupported: 'Тип объекта доступен по адресу, схема для него неполная',
+  cad_entity_geometry_unavailable: 'Геометрия объекта недоступна для схемы',
+  cad_converted_handle_unverified: 'Адрес относится к производной DWG',
 
   pending: 'Ожидает',
   running: 'В работе',

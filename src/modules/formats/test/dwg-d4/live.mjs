@@ -70,7 +70,7 @@ const host = originals.get("xref-host");
 const readerDist = resolve(process.env.FACADE_STEP11_DIST ?? "dist");
 const { createFormatAdapters } = await import(pathToFileURL(join(readerDist, "src/modules/formats/index.js")));
 const adapter = createFormatAdapters().find(({ format }) => format === "dwg");
-assert.equal(await adapter.version(), `formats-1.1.1:dwg:${image}`);
+assert.equal(await adapter.version(), `formats-1.1.4:dwg:${image}`);
 const hostOutputs = [];
 
 for (const state of ["missing", ...Object.keys(references)]) {

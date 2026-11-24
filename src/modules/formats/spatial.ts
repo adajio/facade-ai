@@ -6,8 +6,8 @@ import { inventoryLimitation, matchInventory } from "./physical-inventory.js";
 import type { PhysicalInventory } from "./physical-inventory.js";
 
 type Group = { code: number; value: string };
-type Entity = { type: string; groups: Group[] };
-const first = (record: Entity, code: number): string | undefined =>
+export type Entity = { type: string; groups: Group[]; limitation?: string };
+export const first = (record: Entity, code: number): string | undefined =>
   record.groups.find((group) => group.code === code)?.value.trim();
 
 function dxfRecords(text: string): Entity[] {
@@ -68,110 +68,86 @@ const cadMetadataGroups = new Map<string, Set<number>>([
   ["BLOCK", new Set([70])], ["STYLE", new Set([3, 4])],
 ]);
 
-// Stream converted DXF without indexing BLOCKS, proxy data or other sections the CAD reader cannot open.
-export async function parseConvertedDxf(
+// Keep only fields used by the reader, without accumulating the section in memory.
+export async function* convertedDxfRecords(
   lines: AsyncIterable<string>, decodeValue = (line: string) => line,
-): Promise<Parsed> {
-  const records: Entity[] = [];
-  const counts = new Map<string, number>();
-  const groupBudget = 250_000;
-  const textBudget = 8_000_000;
-  let projectionHold: string | undefined;
-  let footprint = 0;
-  let characters = 0;
+): AsyncGenerator<{ entity: boolean; record: Entity }> {
   let section = "";
-  let seenEntities = false;
+  let entities = false;
   let eof = false;
   let record: Entity = { type: "", groups: [] };
+  let code: number | undefined;
+  let characters = 0;
+  let layoutSubclass = false;
+  const single = new Map<number, Group>();
+  let keys: Set<number> | undefined;
 
-  function holdProjection(code: string): void {
-    projectionHold ??= code;
-    records.length = 0;
-  }
-
-  function keep(): void {
-    if (record.type === "") return;
+  function finish() {
+    const entity = section === "ENTITIES" && !["SECTION", "ENDSEC", "EOF"].includes(record.type);
+    if (!record.type) return;
     if (eof) throw new FormatHold("dxf_group_invalid");
-    if (record.type === "EOF") {
-      if (section) throw new FormatHold("dxf_eof_missing");
-      eof = true;
-      return;
-    }
     if (record.type === "SECTION") {
       if (section) throw new FormatHold("dxf_section_inventory_invalid");
       section = first(record, 2) ?? "";
-      if (!section || (section === "ENTITIES" && seenEntities)) throw new FormatHold("dxf_section_inventory_invalid");
-      if (section === "ENTITIES") seenEntities = true;
+      if (!section || (section === "ENTITIES" && entities)) throw new FormatHold("dxf_section_inventory_invalid");
+      if (section === "ENTITIES") entities = true;
     } else if (record.type === "ENDSEC") {
       if (!section) throw new FormatHold("dxf_section_inventory_invalid");
       section = "";
-    } else if (section === "ENTITIES") {
-      const key = first(record, 410)
-        ? JSON.stringify(["name", first(record, 410)])
-        : JSON.stringify(["owner", first(record, 330)?.toUpperCase(), first(record, 67) === "1"]);
-      const count = counts.get(key);
-      // After a projection hold, count known spaces without retaining more geometry or space keys.
-      if (!projectionHold || count !== undefined) {
-        const next = (count ?? 0) + 1;
-        if (next > cadRowsPerSpace) throw new FormatHold("cad_entity_limit");
-        counts.set(key, next);
-      }
-    } else if (!cadMetadataGroups.has(record.type)) return;
-
-    if (projectionHold) return;
-    footprint += 1 + record.groups.length;
-    if (footprint > groupBudget) holdProjection("dxf_projected_group_limit");
-    else records.push(record);
-  }
-
-  let code: number | undefined;
-  let keys: Set<number> | undefined;
-  const firstGroups = new Map<number, Group>();
-
-  function keepGroup(code: number, line: string): void {
-    if (!keys?.has(code)) return;
-    const address = section === "ENTITIES" && [67, 330, 410].includes(code)
-      || record.type === "SECTION" && code === 2;
-    if (!projectionHold && record.groups.length >= groupBudget - footprint) {
-      holdProjection("dxf_projected_group_limit");
-    }
-    if (projectionHold && !address) return;
-
-    const repeated = record.type === "LWPOLYLINE" && polylineGroups.has(code)
-      || cadTextEntities.has(record.type) && (code === 1 || code === 3);
-    const previous = repeated ? undefined : firstGroups.get(code);
-    if (!previous) {
-      characters += line.length;
-      const group = { code, value: decodeValue(line) };
-      record.groups.push(group);
-      if (!repeated) firstGroups.set(code, group);
-    } else if (record.type === "LAYOUT" && code === 330) {
-      const value = decodeValue(line);
-      characters += value.length - previous.value.length;
-      previous.value = value;
-    }
-    if (!projectionHold && characters > textBudget) holdProjection("dxf_projected_text_limit");
+    } else if (record.type === "EOF") {
+      if (section) throw new FormatHold("dxf_eof_missing");
+      eof = true;
+    } else if (entity || cadMetadataGroups.has(record.type)) return { entity, record };
   }
 
   for await (const line of lines) {
     if (code === undefined) {
       if (!/^[ \t]*\d{1,4}[ \t]*$/.test(line)) throw new FormatHold("dxf_group_invalid");
       code = Number(line);
-    } else {
-      if (code === 0) {
-        keep();
-        record = { type: decodeValue(line).trim().toUpperCase(), groups: [] };
-        keys = cadMetadataGroups.get(record.type) ?? (section === "ENTITIES" ? cadEntityGroups : undefined);
-        firstGroups.clear();
-      } else keepGroup(code, line);
-      code = undefined;
+      continue;
     }
+    if (code === 0) {
+      const previous = finish();
+      if (previous) yield previous;
+      record = { type: decodeValue(line).trim().toUpperCase() || "UNKNOWN", groups: [] };
+      layoutSubclass = false;
+      keys = cadMetadataGroups.get(record.type) ?? (section === "ENTITIES" ? cadEntityGroups : undefined);
+      single.clear();
+      characters = 0;
+    } else if (record.type === "LAYOUT" && code === 100) {
+      layoutSubclass = line.trim() === "AcDbLayout";
+    } else if (keys?.has(code)) {
+      const address = [5, 67, 330, 410].includes(code);
+      const repeated = (record.type === "LWPOLYLINE" && polylineGroups.has(code))
+        || (cadTextEntities.has(record.type) && (code === 1 || code === 3));
+      const existing = repeated ? undefined : single.get(code);
+      if (!existing || (record.type === "LAYOUT" && (code === 330 || (code === 1 && layoutSubclass)))) {
+        characters += line.length;
+        if (!address && (record.groups.length >= 8192 || characters > 256 * 1024)) {
+          if (keys === cadEntityGroups) record.limitation ??= "cad_entity_projection_limit";
+          else throw new FormatHold("cad_metadata_limit");
+        } else {
+          try {
+            const group = { code, value: decodeValue(line) };
+            if (existing) existing.value = group.value;
+            else {
+              record.groups.push(group);
+              if (!repeated) single.set(code, group);
+            }
+          } catch (error) {
+            if (!(error instanceof FormatHold) || keys !== cadEntityGroups || address) throw error;
+            record.limitation ??= error.code;
+          }
+        }
+      }
+    }
+    code = undefined;
   }
   if (code !== undefined) throw new FormatHold("dxf_group_limit_or_invalid");
-  keep();
+  const last = finish();
+  if (last) yield last;
   if (!eof) throw new FormatHold("dxf_eof_missing");
-  if (projectionHold) throw new FormatHold(projectionHold);
-  return parseCadRecords(records);
+  if (!entities) throw new FormatHold("dxf_entities_section_missing");
 }
 
 const dxfAddressLimits = new Set(["cad_entity_handle_unconfirmed"]);
@@ -245,13 +221,14 @@ function dxfInventory(records: Entity[], units: Unit[]): PhysicalInventory {
   return matchInventory(source, mapped, "dxf_structure_inventory_mismatch");
 }
 
-function parseCadRecords(records: Entity[], issues = new Set<string>()): Parsed {
-  const spaces = new Map<string, { rows: Row[]; shapes: CadShape[]; limitations: Set<string> }>();
-  const space = (name: string) => {
-    if (!spaces.has(name)) spaces.set(name, { rows: [], shapes: [], limitations: new Set() });
-    return spaces.get(name)!;
-  };
-  space("Model");
+type CadSpace = { rows: Row[]; shapes: CadShape[]; limitations: Set<string> };
+
+export function cadSpace(): CadSpace {
+  return { rows: [], shapes: [], limitations: new Set() };
+}
+
+export function cadMetadata(records: Entity[], issues = new Set<string>()) {
+  const layouts = new Set(["Model"]);
   const ownerLayouts = new Map<string, string>();
   const views = new Map<string, { x: number; y: number; width: number; height: number }>();
   for (const record of records) {
@@ -259,7 +236,7 @@ function parseCadRecords(records: Entity[], issues = new Set<string>()): Parsed 
       const name = first(record, 1);
       const owner = record.groups.filter((group) => group.code === 330).at(-1)?.value.trim().toUpperCase();
       if (name) {
-        space(name);
+        layouts.add(name);
         if (owner) ownerLayouts.set(owner, name);
       }
     }
@@ -284,6 +261,18 @@ function parseCadRecords(records: Entity[], issues = new Set<string>()): Parsed 
       }
     }
   }
+
+  if (views.size > 200) throw new FormatHold("cad_view_limit");
+  return { layouts, ownerLayouts, views, issues };
+}
+
+function parseCadRecords(records: Entity[], issues = new Set<string>()): Parsed {
+  const { layouts, ownerLayouts, views } = cadMetadata(records, issues);
+  const spaces = new Map([...layouts].map((name) => [name, cadSpace()]));
+  const space = (name: string) => {
+    if (!spaces.has(name)) spaces.set(name, cadSpace());
+    return spaces.get(name)!;
+  };
 
   let section = "";
   let entities = false;
@@ -315,69 +304,7 @@ function parseCadRecords(records: Entity[], issues = new Set<string>()): Parsed 
     const handle = candidate && /^[0-9A-F]{1,16}$/.test(candidate) && handleCounts.get(candidate) === 1
       ? candidate : undefined;
     const entityOrdinal = index + 1;
-    if (!handle) layout.limitations.add("cad_entity_handle_unconfirmed");
-    const type = record.type;
-    const text = cadTextEntities.has(type) ? cadText(record) : "";
-    const x = numeric(record, 10);
-    const y = numeric(record, 20);
-    const layer = first(record, 8) ?? "0";
-    const locator: Locator = handle ? { space: name, handle } : { space: name, entityOrdinal };
-    const row: Row = { locator, text, details: { layer, entity: type } };
-    layout.rows.push(row);
-    if (x === undefined || y === undefined) {
-      layout.limitations.add("cad_entity_geometry_unavailable");
-      continue;
-    }
-    const shape = { handle: handle ?? `ordinal:${entityOrdinal}`, layer, kind: type, x, y };
-    const extrusion = numeric(record, 230);
-    if (numeric(record, 30) || (type === "LINE" && numeric(record, 31)) || numeric(record, 210) || numeric(record, 220)
-        || (extrusion !== undefined && extrusion !== 1)) layout.limitations.add("cad_nonplanar_projection");
-    if (text) {
-      const height = numeric(record, 40) ?? 1;
-      if (height <= 0) {
-        layout.limitations.add("cad_entity_geometry_unavailable");
-        continue;
-      }
-      if (/(?:\\[A-Za-z]|%%)/u.test(text) || numeric(record, 72) || numeric(record, 73)
-          || type === "MTEXT") layout.limitations.add("cad_text_render_approximate");
-      layout.shapes.push({ ...shape, text, height, angle: numeric(record, 50) ?? 0 });
-      row.bounds = { x, y, width: Math.max(height, text.length * height * 0.62), height };
-    } else if (type === "LINE") {
-      const x2 = numeric(record, 11);
-      const y2 = numeric(record, 21);
-      if (x2 === undefined || y2 === undefined) {
-        layout.limitations.add("cad_entity_geometry_unavailable");
-        continue;
-      }
-      layout.shapes.push({ ...shape, x2, y2 });
-      row.bounds = { x: Math.min(x, x2), y: Math.min(y, y2), width: Math.abs(x2 - x), height: Math.abs(y2 - y) };
-    } else if (type === "CIRCLE") {
-      const radius = numeric(record, 40);
-      if (!radius || radius <= 0) {
-        layout.limitations.add("cad_entity_geometry_unavailable");
-        continue;
-      }
-      layout.shapes.push({ ...shape, radius });
-      row.bounds = { x: x - radius, y: y - radius, width: radius * 2, height: radius * 2 };
-    } else if (type === "LWPOLYLINE") {
-      if (record.groups.some((group) => [40, 41, 42, 43].includes(group.code) && Number(group.value))) {
-        layout.limitations.add("cad_polyline_segments_approximate");
-      }
-      const xs = record.groups.filter((group) => group.code === 10).map((group) => Number(group.value));
-      const ys = record.groups.filter((group) => group.code === 20).map((group) => Number(group.value));
-      if (xs.length < 2 || xs.length !== ys.length || xs.length > 1000 || [...xs, ...ys].some(
-        (coordinate) => !Number.isFinite(coordinate) || Math.abs(coordinate) > 1e9,
-      )) {
-        layout.limitations.add("cad_entity_geometry_unavailable");
-        continue;
-      }
-      if (Number(first(record, 70)) & 1) { xs.push(xs[0]); ys.push(ys[0]); }
-      for (let index = 1; index < xs.length; index++) {
-        layout.shapes.push({ ...shape, x: xs[index - 1], y: ys[index - 1], x2: xs[index], y2: ys[index] });
-      }
-    } else {
-      layout.limitations.add("cad_entity_type_unsupported");
-    }
+    appendCadEntity(layout, record, name, entityOrdinal, handle);
   }
   const units: Unit[] = [...spaces].map(([name, { rows, shapes, limitations }]) => {
     if (name.length > 300) throw new FormatHold("cad_layout_name_limit");
@@ -398,13 +325,82 @@ function parseCadRecords(records: Entity[], issues = new Set<string>()): Parsed 
   return { units };
 }
 
-export async function parseDwgRecovery(objects: AsyncIterable<unknown>): Promise<Parsed> {
-  const issues = new Set(["cad_dwg_json_recovery"]);
-  const recovered: Entity[] = [];
-  const rowsBySpace = new Map<number, number>();
-  let total = 0;
+export function appendCadEntity(layout: CadSpace, record: Entity, name: string, entityOrdinal: number, handle?: string) {
+  if (!handle) layout.limitations.add("cad_entity_handle_unconfirmed");
+  const type = record.type;
+  const text = cadTextEntities.has(type) && !record.limitation ? cadText(record) : "";
+  const x = numeric(record, 10);
+  const y = numeric(record, 20);
+  const layer = first(record, 8) ?? "0";
+  const locator: Locator = handle ? { space: name, handle } : { space: name, entityOrdinal };
+  const row: Row = { locator, text, details: { layer, entity: type } };
+  layout.rows.push(row);
+  if (record.limitation) {
+    layout.limitations.add(record.limitation);
+    return;
+  }
+  if (x === undefined || y === undefined) {
+    layout.limitations.add("cad_entity_geometry_unavailable");
+    return;
+  }
+  const shape = { handle: handle ?? `ordinal:${entityOrdinal}`, layer, kind: type, x, y };
+  const extrusion = numeric(record, 230);
+  if (numeric(record, 30) || (type === "LINE" && numeric(record, 31)) || numeric(record, 210) || numeric(record, 220)
+      || (extrusion !== undefined && extrusion !== 1)) layout.limitations.add("cad_nonplanar_projection");
+  if (text) {
+    const height = numeric(record, 40) ?? 1;
+    if (height <= 0) {
+      layout.limitations.add("cad_entity_geometry_unavailable");
+      return;
+    }
+    if (/(?:\\[A-Za-z]|%%)/u.test(text) || numeric(record, 72) || numeric(record, 73)
+        || type === "MTEXT") layout.limitations.add("cad_text_render_approximate");
+    layout.shapes.push({ ...shape, text, height, angle: numeric(record, 50) ?? 0 });
+    row.bounds = { x, y, width: Math.max(height, text.length * height * 0.62), height };
+  } else if (type === "LINE") {
+    const x2 = numeric(record, 11);
+    const y2 = numeric(record, 21);
+    if (x2 === undefined || y2 === undefined) {
+      layout.limitations.add("cad_entity_geometry_unavailable");
+      return;
+    }
+    layout.shapes.push({ ...shape, x2, y2 });
+    row.bounds = { x: Math.min(x, x2), y: Math.min(y, y2), width: Math.abs(x2 - x), height: Math.abs(y2 - y) };
+  } else if (type === "CIRCLE") {
+    const radius = numeric(record, 40);
+    if (!radius || radius <= 0) {
+      layout.limitations.add("cad_entity_geometry_unavailable");
+      return;
+    }
+    layout.shapes.push({ ...shape, radius });
+    row.bounds = { x: x - radius, y: y - radius, width: radius * 2, height: radius * 2 };
+  } else if (type === "LWPOLYLINE") {
+    if (record.groups.some((group) => [40, 41, 42, 43].includes(group.code) && Number(group.value))) {
+      layout.limitations.add("cad_polyline_segments_approximate");
+    }
+    const xs = record.groups.filter((group) => group.code === 10).map((group) => Number(group.value));
+    const ys = record.groups.filter((group) => group.code === 20).map((group) => Number(group.value));
+    if (xs.length < 2 || xs.length !== ys.length || xs.length > 1000 || [...xs, ...ys].some(
+      (coordinate) => !Number.isFinite(coordinate) || Math.abs(coordinate) > 1e9,
+    )) {
+      layout.limitations.add("cad_entity_geometry_unavailable");
+      return;
+    }
+    if (Number(first(record, 70)) & 1) { xs.push(xs[0]); ys.push(ys[0]); }
+    for (let index = 1; index < xs.length; index++) {
+      layout.shapes.push({ ...shape, x: xs[index - 1], y: ys[index - 1], x2: xs[index], y2: ys[index] });
+    }
+  } else {
+    layout.limitations.add("cad_entity_type_unsupported");
+  }
+}
+
+export async function* recoveryCadRecords(
+  objects: AsyncIterable<unknown>, issues: Set<string>,
+): AsyncGenerator<{ entity: boolean; record: Entity }> {
+  issues.add("cad_dwg_json_recovery");
+  let found = false;
   for await (const value of objects) {
-    if (++total > 60_000) throw new FormatHold("cad_entity_limit");
     if (value === null || typeof value !== "object") continue;
     const object = value as Record<string, unknown>;
     const { entity, entmode, ins_pt: point, height, rotation, handle } = object;
@@ -418,14 +414,10 @@ export async function parseDwgRecovery(objects: AsyncIterable<unknown>): Promise
       issues.add("cad_dwg_recovery_text_only");
       continue;
     }
-    if (text.length > 8192) throw new FormatHold("cad_text_limit");
-    const rows = (rowsBySpace.get(entmode) ?? 0) + 1;
-    if (rows > cadRowsPerSpace) throw new FormatHold("cad_entity_limit");
-    rowsBySpace.set(entmode, rows);
     const groups: Group[] = [
       { code: 67, value: entmode === 1 ? "1" : "0" },
       { code: 8, value: "?" },
-      { code: 1, value: text },
+      { code: 1, value: text.length <= 8192 ? text : "" },
     ];
     const handleValue = Array.isArray(handle) ? handle[2] : undefined;
     if (typeof handleValue === "number" && Number.isSafeInteger(handleValue) && handleValue > 0) {
@@ -438,13 +430,10 @@ export async function parseDwgRecovery(objects: AsyncIterable<unknown>): Promise
     if (typeof rotation === "number" && Number.isFinite(rotation)) {
       groups.push({ code: 50, value: String(rotation * 180 / Math.PI) });
     }
-    recovered.push({ type: entity, groups });
+    found = true;
+    yield { entity: true, record: { type: entity, groups, ...(text.length > 8192 ? { limitation: "cad_text_limit" } : {}) } };
   }
-  if (!recovered.length) throw new FormatHold("dwg_recovery_no_addressable_text");
-  return parseCadRecords([
-    { type: "SECTION", groups: [{ code: 2, value: "ENTITIES" }] },
-    ...recovered, { type: "ENDSEC", groups: [] },
-  ], issues);
+  if (!found) throw new FormatHold("dwg_recovery_no_addressable_text");
 }
 
 const ifcRoot = /^IFC(?:PROJECT|SITE|BUILDING|BUILDINGSTOREY|SPACE|WALL|WALLSTANDARDCASE|SLAB|BEAM|COLUMN|MEMBER|PLATE|DOOR|WINDOW|CURTAINWALL|ROOF|OPENINGELEMENT|PROPERTYSET|ELEMENTQUANTITY|REL[A-Z0-9]+|PROXY|BUILDINGELEMENTPROXY|FURNISHINGELEMENT|FLOWTERMINAL)$/;
