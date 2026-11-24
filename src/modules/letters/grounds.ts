@@ -64,13 +64,25 @@ function conflictFact(sources: Ground['sources']): string {
   return `Значения расходятся, ${values.join(', а ')}.`;
 }
 
-export function renderGround(ground: AssessmentGround): Ground {
+function missingAction({ part, requestedAction }: AssessmentGround): string {
+  // Only the generated catalog action embeds the uninflected name.
+  if (requestedAction !== `Предоставить ${part}`) return requestedAction;
+  const name = externalLine(part);
+  const scheme = /^схема(?: ([\p{L}\p{M}\p{N} -]+))?$/iu.exec(name);
+  if (scheme && !/(?:^| )(?:и|или|либо)(?: |$)/iu.test(scheme[1] ?? '')) {
+    return `Предоставить схему${name.slice('схема'.length)}`;
+  }
+  return `Предоставить материал «${name}»`;
+}
+
+export function renderGround(ground: AssessmentGround, { legacyAction = false } = {}): Ground {
   const { scope, subject, part, requestedAction, citations, kind } = ground;
   const item = subject === part ? subject : `${subject} — ${part}`;
   const intro = `${externalLine(scope.name)}. ${externalLine(item)}.`;
   const sources = (kind === 'confirmed_conflict' ? distinctConflictCitations(citations) : citations).map(clientSource);
-  const action = externalLine(requestedAction).replace(/[.!?]+$/u, '');
-  const direction = `Просим ${action.slice(0, 1).toLocaleLowerCase('ru')}${action.slice(1)}.`;
+  const action = kind === 'confirmed_missing' && !legacyAction ? missingAction(ground) : requestedAction;
+  const actionLine = externalLine(action).replace(/[.!?]+$/u, '');
+  const direction = `Просим ${actionLine.slice(0, 1).toLocaleLowerCase('ru')}${actionLine.slice(1)}.`;
   let facts: string[];
   if (kind === 'confirmed_conflict') {
     facts = [conflictFact(sources)];
@@ -89,7 +101,7 @@ export function renderGround(ground: AssessmentGround): Ground {
     scopeId: ground.scopeId,
     recipient: ground.recipient,
     subject,
-    action: requestedAction,
+    action,
     sources,
     basis: ground,
     wording: [intro, ...facts, direction].join(' '),
@@ -107,7 +119,7 @@ export async function getGrounds(
       projectId: args.projectId, scopeId: args.scopeId ?? undefined, assessmentContextId: args.assessmentContextId ?? undefined,
       recipient: args.recipient, items: args.selections, readDocumentRevision,
     });
-    return result.items.map(renderGround);
+    return result.items.map((item) => renderGround(item));
   } catch (error) {
     if (error instanceof AssessmentError) {
       throw new LetterError(error.statusCode, error.code, error.message, error.details);

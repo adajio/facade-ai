@@ -142,10 +142,7 @@ export function registerLetterRoutes(app: FastifyInstance, deps: LetterDependenc
     const matchesText = renderText(recipient, layout, items) === text
       || renderText(recipient, layout, items, false) === text;
     if (grounds.length !== revision.items.length
-      || grounds.some((ground, index) => {
-        const item = revision.items[index];
-        return ground.wording !== item.wording || !wordingIsCurrent(item, ground);
-      })
+      || grounds.some((ground, index) => !wordingIsCurrent(items[index], ground))
       || !matchesText
       || hashText(text) !== textSha256) {
       stale(letter);

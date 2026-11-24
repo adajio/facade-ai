@@ -17,7 +17,7 @@ const golden = [
   'Запрос исходных данных',
   'Кому: ООО «Заказчик»',
   'Стадия РД',
-  '1. Фасад А. Узлы. Не получен материал в требуемом формате (pdf). Основание: «Опись.pdf», стр. 1. Просим предоставить Узлы.',
+  '1. Фасад А. Узлы. Не получен материал в требуемом формате (pdf). Основание: «Опись.pdf», стр. 1. Просим предоставить материал «Узлы».',
   '2. Фасад А. AL-01, толщина. Значения расходятся, в источнике «Спецификация R2.pdf», стр. 3 указано 2 мм, а в источнике «Задание R1.pdf», стр. 1 указано 0,003 м. Просим подтвердить значение для «AL-01, толщина».',
 ].join('\n\n');
 
@@ -99,6 +99,61 @@ test('Адрес письма берётся из закреплённой оп�
   assert.equal(conflict.basis.citations.length, 4);
   assert.equal(conflict.wording.split('26 мм').length - 1, 1);
   assert.match(conflict.wording, /стр\. 1 указано 19 мм[\s\S]*столбец 2 указано 26 мм/u);
+});
+
+test('Письмо о непередаче согласует действие с наименованием из матрицы', async () => {
+  const { catalogRequirement } = await load('assessment/store.js');
+  const { renderGround } = await load('letters/grounds.js');
+  const { renderText, renderDocument } = await load('letters/content.js');
+  const { wordingIsCurrent } = await load('letters/wording.js');
+  const recipient = 'ООО «Испытательная сторона»';
+  const part = 'Схема герметизации верхнего торца';
+  const citation = {
+    label: 'Комплект/Монтаж/Реестр передачи.txt',
+    address: { locator: { line: 2 } },
+    documentRevision: { label: 'N05' },
+    deliveryStatement: { status: 'not_delivered', item: part },
+  };
+  const requirement = (part) => catalogRequirement({
+    key: 'detail', part, formats: ['dwg', 'pdf'], equivalents: [],
+    sourceRoles: ['inventory'], addressee: recipient,
+  }, 'applicable');
+  const basisFor = ({ subject, part, requestedAction, requiredFormats }) => ({
+    scope: { name: 'Антресоль Т4', stage: 'РД' },
+    subject, part, requestedAction, requiredFormats, kind: 'confirmed_missing', citations: [citation],
+  });
+  const basis = basisFor(requirement(part));
+  const ground = renderGround(basis);
+  assert.equal(ground.basis, basis);
+  assert.equal(ground.subject, part);
+  assert.deepEqual(ground.sources, [{ label: '«Комплект/Монтаж/Реестр передачи.txt», ред. N05, строка 2', address: citation }]);
+  const text = renderText(recipient, 'formal', [ground]);
+  assert.equal(text, [
+    'Запрос исходных данных',
+    'Кому: ООО «Испытательная сторона»',
+    'Стадия РД',
+    '1. Антресоль Т4. Схема герметизации верхнего торца. Не получен материал в требуемом формате (dwg, pdf). Основание: «Комплект/Монтаж/Реестр передачи.txt», ред. N05, строка 2. Просим предоставить схему герметизации верхнего торца.',
+  ].join('\n\n'));
+  assert.equal((await renderDocument('txt', text)).toString('utf8'), text);
+  assert.equal(extractDocx(await renderDocument('docx', text)), text);
+  assert.equal(ground.action, 'Предоставить схему герметизации верхнего торца');
+  assert.equal(basis.requestedAction, `Предоставить ${part}`);
+
+  const legacyWording = ground.wording.replace('предоставить схему', 'предоставить Схема');
+  const legacyAlternative = ground.alternativeWording.replace('предоставить схему', 'предоставить Схема');
+  const saved = { ...ground, wording: legacyWording, editedWording: null };
+  assert.equal(wordingIsCurrent(saved, ground), true);
+  assert.equal(wordingIsCurrent({ ...saved, editedWording: legacyAlternative }, ground), true);
+  assert.equal(wordingIsCurrent({ ...saved, editedWording: 'Подмена текста.' }, ground), false);
+  const changedCitation = { ...citation, address: { locator: { line: 3 } } };
+  assert.equal(wordingIsCurrent(saved, renderGround({ ...basis, citations: [changedCitation] })), false);
+
+  for (const title of ['Ведомость крепежа', 'Пояснительная записка АР', 'Узлы', 'AL-01, толщина', 'Схема и пояснительная записка']) {
+    const item = renderGround(basisFor(requirement(title)));
+    assert.ok(item.wording.endsWith(`Просим предоставить материал «${title}».`), item.wording);
+  }
+  const custom = renderGround({ ...basis, requestedAction: 'Направить документ в формате PDF.' });
+  assert.ok(custom.wording.endsWith('Просим направить документ в формате PDF.'), custom.wording);
 });
 
 test('AC06, R02 и блокировка текущего экспорта через HTTP и PostgreSQL', { skip: !runDatabase, timeout: 420_000 }, async (t) => {
