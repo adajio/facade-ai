@@ -19,11 +19,11 @@ export function dwgViewports(scratch: DatabaseSync, index: DatabaseSync, layers:
     if ((Number(first(layer, 70)) & 1) || (numeric(layer, 62) ?? 0) < 0) globallyHidden.add(name);
   }
   scratch.exec(`CREATE TABLE model_geometry (
-    id INTEGER PRIMARY KEY, left REAL, right REAL, top REAL, bottom REAL, data TEXT
+    id INTEGER PRIMARY KEY, left REAL, right REAL, top REAL, bottom REAL, draw_order TEXT, data TEXT
   ); CREATE TABLE viewport_defs (params TEXT PRIMARY KEY, digest TEXT);`);
-  const collect = scratch.prepare("INSERT INTO model_geometry(left,right,top,bottom,data) VALUES (?,?,?,?,?)");
+  const collect = scratch.prepare("INSERT INTO model_geometry(left,right,top,bottom,draw_order,data) VALUES (?,?,?,?,?,?)");
   const candidates = scratch.prepare(`
-    SELECT data FROM model_geometry WHERE right>=? AND left<=? AND bottom>=? AND top<=? ORDER BY id
+    SELECT data FROM model_geometry WHERE right>=? AND left<=? AND bottom>=? AND top<=? ORDER BY draw_order,id
   `);
   const find = index.prepare("SELECT data FROM definitions WHERE digest=?");
   const store = index.prepare("INSERT OR IGNORE INTO definitions VALUES (?,?)");
@@ -108,7 +108,7 @@ export function dwgViewports(scratch: DatabaseSync, index: DatabaseSync, layers:
     project,
     collect(shape: CadShape) {
       const { left, right, top, bottom } = cadShapeBounds(shape);
-      collect.run(left, right, top, bottom, JSON.stringify(shape));
+      collect.run(left, right, top, bottom, shape.order ?? null, JSON.stringify(shape));
     },
   };
 }

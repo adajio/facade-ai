@@ -7,7 +7,8 @@ import type { PhysicalInventory } from "./physical-inventory.js";
 
 type Group = { code: number; value: string };
 export type Entity = { type: string; groups: Group[]; limitation?: string };
-type CadRecord = { entity: boolean; block?: boolean; record: Entity };
+type CadRecord = { entity: boolean; block?: boolean; record: Entity;
+  sort?: { owner: string; handle: string; order: string } };
 export const first = (record: Entity, code: number): string | undefined =>
   record.groups.find((group) => group.code === code)?.value.trim();
 
@@ -71,10 +72,14 @@ const cadMetadataGroups = new Map<string, Set<number>>([
 ]);
 
 const blockAddress = new Set([5, 8, 60, 67, 330, 410]);
-const blockGeometry = new Set([...cadTextEntities, "LINE", "CIRCLE", "ARC", "LWPOLYLINE", "INSERT", "DIMENSION", "VIEWPORT"]);
+const blockGeometry = new Set([...cadTextEntities, "LINE", "CIRCLE", "ARC", "LWPOLYLINE", "INSERT", "DIMENSION", "VIEWPORT", "ACAD_PROXY_ENTITY", "HATCH", "WIPEOUT"]);
 const extraGeometryGroups = new Map<string, number[]>([
   ["INSERT", [2, 44, 45, 60, 71]], ["DIMENSION", [2, 60]], ["ARC", [51, 60]],
   ["LWPOLYLINE", [60]], ["LINE", [60]], ["CIRCLE", [60]],
+  ["ACAD_PROXY_ENTITY", [60, 92, 93, 160, 161, 310]],
+  ["HATCH", [2, 12, 13, 22, 23, 51, 52, 53, 60, 44, 45, 46, 49, 74, 75, 76, 77, 78, 79, 91, 92,
+    93, 94, 95, 96, 97, 98, 450]],
+  ["WIPEOUT", [12, 13, 14, 22, 23, 24, 32, 60, 71, 91, 280, 290]],
   ["VIEWPORT", [12, 16, 17, 22, 26, 27, 36, 37, 45, 51, 60, 68, 69, 90, 281, 331, 340]],
 ]);
 const drawingGroups = new Map([...extraGeometryGroups].map(([type, groups]) =>
@@ -91,6 +96,10 @@ export async function* convertedDxfRecords(
   let code: number | undefined;
   let characters = 0;
   let layoutSubclass = false;
+  let sortOwner = "";
+  let sortEntity = "";
+  let sortSubclass = false;
+  let sortFlag = false;
   const single = new Map<number, Group>();
   let keys: Set<number> | undefined;
 
@@ -119,23 +128,44 @@ export async function* convertedDxfRecords(
       code = Number(line);
       continue;
     }
+    const header = section === "HEADER" || (record.type === "SECTION" && first(record, 2) === "HEADER");
     if (code === 0) {
       const previous = finish();
       if (previous) yield previous;
       record = { type: decodeValue(line).trim().toUpperCase() || "UNKNOWN", groups: [] };
       layoutSubclass = false;
+      sortOwner = "";
+      sortEntity = "";
+      sortSubclass = false;
       const drawing = section === "ENTITIES" || (section === "BLOCKS" && blockGeometry.has(record.type));
       keys = cadMetadataGroups.get(record.type) ?? (drawing ? drawingGroups.get(record.type) ?? cadEntityGroups
         : section === "BLOCKS" ? blockAddress : undefined);
       single.clear();
       characters = 0;
+    } else if (header && code === 9) {
+      sortFlag = line.trim() === "$SORTENTS";
+    } else if (header && sortFlag && code === 280) {
+      sortFlag = false;
+      yield { entity: false, record: { type: "SORTENTS_FLAG", groups: [{ code, value: line.trim() }] } };
+    } else if (section === "OBJECTS" && record.type === "SORTENTSTABLE") {
+      if (code === 100) sortSubclass = line.trim() === "AcDbSortentsTable";
+      if (sortSubclass && code === 330) sortOwner = line.trim().toUpperCase();
+      if (sortSubclass && code === 331) sortEntity = line.trim().toUpperCase();
+      if (sortSubclass && code === 5 && sortOwner && sortEntity) {
+        yield { entity: false, record: { type: "", groups: [] },
+          sort: { owner: sortOwner, handle: sortEntity, order: line.trim().toUpperCase() } };
+        sortEntity = "";
+      }
     } else if (record.type === "LAYOUT" && code === 100) {
       layoutSubclass = line.trim() === "AcDbLayout";
     } else if (keys?.has(code)) {
       const address = [5, 67, 330, 410].includes(code);
       const repeated = (record.type === "LWPOLYLINE" && polylineGroups.has(code))
         || (cadTextEntities.has(record.type) && (code === 1 || code === 3))
-        || (record.type === "VIEWPORT" && code === 331);
+        || (record.type === "VIEWPORT" && code === 331)
+        || (record.type === "HATCH" && ![5, 8, 60, 67, 330, 410].includes(code))
+        || (record.type === "WIPEOUT" && (code === 14 || code === 24))
+        || (record.type === "ACAD_PROXY_ENTITY" && code === 310);
       const existing = repeated ? undefined : single.get(code);
       if (!existing || (record.type === "LAYOUT" && (code === 330 || (code === 1 && layoutSubclass)))) {
         characters += line.length;

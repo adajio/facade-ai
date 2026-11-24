@@ -52,7 +52,7 @@ export function renderCad(
   const scale = Math.min(width / crop.width, height / crop.height);
   const originX = crop.x * scale - (width - crop.width * scale) / 2;
   const originY = crop.y * scale - (height - crop.height * scale) / 2;
-  const bytes = load && unit.cad.some(shape => shape.block || shape.path)
+  const bytes = load && unit.cad.some(shape => shape.block || shape.path || shape.area || shape.pieces)
     ? rasterCad(unit.cad, width, height, scale, originX + entire.x * scale, originY + entire.y * scale, load, handle)
     : legacyPng(unit.cad, width, height, scale, originX, originY, entire.x, entire.y, handle);
   return { bytes, crop, transform: { width, height, pixelsPerPoint: scale,

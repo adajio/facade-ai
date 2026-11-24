@@ -16,7 +16,7 @@ import type { CadDefinition, Unit } from "./model.js";
 import { appendCadEntity, cadMetadata, cadSpace, convertedDxfRecords, first, recoveryCadRecords } from "./spatial.js";
 import type { Entity } from "./spatial.js";
 
-export const dwgReaderProfile = "formats-1.1.5";
+export const dwgReaderProfile = "formats-1.1.6";
 const rowsPerPart = 512;
 const shapesPerPart = 6000;
 const textPerPart = 2 * 1024 ** 2;
@@ -172,6 +172,7 @@ export async function buildDwgIndex(file: FileHandle, sha: string, converter: st
       CREATE TABLE block_headers (name TEXT PRIMARY KEY, data TEXT, owner TEXT, paper INTEGER, ambiguous INTEGER DEFAULT 0);
       CREATE TABLE block_entities (ordinal INTEGER PRIMARY KEY, name TEXT, data TEXT, handle TEXT);
       CREATE TABLE block_compiled (name TEXT PRIMARY KEY, data TEXT);
+      CREATE TABLE redraw (handle TEXT PRIMARY KEY, owner TEXT, sortkey TEXT);
     `);
     const metadata: Entity[] = [];
     let metadataBytes = 0;
@@ -181,12 +182,24 @@ export async function buildDwgIndex(file: FileHandle, sha: string, converter: st
       ON CONFLICT(name) DO UPDATE SET ambiguous=1`);
     const saveChild = records.prepare("INSERT INTO block_entities(name,data,handle) VALUES (?,?,?)");
     let activeBlock: string | undefined;
+    let sortEnabled = false;
+    const sort = records.prepare("INSERT OR IGNORE INTO redraw VALUES (?,?,?)");
     const addressHandle = (record: Entity) => {
       const handle = first(record, 5)?.toUpperCase();
       return handle && /^[0-9A-F]{1,16}$/.test(handle) ? handle : null;
     };
     records.exec("BEGIN");
-    for await (const { entity, block, record } of source) {
+    for await (const { entity, block, record, sort: redraw } of source) {
+      if (redraw) {
+        if ([redraw.handle, redraw.owner, redraw.order].every(value => /^[0-9A-F]{1,16}$/.test(value))) {
+          sort.run(redraw.handle, redraw.owner, /^0+$/.test(redraw.order) ? "~" : redraw.order.padStart(16, "0"));
+        }
+        continue;
+      }
+      if (record.type === "SORTENTS_FLAG") {
+        sortEnabled = Boolean(Number(first(record, 280)) & 16);
+        continue;
+      }
       const raw = JSON.stringify(record);
       if (entity) {
         insert.run(++ordinal, raw, addressHandle(record),
@@ -242,15 +255,15 @@ export async function buildDwgIndex(file: FileHandle, sha: string, converter: st
       const data = JSON.stringify(part);
       publish.run(part.id, data, hash(data), Number(Boolean(part.locator.view)));
     }
-    const geometry = dwgGeometry(records, output);
+    const geometry = dwgGeometry(records, output, sortEnabled);
     const viewport = !recovery && (records.prepare(`SELECT 1 AS present FROM entities WHERE
       space<>'Model' AND json_extract(data,'$.type')='VIEWPORT' LIMIT 1`).get()
       ? dwgViewports(records, output, metadata.filter(r => r.type === "LAYER")) : undefined);
     const select = records.prepare(`
-      SELECT ordinal,data,paper_block,CASE WHEN duplicates.handle IS NULL AND
+      SELECT ordinal,data,paper_block,redraw.sortkey,CASE WHEN duplicates.handle IS NULL AND
         (paper_block=0 OR duplicates_with_paper.handle IS NULL) THEN entities.handle END AS handle
       FROM entities LEFT JOIN duplicates USING(handle) LEFT JOIN duplicates_with_paper USING(handle)
-      WHERE space=? ORDER BY ordinal
+        LEFT JOIN redraw USING(handle) WHERE space=? ORDER BY ordinal
     `);
     const historical = records.prepare("SELECT 1 FROM entities WHERE space=? AND paper_block=0 LIMIT 1");
     function space(name: string) {
@@ -268,7 +281,9 @@ export async function buildDwgIndex(file: FileHandle, sha: string, converter: st
         const partUnit = unit(partId, label, {
           space: name, entityCount: size, ...(split ? { part, firstEntity: start, lastEntity: last } : {}),
         }, current.rows, [...new Set([...issues, ...current.limitations])]);
-        partUnit.cad = current.shapes;
+        partUnit.cad = sortEnabled
+          ? current.shapes.sort((a, b) => (a.order ?? "") < (b.order ?? "") ? -1 : Number((a.order ?? "") > (b.order ?? "")))
+          : current.shapes;
         save(partUnit);
         from += size;
         current = cadSpace();
@@ -310,7 +325,9 @@ export async function buildDwgIndex(file: FileHandle, sha: string, converter: st
         if (current.rows.length && (current.rows.length >= rowsPerPart
             || legacyShapes + previousShapes > shapesPerPart || text + bytes > textPerPart)) overlay(flush(true));
         const onPaper = record.type === "VIEWPORT" && name !== "Model" && viewport;
-        const enhanced = onPaper || ["INSERT", "DIMENSION", "ARC", "LWPOLYLINE"].includes(record.type);
+        const specialized = ["HATCH", "WIPEOUT", "ACAD_PROXY_ENTITY"].includes(record.type);
+        const enhanced = onPaper || specialized || ["INSERT", "DIMENSION", "ARC", "LWPOLYLINE"].includes(record.type);
+        if (specialized) next.limitations.delete("cad_entity_type_unsupported");
         if (enhanced) {
           const address = handle ?? `ordinal:${number}`;
           const result = onPaper ? viewport.project(record, address) : geometry(record, address);
@@ -336,6 +353,11 @@ export async function buildDwgIndex(file: FileHandle, sha: string, converter: st
         entity.details = { ...entity.details, entityOrdinal: number,
           ...(next.limitations.size ? { limitations: [...next.limitations] } : {}) };
         current.rows.push(entity);
+        if (sortEnabled) {
+          const order = handle ? (typeof row.sortkey === "string" ? row.sortkey : handle.padStart(16, "0"))
+            : "~~" + String(number).padStart(12, "0");
+          for (const shape of next.shapes) shape.order = order;
+        }
         current.shapes.push(...next.shapes);
         if (name === "Model" && viewport) for (const shape of next.shapes) viewport.collect(shape);
         for (const limit of next.limitations) current.limitations.add(limit);

@@ -42,7 +42,7 @@ test("DWG parts preserve unique coverage, duplicate-handle ordinals and immutabl
     const rows = first.flatMap(({ unit }) => unit.rows);
     assert.deepEqual(rows.map(row => row.details.entityOrdinal), Array.from({ length: 520 }, (_, i) => i + 1));
     assert.deepEqual(rows.slice(511, 513).map(row => row.locator.entityOrdinal), [512, 513]);
-    assert.ok(rows[513].details.limitations.includes("cad_entity_type_unsupported"));
+    assert.ok(rows[513].details.limitations.includes("cad_hatch_boundary_invalid"));
     assert.ok(!rows[511].locator.derivativeHandle && !rows[512].locator.derivativeHandle);
     assert.throws(() => index.read({ ...first[0].pinned, locator: { ...first[0].pinned.locator, partSha256: "0" } }),
       { code: "dwg_index_identity_changed" });
@@ -231,6 +231,88 @@ test("DWG draws shared nested blocks and clips layout viewports without changing
       assert.equal(renderCad(model, { unitId: model.id }, "A4", definition), undefined);
       assert.throws(() => renderCad(model, { unitId: model.id }, "A1", () => index.definition("0".repeat(64))),
         { code: "dwg_index_invalid" });
+    } finally { await index.close(); }
+  } finally { await fd.close(); await rm(root, { recursive: true, force: true }); }
+});
+
+test("DWG draws proxy shell topology, hatch holes and ordered wipeout occlusion", async () => {
+  const { inflateSync } = await import("node:zlib");
+  const { cadFrame, renderCad } = await import("../../../../../dist/src/modules/formats/cad-render.js");
+  const root = await mkdtemp(join(tmpdir(), "dwg-special-"));
+  const path = join(root, "source");
+  const line = (handle, y) => [0, "LINE", 5, handle, 10, 0, 20, y, 11, 20, 21, y];
+  function hatchLoop(points, flags) {
+    return [92, flags | 2, 72, 0, 73, 1, 93, points.length, ...points.flatMap(([x, y]) => [10, x, 20, y]), 97, 0];
+  }
+  const hatch = [0, "HATCH", 5, "D4", 10, 0, 20, 0, 70, 1, 91, 2,
+    ...hatchLoop([[0, 20], [10, 20], [10, 30], [0, 30]], 1),
+    ...hatchLoop([[3, 23], [7, 23], [7, 27], [3, 27]], 16), 75, 0];
+  const pattern = [0, "HATCH", 5, "D5", 10, 0, 20, 0, 70, 0, 91, 1,
+    ...hatchLoop([[0, 40], [10, 40], [10, 50], [0, 50]], 1),
+    75, 1, 76, 1, 78, 1, 53, 0, 43, 0, 44, 40, 45, 0, 46, 2, 79, 2, 49, 1, 49, -1];
+  const wipeout = [0, "WIPEOUT", 5, "D2", 10, 5, 20, 0, 11, 10, 21, 0, 12, 0, 22, 16,
+    13, 1, 23, 1, 70, 7, 280, 1, 71, 2, 91, 4,
+    14, -.5, 24, .5, 14, .5, 24, .5, 14, .5, 24, -.5, 14, -.5, 24, -.5];
+  const shell = Buffer.alloc(116);
+  shell.writeUInt32LE(shell.length, 0);
+  shell.writeUInt32LE(1, 4);
+  shell.writeUInt32LE(shell.length - 8, 8);
+  shell.writeUInt32LE(9, 12);
+  shell.writeUInt32LE(3, 16);
+  [20, 20, 0, 30, 20, 0, 25, 30, 1].forEach((n, i) => shell.writeDoubleLE(n, 20 + i * 8));
+  [4, 3, 0, 1, 2, 1].forEach((n, i) => shell.writeInt32LE(n, 92 + i * 4));
+  const proxy = [0, "ACAD_PROXY_ENTITY", 5, "D6", 92, shell.length, 310, shell.toString("hex"),
+    93, 8, 310, "FF"];
+  const text = (handle, y) => [0, "TEXT", 5, handle, 10, 8, 20, y, 40, 1, 1, "TEXT"];
+  const dxf = [
+    0, "SECTION", 2, "HEADER", 9, "$SORTENTS", 280, 127, 0, "ENDSEC",
+    0, "SECTION", 2, "ENTITIES", ...wipeout, ...line("D1", 8), ...line("D3", 11), ...hatch, ...pattern, ...proxy,
+    ...text("D7", 3), ...text("D8", 5), 0, "ENDSEC",
+    0, "SECTION", 2, "OBJECTS", 0, "SORTENTSTABLE", 5, "21", 100, "AcDbSortentsTable", 330, "1F",
+    331, "D2", 5, "50", 331, "D1", 5, "40", 331, "D3", 5, "51",
+    331, "D7", 5, "49", 331, "D8", 5, "52",
+    0, "ENDSEC", 0, "EOF", "",
+  ].join("\n");
+  await writeFile(path, dxf);
+  const fd = await open(path);
+  try {
+    const index = await buildDwgIndex(fd, "a".repeat(64), "sha256:" + "b".repeat(64));
+    try {
+      const [{ unit }] = [...index.units()];
+      assert.deepEqual(unit.rows.map(r => r.locator.derivativeHandle), ["D2", "D1", "D3", "D4", "D5", "D6", "D7", "D8"]);
+      assert.deepEqual(unit.cad.slice(0,5).map(s => s.handle), ["D1", "D7", "D2", "D3", "D8"]);
+      assert.ok(unit.rows[5].details.limitations.includes("cad_proxy_shell_traits_approximate"));
+      const frame = cadFrame(unit);
+      const picture = renderCad(unit, { unitId: unit.id }, undefined, h => index.definition(h));
+      const chunks = [];
+      for (let at=8; at<picture.bytes.length;) {
+        const n = picture.bytes.readUInt32BE(at);
+        if (picture.bytes.toString("ascii", at+4, at+8) === "IDAT") chunks.push(picture.bytes.subarray(at+8, at+8+n));
+        at += n + 12;
+      }
+      const pixels = inflateSync(Buffer.concat(chunks));
+      const { width, pixelsPerPoint, pixelOriginX, pixelOriginY } = picture.transform;
+      const pos = (x, y) => {
+        const px = Math.round((x - frame.x) * pixelsPerPoint - pixelOriginX);
+        const py = Math.round((-y - frame.y) * pixelsPerPoint - pixelOriginY);
+        return pixels[py * (width * 3 + 1) + px * 3 + 1];
+      };
+      assert.equal(pos(11, 8), 255, "mask erases earlier stroke");
+      assert.equal(pos(3, 8), 22, "stroke survives outside mask");
+      assert.equal(pos(11, 11), 22, "later stroke remains above mask");
+      assert.equal(pos(1, 25), 172, "solid hatch is filled");
+      assert.equal(pos(5, 25), 255, "inner loop is a real hole");
+      assert.equal(pos(.5, 44), 22, "pattern draws the on stroke");
+      assert.equal(pos(1.5, 44), 255, "pattern keeps the dash gap");
+      assert.equal(pos(25, 20), 22, "proxy uses fallback shell topology");
+      const wordInk = y => {
+        for (let dx = 0; dx < 4; dx += .03) for (let dy = -.05; dy < 1.1; dy += .03) {
+          if (pos(8 + dx, y + dy) < 210) return true;
+        }
+        return false;
+      };
+      assert.equal(wordInk(3), false, "mask erases the earlier glyphs");
+      assert.equal(wordInk(5), true, "later glyphs remain above the mask");
     } finally { await index.close(); }
   } finally { await fd.close(); await rm(root, { recursive: true, force: true }); }
 });

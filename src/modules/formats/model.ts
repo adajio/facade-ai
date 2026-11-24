@@ -29,6 +29,9 @@ export type CadBounds = { left: number; right: number; top: number; bottom: numb
 export type CadBlockUse = { digest: string; matrix: [number, number, number, number, number, number] };
 // Points and circular arcs are expressed in SVG coordinates.
 export type CadPath = (["M" | "L", number, number] | ["A", number, number, number, number, number])[];
+export type CadPoint = [number, number];
+export type CadHatchLine = { base: CadPoint; direction: CadPoint; step: CadPoint; dashes: number[] };
+export type CadArea = { loops: CadPath[]; mode: "solid" | "pattern" | "mask"; pattern?: CadHatchLine[] };
 export type CadDefinition = { shapes: CadShape[] };
 export type CadShape = {
   handle: string;
@@ -46,6 +49,9 @@ export type CadShape = {
   bounds?: CadBounds;
   block?: CadBlockUse;
   clip?: CadBounds;
+  area?: CadArea;
+  pieces?: CadShape[];
+  order?: string;
 };
 export type Parsed = {
   units: Unit[];

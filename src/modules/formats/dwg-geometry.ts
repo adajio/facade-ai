@@ -1,5 +1,7 @@
 import { createHash } from "node:crypto";
 import type { DatabaseSync } from "node:sqlite";
+import { readHatch, readWipeout } from "./dwg-area.js";
+import { readProxy } from "./dwg-proxy.js";
 import { cadBounds, cadShapeBounds } from "./cad-bounds.js";
 import type { CadBlockUse, CadBounds, CadDefinition, CadPath, CadShape } from "./model.js";
 import { appendCadEntity, cadSpace, first, numeric } from "./spatial.js";
@@ -124,10 +126,14 @@ function matrix(record: Entity, block: Block): Matrix | undefined {
 }
 
 /** Store each referenced definition once. Child definitions are authenticated by their digest. */
-export function dwgGeometry(source: DatabaseSync, output: DatabaseSync) {
+export function dwgGeometry(source: DatabaseSync, output: DatabaseSync, sortEnabled = false) {
   const find = source.prepare("SELECT data,ambiguous FROM block_headers WHERE name=?");
-  const children = Array.from({ length: maximumDepth }, () =>
-    source.prepare("SELECT data FROM block_entities WHERE name=? ORDER BY ordinal"));
+  const childrenQuery = sortEnabled
+    ? `SELECT b.data FROM block_entities b JOIN block_headers h USING(name)
+        LEFT JOIN redraw r ON r.handle=b.handle AND r.owner=h.owner
+        WHERE b.name=? ORDER BY coalesce(r.sortkey, substr('0000000000000000'||b.handle,-16), '~'), b.ordinal`
+    : "SELECT data FROM block_entities WHERE name=? ORDER BY ordinal";
+  const children = Array.from({ length: maximumDepth }, () => source.prepare(childrenQuery));
   const cached = source.prepare("SELECT data FROM block_compiled WHERE name=?");
   const cache = source.prepare("INSERT INTO block_compiled VALUES (?,?)");
   const publish = output.prepare("INSERT OR IGNORE INTO definitions VALUES (?,?)");
@@ -205,6 +211,10 @@ export function dwgGeometry(source: DatabaseSync, output: DatabaseSync) {
   function leaf(record: Entity, handle: string): Result {
     if (record.type === "INSERT" || record.type === "DIMENSION") return reference(record, handle);
     if (record.type === "ARC" || record.type === "LWPOLYLINE") return dwgCurve(record, handle);
+    if (record.limitation) return { limits: [record.limitation] };
+    if (record.type === "HATCH") return readHatch(record, handle);
+    if (record.type === "WIPEOUT") return readWipeout(record, handle);
+    if (record.type === "ACAD_PROXY_ENTITY") return readProxy(record, handle);
     if (record.type === "SEQEND") return { limits: [] };
     // Points, attribute templates, and unsupported entity data are not a substitute for a drawing.
     if (!["LINE", "CIRCLE", "TEXT", "MTEXT", "ATTRIB"].includes(record.type)) return { limits: [unsupported] };
