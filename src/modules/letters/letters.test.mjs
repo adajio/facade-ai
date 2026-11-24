@@ -4,13 +4,13 @@ import { randomUUID, createHash } from 'node:crypto';
 import { resolve } from 'node:path';
 import { Readable } from 'node:stream';
 import { setTimeout as delay } from 'node:timers/promises';
-import { pathToFileURL } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import test from 'node:test';
 import Fastify from 'fastify';
 import pg from 'pg';
 
 const runDatabase = process.env.LETTERS_TEST_DB === '1';
-const out = process.env.LETTERS_TEST_BUILD ?? new URL('../../../dist/', import.meta.url).pathname;
+const out = process.env.LETTERS_TEST_BUILD ?? fileURLToPath(new URL('../../../dist/', import.meta.url));
 const load = (module) => import(pathToFileURL(resolve(out, 'src/modules', module)));
 
 const golden = [
