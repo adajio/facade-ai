@@ -1,6 +1,7 @@
 import { canonicalJson } from '../assessment/domain.js';
 import { hashText } from './content.js';
 import type { Ground, LetterItem, TextRange, WordingApproval, WordingReview } from './content.js';
+import { renderGround } from './grounds.js';
 import { LetterError } from './inputs.js';
 
 function basisHash(ground: Ground) {
@@ -19,7 +20,12 @@ function storedApprovalMatches(item: LetterItem, ground: Ground) {
 }
 
 export function wordingIsCurrent(item: LetterItem, ground: Ground) {
-  return item.editedWording === null || managedWording(item.editedWording, ground) || storedApprovalMatches(item, ground);
+  // An older confirmed revision can still carry the former catalog wording.
+  const template = item.wording !== ground.wording && ground.kind === 'confirmed_missing'
+    ? renderGround(ground.basis, { legacyAction: true }) : ground;
+  return item.wording === template.wording && (
+    item.editedWording === null || managedWording(item.editedWording, template) || storedApprovalMatches(item, template)
+  );
 }
 
 function words(value: string): string[] {
