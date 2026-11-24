@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import { test } from 'node:test';
-import type { Branch, ResearchSettings, ResearchTask } from './contracts.js';
+import type { Branch, Citation, ResearchSettings, ResearchTask } from './contracts.js';
 import { validateLivePolicy, type LiveRoute } from './live-policy.js';
 import { loadResearchProfile, profileHold } from './profile.js';
 
@@ -117,4 +117,54 @@ test('the new defaults require independent approvals and leave saved pilot assig
   assert.deepEqual(validateLivePolicy(defaults, [direct, pinned], {}).approvals, [direct]);
   assert.deepEqual(validateLivePolicy(defaults, [direct, { ...pinned, provider: 'alibaba/us-east-1' }], env).approvals, [direct]);
   assert.deepEqual(validateLivePolicy({ A: null, B: null, lead: defaults.A }, [direct], env).approvals, []);
+});
+
+test('a strict ZDR reference alone does not authorize customer data', () => {
+  const customer = { ...settings(kimi), dataClass: 'customer' };
+  const unqualified = { ...kimi, mode: 'strict-zdr' as const };
+  const policy = validateLivePolicy({ A: customer, B: null, lead: null }, [unqualified], {});
+  assert.deepEqual(policy.approvals, []);
+  assert.equal(policy.hold(task('A', customer))?.reason, 'research_route_not_approved');
+});
+
+test('the lead needs a third model and route without disabling the readers', () => {
+  const sharedModel = { ...kimi, routeId: 'same-model' };
+  const sharedRoute = { ...kimi, model: 'moonshotai/kimi-another' };
+  for (const reused of [kimi, sharedModel, sharedRoute]) {
+    const approvals: LiveRoute[] = reused === kimi ? [kimi, qwen] : [kimi, qwen, reused];
+    const policy = validateLivePolicy({ ...profile, lead: settings(reused) }, approvals, env);
+    assert.deepEqual(policy.approvals.map(({ routeId, model }) => [routeId, model]),
+      [[kimi.routeId, kimi.model], [qwen.routeId, qwen.model]]);
+    assert.equal(policy.hold(task('A')), null);
+    assert.equal(policy.hold(task('B')), null);
+  }
+});
+
+test('lead and both verifiers require the approved scope and both originals', () => {
+  const third = { ...kimi, routeId: 'lead', model: 'moonshotai/kimi-third-fixture' };
+  const configuration = { ...profile, lead: settings(third) };
+  const { hold } = validateLivePolicy(configuration, [kimi, qwen, third], env);
+  const primary = task('A');
+  assert.ok(primary.job.mode === 'primary');
+  const { place } = primary.job;
+  const citation = <T extends Branch>(branch: T): Citation & { branch: T } => ({
+    branch, place,
+    observationId: randomUUID(), evidenceId: randomUUID(), quote: 'Thickness 2 mm', value: '2', unit: 'mm',
+  });
+  const dispute = { id: randomUUID(), question: { subject: 'F-A', property: 'Thickness' }, a: citation('A'), b: citation('B') };
+  const proposal = { aObservationId: dispute.a.observationId, bObservationId: dispute.b.observationId, explanation: 'Fixture' };
+  const jobs = [
+    { mode: 'lead', settings: configuration.lead, dispute },
+    { mode: 'verify', branch: 'A', settings: configuration.A, dispute, proposal },
+    { mode: 'verify', branch: 'B', settings: configuration.B, dispute, proposal },
+  ] as const;
+  const b = { ...dispute.b, place: { ...dispute.b.place, source: { ...dispute.b.place.source, sha256: 'b'.repeat(64) } } };
+  for (const job of jobs) {
+    const review: ResearchTask = { ...primary, job };
+    assert.equal(hold(review), null);
+    assert.equal(hold({ ...review, scopeId: randomUUID() })?.reason, 'synthetic_input_not_approved');
+    assert.equal(hold({ ...review, job: { ...job, dispute: { ...dispute, b } } })?.reason, 'synthetic_input_not_approved');
+    assert.equal(hold({ ...review, job: { ...job, settings: { ...job.settings, dataClass: 'customer' } } }, true)?.reason,
+      'research_profile_changed');
+  }
 });

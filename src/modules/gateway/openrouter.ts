@@ -170,7 +170,7 @@ function approvedProfile(profile: OpenRouterProfile): boolean {
   const qwen = profile.model.startsWith('qwen/');
   if ((kimi && !matchesKimiEndpoint(profile.model, profile.provider, profile.mode))
     || (requireZdr(profile) && !profile.zdrEvidenceRef?.trim())) return false;
-  if (profile.mode === 'strict-zdr') return true;
+  if (profile.mode === 'strict-zdr') return profile.syntheticScopes === undefined || validSyntheticScopes(profile.syntheticScopes);
   if (profile.mode !== 'synthetic-research' || (!kimi && !qwen)
     || (qwen && !/^alibaba(?:\/|$)/.test(profile.provider))
     || !Array.isArray(profile.syntheticScopes) || !profile.syntheticScopes.length) return false;
@@ -425,7 +425,7 @@ export function openRouterTransport(approval: Step15Approval): ModelTransport {
     async authorize(tx, route, context) {
       const profile = profileFor(route)?.profile;
       if (!profile) return false;
-      if (profile.mode === 'strict-zdr') return true;
+      if (profile.mode === 'strict-zdr' && profile.syntheticScopes === undefined) return true;
       const scope = syntheticScope(profile.syntheticScopes, context.projectId, context.scopeId);
       if (context.dataClass !== 'synthetic' || !scope) return false;
       if (record(context.payload)?.mode === 'copilot') {
