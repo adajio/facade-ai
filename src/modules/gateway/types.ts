@@ -161,19 +161,25 @@ export async function transaction<T>(
   if (external) return operation(external);
   const tx = await pool.connect();
   let discard = false;
+  // pg-pool handles idle clients. A checked-out client can emit a socket error even without a pending query.
+  const onError = () => { discard = true; };
+  tx.on('error', onError);
   try {
     await tx.query('BEGIN');
     const result = await operation(tx);
     await tx.query('COMMIT');
     return result;
   } catch (error) {
-    try {
-      await tx.query('ROLLBACK');
-    } catch {
-      discard = true;
+    if (!discard) {
+      try {
+        await tx.query('ROLLBACK');
+      } catch {
+        discard = true;
+      }
     }
     throw error;
   } finally {
+    tx.removeListener('error', onError);
     tx.release(discard);
   }
 }

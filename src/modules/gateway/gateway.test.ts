@@ -13,7 +13,7 @@ import { registerOperatorRoutes } from './operator.js';
 import { Gateway } from './gateway.js';
 import { PostgresIntentJournal } from './journal.js';
 import { estimateOpenRouterRequest, openRouterTransport, qwen38Max, type OpenRouterProfile } from './openrouter.js';
-import { BUDGET_USD_NANOS, type Attempt, type CallInput, type CallResult,
+import { BUDGET_USD_NANOS, transaction, type Attempt, type CallInput, type CallResult,
   type GenerationRef, type ModelTransport, type Obligation, type RoutePolicy } from './types.js';
 
 const appUrl = process.env.DATABASE_URL;
@@ -423,6 +423,24 @@ test('Decart is scoped to the qualified synthetic Kimi route and requires a supp
   assert.equal(fetchSpy.mock.callCount(), 0);
   assert.equal((await transport.send(attempt, route, request, signal)).receipt.state, 'paid');
   assert.equal(fetchSpy.mock.callCount(), 1);
+});
+
+test('a terminated checked-out journal client rejects the transaction and is discarded', sqlCase, async t => {
+  const outside = await isolated(t, journalUrl!);
+  let terminatedPid: number | undefined;
+  await assert.rejects(transaction(outside, async client => {
+    const { rows: [backend] } = await client.query<{ pid: number }>('SELECT pg_backend_pid() AS pid');
+    terminatedPid = backend.pid;
+    const disconnected = new Promise<void>(resolve => client.once('end', resolve));
+    const { rows: [result] } = await outside.query<{ terminated: boolean }>(
+      'SELECT pg_terminate_backend($1) AS terminated', [backend.pid],
+    );
+    assert.equal(result.terminated, true);
+    await disconnected;
+  }), /Client has encountered a connection error/);
+  assert.ok(terminatedPid);
+  const { rows: [replacement] } = await outside.query<{ pid: number }>('SELECT pg_backend_pid() AS pid');
+  assert.notEqual(replacement.pid, terminatedPid);
 });
 
 test('journal failure after local reserve and permission revocation both prevent transmission', sqlCase, async t => {
