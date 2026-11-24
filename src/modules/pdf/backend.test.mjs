@@ -11,14 +11,16 @@ import pg from 'pg';
 const compiled = process.env.FACADE_PDF_TEST_BUILD ?? 'dist';
 const load = (module) => import(pathToFileURL(resolve(compiled, module)).href);
 const { createPdfAdapter, createRuntimePdfService } = await load('src/modules/pdf/index.js');
+const { groundComponents } = await load('src/modules/pdf/components.js');
+const { verifiedNativeLineCrops } = await load('src/modules/pdf/native-line.js');
 const { createApi } = await load('src/platform/api.js');
 
-function rotatedPdf(rotation) {
-  const stream = '1 0 0 rg 60 70 20 10 re f\n0 0 0 rg BT /F1 14 Tf 60 70 Td (ROTATE) Tj ET\n';
+function rotatedPdf(rotation, stream = '1 0 0 rg 60 70 20 10 re f\n0 0 0 rg BT /F1 14 Tf 60 70 Td (ROTATE) Tj ET\n',
+  right = 320) {
   const objects = [
     '<< /Type /Catalog /Pages 2 0 R >>',
     '<< /Type /Pages /Count 1 /Kids [3 0 R] >>',
-    `<< /Type /Page /Parent 2 0 R /MediaBox [0 0 400 300] /CropBox [40 30 320 250]
+    `<< /Type /Page /Parent 2 0 R /MediaBox [0 0 ${right + 80} 300] /CropBox [40 30 ${right} 250]
        /Rotate ${rotation} /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>`,
     '<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>',
     `<< /Length ${stream.length} >>\nstream\n${stream}endstream`,
@@ -93,6 +95,102 @@ test('crop and rotated native coordinates land on the original ink at 0°, 90°,
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
+});
+
+test('two windows prove the whole measured PDF line at each page rotation', async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), 'facade-pdf-lines-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const adapter = createPdfAdapter();
+  const target = 'Drawing | Facade: QF-42 | Guide offset: 44 mm';
+  const stream = [
+    'BT /F1 12 Tf 60 180 Td (View WEST | Mark: LK-00AB) Tj ET',
+    'BT /F1 12 Tf 360 180 Td (View EAST | Mark: LK-00AB) Tj ET',
+    'BT /F1 12 Tf 60 120 Td (Facade: QF-43 | Mark: LK-00AB) Tj ET',
+    `BT /F1 12 Tf 360 120 Td (${target}) Tj ET`,
+  ].join('\n') + '\n';
+
+  for (const rotation of [0, 90, 180, 270]) {
+    await t.test(`page rotation ${rotation}°`, async () => {
+      const path = join(directory, `rotation-${rotation}.pdf`);
+      await writeFile(path, rotatedPdf(rotation, stream, 680));
+      const [unit] = await adapter.inspect(path);
+      const read = (box, representation = 'native') => adapter.read(path,
+        { address: { unitId: unit.id, box }, representation }, unit);
+      const page = await read();
+      const full = page.lines.find(({ text }) => text === target);
+      const foreign = page.lines.find(({ text }) => text === 'Facade: QF-43 | Mark: LK-00AB');
+      assert.ok(full && foreign, JSON.stringify(page.lines));
+      assert.notEqual(full.id, foreign.id);
+
+      const [axis, length] = rotation % 180 ? ['y', 'height'] : ['x', 'width'];
+      const start = full.box[axis];
+      const span = full.box[length];
+      const padded = { x: full.box.x - 1, y: full.box.y - 1, width: full.box.width + 2, height: full.box.height + 2 };
+      const lower = { ...padded, [length]: span * 0.73 + 1 };
+      const upper = { ...padded, [axis]: start + span * 0.27, [length]: span * 0.73 + 1 };
+      const [prefix, suffix] = rotation < 180 ? [lower, upper] : [upper, lower];
+      const [left, right, neighbor] = await Promise.all([read(prefix), read(suffix), read(foreign.box)]);
+      const crop = (result, line, evidenceId) => ({ line, evidenceId, frame: result.address.box });
+      const first = crop(left, left.lines.find(({ id }) => id === full.id), 'prefix');
+      const last = crop(right, right.lines.find(({ id }) => id === full.id), 'suffix');
+      assert.ok(first.line.text.includes('Facade: QF-42'));
+      assert.ok(last.line.text.includes('44 mm'));
+      assert.notEqual(first.line.text, full.text);
+      assert.notEqual(last.line.text, full.text);
+      const adjacent = crop(neighbor, neighbor.lines.find(({ id }) => id === foreign.id), 'other-view');
+      assert.ok(adjacent.line);
+      assert.deepEqual(verifiedNativeLineCrops(full, [adjacent, last], 'suffix', '44 mm')?.crops, [last]);
+      assert.deepEqual(verifiedNativeLineCrops(full, [last, first], 'suffix', '44 mm')?.crops, [first, last]);
+
+      const reopened = await read(full.box);
+      assert.deepEqual(reopened.lines, [full]);
+      const image = await read(full.box, 'render');
+      assert.deepEqual(image.address, reopened.address);
+      assert.equal(image.transform.pixelOriginX, Math.floor(full.box.x * image.transform.pixelsPerPoint));
+      assert.equal(image.transform.pixelOriginY, Math.floor(full.box.y * image.transform.pixelsPerPoint));
+      assert.ok(Math.max(image.transform.width, image.transform.height) <= 4096);
+      assert.ok(image.transform.width * image.transform.height <= 12_000_000);
+
+      const source = { projectId: randomUUID(), documentId: randomUUID(), versionId: randomUUID(), sha256: hash(await readFile(path)) };
+      const receiptId = randomUUID();
+      const runId = randomUUID();
+      const asEvidence = (id, { address, lines }) => [id, { lines, evidence: {
+        id, source, receiptId, runId, readerVersion: 'fixture', branch: 'A', format: 'pdf',
+        address, representation: 'native', mediaType: 'application/json',
+      } }];
+      const value = { role: 'value', literal: '44', quote: '44 mm', lineId: full.id, link: { kind: 'anchor' } };
+      const unitPart = { role: 'unit', literal: 'mm', quote: '44 mm', lineId: full.id, link: { kind: 'source_context', to: 0 } };
+      const identifier = { role: 'identifier', literal: 'QF-42', quote: 'Facade: QF-42', lineId: full.id,
+        link: { kind: 'same_row', to: 0 } };
+      const input = [{ ...value, evidenceId: 'suffix' }, { ...unitPart, evidenceId: 'suffix' }, { ...identifier, evidenceId: 'prefix' }];
+      const issued = new Map([asEvidence('prefix', left), asEvidence('suffix', right), asEvidence('other-view', neighbor)]);
+      const { components } = groundComponents(input, issued, page);
+      assert.deepEqual(components.map(({ evidenceId, address }) => [evidenceId, address.box]),
+        [['suffix', last.line.box], ['suffix', last.line.box], ['prefix', first.line.box]]);
+      // A whole-page read can put the two views side by side in one receipt.
+      const pageEvidence = new Map([asEvidence('page', page)]);
+      for (const literal of ['QF-43', 'LK-00AB']) {
+        const foreignId = { ...identifier, literal, quote: foreign.text, lineId: foreign.id };
+        assert.throws(() => groundComponents([...input.slice(0, 2), { ...foreignId, evidenceId: 'other-view' }], issued, page),
+          { code: 'reader_component_link_invalid' });
+        const samePageInput = [value, unitPart, foreignId].map((component) => ({ ...component, evidenceId: 'page' }));
+        assert.throws(() => groundComponents(samePageInput, pageEvidence, page), { code: 'reader_component_link_invalid' });
+      }
+    });
+  }
+});
+
+test('a window seam inside inter-word whitespace keeps the complete native PDF line', () => {
+  const id = '1.0.4.0';
+  const box = (x, width) => ({ x, y: 40, width, height: 10 });
+  const full = { id, text: 'Guide offset: 44 mm', box: box(20, 100) };
+  const first = { evidenceId: 'prefix', frame: box(19, 67), line: { id, text: 'Guide offset:', box: box(20, 63) } };
+  const last = { evidenceId: 'suffix', frame: box(86, 35), line: { id, text: '44 mm', box: box(89, 31) } };
+  assert.deepEqual(verifiedNativeLineCrops(full, [first, last], 'suffix', '44 mm')?.crops, [first, last]);
+  const gap = { ...last, frame: box(88, 33) };
+  assert.deepEqual(verifiedNativeLineCrops(full, [first, gap], 'suffix', '44 mm')?.crops, [gap]);
+  const missed = { ...first, line: { ...first.line, text: 'Guide' } };
+  assert.deepEqual(verifiedNativeLineCrops(full, [missed, last], 'suffix', '44 mm')?.crops, [last]);
 });
 
 const haveStand = Boolean(process.env.DATABASE_URL && process.env.FACADE_DATA_DIR && process.env.FACADE_S3_ENDPOINT);

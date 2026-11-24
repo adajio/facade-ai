@@ -253,7 +253,10 @@ function verifyLink(a: Addressed, b: Addressed, kind: Exclude<ReaderComponentInp
   const sameUnit = sameVersion && component.address.unitId === target.address.unitId;
   const sameEvidence = sameUnit && component.evidenceId === target.evidenceId;
   switch (kind) {
-    case 'same_row': return sameEvidence && adjacent(a, b, 'row');
+    case 'same_row':
+      // Aligned PDF text in distinct lines can belong to side-by-side views.
+      return sameEvidence && (a.format !== 'pdf' || component.role === 'unit' || a.line.id === b.line.id)
+        && adjacent(a, b, 'row');
     case 'column_header': return (component.role === 'unit' || component.role === 'identifier') && target.role === 'value'
       && sameEvidence && adjacent(a, b, 'column');
     case 'source_context': return sameEvidence && a.line.id === b.line.id;
