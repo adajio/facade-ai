@@ -7,6 +7,7 @@ import type { PhysicalInventory } from "./physical-inventory.js";
 
 type Group = { code: number; value: string };
 export type Entity = { type: string; groups: Group[]; limitation?: string };
+type CadRecord = { entity: boolean; block?: boolean; record: Entity };
 export const first = (record: Entity, code: number): string | undefined =>
   record.groups.find((group) => group.code === code)?.value.trim();
 
@@ -40,7 +41,7 @@ function cadText(entity: Entity) {
     String.fromCharCode(Number.parseInt(code, 16))).replace(/\\P/g, "\n");
 }
 
-function numeric(entity: Entity, code: number) {
+export function numeric(entity: Entity, code: number) {
   const value = first(entity, code);
   if (!value) return undefined;
   const number = Number(value);
@@ -65,13 +66,24 @@ const cadEntityGroups = new Set([1, 3, 5, 8, 10, 11, 20, 21, 30, 31, 40, 41, 42,
 const cadMetadataGroups = new Map<string, Set<number>>([
   ["SECTION", new Set([2])], ["ENDSEC", new Set()],
   ["LAYOUT", new Set([1, 330])], ["VIEW", new Set([2, 10, 11, 20, 21, 31, 40, 41, 50])],
-  ["BLOCK", new Set([70])], ["STYLE", new Set([3, 4])],
+  ["BLOCK", new Set([1, 2, 10, 20, 30, 70, 330])], ["STYLE", new Set([3, 4])],
+  ["LAYER", new Set([2, 5, 62, 70])],
 ]);
+
+const blockAddress = new Set([5, 8, 60, 67, 330, 410]);
+const blockGeometry = new Set([...cadTextEntities, "LINE", "CIRCLE", "ARC", "LWPOLYLINE", "INSERT", "DIMENSION", "VIEWPORT"]);
+const extraGeometryGroups = new Map<string, number[]>([
+  ["INSERT", [2, 44, 45, 60, 71]], ["DIMENSION", [2, 60]], ["ARC", [51, 60]],
+  ["LWPOLYLINE", [60]], ["LINE", [60]], ["CIRCLE", [60]],
+  ["VIEWPORT", [12, 16, 17, 22, 26, 27, 36, 37, 45, 51, 60, 68, 69, 90, 281, 331, 340]],
+]);
+const drawingGroups = new Map([...extraGeometryGroups].map(([type, groups]) =>
+  [type, new Set([...cadEntityGroups, ...groups])]));
 
 // Keep only fields used by the reader, without accumulating the section in memory.
 export async function* convertedDxfRecords(
   lines: AsyncIterable<string>, decodeValue = (line: string) => line,
-): AsyncGenerator<{ entity: boolean; record: Entity }> {
+): AsyncGenerator<CadRecord> {
   let section = "";
   let entities = false;
   let eof = false;
@@ -97,7 +109,8 @@ export async function* convertedDxfRecords(
     } else if (record.type === "EOF") {
       if (section) throw new FormatHold("dxf_eof_missing");
       eof = true;
-    } else if (entity || cadMetadataGroups.has(record.type)) return { entity, record };
+    } else if (section === "BLOCKS") return { entity: false, block: true, record };
+    else if (entity || cadMetadataGroups.has(record.type)) return { entity, record };
   }
 
   for await (const line of lines) {
@@ -111,7 +124,9 @@ export async function* convertedDxfRecords(
       if (previous) yield previous;
       record = { type: decodeValue(line).trim().toUpperCase() || "UNKNOWN", groups: [] };
       layoutSubclass = false;
-      keys = cadMetadataGroups.get(record.type) ?? (section === "ENTITIES" ? cadEntityGroups : undefined);
+      const drawing = section === "ENTITIES" || (section === "BLOCKS" && blockGeometry.has(record.type));
+      keys = cadMetadataGroups.get(record.type) ?? (drawing ? drawingGroups.get(record.type) ?? cadEntityGroups
+        : section === "BLOCKS" ? blockAddress : undefined);
       single.clear();
       characters = 0;
     } else if (record.type === "LAYOUT" && code === 100) {
@@ -119,12 +134,13 @@ export async function* convertedDxfRecords(
     } else if (keys?.has(code)) {
       const address = [5, 67, 330, 410].includes(code);
       const repeated = (record.type === "LWPOLYLINE" && polylineGroups.has(code))
-        || (cadTextEntities.has(record.type) && (code === 1 || code === 3));
+        || (cadTextEntities.has(record.type) && (code === 1 || code === 3))
+        || (record.type === "VIEWPORT" && code === 331);
       const existing = repeated ? undefined : single.get(code);
       if (!existing || (record.type === "LAYOUT" && (code === 330 || (code === 1 && layoutSubclass)))) {
         characters += line.length;
         if (!address && (record.groups.length >= 8192 || characters > 256 * 1024)) {
-          if (keys === cadEntityGroups) record.limitation ??= "cad_entity_projection_limit";
+          if (section === "ENTITIES" || section === "BLOCKS") record.limitation ??= "cad_entity_projection_limit";
           else throw new FormatHold("cad_metadata_limit");
         } else {
           try {
@@ -135,7 +151,7 @@ export async function* convertedDxfRecords(
               if (!repeated) single.set(code, group);
             }
           } catch (error) {
-            if (!(error instanceof FormatHold) || keys !== cadEntityGroups || address) throw error;
+            if (!(error instanceof FormatHold) || !(section === "ENTITIES" || section === "BLOCKS") || address) throw error;
             record.limitation ??= error.code;
           }
         }
@@ -397,7 +413,7 @@ export function appendCadEntity(layout: CadSpace, record: Entity, name: string, 
 
 export async function* recoveryCadRecords(
   objects: AsyncIterable<unknown>, issues: Set<string>,
-): AsyncGenerator<{ entity: boolean; record: Entity }> {
+): AsyncGenerator<CadRecord> {
   issues.add("cad_dwg_json_recovery");
   let found = false;
   for await (const value of objects) {

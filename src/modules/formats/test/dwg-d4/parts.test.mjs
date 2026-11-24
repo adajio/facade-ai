@@ -174,3 +174,63 @@ test("layout names come from AcDbLayout and preserve empty sheets", async () => 
     } finally { await index.close(); }
   } finally { await fd.close(); await rm(root, { recursive: true, force: true }); }
 });
+
+test("DWG draws shared nested blocks and clips layout viewports without changing entity addresses", async () => {
+  const { renderCad } = await import("../../../../../dist/src/modules/formats/cad-render.js");
+  const root = await mkdtemp(join(tmpdir(), "dwg-geometry-"));
+  const path = join(root, "source");
+  const line = (handle, layer, x, y, x2, y2) => [
+    0, "LINE", 5, handle, 8, layer, 10, x, 20, y, 11, x2, 21, y2,
+  ];
+  const insert = (handle, name, x, y, sx = 1, sy = 1, rotation = 0) => [
+    0, "INSERT", 5, handle, 2, name, 10, x, 20, y, 41, sx, 42, sy, 50, rotation,
+  ];
+  const block = (name, owner, ...entities) =>
+    [0, "BLOCK", 2, name, 330, owner, 70, 0, 10, 1, 20, 2, ...entities.flat(), 0, "ENDBLK"];
+  const dxf = [
+    0, "SECTION", 2, "TABLES", 0, "LAYER", 5, "FF", 2, "frozen", 70, 0, 62, 7, 0, "ENDSEC",
+    0, "SECTION", 2, "BLOCKS",
+    ...block("A", "10", line("11", "0", 1, 2, 4, 2), line("12", "frozen", 1, 2, 1, 4)),
+    ...block("B", "20", insert("21", "a", 1, 2)),
+    ...block("loop", "30", insert("31", "loop", 0, 0)),
+    ...block("*Paper_Space0", "40", [
+      0, "VIEWPORT", 5, "41", 10, 20, 20, 10, 40, 16, 41, 12, 12, 6, 22, 9, 16, 0, 26, 0, 36, 1,
+      45, 12, 68, 2, 69, 2, 331, "FF",
+    ], line("A1", "0", 5, 2, 6, 3)), 0, "ENDSEC",
+    0, "SECTION", 2, "ENTITIES",
+    ...insert("A1", "b", 5, 7, 2, 3, 90), ...insert("A2", "a", 9, 10),
+    0, "DIMENSION", 5, "A3", 2, "A", 10, 123, 20, 456,
+    ...insert("A4", "loop", 15, 7), 0, "ENDSEC",
+    0, "SECTION", 2, "OBJECTS", 0, "LAYOUT", 100, "AcDbLayout", 1, "Sheet", 330, "40", 0, "ENDSEC",
+    0, "EOF", "",
+  ].join("\n");
+  await writeFile(path, dxf);
+  const fd = await open(path);
+  try {
+    const index = await buildDwgIndex(fd, "a".repeat(64), "sha256:" + "b".repeat(64));
+    try {
+      const [model, sheet] = [...index.units()].map(({ unit }) => unit);
+      assert.deepEqual(model.rows.map(r => r.locator.derivativeHandle), ["A1", "A2", "A3", "A4"]);
+      assert.ok(model.rows[3].details.limitations.includes("cad_block_cycle"));
+      assert.deepEqual(Object.fromEntries(Object.entries(model.cad[0].bounds).map(([k, v]) => [k, Math.round(v)])), { left: -1, right: 5, top: -13, bottom: -7 });
+      assert.equal(model.cad[2].bounds.left, 1);
+      assert.equal(sheet.rows[0].locator.derivativeSection, "BLOCKS");
+      assert.equal(sheet.rows[0].locator.derivativeHandle, "41");
+      assert.equal(sheet.rows[1].locator.entityOrdinal, 6);
+      assert.equal(sheet.rows[1].locator.derivativeHandle, undefined);
+      assert.equal(sheet.cad[0].kind, "VIEWPORT");
+      assert.deepEqual(sheet.cad[0].clip, { left: 12, right: 28, top: -16, bottom: -4 });
+      const definition = digest => index.definition(digest);
+      const layers = shapes => shapes.flatMap(s => [s.layer, ...s.block ? layers(definition(s.block.digest).shapes) : []]);
+      assert.ok(layers(model.cad).includes("frozen"));
+      assert.ok(!layers(sheet.cad).includes("frozen"));
+      for (const [unit, address] of [[model, "A1"], [sheet, "41"], [sheet, undefined]]) {
+        const result = renderCad(unit, { unitId: unit.id }, address, definition);
+        assert.equal(result.bytes.subarray(1, 4).toString(), "PNG");
+      }
+      assert.equal(renderCad(model, { unitId: model.id }, "A4", definition), undefined);
+      assert.throws(() => renderCad(model, { unitId: model.id }, "A1", () => index.definition("0".repeat(64))),
+        { code: "dwg_index_invalid" });
+    } finally { await index.close(); }
+  } finally { await fd.close(); await rm(root, { recursive: true, force: true }); }
+});

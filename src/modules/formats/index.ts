@@ -41,7 +41,7 @@ function invalid(): never {
 function select(current: Unit, request: Locator = {}): { rows: Row[]; locator: Locator; handle?: string } {
   const locator = { ...current.locator };
   const qualifiers = new Set(["line", "paragraph", "section", "row", "column", "cell", "range", "handle",
-    "derivativeHandle", "entityOrdinal", "step", "globalId", "merge"]);
+    "derivativeHandle", "derivativeSection", "entityOrdinal", "step", "globalId", "merge"]);
   for (const [key, value] of Object.entries(request)) {
     if (Object.hasOwn(locator, key) && locator[key] === value) continue;
     if (key === "coverage" && current.coverage === value) continue;
@@ -83,14 +83,14 @@ function mapUnit(current: Unit): ReaderUnit {
   };
 }
 
-function rawOutput(parsed: Parsed, current: Unit, request: ReadRequest): ReaderOutput {
+function rawOutput(parsed: Parsed, current: Unit, request: ReadRequest, load?: Parameters<typeof renderCad>[3]): ReaderOutput {
   const query = Object.fromEntries(Object.entries(request.address.locator ?? {}).filter(([key, value]) =>
     !["limitations", "candidateCount"].includes(key) || mapUnit(current).locator?.[key] !== value));
   const { rows, locator, handle } = select(current, query);
   const address = { ...request.address, locator };
   if (request.address.box && !current.cad) invalid();
   if (request.representation === "render") {
-    const image = current.cad ? renderCad(current, address, handle) : undefined;
+    const image = current.cad ? renderCad(current, address, handle, load) : undefined;
     if (!image) {
       throw new ReaderError(handle ? "cad_entity_geometry_unavailable" : current.limitations[0] ?? "format_render_unavailable",
         "Для указанного места доступно текстовое открытие или исходное ограничение", 424);
@@ -208,7 +208,7 @@ function adapter(format: Format): ReaderAdapter {
     const { unit, digest } = index.read(selected);
     const current = pinned(index, unit, digest);
     return rawOutput({ units: [], converter: index.identity.converter, representationSha256: index.identity.derivative },
-      current, request);
+      current, request, block => index.definition(block));
   }
 
   async function inspectDwg(path: string, source?: SourceRef): Promise<ReaderUnit[]> {

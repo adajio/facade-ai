@@ -24,6 +24,12 @@ export type Unit = {
   cadView?: { x: number; y: number; width: number; height: number };
   physicalRows?: number[];
 };
+export type CadBounds = { left: number; right: number; top: number; bottom: number };
+// A block transform is expressed in SVG coordinates (CAD Y points up).
+export type CadBlockUse = { digest: string; matrix: [number, number, number, number, number, number] };
+// Points and circular arcs are expressed in SVG coordinates.
+export type CadPath = (["M" | "L", number, number] | ["A", number, number, number, number, number])[];
+export type CadDefinition = { shapes: CadShape[] };
 export type CadShape = {
   handle: string;
   layer: string;
@@ -36,6 +42,10 @@ export type CadShape = {
   angle?: number;
   radius?: number;
   text?: string;
+  path?: CadPath;
+  bounds?: CadBounds;
+  block?: CadBlockUse;
+  clip?: CadBounds;
 };
 export type Parsed = {
   units: Unit[];

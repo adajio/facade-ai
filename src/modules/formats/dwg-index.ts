@@ -6,14 +6,17 @@ import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { ReaderError } from "../pdf/types.js";
 import type { ReaderUnit, SourceRef } from "../pdf/types.js";
+import { blockKey, dwgGeometry, geometryDigest } from "./dwg-geometry.js";
+import { dwgViewports } from "./dwg-viewport.js";
+import { cadShapeBounds } from "./cad-bounds.js";
 import { derivativeLines, derivativeText, dxfBytes, dxfValue } from "./dwg-text.js";
 import { recoveryObjects } from "./dwg-recovery.js";
 import { FormatHold, unit } from "./model.js";
-import type { Unit } from "./model.js";
+import type { CadDefinition, Unit } from "./model.js";
 import { appendCadEntity, cadMetadata, cadSpace, convertedDxfRecords, first, recoveryCadRecords } from "./spatial.js";
 import type { Entity } from "./spatial.js";
 
-export const dwgReaderProfile = "formats-1.1.4";
+export const dwgReaderProfile = "formats-1.1.5";
 const rowsPerPart = 512;
 const shapesPerPart = 6000;
 const textPerPart = 2 * 1024 ** 2;
@@ -80,6 +83,17 @@ export class DwgIndex {
       throw new ReaderError("dwg_index_invalid", "Контрольная сумма части DWG расходится", 424);
     }
     return { unit: JSON.parse(data) as Unit, digest };
+  }
+  definition(digest: string): CadDefinition {
+    try {
+      const raw = this.db.prepare("SELECT data FROM definitions WHERE digest=?").get(digest)?.data;
+      if (typeof raw !== "string" || geometryDigest(raw) !== digest) {
+        throw new ReaderError("dwg_index_invalid", "Контрольная сумма блока DWG расходится", 424);
+      }
+      return JSON.parse(raw) as CadDefinition;
+    } catch (error) {
+      return indexError(error);
+    }
   }
   async close() {
     try { this.db.close(); } finally { await this.dispose?.(); }
@@ -153,20 +167,38 @@ export async function buildDwgIndex(file: FileHandle, sha: string, converter: st
     records = new DatabaseSync(join(tmp, "records"));
     budget(records, capacity / 3n);
     records.exec(`
-      CREATE TABLE entities (ordinal INTEGER PRIMARY KEY, data TEXT, handle TEXT, direct TEXT, owner TEXT, paper INTEGER, space TEXT);
+      CREATE TABLE entities (ordinal INTEGER PRIMARY KEY, data TEXT, handle TEXT, direct TEXT, owner TEXT, paper INTEGER, space TEXT, paper_block INTEGER NOT NULL);
       CREATE TABLE owners (id TEXT PRIMARY KEY, name TEXT);
+      CREATE TABLE block_headers (name TEXT PRIMARY KEY, data TEXT, owner TEXT, paper INTEGER, ambiguous INTEGER DEFAULT 0);
+      CREATE TABLE block_entities (ordinal INTEGER PRIMARY KEY, name TEXT, data TEXT, handle TEXT);
+      CREATE TABLE block_compiled (name TEXT PRIMARY KEY, data TEXT);
     `);
     const metadata: Entity[] = [];
     let metadataBytes = 0;
     let ordinal = 0;
-    const insert = records.prepare("INSERT INTO entities VALUES (?,?,?,?,?,?,NULL)");
+    const insert = records.prepare("INSERT INTO entities VALUES (?,?,?,?,?,?,NULL,0)");
+    const saveHeader = records.prepare(`INSERT INTO block_headers(name,data,owner,paper) VALUES (?,?,?,?)
+      ON CONFLICT(name) DO UPDATE SET ambiguous=1`);
+    const saveChild = records.prepare("INSERT INTO block_entities(name,data,handle) VALUES (?,?,?)");
+    let activeBlock: string | undefined;
+    const addressHandle = (record: Entity) => {
+      const handle = first(record, 5)?.toUpperCase();
+      return handle && /^[0-9A-F]{1,16}$/.test(handle) ? handle : null;
+    };
     records.exec("BEGIN");
-    for await (const { entity, record } of source) {
+    for await (const { entity, block, record } of source) {
       const raw = JSON.stringify(record);
       if (entity) {
-        const handle = first(record, 5)?.toUpperCase();
-        insert.run(++ordinal, raw, handle && /^[0-9A-F]{1,16}$/.test(handle) ? handle : null,
+        insert.run(++ordinal, raw, addressHandle(record),
           first(record, 410) || null, first(record, 330)?.toUpperCase() ?? null, Number(first(record, 67) === "1"));
+      } else if (block) {
+        if (record.type === "BLOCK") {
+          activeBlock = blockKey(first(record, 2));
+          if ((Number(first(record, 70)) & 12) || first(record, 1)) issues.add("cad_external_reference");
+          if (activeBlock) saveHeader.run(activeBlock, raw, first(record, 330)?.toUpperCase() ?? null,
+            Number(/^\*PAPER_SPACE\d*$/.test(activeBlock)));
+        } else if (record.type === "ENDBLK") activeBlock = undefined;
+        else if (activeBlock) saveChild.run(activeBlock, raw, addressHandle(record));
       } else {
         metadataBytes += Buffer.byteLength(raw);
         if (metadataBytes > 8 * 1024 ** 2) throw new FormatHold("cad_metadata_limit");
@@ -180,16 +212,27 @@ export async function buildDwgIndex(file: FileHandle, sha: string, converter: st
     records.exec(`
       UPDATE entities SET space=coalesce(direct, (SELECT name FROM owners WHERE id=entities.owner),
         CASE paper WHEN 1 THEN 'Paper' ELSE 'Model' END);
+      CREATE INDEX block_entities_name ON block_entities(name,ordinal);
+      INSERT INTO entities
+        SELECT (SELECT coalesce(max(ordinal),0) FROM entities) + row_number() OVER (ORDER BY b.ordinal),
+          b.data,b.handle,NULL,h.owner,1,o.name,1
+        FROM block_entities b JOIN block_headers h USING(name) JOIN owners o ON o.id=h.owner
+        WHERE h.paper=1 AND h.ambiguous=0 AND o.name<>'Model';
       CREATE INDEX entities_space ON entities(space,ordinal);
       CREATE INDEX entities_handle ON entities(handle);
       CREATE TABLE duplicates (handle TEXT PRIMARY KEY);
-      INSERT INTO duplicates SELECT handle FROM entities WHERE handle IS NOT NULL GROUP BY handle HAVING count(*)>1;
+      INSERT INTO duplicates SELECT handle FROM entities WHERE handle IS NOT NULL AND paper_block=0
+        GROUP BY handle HAVING count(*)>1;
+      CREATE TABLE duplicates_with_paper (handle TEXT PRIMARY KEY);
+      INSERT INTO duplicates_with_paper SELECT handle FROM entities WHERE handle IS NOT NULL
+        GROUP BY handle HAVING count(*)>1;
     `);
     const diskFile = join(tmp, "index.sqlite");
     output = new DatabaseSync(diskFile);
     budget(output, capacity / 3n);
     output.exec(`CREATE TABLE identity (data TEXT); CREATE TABLE parts (
-      ordinal INTEGER PRIMARY KEY, id TEXT UNIQUE, data TEXT, digest TEXT, view INTEGER);`);
+      ordinal INTEGER PRIMARY KEY, id TEXT UNIQUE, data TEXT, digest TEXT, view INTEGER);
+      CREATE TABLE definitions (digest TEXT PRIMARY KEY, data TEXT);`);
     output.prepare("INSERT INTO identity VALUES (?)").run(JSON.stringify({ converter, derivative: sha, kind }));
     const publish = output.prepare("INSERT INTO parts(id,data,digest,view) VALUES (?,?,?,?)");
     function save(part: Unit) {
@@ -199,19 +242,30 @@ export async function buildDwgIndex(file: FileHandle, sha: string, converter: st
       const data = JSON.stringify(part);
       publish.run(part.id, data, hash(data), Number(Boolean(part.locator.view)));
     }
+    const geometry = dwgGeometry(records, output);
+    const viewport = !recovery && (records.prepare(`SELECT 1 AS present FROM entities WHERE
+      space<>'Model' AND json_extract(data,'$.type')='VIEWPORT' LIMIT 1`).get()
+      ? dwgViewports(records, output, metadata.filter(r => r.type === "LAYER")) : undefined);
     const select = records.prepare(`
-      SELECT ordinal,data,CASE WHEN duplicates.handle IS NULL THEN entities.handle END AS handle
-      FROM entities LEFT JOIN duplicates USING(handle) WHERE space=? ORDER BY ordinal
+      SELECT ordinal,data,paper_block,CASE WHEN duplicates.handle IS NULL AND
+        (paper_block=0 OR duplicates_with_paper.handle IS NULL) THEN entities.handle END AS handle
+      FROM entities LEFT JOIN duplicates USING(handle) LEFT JOIN duplicates_with_paper USING(handle)
+      WHERE space=? ORDER BY ordinal
     `);
+    const historical = records.prepare("SELECT 1 FROM entities WHERE space=? AND paper_block=0 LIMIT 1");
     function space(name: string) {
       if (name.length > 300) throw new FormatHold("cad_layout_name_limit");
       const base = "space:" + short(name);
+      const newSheetRows = !historical.get(name);
       let current = cadSpace();
-      let part = 0, from = 1, start = 0, last = 0, text = 0;
+      let part = 0, from = 1, start = 0, last = 0, text = 0, legacyShapes = 0;
       function flush(split: boolean) {
         const size = current.rows.length;
         const label = split ? `${name} · объекты ${from}–${from + size - 1}` : name;
-        const partUnit = unit(split ? `${base}:${++part}` : base, label, {
+        if (split) part++;
+        // Older maps already exposed the empty sheet's ID. Keep it as the first part's link.
+        const partId = !split || (newSheetRows && part === 1) ? base : `${base}:${part}`;
+        const partUnit = unit(partId, label, {
           space: name, entityCount: size, ...(split ? { part, firstEntity: start, lastEntity: last } : {}),
         }, current.rows, [...new Set([...issues, ...current.limitations])]);
         partUnit.cad = current.shapes;
@@ -219,6 +273,7 @@ export async function buildDwgIndex(file: FileHandle, sha: string, converter: st
         from += size;
         current = cadSpace();
         text = 0;
+        legacyShapes = 0;
         return partUnit;
       }
       function overlay(partUnit: Unit) {
@@ -248,12 +303,30 @@ export async function buildDwgIndex(file: FileHandle, sha: string, converter: st
           appendCadEntity(next, { ...record, limitation: error.code }, name, number, handle);
         }
         const [entity] = next.rows;
-        if (!["TEXT", "MTEXT", "ATTRIB", "ATTDEF", "LINE", "CIRCLE", "LWPOLYLINE"].includes(record.type)) {
-          next.limitations.add("cad_entity_type_unsupported");
-        }
+        const previousShapes = next.shapes.length;
+        // Keep existing part boundaries and entity locators. Supplemental graphics
+        // never participate in the legacy partition sizing.
         const bytes = Buffer.byteLength(JSON.stringify(entity));
         if (current.rows.length && (current.rows.length >= rowsPerPart
-            || current.shapes.length + next.shapes.length > shapesPerPart || text + bytes > textPerPart)) overlay(flush(true));
+            || legacyShapes + previousShapes > shapesPerPart || text + bytes > textPerPart)) overlay(flush(true));
+        const onPaper = record.type === "VIEWPORT" && name !== "Model" && viewport;
+        const enhanced = onPaper || ["INSERT", "DIMENSION", "ARC", "LWPOLYLINE"].includes(record.type);
+        if (enhanced) {
+          const address = handle ?? `ordinal:${number}`;
+          const result = onPaper ? viewport.project(record, address) : geometry(record, address);
+          if (result.shape) {
+            next.shapes = [result.shape];
+            next.limitations.delete("cad_entity_geometry_unavailable");
+            next.limitations.delete("cad_entity_type_unsupported");
+            next.limitations.delete("cad_polyline_segments_approximate");
+            const { left, top, right, bottom } = cadShapeBounds(result.shape);
+            entity.bounds = { x: left, y: -bottom, width: right - left, height: bottom - top };
+          }
+          for (const issue of result.limits) next.limitations.add(issue);
+        } else if (!["TEXT", "MTEXT", "ATTRIB", "ATTDEF", "LINE", "CIRCLE", "SEQEND"].includes(record.type)) {
+          next.limitations.add("cad_entity_type_unsupported");
+        }
+        if (row.paper_block) entity.locator.derivativeSection = "BLOCKS";
         if (!current.rows.length) start = number;
         last = number;
         if (handle) {
@@ -264,18 +337,22 @@ export async function buildDwgIndex(file: FileHandle, sha: string, converter: st
           ...(next.limitations.size ? { limitations: [...next.limitations] } : {}) };
         current.rows.push(entity);
         current.shapes.push(...next.shapes);
+        if (name === "Model" && viewport) for (const shape of next.shapes) viewport.collect(shape);
         for (const limit of next.limitations) current.limitations.add(limit);
         text += bytes;
+        legacyShapes += previousShapes;
       }
       overlay(flush(part > 0));
     }
     output.exec("BEGIN");
+    records.exec("BEGIN");
     for (const name of layouts) space(name);
     for (const row of records.prepare("SELECT space FROM entities GROUP BY space ORDER BY min(ordinal)").iterate()) {
       const name = String(row.space);
       if (!layouts.has(name)) space(name);
     }
     output.exec("COMMIT");
+    records.exec("COMMIT");
     records.close();
     records = undefined;
     output.close();
