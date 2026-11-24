@@ -21,4 +21,6 @@ docker --context orbstack network connect --alias facade-ci-proxy \
   facade-ai-ci-private facade-ai-ci-proxy
 ```
 
-На Mac скопируйте `run-local.sh` на SSD и запустите через LaunchAgent пользователя. Права администратора GitHub требуются только локальному контроллеру для получения конфигурации. Проверьте онлайн-статус раннера в Actions. При недоступном Mac или SSD задания ожидают подключения раннера.
+На Mac установите `run-local.sh` в `~/Library/Application Support/Facade AI CI` и запустите через пользовательский LaunchAgent `com.adajio.facade-ai-ci` с `RunAtLoad` и `KeepAlive`. Добавьте пути к `gh`, `jq` и `docker` в `PATH` агента и направьте журналы в `~/Library/Logs/Facade AI CI`. Образы, рабочие каталоги и данные заданий находятся на внешнем SSD в хранилище OrbStack.
+
+Права администратора GitHub требуются локальному контроллеру для получения конфигурации. Проверьте состояние агента командой `launchctl print "gui/$(id -u)/com.adajio.facade-ai-ci"` и онлайн-статус раннера в Actions. Когда Mac, SSD или OrbStack недоступны, задания ожидают подключения раннера.
