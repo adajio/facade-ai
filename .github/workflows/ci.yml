@@ -1,0 +1,45 @@
+name: Facade CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: facade-ci-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  verify:
+    name: ${{ matrix.check }}
+    runs-on: [self-hosted, linux, arm64, facade-ai-ssd]
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        check: [Build, Typecheck, Tests, Contracts]
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - name: Install Node dependencies
+        if: matrix.check != 'Contracts'
+        run: npm ci --no-audit --no-fund
+      - name: Install web dependencies
+        if: matrix.check == 'Build' || matrix.check == 'Typecheck'
+        run: npm ci --prefix web --no-audit --no-fund
+      - name: ${{ matrix.check }}
+        env:
+          FACADE_CI_CHECK: ${{ matrix.check }}
+          PYTHONDONTWRITEBYTECODE: '1'
+        run: |
+          case "$FACADE_CI_CHECK" in
+            Build) npm run build ;;
+            Typecheck) npm run typecheck ;;
+            Tests) npm test ;;
+            Contracts) python3 contracts/check_examples.py ;;
+            *) exit 2 ;;
+          esac
