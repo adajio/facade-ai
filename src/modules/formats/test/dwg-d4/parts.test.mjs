@@ -460,3 +460,53 @@ test("DWG pins SHX strokes, reports missing glyphs and ignores font paths outsid
     await rm(root,{recursive:true,force:true});
   }
 });
+
+test("DWG renders the full viewport with over 4000 short glyph runs in paint order", async () => {
+  const { inflateSync } = await import("node:zlib");
+  const { cadFrame, renderCad } = await import("../../../../../dist/src/modules/formats/cad-render.js");
+  const clip = { left: 0, right: 1600, top: 0, bottom: 800 };
+  const digest = "a".repeat(64);
+  const viewport = { kind: "VIEWPORT", handle: "1", layer: "0", x: 800, y: -400, bounds: clip, clip,
+    block: { digest, matrix: [1, 0, 0, 1, 0, 0] } };
+  const line = (y) => ({ kind: "LINE", layer: "0", x: 20, y: -y, x2: 1550, y2: -y });
+  const mask = { kind: "WIPEOUT", layer: "0", x: 500, y: -680,
+    bounds: { left: 500, right: 1100, top: 680, bottom: 740 },
+    area: { mode: "mask", loops: [[["M", 500, 680], ["L", 1100, 680], ["L", 1100, 740], ["L", 500, 740]]] } };
+  const labels = Array.from({ length: 4100 }, (_, i) => ({
+    kind: "TEXT", layer: "0", x: 20 + i % 100 * 15, y: -60 - Math.floor(i / 100) * 12, text: "К4", height: 3,
+    textSpans: [{ text: "К4", x: 0, y: 0, height: 3, width: 1, oblique: 0, advance: 4 }],
+  }));
+  const unit = { id: "paper", cad: [viewport], limitations: [] };
+  const result = renderCad(unit, { unitId: unit.id }, undefined, key => {
+    assert.equal(key, digest);
+    return { shapes: [...labels, line(700), mask, line(730)] };
+  });
+  const frame = cadFrame(unit);
+  assert.deepEqual(result.crop, { x: 0, y: 0, width: frame.width, height: frame.height });
+  const chunks = [];
+  for (let offset = 8; offset < result.bytes.length;) {
+    const length = result.bytes.readUInt32BE(offset);
+    if (result.bytes.toString("ascii", offset + 4, offset + 8) === "IDAT") {
+      chunks.push(result.bytes.subarray(offset + 8, offset + 8 + length));
+    }
+    offset += length + 12;
+  }
+  const pixels = inflateSync(Buffer.concat(chunks));
+  const { width, pixelsPerPoint, pixelOriginX, pixelOriginY } = result.transform;
+  function pixel(x, y) {
+    const px = Math.round((x - frame.x) * pixelsPerPoint - pixelOriginX);
+    const py = Math.round((y - frame.y) * pixelsPerPoint - pixelOriginY);
+    return pixels[py * (width * 3 + 1) + px * 3 + 1];
+  }
+  assert.equal(pixel(30, 700), 22, "left side of the full viewport");
+  assert.equal(pixel(1540, 700), 22, "right side of the full viewport");
+  assert.equal(pixel(800, 700), 255, "the intervening mask covers the earlier stroke");
+  assert.equal(pixel(800, 730), 22, "the later stroke survives the mask");
+});
+
+test("DWG retains a UTF-8 glyph markup limit for large text", async () => {
+  const { rasterCad } = await import("../../../../../dist/src/modules/formats/cad-raster.js");
+  const label = { kind: "TEXT", layer: "0", x: 1, y: -10, height: 4, text: "Ж".repeat(1024) };
+  assert.throws(() => rasterCad(Array(1100).fill(label), 100, 100, 1, 0, 0, () => ({ shapes: [] })),
+    { code: "cad_block_render_limit" });
+});

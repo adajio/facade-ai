@@ -60,7 +60,6 @@ export function rasterCad(
   const definitions = new Map<string, CadShape[]>();
   const text = new Map<CadBounds, string[]>();
   const fontsUsed = new Set<string>();
-  let textCount = 0;
   let visits = 0, work = 0, areaWork = 0, definitionBytes = 0, glyphsBytes = 0, glyphPasses = 0;
 
   function limit(): never {
@@ -245,8 +244,9 @@ export function rasterCad(
   }
 
   function addGlyphRun(item: string, box: CadBounds) {
-    glyphsBytes += item.length;
-    if (glyphsBytes > 2 * 1024 ** 2 || ++textCount > 4000) limit();
+    // Bound text by the volume sent to the rasterizer across all mask passes.
+    glyphsBytes += Buffer.byteLength(item, "utf8");
+    if (glyphsBytes > 2 * 1024 ** 2) limit();
     if (!text.has(box)) text.set(box, []);
     text.get(box)!.push(item);
   }
