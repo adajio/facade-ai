@@ -13,7 +13,7 @@ import { packageCommonGrounded, packageNonDeliveryGrounded, verifiedNativeInvent
 import { escapeRegex } from '../questions/domain.js';
 import {
   checkToolArguments, commands, parseCompound, parseContext, decodeCompletion, hashBytes, imageMessage, initialMessages, observationArguments, permittedTool, request,
-  reviewCommands, toolMessage, walkJob, type AssistantMessage, type FunctionCall, type ToolReply,
+  packageArgumentPaths, reviewCommands, toolMessage, toolWireFor, walkJob, type AssistantMessage, type FunctionCall, type ToolReply,
 } from './openrouter.js';
 
 type AssistantEvent = {
@@ -144,7 +144,7 @@ function restore(task: ResearchTask, events: ResearchEvent[]) {
             if (body && typeof body === 'object' && 'code' in body) {
               const prior = !('nextAction' in body) && argumentCorrection(call.function.name, body.code);
               if (prior) legacyCorrections.set(messages.length, toolMessage(call, { body: { ...body, nextAction: prior } }));
-              const nextAction = recordedCorrection(call, body.code, task)
+              const nextAction = ('invalidPaths' in body ? undefined : recordedCorrection(call, body.code, task))
                 ?? (!('nextAction' in body) && typeof body.code === 'string' ? readerCorrections[body.code] : undefined);
               if (nextAction) corrections.set(messages.length, toolMessage(call, { body: { ...body, nextAction } }));
             }
@@ -414,6 +414,11 @@ async function executeTool(
   const args = decodeArguments(call.function.arguments);
   const parsed = checkToolArguments(task.job, name, args, earlyPair);
   if (!parsed.success) {
+    const invalidPaths = packageArgumentPaths(task.job, name, args);
+    if (invalidPaths.length) {
+      return { reply: { body: { ok: false, code: 'invalid_arguments', invalidPaths,
+        nextAction: `Исправьте поля: ${invalidPaths.join(', ')}. Поместите state, labels, reason, quote и projectContext в package.binding. Передайте role, stage, revision и valueRole объектами внутри package. Для отдельного фрагмента укажите индекс его компонента в package.references. Сохраните подтверждённую цитату и опустите поля без опоры.` } } };
+    }
     const nextAction = name === 'save_observation' ? observationCorrection(args) :
       earlyPair && (name === 'verify_resolution' || name === 'propose_resolution')
         ? 'Укажите checks по исполнению, ревизии, применимости и сопоставимости и evidenceIds открытых опор.' : name === 'verify_resolution'
@@ -787,7 +792,8 @@ export async function advance(task: ResearchTask, ports: SessionPorts): Promise<
     };
   }
   const turn = state.latestModel + 1;
-  const modelRequest = request(task.job, state.currentMessages, 'current',
+  const toolWire = toolWireFor(task.job);
+  const modelRequest = request(task.job, state.currentMessages, toolWire,
     task.earlyPair && task.pairScopeName ? { scopeName: task.pairScopeName } : undefined);
   let serialized = JSON.stringify(modelRequest);
   if (Buffer.byteLength(serialized) > 16 * 1024 * 1024) {
@@ -804,6 +810,15 @@ export async function advance(task: ResearchTask, ports: SessionPorts): Promise<
   let result = await send(modelRequest);
   let compoundContract = true;
   let pairContract = task.earlyPair;
+  if (toolWire === 'package-observation-v2' && result.status === 'held' && result.code === 'effect_conflict' && result.attemptId) {
+    // A gateway attempt opened before this change is bound to the previous serialized request.
+    const previous = request(task.job, state.currentMessages, 'current');
+    const previousWire = JSON.stringify(previous);
+    if (Buffer.byteLength(previousWire) <= 16 * 1024 * 1024) {
+      result = await send(previous);
+      serialized = previousWire;
+    }
+  }
   if (task.scopeId !== null && task.earlyPair && result.status === 'held' && result.code === 'effect_conflict' && result.attemptId) {
     const previous = request(task.job, state.currentMessages, 'current', { legacy: true });
     const wire = JSON.stringify(previous);

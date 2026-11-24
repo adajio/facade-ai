@@ -416,6 +416,77 @@ test('published observation forms require grounded measurement fields or an expl
   assert.equal(parse.safeParse({ evidenceId: textId, limitation: 'Единица не читается.' }).success, true);
 });
 
+test('package observation refusals identify misplaced fields and let the same evidence be saved', async () => {
+  const { task, ports, textId, observationId, recorded } = setup();
+  if (task.job.mode !== 'primary') assert.fail();
+  task.scopeId = null;
+  task.job.packageWindow = { id: randomUUID(), readerVersion: 'test', routeRevision: 'known', walkProtocol: 1 };
+  task.job.observationProtocol = 2;
+  const measure = { evidenceId: textId, quote: 'Толщина 2 мм', value: '2', unit: 'мм' };
+  let turn = 0;
+  ports.call = async ({ request: wire }) => {
+    const last = String(wire.messages.at(-1)?.content);
+    switch (++turn) {
+      case 1: return receipt('survey', {});
+      case 2: return receipt('extract', {});
+      case 3: return receipt('save_observation', { ...measure, package: { attribute: 'Толщина',
+        state: 'identified', labels: ['FX'], reason: 'Printed' }, role: '{"value":"drawing"}' });
+      case 4:
+        assert.match(last, /invalid_arguments/);
+        assert.match(last, /package\.state/);
+        assert.match(last, /package\.binding/);
+        return receipt('save_compound_observation', { components: [
+          { role: 'value', evidenceId: textId, lineId: '1.0.4.0', quote: measure.quote, literal: '2', link: { kind: 'anchor' } },
+          { role: 'unit', evidenceId: textId, lineId: '1.0.4.0', quote: measure.quote, literal: 'мм',
+            link: { kind: 'source_context', to: 0 } },
+        ], package: { attribute: 'Толщина', labels: ['FX'] } });
+      case 5:
+        assert.match(last, /invalid_arguments/);
+        assert.match(last, /package\.labels/);
+        assert.deepEqual(recorded, []);
+        return receipt('save_observation', { ...measure, package: { attribute: 'Толщина' } });
+      case 6: return receipt('finish_reading', { status: 'covered', explanation: 'Сохранена адресная цитата.' });
+      default: return assert.fail('Unexpected model send');
+    }
+  };
+  const signal = new AbortController().signal;
+  let result = await runResearchWorkflow(task, ports, signal);
+  if (result.status === 'continue') result = await runResearchWorkflow(task, ports, signal);
+  assert.deepEqual(result, { status: 'done', outcome: { kind: 'covered', observationIds: [observationId] } });
+  assert.equal(recorded.length, 1);
+});
+
+test('new package tool schema is compact and an established request is recovered by its original hash', async () => {
+  const { task, ports, events } = setup();
+  if (task.job.mode !== 'primary') assert.fail();
+  task.scopeId = null;
+  task.job.packageWindow = { id: randomUUID(), readerVersion: 'test', routeRevision: 'known', walkProtocol: 1 };
+  task.job.observationProtocol = 2;
+  const previous = request(task.job, initialMessages(task.job), 'current');
+  const saved = receipt('inventory', {});
+  const originalHash = hashBytes(JSON.stringify(previous));
+  const sent: string[] = [];
+  ports.call = async ({ request: wire, effectKey }) => {
+    assert.equal(effectKey, `${task.jobId}:model:1`);
+    const hash = hashBytes(JSON.stringify(wire));
+    sent.push(hash);
+    if (hash === originalHash) return saved;
+    const observation = wire.tools.find(({ function: tool }) => tool.name === 'save_observation')!.function;
+    assert.equal(observation.parameters.type, 'object');
+    assert.equal(observation.parameters.additionalProperties, false);
+    assert.equal(observation.parameters.anyOf, undefined);
+    assert.match(observation.description, /package\.binding/);
+    return { status: 'held', code: 'effect_conflict', attemptId: saved.attemptId, nextAction: 'inspect_original_effect' };
+  };
+  assert.deepEqual(await advance(task, ports), { status: 'continue' });
+  assert.equal(sent.length, 2);
+  assert.notEqual(sent[0], originalHash);
+  const last = events.at(-1);
+  assert.equal(last?.kind, 'model');
+  assert.equal(last.attemptId, saved.attemptId);
+  assert.equal(last.requestHash, originalHash);
+});
+
 test('the same reader can correct a missing unit, then keeps the evidence and the literal quote', async () => {
   const { task, ports, textId, recorded, observationId } = setup();
   const addr = { evidenceId: textId, quote: 'Толщина 2 мм', value: '2' };
