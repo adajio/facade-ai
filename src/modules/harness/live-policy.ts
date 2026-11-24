@@ -7,27 +7,25 @@ export type LiveRoute = (Pick<OpenRouterProfile,
   | Pick<CheaperInferenceProfile, 'transport' | 'routeId' | 'model' | 'mode' | 'zdrEvidenceRef' | 'syntheticScopes'>;
 
 function matchesPolicy(route: LiveRoute, { dataClass, toolChoice }: ResearchSettings, policy: string, slot: ResearchSlot) {
+  // A per-request ZDR flag follows the key's account or guardrail settings. The
+  // current profile has no attestation binding ZDR only to that key.
+  if (dataClass !== 'synthetic' || (policy !== 'strict-zdr' && policy !== 'synthetic-research')) return false;
+  if (!Array.isArray(route.syntheticScopes) || !route.syntheticScopes.length) return false;
+  const hasZdr = typeof route.zdrEvidenceRef === 'string' && Boolean(route.zdrEvidenceRef.trim());
   if (route.transport === 'cheaperinference') {
-    return slot === 'A' && route.model === terraModel && dataClass === 'synthetic' && route.mode === 'strict-zdr'
-      && typeof route.zdrEvidenceRef === 'string' && Boolean(route.zdrEvidenceRef.trim()) && Array.isArray(route.syntheticScopes) && route.syntheticScopes.length > 0
-      && (policy === 'strict-zdr' || policy === 'synthetic-research');
+    return slot === 'A' && route.model === terraModel && route.mode === 'strict-zdr' && hasZdr;
   }
-  if (route.model === qwen38Max && (route.provider !== 'alibaba' || dataClass !== 'synthetic' || route.mode !== 'synthetic-research')) {
+  if (route.model === qwen38Max && (route.provider !== 'alibaba' || route.mode !== 'synthetic-research')) {
     return false;
   }
   if (typeof route.provider !== 'string' || (route.mode !== 'strict-zdr' && route.mode !== 'synthetic-research')) return false;
-  const hasZdr = typeof route.zdrEvidenceRef === 'string' && Boolean(route.zdrEvidenceRef.trim());
   if (route.model.startsWith('moonshotai/kimi-') && (!hasZdr || !matchesKimiEndpoint(route.model, route.provider, route.mode))) {
     return false;
   }
   if (route.provider === 'decart/mxfp4' && toolChoice !== 'auto') return false;
   if (policy === 'strict-zdr' && (route.mode !== 'strict-zdr' || !hasZdr)) return false;
-  if (policy === 'synthetic-research' &&
-      (dataClass !== 'synthetic' || (route.model.startsWith('qwen/') && !/^alibaba(?:\/|$)/.test(route.provider)))) {
-    return false;
-  }
-  return (policy === 'strict-zdr' || policy === 'synthetic-research') &&
-    ((dataClass !== 'synthetic' && route.mode !== 'synthetic-research') || (Array.isArray(route.syntheticScopes) && route.syntheticScopes.length > 0));
+  return policy !== 'synthetic-research' || !route.model.startsWith('qwen/')
+    || /^alibaba(?:\/|$)/.test(route.provider);
 }
 
 export function validateLivePolicy<T extends LiveRoute>(
@@ -45,6 +43,8 @@ export function validateLivePolicy<T extends LiveRoute>(
   for (const slot of researchSlots) {
     const settings = configuration[slot];
     if (!settings) continue;
+    if (slot === 'lead' && [configuration.A, configuration.B].some(reader =>
+      reader?.model === settings.model || reader?.routeId === settings.routeId)) continue;
     const route = select(settings, slot);
     if (route) routes.set(slot, route);
   }
@@ -61,7 +61,6 @@ export function validateLivePolicy<T extends LiveRoute>(
         reason: 'research_route_not_approved',
         nextAction: `Подтвердить маршрут для ${slot}.`,
       };
-      if (policy === 'strict-zdr' && actual.dataClass !== 'synthetic') return null;
       const approved = route.syntheticScopes?.find(({ projectId, scopeId }) =>
         task.projectId === projectId && task.scopeId === scopeId);
       const places = task.job.mode === 'primary' ? [task.job.place] : [task.job.dispute.a.place, task.job.dispute.b.place];

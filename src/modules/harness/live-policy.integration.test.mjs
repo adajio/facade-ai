@@ -18,6 +18,8 @@ const fixture = {
 };
 const wafer = { ...fixture.A, model: 'moonshotai/kimi-k3.1-pro', routeId: 'fixture-wafer-comparison', toolChoice: 'auto' };
 const decart = { ...wafer, routeId: 'fixture-decart-comparison', provider: 'decart/mxfp4', responseProvider: 'Decart' };
+const lead = { ...wafer, routeId: 'fixture-lead', toolChoice: 'required' };
+const readers = ['A', 'B'];
 const settings = ({ routeId, model, toolChoice }) => ({
   routeId, model, dataClass: 'synthetic', maxTokens: 512, maxTurns: 16, maxKnownRejections: 1,
   ...(toolChoice && { toolChoice }),
@@ -25,7 +27,7 @@ const settings = ({ routeId, model, toolChoice }) => ({
 const formatProfile = (source, authorized) => ({
   routeId: source.routeId, model: source.model, revision: 'local-test', provider: source.provider,
   expectedResponseProvider: source.responseProvider,
-  mode: 'synthetic-research', zdrEvidenceRef: source === fixture.B ? undefined : 'fixture-zdr',
+  mode: 'synthetic-research', zdrEvidenceRef: source.model.startsWith('qwen/') ? undefined : 'fixture-zdr-wafer-r1',
   boundEvidenceRef: 'fixture-pricing', validUntil: '2099-01-01T00:00:00Z',
   inputTokenUpperBound: 10000, outputTokenLimit: 512,
   maxImages: 0, maxImagePixels: 0, maxImageWidth: 0, maxImageHeight: 0, maxImageBytes: 0,
@@ -48,7 +50,7 @@ async function until(read, done) {
 }
 
 test('partial live configuration uses only independently admitted routes with the outbound fetch stubbed', {
-  skip: !optIn, timeout: 210_000,
+  skip: !optIn, timeout: 480_000,
 }, async (t) => {
   const priorEnv = { ...process.env };
   const priorFetch = globalThis.fetch;
@@ -94,7 +96,7 @@ test('partial live configuration uses only independently admitted routes with th
       sourceRoles: ['design', 'specification'], completenessCriterion: 'Addressed value', addressee: 'customer' }],
   });
   const gateway = createGateway(app.db);
-  for (const { routeId } of [...Object.values(fixture), wafer, decart]) {
+  for (const { routeId } of [...Object.values(fixture), wafer, decart, lead]) {
     await gateway.configureRoute({
       id: routeId, revision: 'local-test', transport: 'openrouter', enabled: true,
       maxRequestBytes: 2 * 1024 * 1024, ceilingUsdNanos: 1, timeoutMs: 8000,
@@ -125,11 +127,14 @@ test('partial live configuration uses only independently admitted routes with th
   const compoundHashes = compoundTexts.map(checksum);
   let compoundProject;
   let revoke;
+  let activeCase;
   globalThis.fetch = async (url, options) => {
     try {
       const input = JSON.parse(options.body);
-      const branch = input.model === selectedB.model ? 'B' : 'A';
-      const selected = branch === 'A' ? selectedA : selectedB;
+      const assignment = JSON.parse(input.messages[1].content);
+      const branch = assignment.mode === 'lead' ? 'lead' : input.model === selectedB.model ? 'B' : 'A';
+      const selected = branch === 'lead' ? lead : branch === 'A' ? selectedA : selectedB;
+      const role = assignment.mode === 'verify' ? `verify-${branch}` : branch;
       assert.equal(input.model, selected.model);
       assert.equal(options.redirect, 'error');
       if (selected.direct) {
@@ -147,12 +152,17 @@ test('partial live configuration uses only independently admitted routes with th
         assert.equal(input.provider.allow_fallbacks, false);
         assert.equal(input.provider.require_parameters, true);
         assert.equal(input.provider.data_collection, selected === qwen38 ? 'allow' : 'deny');
-        assert.equal(input.provider.zdr, branch === 'A');
+        assert.equal(input.provider.zdr, branch !== 'B');
       }
       assert.equal(input.tool_choice, selected.toolChoice ?? 'required');
-      const assignment = JSON.parse(input.messages[1].content);
-      const projectId = assignment.place.source.projectId;
-      calls.push({ projectId, branch });
+      const projectId = (assignment.place ?? assignment.dispute.a.place).source.projectId;
+      const image = input.messages.flatMap(({ content }) => Array.isArray(content) ? content : [])
+        .find(({ type }) => type === 'image_url');
+      calls.push({ projectId, branch, role, image: Boolean(image) });
+      if (role === 'lead' && activeCase.unavailableLead) {
+        return Response.json({ error: { code: 404, metadata: { error_type: 'not_found' } },
+          openrouter_metadata: { attempt: 0 } }, { status: 404 });
+      }
       const outputs = input.messages.filter(({ role }) => role === 'tool').map(({ content }) => JSON.parse(content));
       if (revoke?.projectId === projectId && revoke.branch === branch && outputs.length === 0) {
         await grant(projectId, branch, false);
@@ -172,7 +182,37 @@ test('partial live configuration uses only independently admitted routes with th
       }
       let name = 'extract';
       let args = {};
-      if (projectId === compoundProject) {
+      if (assignment.mode !== 'primary') {
+        if (outputs.length < 2) {
+          args = { support: readers[outputs.length] };
+        } else {
+          const sources = outputs.map(({ content, evidence }) => ({
+            evidenceId: evidence.evidenceId,
+            quote: JSON.parse(content).lines[0].text,
+          }));
+          const check = { status: 'confirmed', reason: 'The fixture identifies the same scope and variant.', sources };
+          if (role === 'lead' && activeCase.revokeReview) {
+            await grantReview(projectId, activeCase.revokeReview, false);
+          }
+          name = role === 'lead' ? 'propose_resolution' : 'verify_resolution';
+          args = {
+            ...(role === 'lead'
+              ? { aObservationId: assignment.dispute.a.observationId, bObservationId: assignment.dispute.b.observationId }
+              : { verdict: 'supported' }),
+            explanation: 'Both original lines were checked.',
+            evidenceIds: sources.map(({ evidenceId }) => evidenceId),
+            checks: { variant: check, revision: check, applicability: check, comparability: check },
+          };
+        }
+      } else if (activeCase.visual) {
+        if (!outputs.length) name = 'survey';
+        else {
+          assert.ok(image);
+          assert.equal(checksum(Buffer.from(image.image_url.url.split(',')[1], 'base64')), outputs[0].evidence.sha256);
+          name = 'finish_reading';
+          args = { status: 'no_match', explanation: 'The synthetic page has no matching text.' };
+        }
+      } else if (projectId === compoundProject) {
         if (assignment.place.source.sha256 === compoundHashes[1]) {
           if (outputs.length) {
             name = 'finish_reading'; args = { status: 'no_match', explanation: 'Revision record carries no measurement.' };
@@ -239,29 +279,62 @@ test('partial live configuration uses only independently admitted routes with th
   delete process.env.FACADE_HARNESS_MANAGED_URL;
   delete process.env.FACADE_GATEWAY_OPENROUTER_ENDPOINT;
 
+  async function grantReview(projectId, slot, allowed) {
+    const route = { A: selectedA, B: selectedB, lead }[slot];
+    await gateway.grantRoute({ projectId, routeId: route.routeId, revision: 'local-test',
+      dataClass: 'synthetic', purpose: 'review', allowed });
+  }
+
   async function runCase(testCase) {
-    selectedA = testCase.mixed ? terra : testCase.comparison ?? fixture.A;
-    selectedB = testCase.mixed ? qwen38 : fixture.B;
+    activeCase = testCase;
+    const strict = testCase.customer || testCase.extraOriginal;
+    process.env.FACADE_HARNESS_LIVE_POLICY = strict ? 'strict-zdr' : 'synthetic-research';
+    selectedA = testCase.mixed || testCase.review ? terra : testCase.comparison ?? fixture.A;
+    selectedB = testCase.mixed || testCase.review ? qwen38 : fixture.B;
     const sources = { A: selectedA, B: selectedB };
     const project = await post('/api/projects', { name: testCase.name, catalogVersionId: catalog.id, scopeName: 'F-A', stage: 'P' });
     const scopeId = project.scopes[0].id;
-    const files = testCase.compound ? compoundTexts : testCase.dispute ? ['Thickness 2 mm', 'Thickness 3 mm'] : ['Thickness 2 mm'];
+    const files = testCase.visual
+      ? [await readFile(new URL('../../../test/fixtures/input/facade-supplement.pdf', import.meta.url))]
+      : testCase.compound ? compoundTexts
+      : testCase.review ? ['Current Revision R1 | Scope: F-A | Variant A | Thickness 2 mm',
+        'Current Revision R1 | Scope: F-A | Variant A | Thickness 3 mm']
+      : testCase.dispute || testCase.extraOriginal ? ['Thickness 2 mm', 'Thickness 3 mm'] : ['Thickness 2 mm'];
     if (testCase.compound) compoundProject = project.id;
-    const authorized = { projectId: project.id, scopeId, originalSha256s: files.map(checksum) };
+    const authorized = { projectId: project.id, scopeId, originalSha256s: (testCase.extraOriginal ? files.slice(0, 1) : files).map(checksum) };
     const approvals = testCase.approvals.filter(branch => !sources[branch].direct).map(branch => {
       const source = sources[branch];
       const profile = formatProfile(source, {
-        ...authorized, ...(source === qwen38 && { retentionApproval }),
+        ...authorized, ...(testCase.wrongScope === branch && { scopeId: randomUUID() }),
+        ...(source === qwen38 && { retentionApproval }),
       });
-      return source === qwen38 ? { ...profile, outputTokenLimit: defaults.B.maxTokens } : profile;
+      if (strict) return { ...profile, mode: 'strict-zdr' };
+      if (source === qwen38) return { ...profile, outputTokenLimit: defaults.B.maxTokens };
+      if (testCase.visual && branch === 'A') return { ...profile,
+        maxImages: 1, maxImagePixels: 16_000_000, maxImageWidth: 4_000, maxImageHeight: 4_000, maxImageBytes: 1_000_000 };
+      return profile;
     });
-    for (const branch of ['A', 'B']) await grant(project.id, branch, true);
-    if (testCase.mixed) {
-      delete process.env.FACADE_HARNESS_PROFILE;
+    for (const branch of readers) await grant(project.id, branch, true);
+    if (testCase.customer) {
+      await gateway.grantRoute({ projectId: project.id, routeId: selectedA.routeId, revision: 'local-test',
+        dataClass: 'customer', purpose: 'primary_a', allowed: true });
+    }
+    if (testCase.review) {
+      approvals.push({ ...formatProfile(lead, {
+        ...authorized, ...(testCase.wrongScope === 'lead' && { scopeId: randomUUID() }),
+      }), mode: 'strict-zdr', zdrEvidenceRef: 'fixture-zdr-wafer-r1', knownNoChargeStatuses: [404, 429] });
+      for (const slot of [...readers, 'lead']) await grantReview(project.id, slot, true);
+    }
+    if (testCase.mixed || testCase.review) {
+      if (testCase.review) {
+        process.env.FACADE_HARNESS_PROFILE = JSON.stringify({ A: defaults.A, B: defaults.B, lead: settings(lead) });
+      } else {
+        delete process.env.FACADE_HARNESS_PROFILE;
+      }
       process.env.FACADE_GATEWAY_CHEAPERINFERENCE_KEY = directKey;
       process.env.FACADE_GATEWAY_CHEAPERINFERENCE_PROFILES = JSON.stringify([{
         transport: 'cheaperinference', routeId: terra.routeId, model: terra.model,
-        revision: 'local-test', mode: 'strict-zdr', zdrEvidenceRef: 'fixture-zdr',
+        revision: 'local-test', mode: 'strict-zdr', zdrEvidenceRef: 'fixture-zdr-terra-r1',
         boundEvidenceRef: 'fixture-rates', validUntil: '2099-01-01T00:00:00Z',
         syntheticScopes: [{...authorized, approvalRef: 'fixture'}],
         inputNanosPerToken: 2500, outputNanosPerToken: 7500, outputTokenLimit: defaults.A.maxTokens,
@@ -283,8 +356,8 @@ test('partial live configuration uses only independently admitted routes with th
     for (const [index, content] of files.entries()) {
       const bytes = Buffer.from(content);
       const upload = await post(`/api/receipts/${receipt.receiptId}/uploads`, {
-        relativePath: `drawing-${index}.txt`, size: bytes.length, sha256: checksum(bytes),
-        mediaType: 'text/plain', scopeIds: [scopeId],
+        relativePath: `drawing-${index}.${testCase.visual ? 'pdf' : 'txt'}`, size: bytes.length, sha256: checksum(bytes),
+        mediaType: testCase.visual ? 'application/pdf' : 'text/plain', scopeIds: [scopeId],
       });
       await http('PUT', `/api/uploads/${upload.uploadId}/parts/1`, bytes, {
         'content-type': 'application/octet-stream', 'x-part-sha256': checksum(bytes), 'content-length': String(bytes.length),
@@ -297,16 +370,50 @@ test('partial live configuration uses only independently admitted routes with th
       info() {}, warn(message) { warnings.push(message); }, error(message) { warnings.push(message); },
     } });
     const rows = await until(async () => (await app.db.query(
-      'SELECT purpose,state,reason FROM gateway_jobs WHERE project_id=$1 ORDER BY purpose,state', [project.id])).rows,
+      `SELECT purpose,state,reason,payload->>'mode' AS mode,payload->>'branch' AS branch
+       FROM gateway_jobs WHERE project_id=$1 ORDER BY purpose,mode,branch,state,reason`, [project.id])).rows,
     (rows) => rows.length === testCase.expected.length && rows.every(({ state }) => ['done', 'held'].includes(state)));
-    assert.deepEqual(rows.map(({ purpose, state, reason }) => [purpose, state, reason]), testCase.expected);
+    assert.deepEqual(rows.map(({ purpose, mode, branch, state, reason }) =>
+      [testCase.review && purpose === 'review' ? (branch ? `verify-${branch}` : mode) : purpose, state, reason]), testCase.expected);
     const obligations = (await app.db.query(
       `SELECT p.branch,p.state FROM gateway_primary p JOIN gateway_generations g USING(generation_id)
        WHERE g.project_id=$1 AND g.current ORDER BY p.branch,p.state`, [project.id])).rows;
     assert.deepEqual(obligations.map(({ branch, state }) => [branch, state]), testCase.expected
-      .filter(([purpose]) => purpose !== 'review')
+      .filter(([purpose]) => purpose.startsWith('primary_'))
       .map(([purpose, state]) => [purpose.endsWith('_a') ? 'A' : 'B', state === 'done' ? 'completed' : 'pending']));
-    assert.deepEqual(calls.filter(({ projectId }) => project.id === projectId).map(({ branch }) => branch).sort(), testCase.calls);
+    const projectCalls = calls.filter(({ projectId }) => project.id === projectId);
+    assert.deepEqual(projectCalls.map(({ role }) => role).sort(), testCase.calls);
+    if (testCase.visual) {
+      assert.deepEqual(projectCalls.filter(({ image }) => image).map(({ role }) => role), ['A']);
+    }
+    if (testCase.review) {
+      const { rows: receipts } = await app.db.query(
+        `SELECT DISTINCT j.payload->>'mode' AS mode, j.payload->>'branch' AS step, a.route_id, a.revision AS route_revision,
+         a.receipt->>'model' AS model, a.receipt->>'provider' AS provider
+         FROM gateway_attempts a JOIN gateway_jobs j ON j.id=a.job_id
+         WHERE a.project_id=$1 AND j.purpose='review' AND a.state='paid' ORDER BY mode,step`, [project.id]);
+      const expected = [
+        { mode: 'lead', step: null, route_id: lead.routeId, route_revision: 'local-test', model: lead.model, provider: 'Wafer' },
+        { mode: 'verify', step: 'A', route_id: terra.routeId, route_revision: 'local-test', model: terra.model, provider: 'CheaperInference' },
+        { mode: 'verify', step: 'B', route_id: qwen38.routeId, route_revision: 'local-test', model: qwen38.model, provider: 'Alibaba' },
+      ].filter(({ mode, step }) => testCase.calls.includes(step ? `verify-${step}` : mode)
+        && !(mode === 'lead' && testCase.unavailableLead));
+      assert.deepEqual(receipts, expected);
+    }
+    if (testCase.review || testCase.visual || strict || testCase.wrongScope || testCase.revoke) {
+      const { rows: attempts } = await app.db.query(
+        `SELECT j.payload->>'mode' AS mode, j.payload->>'branch' AS branch, a.route_id, a.revision AS route_revision, a.state,
+            a.receipt->>'model' AS model, a.receipt->>'provider' AS provider, count(*)::int AS count
+         FROM gateway_attempts a JOIN gateway_jobs j ON j.id=a.job_id
+         WHERE a.project_id=$1 GROUP BY 1,2,3,4,5,6,7 ORDER BY 1,2,3,5`, [project.id]);
+      const profileEvidence = [...approvals];
+      if (testCase.review) profileEvidence.push(...JSON.parse(process.env.FACADE_GATEWAY_CHEAPERINFERENCE_PROFILES));
+      t.diagnostic(JSON.stringify({ scenario: testCase.name, projectId: project.id, scopeId, rows, attempts,
+        profiles: profileEvidence.map(({ routeId, model, revision, mode, provider, zdrEvidenceRef, maxImages, syntheticScopes }) =>
+          ({ routeId, model, revision, mode, provider, zdrEvidenceRef, maxImages, syntheticScopes })),
+        posts: projectCalls.map(({ role, image }) => ({ role, modality: image ? 'png' : 'text' })),
+      }));
+    }
     if (testCase.mixed) {
       const { rows: bindings } = await app.db.query(
         `SELECT j.purpose, coalesce(nullif(j.payload->'settings','null'::jsonb),b.settings) AS settings
@@ -344,7 +451,9 @@ test('partial live configuration uses only independently admitted routes with th
       assert.ok(evidence.lines.some(({ text }) => text === claim.quote));
     }
     const response = (await http('GET', `/api/projects/${project.id}/assessments/current?scopeId=${scopeId}`)).json();
-    assert.equal(response.questions[0].machine.outcome, testCase.mixed ? 'covered' : 'needs_review');
+    if (!testCase.review && !testCase.visual) {
+      assert.equal(response.questions[0].machine.outcome, testCase.mixed ? 'covered' : 'needs_review');
+    }
     if (testCase.dispute) {
       const [question] = response.questions;
       assert.ok(question.machine.limitations.includes('dispute_pending'));
@@ -425,6 +534,29 @@ test('partial live configuration uses only independently admitted routes with th
   const done = (branch) => [`primary_${branch}`, 'done', null];
   const held = (branch, reason) => [`primary_${branch}`, 'held', reason];
   if (process.env.FACADE_HARNESS_COMPOUND_ONLY !== '1') {
+    const primary = [done('a'), done('a'), done('b'), done('b')];
+    const posts = [...Array(6).fill('A'), ...Array(6).fill('B')];
+    const review = { review: true, approvals: ['A', 'B'] };
+    await runCase({ ...review, name: 'Third model and both rechecks', calls: [...posts, ...Array(3).fill('lead'),
+      ...Array(3).fill('verify-A'), ...Array(3).fill('verify-B')],
+      expected: [...primary, ['lead', 'done', null], ['verify-A', 'done', null], ['verify-B', 'done', null]] });
+    await runCase({ ...review, name: 'Third model outside approved scope', wrongScope: 'lead', calls: posts,
+      expected: [...primary, ['lead', 'held', 'synthetic_input_not_approved']] });
+    await runCase({ ...review, name: 'Third model unavailable at fixed endpoint', unavailableLead: true, calls: [...posts, 'lead'],
+      expected: [...primary, ['lead', 'held', 'http_404']] });
+    await runCase({ ...review, name: 'B recheck grant revoked', revokeReview: 'B',
+      calls: [...posts, ...Array(3).fill('lead'), ...Array(3).fill('verify-A')],
+      expected: [...primary, ['lead', 'done', null], ['verify-A', 'done', null], ['verify-B', 'held', 'route_denied']] });
+    await runCase({ name: 'B outside approved scope', approvals: ['A', 'B'], wrongScope: 'B',
+      calls: Array(3).fill('A'), expected: [done('a'), held('b', 'synthetic_input_not_approved')] });
+    await runCase({ name: 'Unverified customer ZDR is held despite an explicit route grant', customer: true, approvals: ['A'],
+      settings: { A: { ...settings(fixture.A), dataClass: 'customer' } }, calls: [],
+      expected: [held('a', 'research_route_not_approved'), held('b', 'research_route_not_approved')] });
+    await runCase({ name: 'An extra original blocks strict synthetic authorization', extraOriginal: true, approvals: ['A'],
+      calls: [], expected: [held('a', 'route_data_unapproved'), held('a', 'synthetic_input_not_approved'),
+        held('b', 'research_route_not_approved'), held('b', 'research_route_not_approved')] });
+    await runCase({ name: 'PNG allowed for A and held for B', approvals: ['A', 'B'], visual: true,
+      calls: ['A', 'A', 'B'], expected: [done('a'), held('b', 'route_bound_unavailable')] });
     await runCase({ name: 'Default Terra and Qwen3.8 Max', mixed: true, approvals: ['A', 'B'],
       calls: ['A', 'A', 'A', 'B', 'B', 'B'], expected: [done('a'), done('b')] });
     await runCase({ name: 'Only A', approvals: ['A'], malformed: 'B', calls: ['A', 'A', 'A'],
@@ -442,6 +574,7 @@ test('partial live configuration uses only independently admitted routes with th
     await runCase({ name: 'Leader unavailable', approvals: ['A', 'B'], dispute: true,
       calls: [...Array(6).fill('A'), ...Array(6).fill('B')],
       expected: [done('a'), done('a'), done('b'), done('b'), ['review', 'held', 'research_profile_unavailable']] });
+
   }
   await runCase({ name: 'Compound after repeated error', compound: true, approvals: ['A'], calls: Array(5).fill('A'),
     expected: [done('a'), held('a', 'repeated_rejected_action'),
