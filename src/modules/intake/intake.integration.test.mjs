@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
-import { readFile } from "node:fs/promises";
+import { access, readFile } from "node:fs/promises";
 import { request as httpRequest } from "node:http";
 import { resolve } from "node:path";
 import { Readable } from "node:stream";
@@ -58,7 +58,7 @@ test("durable intake, replay, project holds and private Range over HTTP", { time
   const connectionString = process.env.DATABASE_URL;
   assert.match(new URL(connectionString).pathname, /^\/test_step3[a-z0-9_]*$/, "Use a fresh isolated step3 database");
   assert.ok(process.env.FACADE_DATA_DIR && process.env.FACADE_S3_BUCKET);
-  const [{ register, createIntakeStorage }, uploads, gate, receipts, { csrfToken }, { transaction }, imports] = await Promise.all([
+  const [{ register, createIntakeStorage }, uploads, gate, receipts, { csrfToken }, { transaction }, imports, { partPath }] = await Promise.all([
     compiled("src/modules/intake/index.js"),
     compiled("src/modules/intake/uploads.js"),
     compiled("src/modules/intake/gate.js"),
@@ -66,6 +66,7 @@ test("durable intake, replay, project holds and private Range over HTTP", { time
     compiled("src/modules/access/auth.js"),
     compiled("src/modules/access/commands.js"),
     compiled("src/modules/imports/index.js"),
+    compiled("src/modules/intake/blob.js"),
   ]);
   const db = new pg.Pool({ connectionString });
   const storage = createIntakeStorage(process.env.FACADE_DATA_DIR);
@@ -143,8 +144,15 @@ test("durable intake, replay, project holds and private Range over HTTP", { time
   assert.deepEqual((await snapshot(scopeA)).holds.map((hold) => hold.id), [upload.holdId]);
   const expired = await declare(await newReceipt(), { ...data, scopeIds: undefined });
   assert.equal((await snapshot(scopeB)).holds[0].id, expired.holdId);
+  const firstPart = pdf.subarray(0, partSize);
+  const part = { number: 1, length: partSize, sha256: sha(firstPart) };
+  await uploads.writePart(db, storage, { projectId: project, uploadId: expired.uploadId, ...part },
+    Readable.from([firstPart]));
+  const expiredPath = partPath(storage, expired.uploadId, part);
+  await access(expiredPath);
   await db.query("UPDATE intake_uploads SET expires_at = now() - interval '1 second' WHERE id = $1", [expired.uploadId]);
   await uploads.cleanIntakeUploads(db, storage);
+  await assert.rejects(access(expiredPath), { code: "ENOENT" });
   assert.deepEqual((await snapshot(scopeB)).holds, []);
   assert.equal((await (await get(`/uploads/${expired.uploadId}`)).json()).status, "expired");
 
@@ -190,9 +198,18 @@ test("durable intake, replay, project holds and private Range over HTTP", { time
   assert.equal((await (await get(u)).json()).confirmedBytes, pdf.length);
 
   const coords = { projectId: project, uploadId: upload.uploadId };
-  const prepared = await uploads.prepareOriginal(db, storage, coords);
   const blobKey = `originals/${project}/${upload.uploadId}`;
+  // The write reaches S3 while the application sees an interrupted response.
+  const interruptedStore = { ...storage, objects: {
+    ...storage.objects,
+    async put(...args) {
+      await storage.objects.put(...args);
+      throw new Error("simulated lost S3 acknowledgement");
+    },
+  } };
+  await assert.rejects(uploads.prepareOriginal(db, interruptedStore, coords), /simulated lost S3 acknowledgement/);
   assert.deepEqual(await storage.objects.head(blobKey), { size: pdf.length, sha256: sha(pdf) });
+  const prepared = await uploads.prepareOriginal(db, interruptedStore, coords);
   assert.equal(prepared.objectKey, blobKey);
   await assert.rejects(transaction(db, async (tx) => {
     await uploads.publishPreparedOriginal(tx, coords, prepared);
