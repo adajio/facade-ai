@@ -25,10 +25,10 @@ export function cadEntity(locator?: Locator) {
 
 export function cadAddress(part?: string, locator?: Locator): CadAddress | undefined {
   if (!part || !locator) return;
-  const partSha256 = typeof locator.partSha256 === 'string' ? locator.partSha256 : undefined;
-  const derivativeSha256 = typeof locator.derivativeSha256 === 'string' ? locator.derivativeSha256 : undefined;
+  const partSha256 = typeof locator.partSha256 === 'string' && /^[a-f0-9]{64}$/u.test(locator.partSha256) ? locator.partSha256 : undefined;
+  const derivativeSha256 = typeof locator.derivativeSha256 === 'string' && /^[a-f0-9]{64}$/u.test(locator.derivativeSha256) ? locator.derivativeSha256 : undefined;
   const entity = cadEntity(locator);
-  if (partSha256 || entity && (derivativeSha256 || entity.startsWith('h:'))) {
+  if (partSha256 || derivativeSha256 && entity) {
     return { part, entity, partSha256, derivativeSha256 };
   }
 }
