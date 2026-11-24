@@ -62,12 +62,12 @@ const cadRowsPerSpace = 6000;
 const cadShapesPerSpace = 15000;
 const cadTextEntities = new Set(["TEXT", "MTEXT", "ATTRIB", "ATTDEF"]);
 const polylineGroups = new Set([10, 20, 40, 41, 42, 43]);
-const cadEntityGroups = new Set([1, 3, 5, 8, 10, 11, 20, 21, 30, 31, 40, 41, 42, 43, 50, 67, 70, 72, 73,
+const cadEntityGroups = new Set([1, 3, 5, 7, 8, 10, 11, 20, 21, 30, 31, 40, 41, 42, 43, 50, 51, 60, 67, 70, 72, 73,
   210, 220, 230, 330, 410]);
 const cadMetadataGroups = new Map<string, Set<number>>([
   ["SECTION", new Set([2])], ["ENDSEC", new Set()],
   ["LAYOUT", new Set([1, 330])], ["VIEW", new Set([2, 10, 11, 20, 21, 31, 40, 41, 50])],
-  ["BLOCK", new Set([1, 2, 10, 20, 30, 70, 330])], ["STYLE", new Set([3, 4])],
+  ["BLOCK", new Set([1, 2, 10, 20, 30, 70, 330])], ["STYLE", new Set([2, 3, 4, 40, 41, 50, 70, 71])],
   ["LAYER", new Set([2, 5, 62, 70])],
 ]);
 

@@ -177,19 +177,22 @@ export async function register(
   });
 
   type CadPreviewRoute = { Params: UnitsRoute['Params'] & { unitId: string }; Querystring: {
-    readerVersion?: string; representation?: string; entityOrdinal?: string; derivativeHandle?: string;
+    readerVersion?: string; representation?: string; entityOrdinal?: string; derivativeHandle?: string; textFont?: string;
   } };
   app.get<CadPreviewRoute>('/api/v1/documents/:documentId/versions/:versionId/reader/units/:unitId', async (request, reply) => {
     const document = await authorizedDocument(request);
-    const { readerVersion, representation = 'native', entityOrdinal, derivativeHandle } = request.query;
+    const { readerVersion, representation = 'native', entityOrdinal, derivativeHandle, textFont } = request.query;
     const ordinal = entityOrdinal === undefined ? undefined : Number(entityOrdinal);
     if (!readerVersion || !['native', 'render'].includes(representation)
       || (entityOrdinal !== undefined && (!/^[1-9]\d*$/.test(entityOrdinal) || !Number.isSafeInteger(ordinal)))
       || (derivativeHandle !== undefined && !/^[0-9A-F]{1,16}$/.test(derivativeHandle))
-      || (ordinal !== undefined && derivativeHandle !== undefined)) {
+      || (ordinal !== undefined && derivativeHandle !== undefined)
+      || (textFont !== undefined && (representation !== 'render' || ordinal === undefined && !derivativeHandle
+        || !/^[a-f0-9]{64}$/.test(textFont)))) {
       throw new ReaderError('reader_address_invalid', 'Некорректный адрес части DWG', 422);
     }
     const locator: Record<string, string | number> | undefined = ordinal !== undefined ? { entityOrdinal: ordinal } : derivativeHandle ? { derivativeHandle } : undefined;
+    if (locator && textFont) locator.textFont = textFont;
     const result = await reader().previewDwg(document, { readerVersion, address: { unitId: request.params.unitId, locator },
       representation: representation as 'native' | 'render' });
     return reply.header('X-Content-Type-Options', 'nosniff').type(result.mediaType).send(result.bytes);

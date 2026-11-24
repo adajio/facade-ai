@@ -2,8 +2,10 @@ import { createHash } from "node:crypto";
 import type { DatabaseSync } from "node:sqlite";
 import { readHatch, readWipeout } from "./dwg-area.js";
 import { readProxy } from "./dwg-proxy.js";
+import { mergeFontUses } from "./dwg-cad-text.js";
+import type { dwgCadText } from "./dwg-cad-text.js";
 import { cadBounds, cadShapeBounds } from "./cad-bounds.js";
-import type { CadBlockUse, CadBounds, CadDefinition, CadPath, CadShape } from "./model.js";
+import type { CadBlockUse, CadBounds, CadDefinition, CadFontUse, CadPath, CadShape } from "./model.js";
 import { appendCadEntity, cadSpace, first, numeric } from "./spatial.js";
 import { FormatHold } from "./model.js";
 import type { Entity } from "./spatial.js";
@@ -24,10 +26,10 @@ const maximumBytes = 2 * 1024 ** 2;
 export const geometryDigest = (data: string) => createHash("sha256").update(data).digest("hex");
 export const blockKey = (value?: string) => value && value.length <= 300 ? value.toUpperCase() : undefined;
 
-type Result = { shape?: CadShape; limits: string[] };
+type Result = { shape?: CadShape; limits: string[]; fonts?: CadFontUse[] };
 type Point = [number, number];
 type Matrix = CadBlockUse["matrix"];
-type Block = { digest?: string; bounds?: CadBounds; x: number; y: number; limits: string[] };
+type Block = { digest?: string; bounds?: CadBounds; x: number; y: number; limits: string[]; fonts?: CadFontUse[] };
 
 const point = (x: number, y: number) => ({ left: x, top: y, right: x, bottom: y });
 const quad = ({ left, right, top, bottom }: CadBounds): Point[] =>
@@ -126,7 +128,9 @@ function matrix(record: Entity, block: Block): Matrix | undefined {
 }
 
 /** Store each referenced definition once. Child definitions are authenticated by their digest. */
-export function dwgGeometry(source: DatabaseSync, output: DatabaseSync, sortEnabled = false) {
+export function dwgGeometry(
+  source: DatabaseSync, output: DatabaseSync, sortEnabled = false, text?: ReturnType<typeof dwgCadText>,
+) {
   const find = source.prepare("SELECT data,ambiguous FROM block_headers WHERE name=?");
   const childrenQuery = sortEnabled
     ? `SELECT b.data FROM block_entities b JOIN block_headers h USING(name)
@@ -156,13 +160,15 @@ export function dwgGeometry(source: DatabaseSync, output: DatabaseSync, sortEnab
     active.add(key);
     const shapes: CadShape[] = [];
     const limits = new Set<string>();
+    const fonts = new Map<string,CadFontUse>();
     let count = 0, bytes = 0;
     try {
       for (const child of children[active.size - 1].iterate(key)) {
         if (++count > maximumElements) { limits.add(limited); break; }
         const entity = JSON.parse(String(child.data)) as Entity;
-        const { shape, limits: issues } = leaf(entity, String(count));
+        const { shape, limits: issues, fonts: uses } = leaf(entity, String(count));
         for (const issue of issues) limits.add(issue);
+        if (uses) mergeFontUses(fonts, uses);
         if (shape) {
           bytes += Buffer.byteLength(JSON.stringify(shape));
           if (bytes > maximumBytes) { limits.add(limited); break; }
@@ -172,7 +178,7 @@ export function dwgGeometry(source: DatabaseSync, output: DatabaseSync, sortEnab
     } finally {
       active.delete(key);
     }
-    const block: Block = { x: numeric(record, 10) ?? 0, y: numeric(record, 20) ?? 0, limits: [...limits] };
+    const block: Block = { x: numeric(record, 10) ?? 0, y: numeric(record, 20) ?? 0, limits: [...limits], fonts: [...fonts.values()] };
     if (shapes.length) {
       const definition: CadDefinition = { shapes };
       const data = JSON.stringify(definition);
@@ -204,7 +210,7 @@ export function dwgGeometry(source: DatabaseSync, output: DatabaseSync, sortEnab
     if (!Object.values(bounds).every(finite)) return { limits: ["cad_block_transform_unsupported"] };
     return {
       shape: { ...shapeBase(record, handle), x, y: -y, bounds, block: { digest: block.digest, matrix: transform } },
-      limits: block.limits.length ? [projection, ...block.limits] : [],
+      limits: block.limits.length ? [projection, ...block.limits] : [], fonts: block.fonts,
     };
   }
 
@@ -214,7 +220,12 @@ export function dwgGeometry(source: DatabaseSync, output: DatabaseSync, sortEnab
     if (record.limitation) return { limits: [record.limitation] };
     if (record.type === "HATCH") return readHatch(record, handle);
     if (record.type === "WIPEOUT") return readWipeout(record, handle);
-    if (record.type === "ACAD_PROXY_ENTITY") return readProxy(record, handle);
+    if (record.type === "ACAD_PROXY_ENTITY") {
+      const result = readProxy(record, handle);
+      if (!text || !result.shape) return result;
+      const planned = text(result.shape);
+      return { shape: result.shape, limits: [...result.limits, ...planned.limits], fonts: planned.fonts };
+    }
     if (record.type === "SEQEND") return { limits: [] };
     // Points, attribute templates, and unsupported entity data are not a substitute for a drawing.
     if (!["LINE", "CIRCLE", "TEXT", "MTEXT", "ATTRIB"].includes(record.type)) return { limits: [unsupported] };
@@ -227,8 +238,9 @@ export function dwgGeometry(source: DatabaseSync, output: DatabaseSync, sortEnab
       return { limits: [error.code] };
     }
     const shape = local.shapes[0];
+    const planned = shape?.text && text ? text(shape,record) : undefined;
     if (shape && shape.x2 === shape.x && shape.y2 === shape.y) return { limits: [unavailable] };
-    return { shape, limits: [...local.limitations] };
+    return { shape, limits: [...local.limitations, ...planned?.limits ?? []], fonts: planned?.fonts };
   }
 
   return (record: Entity, handle: string) => {

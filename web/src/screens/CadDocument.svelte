@@ -5,8 +5,9 @@
   import Notice from '../lib/Notice.svelte';
 
   type Unit = { id: string; label?: string; locator?: Record<string, string | number> };
+  type Font = { name: string; sha256?: string };
   type Row = { id: string; text: string; locator: { derivativeHandle?: string; entityOrdinal?: number };
-    details?: { entity?: string; entityOrdinal?: number; limitations?: string[] } };
+    details?: { entity?: string; entityOrdinal?: number; limitations?: string[]; fonts?: Font[] } };
   type Native = { lines: Row[]; limitations: string[]; derivativeSha256?: string };
   let { api, context, units, readerVersion, endpoint }: {
     api: Api; context: WorkspaceProps; units: Unit[]; readerVersion: string; endpoint: string;
@@ -21,12 +22,17 @@
   let objectError = $state('');
   let image = $state('');
   let imageError = $state('');
-  let imageRequest = $state<string>();
+  let imageRequest = $state<{ key: string; textFont?: string }>();
 
-  function parameters(address: string, representation: 'native' | 'render') {
+  function show(textFont?: string) {
+    if (url) imageRequest = { key: url + '#' + selector, textFont };
+  }
+
+  function parameters(address: string, representation: 'native' | 'render', textFont?: string) {
     const query = new URLSearchParams({ readerVersion, representation });
     if (address.startsWith('h:')) query.set('derivativeHandle', address.slice(2));
     if (address.startsWith('o:')) query.set('entityOrdinal', address.slice(2));
+    if (textFont) query.set('textFont', textFont);
     return '?' + query.toString();
   }
 
@@ -65,10 +71,10 @@
     const path = url;
     const addr = selector;
     const key = path && path + '#' + addr;
-    const query = parameters(addr, 'render');
+    const query = parameters(addr, 'render', imageRequest?.textFont);
     image = '';
     imageError = '';
-    if (!path || !key || imageRequest !== key) return;
+    if (!path || !key || imageRequest?.key !== key) return;
     const controller = new AbortController();
     let objectUrl: string | undefined;
     void api.response(path + query, { signal: controller.signal }).then(response => response.blob()).then(blob => {
@@ -114,10 +120,13 @@
         <div aria-label="Открытый объект DWG">
           <p>{row.details?.entity ?? 'Объект'} · {row.locator.derivativeHandle ?? row.locator.entityOrdinal}</p>
           {#if row.text}<p>{row.text}</p>{/if}
+          {#each row.details?.fonts?.filter(font => font.sha256) ?? [] as font (font.name)}
+            <button type="button" title={font.sha256} onclick={() => show(font.sha256)}>Приблизить подпись · {font.name}</button>
+          {/each}
           {#if row.details?.limitations?.length}<p>{row.details.limitations.map(value => label(value)).join(' · ')}</p>{/if}
         </div>
       {/if}
-      <button type="button" onclick={() => { imageRequest = url + '#' + selector; }}>Показать схему</button>
+      <button type="button" onclick={() => show()}>Показать схему</button>
       <Notice message={imageError} />
       {#if image}<img src={image} alt="Схематическое представление DWG" />{/if}
     {/if}

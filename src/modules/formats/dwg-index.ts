@@ -8,16 +8,19 @@ import { ReaderError } from "../pdf/types.js";
 import type { ReaderUnit, SourceRef } from "../pdf/types.js";
 import { blockKey, dwgGeometry, geometryDigest } from "./dwg-geometry.js";
 import { dwgViewports } from "./dwg-viewport.js";
+import { dwgFontAssets } from "./cad-font-assets.js";
+import type { CadFontAssets } from "./cad-font-assets.js";
+import { dwgCadText, mergeFontUses } from "./dwg-cad-text.js";
 import { dwgMaskContext } from "./dwg-mask-context.js";
 import { cadPaintOrder, cadShapeBounds } from "./cad-bounds.js";
 import { derivativeLines, derivativeText, dxfBytes, dxfValue } from "./dwg-text.js";
 import { recoveryObjects } from "./dwg-recovery.js";
 import { FormatHold, unit } from "./model.js";
-import type { CadDefinition, Unit } from "./model.js";
+import type { CadDefinition, CadFontUse, Unit } from "./model.js";
 import { appendCadEntity, cadMetadata, cadSpace, convertedDxfRecords, first, recoveryCadRecords } from "./spatial.js";
 import type { Entity } from "./spatial.js";
 
-export const dwgReaderProfile = "formats-1.1.7";
+export const dwgReaderProfile = "formats-1.1.8";
 const rowsPerPart = 512;
 const shapesPerPart = 6000;
 const textPerPart = 2 * 1024 ** 2;
@@ -26,12 +29,12 @@ const short = (value: string) => hash(value).slice(0, 24);
 
 type Pin = { source: SourceRef; converter: string; reserve: number };
 type IndexedUnit = { unit: Unit; digest: string };
-type IndexIdentity = { converter: string; derivative: string; kind: "dxf" | "dwg-json" };
+type IndexIdentity = { converter: string; derivative: string; kind: "dxf" | "dwg-json"; fonts?: string };
 
-function location(pin: Pin) {
+function location(pin: Pin, fonts: CadFontAssets) {
   if (!process.env.FACADE_DATA_DIR) return;
   return join(process.env.FACADE_DATA_DIR, "dwg-index", hash(JSON.stringify([
-    dwgReaderProfile, pin.source.projectId, pin.source.sha256, pin.converter,
+    dwgReaderProfile, pin.source.projectId, pin.source.sha256, pin.converter, fonts.identity,
   ])));
 }
 
@@ -101,8 +104,8 @@ export class DwgIndex {
   }
 }
 
-export async function openDwgIndex(pin: Pin): Promise<DwgIndex | undefined> {
-  const path = location(pin);
+export async function openDwgIndex(pin: Pin, fonts = dwgFontAssets()): Promise<DwgIndex | undefined> {
+  const path = location(pin, fonts);
   if (!path) return;
   if (!(await stat(path).catch((error: NodeJS.ErrnoException) => {
     if (!cacheUnavailable(error)) throw error;
@@ -111,7 +114,7 @@ export async function openDwgIndex(pin: Pin): Promise<DwgIndex | undefined> {
   try {
     db = new DatabaseSync(path, { readOnly: true, allowExtension: false });
     const index = new DwgIndex(db);
-    if (index.identity.converter !== pin.converter) throw new ReaderError(
+    if (index.identity.converter !== pin.converter || index.identity.fonts !== fonts.identity) throw new ReaderError(
       "dwg_index_identity_changed", "Профиль сохранённой производной DWG изменился", 409);
     return index;
   } catch (error) {
@@ -126,8 +129,10 @@ function budget(db: DatabaseSync, bytes: bigint) {
     PRAGMA max_page_count=${bytes / 4096n};`);
 }
 
-export async function buildDwgIndex(file: FileHandle, sha: string, converter: string, pin?: Pin): Promise<DwgIndex> {
-  let path = pin && location(pin);
+export async function buildDwgIndex(
+  file: FileHandle, sha: string, converter: string, pin?: Pin, fonts = dwgFontAssets(),
+): Promise<DwgIndex> {
+  let path = pin && location(pin, fonts);
   let root = path ? join(path, "..") : tmpdir();
   try {
     await mkdir(root, { recursive: true, mode: 0o700 });
@@ -221,6 +226,8 @@ export async function buildDwgIndex(file: FileHandle, sha: string, converter: st
     }
     records.exec("COMMIT");
     const { layouts, ownerLayouts, views } = cadMetadata(metadata, issues);
+    issues.delete("cad_font_substitution"); // Report actual runs, not unreferenced STYLE declarations.
+    const textPlan = dwgCadText(metadata, fonts);
     const owner = records.prepare("INSERT INTO owners VALUES (?,?)");
     for (const [id, name] of ownerLayouts) owner.run(id, name);
     records.exec(`
@@ -247,7 +254,7 @@ export async function buildDwgIndex(file: FileHandle, sha: string, converter: st
     output.exec(`CREATE TABLE identity (data TEXT); CREATE TABLE parts (
       ordinal INTEGER PRIMARY KEY, id TEXT UNIQUE, data TEXT, digest TEXT, view INTEGER, mask_source TEXT);
       CREATE TABLE definitions (digest TEXT PRIMARY KEY, data TEXT);`);
-    output.prepare("INSERT INTO identity VALUES (?)").run(JSON.stringify({ converter, derivative: sha, kind }));
+    output.prepare("INSERT INTO identity VALUES (?)").run(JSON.stringify({ converter, derivative: sha, kind, fonts: fonts.identity }));
     const publish = output.prepare("INSERT INTO parts(id,data,digest,view,mask_source) VALUES (?,?,?,?,?)");
     const masks = dwgMaskContext(records, output);
     function save(part: Unit, maskSource = part.id) {
@@ -258,7 +265,7 @@ export async function buildDwgIndex(file: FileHandle, sha: string, converter: st
       publish.run(part.id, data, hash(data), Number(Boolean(part.locator.view)), maskSource);
       if (!part.locator.view) masks.record(part);
     }
-    const geometry = dwgGeometry(records, output, sortEnabled);
+    const geometry = dwgGeometry(records, output, sortEnabled, textPlan);
     const viewport = !recovery && (records.prepare(`SELECT 1 AS present FROM entities WHERE
       space<>'Model' AND json_extract(data,'$.type')='VIEWPORT' LIMIT 1`).get()
       ? dwgViewports(records, output, metadata.filter(r => r.type === "LAYER")) : undefined);
@@ -326,6 +333,7 @@ export async function buildDwgIndex(file: FileHandle, sha: string, converter: st
         if (current.rows.length && (current.rows.length >= rowsPerPart
             || legacyShapes + previousShapes > shapesPerPart || text + bytes > textPerPart)) overlay(flush(true));
         const onPaper = record.type === "VIEWPORT" && name !== "Model" && viewport;
+        const usedFonts = new Map<string, CadFontUse>();
         const specialized = ["HATCH", "WIPEOUT", "ACAD_PROXY_ENTITY"].includes(record.type);
         const enhanced = onPaper || specialized || ["INSERT", "DIMENSION", "ARC", "LWPOLYLINE"].includes(record.type);
         if (specialized) next.limitations.delete("cad_entity_type_unsupported");
@@ -341,8 +349,15 @@ export async function buildDwgIndex(file: FileHandle, sha: string, converter: st
             entity.bounds = { x: left, y: -bottom, width: right - left, height: bottom - top };
           }
           for (const issue of result.limits) next.limitations.add(issue);
+          if ("fonts" in result && result.fonts) mergeFontUses(usedFonts, result.fonts);
         } else if (!["TEXT", "MTEXT", "ATTRIB", "ATTDEF", "LINE", "CIRCLE", "SEQEND"].includes(record.type)) {
           next.limitations.add("cad_entity_type_unsupported");
+        }
+        if (!enhanced) for (const shape of next.shapes) {
+          if (!shape.text) continue;
+          const plan = textPlan(shape,record);
+          mergeFontUses(usedFonts,plan.fonts);
+          for (const issue of plan.limits) next.limitations.add(issue);
         }
         if (row.paper_block) entity.locator.derivativeSection = "BLOCKS";
         if (!current.rows.length) start = number;
@@ -352,6 +367,7 @@ export async function buildDwgIndex(file: FileHandle, sha: string, converter: st
           entity.locator.derivativeHandle = handle;
         }
         entity.details = { ...entity.details, entityOrdinal: number,
+          ...(usedFonts.size ? { fonts: [...usedFonts.values()] } : {}),
           ...(next.limitations.size ? { limitations: [...next.limitations] } : {}) };
         current.rows.push(entity);
         const ordinal = String(number).padStart(16, "0");
@@ -386,7 +402,7 @@ export async function buildDwgIndex(file: FileHandle, sha: string, converter: st
       if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
     }
     await clean();
-    return (await openDwgIndex(pin!))!;
+    return (await openDwgIndex(pin!, fonts))!;
   } catch (error) {
     records?.close();
     output?.close();

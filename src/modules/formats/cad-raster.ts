@@ -2,7 +2,8 @@ import { Resvg } from "@resvg/resvg-js";
 import { existsSync } from "node:fs";
 import { crc32, deflateSync } from "node:zlib";
 import { ReaderError } from "../pdf/types.js";
-import { cadShapeBounds, escapeXml, transformCadBounds } from "./cad-bounds.js";
+import { dwgFontAssets } from "./cad-font-assets.js";
+import { cadShapeBounds, composeCadTransform, escapeXml, transformCadBounds } from "./cad-bounds.js";
 import type { CadArea, CadBlockUse, CadBounds, CadDefinition, CadPath, CadShape } from "./model.js";
 
 type Matrix = CadBlockUse["matrix"];
@@ -19,9 +20,6 @@ const color = [[255, 255, 255], [22, 38, 49], [160, 32, 32], [172, 179, 184], [2
 const dot = ([ax, ay]: Point, [bx, by]: Point) => ax * bx + ay * by;
 const emptyBounds = (b: CadBounds) => b.left > b.right || b.top > b.bottom;
 
-function product([a, b, c, d, x, y]: Matrix, [e, f, g, h, u, v]: Matrix): Matrix {
-  return [a * e + c * f, b * e + d * f, a * g + c * h, b * g + d * h, a * u + c * v + x, b * u + d * v + y];
-}
 function position([a, b, c, d, x, y]: Matrix, u: number, v: number): Point {
   return [a * u + c * v + x, b * u + d * v + y];
 }
@@ -54,13 +52,14 @@ function png(width: number, height: number, pixels: Buffer) {
 
 export function rasterCad(
   shapes: CadShape[], width: number, height: number, scale: number, originX: number, originY: number,
-  load: (digest: string) => CadDefinition, selected?: string,
+  load: (digest: string) => CadDefinition, selected?: string, assets = dwgFontAssets(),
 ): Buffer {
   const pixels = Buffer.alloc(3 * width * height, 255);
   const canvas = { left: 0, right: width - 1, top: 0, bottom: height - 1 };
   const screen: Matrix = [scale, 0, 0, scale, -originX, -originY];
   const definitions = new Map<string, CadShape[]>();
   const text = new Map<CadBounds, string[]>();
+  const fontsUsed = new Set<string>();
   let textCount = 0;
   let visits = 0, work = 0, areaWork = 0, definitionBytes = 0, glyphsBytes = 0, glyphPasses = 0;
 
@@ -231,16 +230,62 @@ export function rasterCad(
     for (const family of families) drawFamily(family, false);
   }
 
-  function label(shape: CadShape, matrix: Matrix, box: CadBounds, tint: number) {
-    if (!shape.text || (shape.height ?? 1) * Math.hypot(matrix[2], matrix[3]) < 1) return;
-    const font = shape.height ?? 1;
-    const content = shape.text.split("\n").map((line, i) =>
-      `<tspan x="0" y="${i * font * 1.2}">${escapeXml(line)}</tspan>`).join("");
-    const item = `<text transform="matrix(${matrix.join(" ")}) translate(${shape.x} ${-shape.y}) rotate(${-(shape.angle ?? 0)})" font-size="${font}" fill="rgb(${color[tint].join(",")})">${content}</text>`;
+  function stroke(path: CadPath, matrix: Matrix, box: CadBounds, tint: number) {
+    let previous: Point | undefined;
+    for (const command of path) {
+      const [kind, x, y] = command;
+      if (kind === "A") {
+        previous = curve(matrix, box, tint, x, y, command[3], command[4], command[5]);
+      } else {
+        const point = position(matrix, x, y);
+        if (kind === "L" && previous) drawLine(previous, point, box, tint);
+        previous = point;
+      }
+    }
+  }
+
+  function addGlyphRun(item: string, box: CadBounds) {
     glyphsBytes += item.length;
     if (glyphsBytes > 2 * 1024 ** 2 || ++textCount > 4000) limit();
     if (!text.has(box)) text.set(box, []);
     text.get(box)!.push(item);
+  }
+
+  function label(shape: CadShape, matrix: Matrix, box: CadBounds, tint: number) {
+    const fill = `rgb(${color[tint].join(",")})`;
+    if (!shape.textSpans) {
+      if (!shape.text || (shape.height ?? 1) * Math.hypot(matrix[2], matrix[3]) < 1) return;
+      const fontSize = shape.height ?? 1;
+      const content = shape.text.split("\n").map((line, i) =>
+        `<tspan x="0" y="${i * fontSize * 1.2}">${escapeXml(line)}</tspan>`).join("");
+      addGlyphRun(`<text transform="matrix(${matrix.join(" ")}) translate(${shape.x} ${-shape.y}) rotate(${-(shape.angle ?? 0)})" font-size="${fontSize}" fill="${fill}">${content}</text>`,box);
+      return;
+    }
+    const angle = -(shape.angle ?? 0) * Math.PI / 180;
+    const c = Math.cos(angle), s = Math.sin(angle);
+    const base = composeCadTransform(matrix,[c,s,-s,c,shape.x,-shape.y]);
+    for (const span of shape.textSpans) {
+      if (span.height * Math.hypot(base[2],base[3]) < 1) continue;
+      const asset = span.sha256 ? assets.asset(span.sha256) : undefined;
+      if (span.sha256 && !asset) throw new ReaderError("cad_font_assets_changed", "Нет закреплённого шрифта DWG", 409);
+      const shear = -Math.tan(span.oblique * Math.PI / 180);
+      if (asset?.kind === "shx") {
+        let x = span.x;
+        const factor = span.height / asset.font.capHeight;
+        for (const char of span.text) {
+          const glyph = asset.font.glyph(char.codePointAt(0)!);
+          if (!glyph) throw new ReaderError("cad_font_assets_changed", "Глиф закреплённого SHX изменился", 409);
+          stroke(glyph.path,composeCadTransform(base,[factor * span.width,0,factor * shear,factor,x,span.y]),box,tint);
+          x += factor * span.width * glyph.advance;
+        }
+      } else {
+        const transform = composeCadTransform(base,[span.width,0,shear,1,span.x,span.y]);
+        const attributes = asset ? ` font-family="${escapeXml(asset.font.family)}" font-weight="${asset.font.bold ? 700 : 400}" font-style="${asset.font.italic ? "italic" : "normal"}"` : "";
+        if (asset) fontsUsed.add(asset.sha256);
+        const size = asset ? span.height * asset.font.em / asset.font.capHeight : span.height;
+        addGlyphRun(`<text xml:space="preserve" transform="matrix(${transform.join(" ")})"${attributes} font-size="${size}" fill="${fill}">${escapeXml(span.text)}</text>`,box);
+      }
+    }
   }
 
   function draw(shape: CadShape, matrix: Matrix, box: CadBounds, tint: number, depth: number) {
@@ -263,21 +308,11 @@ export function rasterCad(
         if (definitions.size >= 8192 || definitionBytes > 12 * 1024 ** 2) limit();
         definitions.set(digest, items);
       }
-      const nested = product(matrix, local);
+      const nested = composeCadTransform(matrix, local);
       const clip = shape.clip ? intersect(box, transformCadBounds(matrix, shape.clip)) : box;
       for (const item of items) draw(item, nested, clip, tint, depth + 1);
     } else if (shape.path) {
-      let previous: Point | undefined;
-      for (const command of shape.path) {
-        const [kind, x, y] = command;
-        if (kind === "A") {
-          previous = curve(matrix, box, tint, x, y, command[3], command[4], command[5]);
-        } else {
-          const point = position(matrix, x, y);
-          if (kind === "L" && previous) drawLine(previous, point, box, tint);
-          previous = point;
-        }
-      }
+      stroke(shape.path,matrix,box,tint);
     } else if (shape.radius) {
       curve(matrix, box, tint, shape.x, -shape.y, shape.radius, 0, 2 * Math.PI);
     } else if (shape.x2 !== undefined && shape.y2 !== undefined) {
@@ -294,14 +329,19 @@ export function rasterCad(
       clips.push(`<clipPath id="clip${id}"><rect x="${box.left}" y="${box.top}" width="${box.right - box.left + 1}" height="${box.bottom - box.top + 1}"/></clipPath>`);
       return `<g clip-path="url(#clip${id})">${runs.join("")}</g>`;
     });
+    const files = assets.fontFiles(fontsUsed);
+    const pinned = files.length
+      ? { loadSystemFonts: false, fontFiles: [...new Set([...files, ...font?.fontFiles ?? []])],
+        sansSerifFamily: font?.sansSerifFamily }
+      : font;
     const glyphs = new Resvg(`<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}"
-      font-family="sans-serif"><defs>${clips.join("")}</defs>${glyphRuns.join("")}</svg>`, { font }).render().pixels;
+      font-family="sans-serif"><defs>${clips.join("")}</defs>${glyphRuns.join("")}</svg>`, { font: pinned }).render().pixels;
     for (let i = 0, j = 0; i < glyphs.length; i += 4, j += 3) {
       if (!glyphs[i+3]) continue;
       const ratio = 1 - glyphs[i+3] / 255;
       for (let c = 0; c < 3; c++) pixels[j+c] = Math.round(pixels[j+c] * ratio + glyphs[i+c]);
     }
-    text.clear();
+    text.clear(); fontsUsed.clear();
   }
 
   for (const shape of shapes) draw(shape, screen, canvas, shape.handle === selected ? 2 : 1, 0);

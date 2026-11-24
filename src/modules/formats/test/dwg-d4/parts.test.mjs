@@ -391,3 +391,72 @@ test("DWG composites later direct and nested masks across parts without moving a
     } finally { await index.close(); }
   } finally { await fd.close(); await rm(root, { recursive: true, force: true }); }
 });
+
+test("DWG pins SHX strokes, reports missing glyphs and ignores font paths outside the configured assets", async () => {
+  const { symlink, mkdir } = await import("node:fs/promises");
+  const { dwgFontAssets } = await import("../../../../../dist/src/modules/formats/cad-font-assets.js");
+  const { renderCad } = await import("../../../../../dist/src/modules/formats/cad-render.js");
+  const root = await mkdtemp(join(tmpdir(), "dwg-font-"));
+  const fontDir = join(root, "fonts");
+  const input = join(root, "source");
+  await mkdir(fontDir);
+  const previous = process.env.FACADE_DWG_FONT_DIR;
+  process.env.FACADE_DWG_FONT_DIR = fontDir;
+  const header = Buffer.from("AutoCAD-86 unifont 1.0\r\n\x1a","ascii");
+  const definition = Buffer.concat([Buffer.from("Test\0"),Buffer.from([10,3,0,0,0,0])]);
+  const glyph = Buffer.from([0,8,3,10,8,3,246,2,8,2,0,0]);
+  const structure = Buffer.alloc(6), record = Buffer.alloc(4);
+  structure.writeUInt16LE(2,0);
+  structure.writeUInt16LE(definition.length,4);
+  record.writeUInt16LE(0x410,0);
+  record.writeUInt16LE(glyph.length,2);
+  await writeFile(join(fontDir,"quoted.shx"),Buffer.concat([header,structure,definition,record,glyph]));
+  await symlink(join(fontDir,"quoted.shx"),join(fontDir,"link.shx"));
+  const document = [
+    0,"SECTION",2,"TABLES",0,"STYLE",2,"Active",3,"quoted.shx",40,0,41,1,50,0,
+    0,"STYLE",2,"Escaped",3,"../quoted.shx",0,"ENDSEC",
+    0,"SECTION",2,"ENTITIES",
+    0,"TEXT",5,"A1",7,"Active",10,0,20,0,40,10,1,"АЖ",
+    0,"TEXT",5,"A2",7,"Escaped",10,0,20,20,40,10,1,"А",
+    0,"ENDSEC",0,"EOF","",
+  ].join("\n");
+  await writeFile(input,document);
+  const file = await open(input);
+  try {
+    const assets = dwgFontAssets();
+    const font = assets.select("quoted.shx");
+    assert.equal(font.kind,"shx");
+    assert.equal(assets.select("link.shx"),undefined);
+    assert.equal(assets.select("../quoted.shx"),undefined);
+    const index = await buildDwgIndex(file,"a".repeat(64),"p",undefined,assets);
+    try {
+      const [{ unit }] = [...index.units()];
+      assert.equal(index.identity.fonts,assets.identity);
+      assert.deepEqual(unit.rows[0].details.fonts,[
+        { name:"quoted.shx",sha256:font.sha256,kind:"shx" },
+        { name:"quoted.shx",fallback:"glyph",glyph:"Ж" },
+      ]);
+      assert.deepEqual(unit.rows[1].details.fonts,[{ name:"../quoted.shx",fallback:"font" }]);
+      const shape = unit.cad[0];
+      assert.deepEqual(font.font.glyph(0x410).path,[["M",0,-0],["L",3,-10],["M",3,-10],["L",6,-0]]);
+      assert.equal(shape.textSpans[0].advance,8);
+      const one = { ...unit,cad:[{ ...shape, textSpans:shape.textSpans.slice(0,1) }] };
+      const png = renderCad(one,{unitId:unit.id},"A1",d=>index.definition(d),assets);
+      assert.equal(png.bytes.subarray(1,4).toString(),"PNG");
+      const focused = renderCad(one,{unitId:unit.id},"A1",d=>index.definition(d),assets,font.sha256);
+      assert.equal(focused.bytes.subarray(1,4).toString(),"PNG");
+      assert.ok(focused.transform.pixelsPerPoint >= png.transform.pixelsPerPoint);
+      assert.throws(()=>renderCad(one,{unitId:unit.id},"A1",d=>index.definition(d),assets,"0".repeat(64)),
+        {code:"cad_font_text_unavailable"});
+      process.env.FACADE_DWG_FONT_DIR = join(root,"unmounted");
+      assert.notEqual(dwgFontAssets().identity,assets.identity);
+      assert.throws(()=>renderCad(one,{unitId:unit.id},"A1",d=>index.definition(d),dwgFontAssets()),
+        {code:"cad_font_assets_changed"});
+    } finally { await index.close(); }
+  } finally {
+    await file.close();
+    if (previous === undefined) delete process.env.FACADE_DWG_FONT_DIR;
+    else process.env.FACADE_DWG_FONT_DIR = previous;
+    await rm(root,{recursive:true,force:true});
+  }
+});

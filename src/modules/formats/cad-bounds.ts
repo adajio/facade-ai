@@ -9,8 +9,11 @@ export function cadShapeBounds(shape: CadShape): CadBounds {
   const { x, y, x2 = x, y2 = y, radius = 0, text = "", height = 0, angle = 0 } = shape;
   if (text) {
     const radians = angle * Math.PI / 180;
-    const span = Math.max(...text.split("\n").map((line) => [...line].length)) * height * 0.72;
-    const tall = Math.max(1, text.split("\n").length) * height * 1.2;
+    const plan = shape.textSpans;
+    const span = plan?.length ? Math.max(...plan.map(run => run.x + run.advance + run.height * .6))
+      : Math.max(...text.split("\n").map((line) => [...line].length)) * height * 0.72;
+    const tall = plan?.length ? Math.max(...plan.map(run => run.y + run.height * 1.2))
+      : Math.max(1, text.split("\n").length) * height * 1.2;
     const corners = [[0, 0], [span, 0], [span, tall], [0, tall]].map(([cx, cy]) => [
       x + cx * Math.cos(radians) - cy * Math.sin(radians),
       -y - cx * Math.sin(radians) - cy * Math.cos(radians),
@@ -61,4 +64,10 @@ export function transformCadBounds([a, b, c, d, x, y]: CadBlockUse["matrix"], bo
 export function cadPaintOrder(a: CadShape, b: CadShape) {
   const left = a.order ?? "", right = b.order ?? "";
   return left < right ? -1 : Number(left > right);
+}
+
+export function composeCadTransform(
+  [a, b, c, d, x, y]: CadBlockUse["matrix"], [e, f, g, h, u, v]: CadBlockUse["matrix"],
+): CadBlockUse["matrix"] {
+  return [a * e + c * f, b * e + d * f, a * g + c * h, b * g + d * h, a * u + c * v + x, b * u + d * v + y];
 }

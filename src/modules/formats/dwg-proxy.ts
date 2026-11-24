@@ -174,16 +174,29 @@ export function readProxy(record: Entity, handle: string): CadDrawing {
           break;
         case 38: {
           const anchor = xyz(), axis = xyz(), direction = xyz();
-          let end = at;
-          while (end + 2 <= bytes.length && bytes.readUInt16LE(end)) end += 2;
-          if (end + 2 > bytes.length || end - at > 8192) throw new RangeError("proxy text");
-          const text = new TextDecoder("utf-16le", { fatal: true }).decode(bytes.subarray(at, end));
-          at = ((end + 2 + 3) & ~3) + 8;
+          const utf16 = () => {
+            let end = at;
+            while (end + 2 <= bytes.length && bytes.readUInt16LE(end)) end += 2;
+            if (end + 2 > bytes.length || end - at > 8192) throw new RangeError("proxy text");
+            const value = new TextDecoder("utf-16le", { fatal: true }).decode(bytes.subarray(at, end));
+            at = (end + 5) & ~3;
+            return value;
+          };
+          const text = utf16();
+          at += 8;
           const origin = map(anchor), along = map([anchor[0] + direction[0], anchor[1] + direction[1], anchor[2] + direction[2]]);
           const height = number() * Math.hypot(along[0] - origin[0], along[1] - origin[1]) / Math.hypot(...direction);
+          const width = number(), oblique = number() * 180 / Math.PI;
+          at += 8 + 20;
+          const bold = Boolean(count()), italic = Boolean(count());
+          at += 8;
+          const face = utf16(), file = utf16(), bigfont = utf16();
           if (text && finite(height) && height > 0) {
             pieces.push({ ...base, x: origin[0], y: -origin[1], text, height,
-              angle: -Math.atan2(along[1] - origin[1], along[0] - origin[0]) * 180 / Math.PI });
+              angle: -Math.atan2(along[1] - origin[1], along[0] - origin[0]) * 180 / Math.PI,
+              fontRequest: { name: file || face || "Proxy", ...(file ? {} : { bold, italic }),
+                width: width >= .01 && width <= 100 ? width : 1, oblique: Math.abs(oblique) < 85 ? oblique : 0,
+                bigfont: bigfont || undefined } });
             limits.add("cad_text_render_approximate");
             if (Math.abs(axis[2]) < 1 - 1e-8) limits.add("cad_nonplanar_projection");
           }

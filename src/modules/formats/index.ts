@@ -2,6 +2,8 @@ import { createHash } from "node:crypto";
 import type { FastifyInstance } from "fastify";
 import { ReaderError } from "../pdf/types.js";
 import type { ReaderAdapter, ReaderOutput, ReaderUnit, ReadRequest, SourceRef } from "../pdf/types.js";
+import { dwgFontAssets } from "./cad-font-assets.js";
+import type { CadFontAssets } from "./cad-font-assets.js";
 import { cadFrame, renderCad } from "./cad-render.js";
 import { convert, converterFor, withDwgDerivative } from "./conversion.js";
 import type { Converter, Legacy } from "./conversion.js";
@@ -83,14 +85,19 @@ function mapUnit(current: Unit): ReaderUnit {
   };
 }
 
-function rawOutput(parsed: Parsed, current: Unit, request: ReadRequest, load?: Parameters<typeof renderCad>[3]): ReaderOutput {
-  const query = Object.fromEntries(Object.entries(request.address.locator ?? {}).filter(([key, value]) =>
+function rawOutput(parsed: Parsed, current: Unit, request: ReadRequest,
+  load?: Parameters<typeof renderCad>[3], fonts?: CadFontAssets): ReaderOutput {
+  const { textFont, ...requested } = request.address.locator ?? {};
+  const query = Object.fromEntries(Object.entries(requested).filter(([key, value]) =>
     !["limitations", "candidateCount"].includes(key) || mapUnit(current).locator?.[key] !== value));
   const { rows, locator, handle } = select(current, query);
-  const address = { ...request.address, locator };
+  if (textFont !== undefined && (!fonts || !handle || request.representation !== "render" || request.address.box
+      || typeof textFont !== "string" || !/^[a-f0-9]{64}$/.test(textFont)
+      || !rows.some(row => Array.isArray(row.details?.fonts) && row.details.fonts.some((font) => font.sha256 === textFont)))) invalid();
+  const address = { ...request.address, locator: textFont ? { ...locator, textFont } : locator };
   if (request.address.box && !current.cad) invalid();
   if (request.representation === "render") {
-    const image = current.cad ? renderCad(current, address, handle, load) : undefined;
+    const image = current.cad ? renderCad(current, address, handle, load, fonts, typeof textFont === "string" ? textFont : undefined) : undefined;
     if (!image) {
       throw new ReaderError(handle ? "cad_entity_geometry_unavailable" : current.limitations[0] ?? "format_render_unavailable",
         "Для указанного места доступно текстовое открытие или исходное ограничение", 424);
@@ -143,6 +150,7 @@ function adapter(format: Format): ReaderAdapter {
   const legacy = isLegacy(format) ? format : undefined;
   const profile = native.has(format) || format === "image" ? "formats-1.1.3"
     : format === "dwg" ? dwgReaderProfile : format === "doc" ? "formats-1.1.1" : readerVersion;
+  const fonts = format === "dwg" ? dwgFontAssets() : undefined;
   let configured: ReturnType<typeof converterFor> | undefined;
   const resolve = () => legacy ? configured ??= converterFor(legacy).catch((error) => {
     configured = undefined;
@@ -151,7 +159,8 @@ function adapter(format: Format): ReaderAdapter {
   const version = async () => {
     const converter = await resolve();
     const identity = converter?.format === "dwg" ? converter.identity : converter?.id;
-    return legacy ? `${profile}:${format}:${identity ?? "unavailable"}` : `${profile}:${format}`;
+    return legacy ? `${profile}:${format}:${identity ?? "unavailable"}${fonts ? `:fonts:sha256:${fonts.identity}` : ""}`
+      : `${profile}:${format}`;
   };
 
   async function parse(path: string, checkInventory = false): Promise<Parsed> {
@@ -190,13 +199,13 @@ function adapter(format: Format): ReaderAdapter {
     const converter = await resolve();
     if (converter?.format !== "dwg") throw new FormatHold("dwg_converter_unavailable");
     const pin = source && { source, converter: converter.identity, reserve: converter.reserve };
-    const cached = pin && await openDwgIndex(pin);
+    const cached = pin && await openDwgIndex(pin, fonts);
     if (cached || !path) return cached;
     return withDwgDerivative(path, converter, (file, sha) => {
       if (expected !== undefined && expected !== sha) {
         throw new ReaderError("dwg_index_identity_changed", "Повторная конвертация вернула другую производную DWG", 409);
       }
-      return buildDwgIndex(file, sha, converter.identity, pin);
+      return buildDwgIndex(file, sha, converter.identity, pin, fonts);
     });
   }
 
@@ -208,7 +217,7 @@ function adapter(format: Format): ReaderAdapter {
     const { unit, digest } = index.read(selected);
     const current = pinned(index, unit, digest);
     return rawOutput({ units: [], converter: index.identity.converter, representationSha256: index.identity.derivative },
-      current, request, block => index.definition(block));
+      current, request, block => index.definition(block), fonts);
   }
 
   async function inspectDwg(path: string, source?: SourceRef): Promise<ReaderUnit[]> {
