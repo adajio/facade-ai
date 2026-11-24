@@ -1,0 +1,37 @@
+[
+  {
+    "name": "schedule",
+    "source": "../fixtures/schedule.dwg",
+    "expectedSha256": "f2c9e2d20e11451d6fcb4bbcde16dc7d726358a4a7273cccda660c5ce86944be"
+  },
+  {
+    "name": "recovery",
+    "source": "../fixtures/dwg-recovery.dwg",
+    "expectedSha256": "7153dd21a60e1b5052b6abbd9da04eae4b36ae6e95fa58c8b2356f76270384d8"
+  },
+  {
+    "name": "unreadable",
+    "source": "../fixtures/unreadable.dwg",
+    "expectedSha256": "667395e2fdc0ca0b45453a34dd5c3a4b8815ee68a263ef2a4920dfc1d4cb84d7"
+  },
+  {
+    "name": "xref-host",
+    "source": "./fixtures/xref-host.dwg",
+    "expectedSha256": "64c715dab801e8e7729d6cb5e426ccfd7aab9f1f88c11158a14cd763107913a3"
+  },
+  {
+    "name": "xref-accepted",
+    "source": "./fixtures/xref-accepted.dwg",
+    "expectedSha256": "db21b4a0908c55665a142e655f789aa9560856258dc2e9971e25e73b013dd9d1"
+  },
+  {
+    "name": "xref-stale",
+    "source": "./fixtures/xref-stale.dwg",
+    "expectedSha256": "935740a158691c9c4fbfa37c5f81e943a93b555e139c1decacd334433b1ebc5c"
+  },
+  {
+    "name": "xref-foreign",
+    "source": "./fixtures/xref-foreign.dwg",
+    "expectedSha256": "4e67ca02abf29610c36e0680ce2e05cd46e57ba120be6c5ca66dc889d0750635"
+  }
+]

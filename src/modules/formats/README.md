@@ -182,3 +182,5 @@ docker --context orbstack run --rm --pull=never --init --read-only \
 селектор относится к производной. При восстановлении DWG через JSON
 у единицы `derivative: dwg-json`, подтверждённый адрес выдачи сохраняется
 как `derivativeHandle`. [Поиск причины и адресные проверки](test/postblind-201dc93.md).
+
+[Подготовка квалификации DWG для D4](test/dwg-d4/README.md).
