@@ -80,7 +80,9 @@ test('document work verifies source pairing, role, job revision and unknown effe
 
   const response = await get(work);
   assert.equal(response.statusCode, 200, response.payload);
-  const first = response.json().jobs[0];
+  const { branches, jobs } = response.json();
+  assert.deepEqual(branches, [{ branch: 'A', total: 1, completed: 0, outcome: 'waiting_route' }]);
+  const first = jobs[0];
   assert.equal(first.id, jobId);
   assert.equal(first.actions.priority.version, first.version);
   assert.equal(first.reason, 'waiting_route');

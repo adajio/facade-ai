@@ -118,7 +118,7 @@ export async function register(app: FastifyInstance) {
          EXISTS(SELECT 1 FROM reader_maps WHERE project_id=$1 AND version_id=$2) AS "mapReady",
          EXISTS(SELECT 1 FROM intake_reader_jobs WHERE project_id=$1 AND version_id=$2 AND dispatched_at IS NOT NULL) AS mapped,
          p.catalog_version_id IS NOT NULL AS "catalogAssigned",
-         coalesce((SELECT jsonb_agg(to_jsonb(branch) ORDER BY branch.branch) FROM branch),'[]'::jsonb) AS branches,
+         coalesce((SELECT jsonb_agg(to_jsonb(summary) ORDER BY summary.branch) FROM branch AS summary),'[]'::jsonb) AS branches,
          coalesce((SELECT jsonb_agg(to_jsonb(visible)) FROM visible),'[]'::jsonb) AS jobs,
          (SELECT count(*)::int FROM work) AS "jobCount"
        FROM projects p WHERE p.id=$1`,
