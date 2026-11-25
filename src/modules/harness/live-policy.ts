@@ -1,5 +1,5 @@
 import { featherlessQwenVisionModel, isFeatherlessQwen, matchesKimiEndpoint, qwen38Max, qwen4Max, terraModel, type CheaperInferenceProfile, type FeatherlessProfile, type OpenRouterProfile } from '../gateway/index.js';
-import { customerScope } from '../gateway/admission.js';
+import { customerScope, scopeAllowsOriginal } from '../gateway/admission.js';
 import type { ResearchSettings, ResearchSuspension, ResearchTask } from './contracts.js';
 import { profileHold, researchSlot, researchSlots, type ResearchProfile, type ResearchSlot } from './profile.js';
 
@@ -14,7 +14,7 @@ function matchesPolicy(route: LiveRoute, { dataClass, toolChoice }: ResearchSett
     if (route.transport === 'cheaperinference') return slot === 'A' && route.model === terraModel
       && route.mode === 'strict-zdr' && Boolean(route.zdrEvidenceRef?.trim());
     if (route.transport === 'featherless') return slot === 'B' && route.model === featherlessQwenVisionModel
-      && route.mode === 'customer' && toolChoice === 'auto';
+      && route.mode === 'customer' && (toolChoice ?? 'required') === 'required';
     return slot === 'lead' && route.model === 'moonshotai/kimi-k3.1-pro' && route.provider === 'wafer/us'
       && route.mode === 'strict-zdr' && route.customerAccess.excludesSafetyRetention === true;
   }
@@ -23,7 +23,8 @@ function matchesPolicy(route: LiveRoute, { dataClass, toolChoice }: ResearchSett
   if (!Array.isArray(route.syntheticScopes) || !route.syntheticScopes.length) return false;
   if (route.transport === 'featherless' || isFeatherlessQwen(route.model)) {
     return route.transport === 'featherless' && syntheticResearch && slot === 'B' && isFeatherlessQwen(route.model)
-      && route.mode === 'synthetic-research' && toolChoice === 'auto';
+      && route.mode === 'synthetic-research'
+      && (toolChoice ?? 'required') === (route.model === featherlessQwenVisionModel ? 'required' : 'auto');
   }
   const hasZdr = typeof route.zdrEvidenceRef === 'string' && Boolean(route.zdrEvidenceRef.trim());
   if (route.transport === 'cheaperinference') {
@@ -81,7 +82,7 @@ export function validateLivePolicy<T extends LiveRoute>(
         : route.syntheticScopes?.find(({ projectId, scopeId }) => task.projectId === projectId && task.scopeId === scopeId);
       const places = task.job.mode === 'primary' ? [task.job.place] : [task.job.dispute.a.place, task.job.dispute.b.place];
       if (approved && places.every(({ source }) =>
-        source.projectId === task.projectId && approved.originalSha256s.includes(source.sha256))) return null;
+        source.projectId === task.projectId && scopeAllowsOriginal(approved, source.sha256))) return null;
       return {
         reason: customer ? 'customer_input_not_approved' : 'synthetic_input_not_approved',
         nextAction: `Сверить проект, область и SHA-256 оригиналов с допуском ${slot}.`,

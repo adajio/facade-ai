@@ -1,4 +1,4 @@
-import { featherlessQwenModel, terraModel } from '../gateway/index.js';
+import { featherlessQwenVisionModel, terraModel } from '../gateway/index.js';
 import { settingsSchema, type ResearchSettings, type ResearchSuspension, type ResearchTask, type ScheduledResearchJob } from './contracts.js';
 
 export const researchSlots = ['A', 'B', 'lead'] as const;
@@ -13,7 +13,7 @@ function defaultResearchProfile(): ResearchProfile {
   const reader = { dataClass: 'synthetic', maxTokens: 2_048, maxTurns: 32, maxKnownRejections: 1 };
   return {
     A: { ...reader, routeId: 'cheaperinference-terra-reader', model: terraModel },
-    B: { ...reader, routeId: 'featherless-qwen38-2.4t-a95b-reader', model: featherlessQwenModel, toolChoice: 'auto' },
+    B: { ...reader, routeId: 'featherless-qwen38-27b-reader', model: featherlessQwenVisionModel, toolChoice: 'required' },
     lead: null,
   };
 }

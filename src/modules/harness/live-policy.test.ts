@@ -100,16 +100,16 @@ test('policy, envelope and configuration failures are isolated to the affected b
 
 test('the new defaults require independent approvals and leave saved pilot assignments and lead explicit', () => {
   const defaults = loadResearchProfile({});
-  assert.deepEqual([defaults.A?.model, defaults.B?.model, defaults.lead], ['gpt-6.1-terra', 'Qwen/Qwen3.8-2.4T-A95B', null]);
+  assert.deepEqual([defaults.A?.model, defaults.B?.model, defaults.lead], ['gpt-6.1-terra', 'Qwen/Qwen3.8-27B', null]);
   assert.deepEqual(loadResearchProfile({ FACADE_HARNESS_PROFILE: JSON.stringify(profile) }), profile);
   assert.equal(profileHold(defaults, task('A'))?.reason, 'research_profile_changed');
   assert.equal(profileHold(defaults, task('B'))?.reason, 'research_profile_changed');
   assert.ok(defaults.A && defaults.B);
-  assert.equal(defaults.B.routeId, 'featherless-qwen38-2.4t-a95b-reader');
-  assert.equal(defaults.B.toolChoice, 'auto');
+  assert.equal(defaults.B.routeId, 'featherless-qwen38-27b-reader');
+  assert.equal(defaults.B.toolChoice, 'required');
   const direct: LiveRoute = { transport: 'cheaperinference', routeId: defaults.A.routeId, model: 'gpt-6.1-terra',
     mode: 'strict-zdr', zdrEvidenceRef: 'fixture', syntheticScopes: [testedScope] };
-  const pinned = { transport: 'featherless', routeId: defaults.B.routeId, model: 'Qwen/Qwen3.8-2.4T-A95B',
+  const pinned = { transport: 'featherless', routeId: defaults.B.routeId, model: 'Qwen/Qwen3.8-27B',
     mode: 'synthetic-research', syntheticScopes: [testedScope] } as const satisfies LiveRoute;
   const synthetic = validateLivePolicy(defaults, [direct, pinned], env);
   assert.equal(synthetic.hold(task('A', defaults.A)), null);
@@ -128,8 +128,13 @@ test('the new defaults require independent approvals and leave saved pilot assig
   const withPrevious = validateLivePolicy(defaults, [direct, pinned, previousQwen], env);
   assert.equal(withPrevious.hold(previousTask)?.reason, 'research_profile_changed');
   assert.equal(withPrevious.hold(previousTask, true), null);
+  const previousFeatherless = { ...pinned, routeId: 'featherless-qwen38-2.4t-a95b-reader', model: 'Qwen/Qwen3.8-2.4T-A95B' } as const;
+  const previousFeatherlessTask = task('B', { ...settings(previousFeatherless), toolChoice: 'auto' });
+  assert.equal(validateLivePolicy(defaults, [direct, pinned, previousFeatherless], env).hold(previousFeatherlessTask, true), null);
+  assert.equal(validateLivePolicy(defaults, [direct, pinned], env).hold(previousFeatherlessTask, true)?.reason,
+    'research_profile_changed');
   assert.deepEqual(validateLivePolicy(defaults, [direct, { ...qwen, routeId: pinned.routeId, model: pinned.model }], env).approvals, [direct]);
-  assert.deepEqual(validateLivePolicy({ ...defaults, B: { ...defaults.B, toolChoice: 'required' } }, [direct, pinned], env).approvals, [direct]);
+  assert.deepEqual(validateLivePolicy({ ...defaults, B: { ...defaults.B, toolChoice: 'auto' } }, [direct, pinned], env).approvals, [direct]);
   assert.deepEqual(validateLivePolicy({ A: null, B: null, lead: defaults.A }, [direct], env).approvals, []);
 });
 
@@ -183,7 +188,7 @@ test('lead and both verifiers require the approved scope and both originals', ()
   }
 });
 
-test('customer admission is explicit for Terra, Flash Next and the Wafer lead and pins original identity', () => {
+test('customer admission is explicit for Terra, Qwen3.8-27B and the Wafer lead and pins original identity', () => {
   const customerAccess = {
     keyFingerprint: 'f'.repeat(64), evidenceRef: 'qualification/fixture', validUntil: '2099-01-01T00:00:00Z',
     scopes: [{ ...testedScope, allowImages: true }],
@@ -195,7 +200,7 @@ test('customer admission is explicit for Terra, Flash Next and the Wafer lead an
   const leader = { ...kimi, routeId: 'customer-lead', model: 'moonshotai/kimi-k3.1-pro', mode: 'strict-zdr',
     customerAccess: { ...customerAccess, guardrailId: randomUUID(), excludesSafetyRetention: true } } satisfies LiveRoute;
   const setting = (route: LiveRoute) => ({ ...settings(route), dataClass: 'customer' });
-  const configured = { A: setting(A), B: { ...setting(B), toolChoice: 'auto' as const }, lead: setting(leader) };
+  const configured = { A: setting(A), B: { ...setting(B), toolChoice: 'required' as const }, lead: setting(leader) };
   const all = [A, B, leader];
   assert.deepEqual(validateLivePolicy(configured, all, env).approvals, []);
   const customerEnv = { FACADE_HARNESS_LIVE_POLICY: 'customer' };

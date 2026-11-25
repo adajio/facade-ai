@@ -1,4 +1,5 @@
 import type { PoolClient } from 'pg';
+import { acceptedOriginals } from '../intake/accepted-originals.js';
 import { hash, positiveInteger, type ModelAuthorization } from './types.js';
 
 export type SyntheticScope = {
@@ -13,9 +14,14 @@ export type SyntheticScope = {
   };
 };
 
-export type CustomerScope = Omit<SyntheticScope, 'retentionApproval'> & {
+export type CustomerScope = {
+  projectId: string;
+  approvalRef: string;
   allowImages: boolean;
-};
+} & (
+  | { scopeId: string | null; originalSha256s: readonly string[]; acceptedProjectOriginals?: never }
+  | { scopeId: null; acceptedProjectOriginals: true; originalSha256s?: never }
+);
 
 export type CustomerAccess = {
   keyFingerprint: string;
@@ -33,13 +39,20 @@ export function record(value: unknown): Record<string, unknown> | null {
   return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : null;
 }
 
-export function validSyntheticScopes(scopes: readonly SyntheticScope[] | undefined): boolean {
-  return Array.isArray(scopes) && scopes.length > 0 && scopes.every(scope =>
-    scope && typeof scope.projectId === 'string' && uuid.test(scope.projectId)
+function validScope(scope: Pick<SyntheticScope, 'projectId' | 'scopeId' | 'approvalRef'>) {
+  return scope && typeof scope.projectId === 'string' && uuid.test(scope.projectId)
     && (scope.scopeId === null || (typeof scope.scopeId === 'string' && uuid.test(scope.scopeId)))
-    && typeof scope.approvalRef === 'string' && Boolean(scope.approvalRef.trim())
-    && Array.isArray(scope.originalSha256s) && scope.originalSha256s.length > 0
-    && scope.originalSha256s.every((digest: unknown) => typeof digest === 'string' && sha256.test(digest)));
+    && typeof scope.approvalRef === 'string' && Boolean(scope.approvalRef.trim());
+}
+
+function validOriginalPins(pins: unknown) {
+  return Array.isArray(pins) && pins.length > 0
+    && pins.every((digest: unknown) => typeof digest === 'string' && sha256.test(digest));
+}
+
+export function validSyntheticScopes(scopes: readonly SyntheticScope[] | undefined): boolean {
+  return Array.isArray(scopes) && scopes.length > 0
+    && scopes.every(scope => validScope(scope) && validOriginalPins(scope.originalSha256s));
 }
 
 export function syntheticScope(scopes: readonly SyntheticScope[] | undefined, projectId: string, scopeId: string | null) {
@@ -49,8 +62,11 @@ export function syntheticScope(scopes: readonly SyntheticScope[] | undefined, pr
 export function validCustomerAccess(access: CustomerAccess | undefined, apiKey: string): boolean {
   return Boolean(access && access.keyFingerprint === hash(apiKey)
     && typeof access.evidenceRef === 'string' && access.evidenceRef.trim()
-    && Date.parse(access.validUntil) > Date.now() && validSyntheticScopes(access.scopes)
-    && access.scopes.every(scope => typeof scope.allowImages === 'boolean')
+    && Date.parse(access.validUntil) > Date.now() && Array.isArray(access.scopes) && access.scopes.length > 0
+    && access.scopes.every(scope => validScope(scope) && typeof scope.allowImages === 'boolean'
+      && (scope.acceptedProjectOriginals === true
+        ? scope.scopeId === null && scope.originalSha256s === undefined
+        : scope.acceptedProjectOriginals === undefined && validOriginalPins(scope.originalSha256s)))
     && new Set(access.scopes.map(scope => JSON.stringify([scope.projectId, scope.scopeId]))).size === access.scopes.length);
 }
 
@@ -58,6 +74,11 @@ export function customerScope(access: CustomerAccess | undefined, projectId: str
   return access && Date.parse(access.validUntil) > Date.now()
     ? access.scopes.find(scope => scope.projectId === projectId && scope.scopeId === scopeId)
     : undefined;
+}
+
+export function scopeAllowsOriginal(scope: SyntheticScope | CustomerScope, digest: string): boolean {
+  return sha256.test(digest) && ((scope.originalSha256s?.includes(digest) ?? false) || 'acceptedProjectOriginals' in scope
+    && scope.acceptedProjectOriginals === true);
 }
 
 export function requestHasImages(request: unknown): boolean {
@@ -103,20 +124,44 @@ function assignedSources(payload: unknown): Record<string, unknown>[] {
   return places.map(place => record(record(place)?.source) ?? {});
 }
 
-export async function verifyApprovedResearchInputs(tx: PoolClient, context: ModelAuthorization, scope: SyntheticScope,
+export async function verifyApprovedResearchInputs(tx: PoolClient, context: ModelAuthorization, scope: SyntheticScope | CustomerScope,
   policyBlock?: (scope: SyntheticScope) => string | null,
 ) {
   const sources = assignedSources(context.payload);
   if (!sources.length || sources.some(source => source.projectId !== context.projectId
     || typeof source.versionId !== 'string' || !uuid.test(source.versionId)
     || typeof source.documentId !== 'string' || !uuid.test(source.documentId)
-    || typeof source.sha256 !== 'string' || !scope.originalSha256s.includes(source.sha256))
+    || typeof source.sha256 !== 'string' || !scopeAllowsOriginal(scope, source.sha256))
     || context.inputRefs.some(id => !uuid.test(id))) return false;
-  const blocked = policyBlock?.(scope);
+  const evidenceIds = [...new Set(context.inputRefs)];
+  if ('acceptedProjectOriginals' in scope && scope.acceptedProjectOriginals === true) {
+    if (context.dataClass !== 'customer' || context.scopeId !== null) return false;
+    const project = await tx.query('SELECT 1 FROM projects WHERE id=$1 AND intake_mode', [context.projectId]);
+    if (!project.rowCount) return false;
+    const evidence = await tx.query<{ versionId: string; sha256: string }>(
+      `SELECT e.version_id AS "versionId", m.original_sha256 AS sha256 FROM reader_evidence e
+       JOIN reader_maps m USING(project_id,version_id,reader_version)
+       WHERE e.project_id=$1 AND e.run_id=$2 AND e.id=ANY($3::uuid[])`,
+      [context.projectId, context.jobId, evidenceIds],
+    );
+    if (evidence.rowCount !== evidenceIds.length) return false;
+    const originals = new Map<string, Awaited<ReturnType<typeof acceptedOriginals>>[number]>();
+    for (const versionId of new Set([...sources.map(source => source.versionId as string), ...evidence.rows.map(row => row.versionId)])) {
+      const [accepted] = await acceptedOriginals(tx, context.projectId, { versionId });
+      if (!accepted) return false;
+      originals.set(versionId, accepted);
+    }
+    if (sources.some(source => {
+      const accepted = originals.get(source.versionId as string);
+      return !accepted || accepted.documentId !== source.documentId || accepted.sha256 !== source.sha256;
+    }) || evidence.rows.some(({ versionId, sha256 }) => originals.get(versionId)?.sha256 !== sha256)) return false;
+    return true;
+  }
+  if (!scope.originalSha256s) return false;
+  const blocked = policyBlock?.({ ...scope, originalSha256s: scope.originalSha256s });
   if (blocked) return blocked;
 
   const expected = sources.map(source => ({ version_id: source.versionId, document_id: source.documentId, sha256: source.sha256 }));
-  const evidenceIds = [...new Set(context.inputRefs)];
   const result = await tx.query<{ authorized: boolean }>(
     `SELECT
       NOT EXISTS (SELECT 1 FROM intake_originals WHERE project_id=$1 AND sha256<>ALL($2::text[]))

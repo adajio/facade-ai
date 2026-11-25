@@ -107,7 +107,7 @@ test('partial live configuration uses only independently admitted routes with th
   const defaults = loadResearchProfile({});
   const terra = { ...defaults.A, direct: true };
   const defaultQwen = { ...defaults.B, featherless: true };
-  const visualQwen = { ...defaultQwen, routeId: 'fixture-featherless-flash-next', model: 'Qwen/Qwen3.8-Flash-Next' };
+  const visualQwen = { ...defaultQwen, routeId: "fixture-featherless-qwen38-27b" };
   for (const [cfg, transport, ceilingUsdNanos] of [[terra, 'cheaperinference', 3_000_000_000], [defaultQwen, 'featherless', 2_000_000_000], [visualQwen, 'featherless', 2_000_000_000]]) {
     await gateway.configureRoute({
       id: cfg.routeId, revision: 'local-test', transport, enabled: true,
@@ -161,7 +161,13 @@ test('partial live configuration uses only independently admitted routes with th
         assert.equal(input.provider.data_collection, 'deny');
         assert.equal(input.provider.zdr, branch !== 'B');
       }
-      assert.equal(input.tool_choice, selected.toolChoice ?? 'required');
+      if (selected.featherless) {
+        assert.equal(input.tools, undefined);
+        assert.equal(input.tool_choice, undefined);
+        assert.match(input.messages[0].content, /Available tools:/);
+      } else {
+        assert.equal(input.tool_choice, selected.toolChoice ?? 'required');
+      }
       const projectId = (assignment.place ?? assignment.dispute.a.place).source.projectId;
       const image = input.messages.flatMap(({ content }) => Array.isArray(content) ? content : [])
         .find(({ type }) => type === 'image_url');
@@ -170,7 +176,10 @@ test('partial live configuration uses only independently admitted routes with th
         return Response.json({ error: { code: 404, metadata: { error_type: 'not_found' } },
           openrouter_metadata: { attempt: 0 } }, { status: 404 });
       }
-      const outputs = input.messages.filter(({ role }) => role === 'tool').map(({ content }) => JSON.parse(content));
+      const outputs = selected.featherless
+        ? input.messages.filter(({ role, content }) => role === 'user' && typeof content === 'string' && content.startsWith('Local tool result for '))
+          .map(({ content }) => JSON.parse(content.slice(content.indexOf('\n') + 1)))
+        : input.messages.filter(({ role }) => role === 'tool').map(({ content }) => JSON.parse(content));
       if (revoke?.projectId === projectId && revoke.branch === branch && outputs.length === 0) {
         await grant(projectId, branch, false);
       }
@@ -265,6 +274,10 @@ test('partial live configuration uses only independently admitted routes with th
         name = 'finish_reading';
         args = { status: 'covered', explanation: 'Checked a synthetic line.' };
       }
+      if (selected.featherless) {
+        return Response.json({ ...receipt, choices: [{ finish_reason: 'stop',
+          message: { role: 'assistant', content: JSON.stringify({ name, arguments: args }) } }] });
+      }
       return Response.json({ ...receipt, choices: [{ finish_reason: 'tool_calls', message: { role: 'assistant', content: null,
           tool_calls: [{ id: randomUUID(), type: 'function', function: { name, arguments: JSON.stringify(args) } }] } }] });
     } catch (error) {
@@ -351,7 +364,7 @@ test('partial live configuration uses only independently admitted routes with th
         revision: 'local-test', mode: 'synthetic-research', contextTokens: 262_144,
         boundEvidenceRef: 'fixture-featherless-rates', validUntil: '2099-01-01T00:00:00Z',
         syntheticScopes: [{ ...authorized, approvalRef: 'fixture' }],
-        inputNanosPerToken: testCase.review ? 150 : 1000, outputNanosPerToken: testCase.review ? 500 : 4000,
+        inputNanosPerToken: 400, outputNanosPerToken: 3000,
         outputTokenLimit: testCase.review ? 512 : defaults.B.maxTokens,
       }]);
     } else {
