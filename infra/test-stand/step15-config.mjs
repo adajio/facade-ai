@@ -5,6 +5,7 @@ const env = parseEnv(readFileSync(process.argv[2], 'utf8'));
 const namespaces = {
   openrouter: ['FACADE_GATEWAY_OPENROUTER_KEY', 'FACADE_GATEWAY_STEP15_PROFILES'],
   cheaperinference: ['FACADE_GATEWAY_CHEAPERINFERENCE_KEY', 'FACADE_GATEWAY_CHEAPERINFERENCE_PROFILES'],
+  featherless: ['FACADE_GATEWAY_FEATHERLESS_KEY', 'FACADE_GATEWAY_FEATHERLESS_PROFILES'],
 };
 const permitted = [...Object.values(namespaces).flat(), 'FACADE_HARNESS_PROFILE',
   'FACADE_GATEWAY_OPENROUTER_ENDPOINT', 'FACADE_HARNESS_LIVE_POLICY'];
@@ -36,4 +37,4 @@ if (!['https://openrouter.ai', 'https://eu.openrouter.ai', 'https://us.openroute
 }
 const policy = env.FACADE_HARNESS_LIVE_POLICY ?? 'strict-zdr';
 if (!['strict-zdr', 'synthetic-research'].includes(policy)) throw new Error('Invalid step 15 harness policy');
-console.log(providers.length === 2 ? 'mixed' : providers[0]);
+console.log(providers.join('+') === 'openrouter+cheaperinference' ? 'mixed' : providers.join('+'));

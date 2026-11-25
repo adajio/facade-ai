@@ -99,14 +99,17 @@ test('policy, envelope and configuration failures are isolated to the affected b
 
 test('the new defaults require independent approvals and leave saved pilot assignments and lead explicit', () => {
   const defaults = loadResearchProfile({});
-  assert.deepEqual([defaults.A?.model, defaults.B?.model, defaults.lead], ['gpt-6.1-terra', 'qwen/qwen3.8-max-0902', null]);
+  assert.deepEqual([defaults.A?.model, defaults.B?.model, defaults.lead], ['gpt-6.1-terra', 'Qwen/Qwen3.8-2.4T-A95B', null]);
   assert.deepEqual(loadResearchProfile({ FACADE_HARNESS_PROFILE: JSON.stringify(profile) }), profile);
   assert.equal(profileHold(defaults, task('A'))?.reason, 'research_profile_changed');
   assert.equal(profileHold(defaults, task('B'))?.reason, 'research_profile_changed');
   assert.ok(defaults.A && defaults.B);
+  assert.equal(defaults.B.routeId, 'featherless-qwen38-2.4t-a95b-reader');
+  assert.equal(defaults.B.toolChoice, 'auto');
   const direct: LiveRoute = { transport: 'cheaperinference', routeId: defaults.A.routeId, model: 'gpt-6.1-terra',
     mode: 'strict-zdr', zdrEvidenceRef: 'fixture', syntheticScopes: [testedScope] };
-  const pinned = { ...qwen, routeId: defaults.B.routeId, model: defaults.B.model };
+  const pinned = { transport: 'featherless', routeId: defaults.B.routeId, model: 'Qwen/Qwen3.8-2.4T-A95B',
+    mode: 'synthetic-research', syntheticScopes: [testedScope] } as const satisfies LiveRoute;
   const synthetic = validateLivePolicy(defaults, [direct, pinned], env);
   assert.equal(synthetic.hold(task('A', defaults.A)), null);
   assert.equal(synthetic.hold(task('B', defaults.B)), null);
@@ -115,7 +118,17 @@ test('the new defaults require independent approvals and leave saved pilot assig
   assert.equal(withPilot.hold(task('A'), true), null);
   assert.equal(synthetic.hold(task('A'), true)?.reason, 'research_profile_changed');
   assert.deepEqual(validateLivePolicy(defaults, [direct, pinned], {}).approvals, [direct]);
-  assert.deepEqual(validateLivePolicy(defaults, [direct, { ...pinned, provider: 'alibaba/us-east-1' }], env).approvals, [direct]);
+  const strictQwen = { ...qwen, routeId: pinned.routeId, model: pinned.model, mode: 'strict-zdr' as const, zdrEvidenceRef: 'fixture' };
+  assert.deepEqual(validateLivePolicy(defaults, [direct, strictQwen], {}).approvals, [direct]);
+  const customer = { A: { ...defaults.A, dataClass: 'customer' }, B: { ...defaults.B, dataClass: 'customer' }, lead: null };
+  assert.deepEqual(validateLivePolicy(customer, [direct, pinned], env).approvals, []);
+  const previousQwen = { ...qwen, routeId: 'openrouter-alibaba-qwen38-max-reader', model: 'qwen/qwen3.8-max-0902' };
+  const previousTask = task('B', settings(previousQwen));
+  const withPrevious = validateLivePolicy(defaults, [direct, pinned, previousQwen], env);
+  assert.equal(withPrevious.hold(previousTask)?.reason, 'research_profile_changed');
+  assert.equal(withPrevious.hold(previousTask, true), null);
+  assert.deepEqual(validateLivePolicy(defaults, [direct, { ...qwen, routeId: pinned.routeId, model: pinned.model }], env).approvals, [direct]);
+  assert.deepEqual(validateLivePolicy({ ...defaults, B: { ...defaults.B, toolChoice: 'required' } }, [direct, pinned], env).approvals, [direct]);
   assert.deepEqual(validateLivePolicy({ A: null, B: null, lead: defaults.A }, [direct], env).approvals, []);
 });
 

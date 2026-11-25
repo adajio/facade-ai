@@ -8,7 +8,7 @@ import type { Pool } from 'pg';
 import type { WorkerContext } from '../../platform/worker-context.js';
 import { sealManagedTestDatabase, toolHash } from '../../platform/runtime-boundary.js';
 import { createFormatAdapters } from '../formats/index.js';
-import { createGateway, createLiveGateway, journalFromEnv, type CheaperInferenceProfile, type OpenRouterProfile, type Step15Approval } from '../gateway/index.js';
+import { createGateway, createLiveGateway, journalFromEnv, type CheaperInferenceProfile, type FeatherlessProfile, type OpenRouterProfile, type Step15Approval } from '../gateway/index.js';
 import type { ModelTransport } from '../gateway/types.js';
 import { startImports } from '../imports/index.js';
 import { createIntakeStorage } from '../intake/blob.js';
@@ -33,7 +33,7 @@ export { register } from './stops.js';
 export { readPackageAnalysis, type PackageAnalysis } from './package-analysis.js';
 
 type RouterApproval = OpenRouterProfile & { transport?: 'openrouter' };
-type LiveApproval = RouterApproval | CheaperInferenceProfile;
+type LiveApproval = RouterApproval | CheaperInferenceProfile | FeatherlessProfile;
 
 function configuredApprovals(): LiveApproval[] {
   const read = (input: string | undefined): LiveApproval[] => {
@@ -47,6 +47,7 @@ function configuredApprovals(): LiveApproval[] {
   return [
     ...read(process.env.FACADE_GATEWAY_STEP15_PROFILES).filter(item => item.transport === undefined || item.transport === 'openrouter'),
     ...read(process.env.FACADE_GATEWAY_CHEAPERINFERENCE_PROFILES).filter(item => item.transport === 'cheaperinference'),
+    ...read(process.env.FACADE_GATEWAY_FEATHERLESS_PROFILES).filter(item => item.transport === 'featherless'),
   ];
 }
 
@@ -78,7 +79,7 @@ function modelGateway(context: WorkerContext, external: ReturnType<typeof journa
   const localGateway = () => createGateway(context.db, { journal: external?.journal, reviewAdmission, ...policyOptions });
   if (test) {
     if (!external || process.env.FACADE_GATEWAY_LIVE_MODE || process.env.FACADE_GATEWAY_OPENROUTER_KEY
-      || process.env.FACADE_GATEWAY_CHEAPERINFERENCE_KEY) {
+      || process.env.FACADE_GATEWAY_CHEAPERINFERENCE_KEY || process.env.FACADE_GATEWAY_FEATHERLESS_KEY) {
       throw new Error('Managed model tests require an isolated journal and disabled live gateway');
     }
     const gateway = createGateway(context.db, {
@@ -89,7 +90,8 @@ function modelGateway(context: WorkerContext, external: ReturnType<typeof journa
   if (process.env.FACADE_GATEWAY_LIVE_MODE === 'step-15') {
     const routerKey = process.env.FACADE_GATEWAY_OPENROUTER_KEY;
     const directKey = process.env.FACADE_GATEWAY_CHEAPERINFERENCE_KEY;
-    if (!external || (!routerKey?.trim() && !directKey?.trim())) return {
+    const featherlessKey = process.env.FACADE_GATEWAY_FEATHERLESS_KEY;
+    if (!external || ![routerKey, directKey, featherlessKey].some(key => key?.trim())) return {
       gateway: localGateway(), hasTransport: false, mode: 'disabled',
       admit: (task: ResearchTask) => ({
         reason: 'research_gateway_unconfigured',
@@ -98,14 +100,16 @@ function modelGateway(context: WorkerContext, external: ReturnType<typeof journa
     };
     const approvals = configuredApprovals();
     function enabledFor(profiles: readonly LiveApproval[]): Parameters<typeof createLiveGateway>[2] {
-      const openRouter = profiles.filter((route): route is RouterApproval => route.transport !== 'cheaperinference');
+      const openRouter = profiles.filter((route): route is RouterApproval => route.transport === undefined || route.transport === 'openrouter');
       const cheaperInference = profiles.filter((route): route is CheaperInferenceProfile => route.transport === 'cheaperinference');
+      const featherless = profiles.filter((route): route is FeatherlessProfile => route.transport === 'featherless');
       return {
         ...(openRouter.length && { openRouter: {
           qualification: 'step-15', apiKey: routerKey ?? '', profiles: openRouter,
           endpoint: (process.env.FACADE_GATEWAY_OPENROUTER_ENDPOINT ?? 'https://openrouter.ai') as Step15Approval['endpoint'],
         } }),
         ...(cheaperInference.length && { cheaperInference: { apiKey: directKey ?? '', profiles: cheaperInference } }),
+        ...(featherless.length && { featherless: { apiKey: featherlessKey ?? '', profiles: featherless } }),
       };
     }
     const usable = (route: LiveApproval) => {
@@ -130,7 +134,8 @@ function modelGateway(context: WorkerContext, external: ReturnType<typeof journa
     const hasTransport = qualified.length > 0;
     const gateway = hasTransport
       ? createLiveGateway(context.db, external.journal, enabled, reviewAdmission, policyOptions) : localGateway();
-    const provider = enabled.cheaperInference ? enabled.openRouter ? 'mixed' : 'cheaperinference' : 'openrouter';
+    const providers = [...new Set(qualified.map(route => route.transport ?? 'openrouter'))];
+    const provider = providers.length > 1 ? 'mixed' : providers[0];
     return { gateway, admit: policy.hold, hasTransport, copilotRoute: copilotPolicy?.approvals.length ? copilot : null,
       mode: hasTransport ? provider + (policyOptions.replayOnly ? '-replay' : '-live') : 'disabled' };
   }

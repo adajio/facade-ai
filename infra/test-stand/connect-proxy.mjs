@@ -11,6 +11,10 @@ export const allowlists = {
   openrouter,
   cheaperinference,
   mixed: [...openrouter, ...cheaperinference],
+  featherless: ['api.featherless.ai'],
+  'openrouter+featherless': [...openrouter, 'api.featherless.ai'],
+  'cheaperinference+featherless': [...cheaperinference, 'api.featherless.ai'],
+  'openrouter+cheaperinference+featherless': [...openrouter, ...cheaperinference, 'api.featherless.ai'],
   import: ['cloud-api.yandex.net', 'downloader.disk.yandex.ru', 'downloader.disk.yandex.net'],
 };
 const blocked = new BlockList();

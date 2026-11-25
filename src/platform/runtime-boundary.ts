@@ -24,7 +24,7 @@ export function checkRuntimeInvocation(): void {
     throw new StartupError('Managed model endpoints require the isolated test entrypoint')
   }
   if ([process.env.FACADE_HARNESS_PROFILE, process.env.FACADE_GATEWAY_STEP15_PROFILES,
-    process.env.FACADE_GATEWAY_CHEAPERINFERENCE_PROFILES, process.env.FACADE_COPILOT_PROFILE].some(hasManagedSlots)) {
+    process.env.FACADE_GATEWAY_CHEAPERINFERENCE_PROFILES, process.env.FACADE_GATEWAY_FEATHERLESS_PROFILES, process.env.FACADE_COPILOT_PROFILE].some(hasManagedSlots)) {
     throw new StartupError('Managed model profiles require the isolated test entrypoint')
   }
   if (process.env.NODE_TLS_REJECT_UNAUTHORIZED === '0') {

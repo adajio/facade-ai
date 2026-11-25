@@ -65,6 +65,7 @@ const messageFields = new Set(['role','name','content','tool_call_id','tool_call
 const functionFields = new Set(['name','description','parameters','strict']);
 const endpoints = ['https://openrouter.ai','https://eu.openrouter.ai','https://us.openrouter.ai'];
 export const qwen38Max = 'qwen/qwen3.8-max-0902';
+export const qwen4Max = 'qwen/qwen4-max';
 const qwen38LowReasoningTokens = 4_096;
 const alibabaTokenTolerance = 10;
 const allowedModel = /^[a-z0-9._-]+\/[a-z0-9._-]+$/;
@@ -178,7 +179,7 @@ function approvedProfile(profile: OpenRouterProfile): boolean {
 }
 
 function isAlibabaQwenMax(profile: OpenRouterProfile): boolean {
-  return (profile.model === 'qwen/qwen4-max' || profile.model === qwen38Max) && profile.provider === 'alibaba';
+  return (profile.model === qwen4Max || profile.model === qwen38Max) && profile.provider === 'alibaba';
 }
 
 function isWaferKimiK31Pro(profile: OpenRouterProfile): boolean {

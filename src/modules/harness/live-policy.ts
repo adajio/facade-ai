@@ -1,21 +1,27 @@
-import { matchesKimiEndpoint, qwen38Max, terraModel, type CheaperInferenceProfile, type OpenRouterProfile } from '../gateway/index.js';
+import { featherlessQwenModel, matchesKimiEndpoint, qwen38Max, qwen4Max, terraModel, type CheaperInferenceProfile, type FeatherlessProfile, type OpenRouterProfile } from '../gateway/index.js';
 import type { ResearchSettings, ResearchSuspension, ResearchTask } from './contracts.js';
 import { profileHold, researchSlot, researchSlots, type ResearchProfile, type ResearchSlot } from './profile.js';
 
 export type LiveRoute = (Pick<OpenRouterProfile,
   'routeId' | 'model' | 'provider' | 'mode' | 'zdrEvidenceRef' | 'syntheticScopes'> & { transport?: 'openrouter' })
-  | Pick<CheaperInferenceProfile, 'transport' | 'routeId' | 'model' | 'mode' | 'zdrEvidenceRef' | 'syntheticScopes'>;
+  | Pick<CheaperInferenceProfile, 'transport' | 'routeId' | 'model' | 'mode' | 'zdrEvidenceRef' | 'syntheticScopes'>
+  | Pick<FeatherlessProfile, 'transport' | 'routeId' | 'model' | 'mode' | 'syntheticScopes'>;
 
 function matchesPolicy(route: LiveRoute, { dataClass, toolChoice }: ResearchSettings, policy: string, slot: ResearchSlot) {
   // A per-request ZDR flag follows the key's account or guardrail settings. The
   // current profile has no attestation binding ZDR only to that key.
   if (dataClass !== 'synthetic' || (policy !== 'strict-zdr' && policy !== 'synthetic-research')) return false;
   if (!Array.isArray(route.syntheticScopes) || !route.syntheticScopes.length) return false;
+  if (route.transport === 'featherless' || route.model === featherlessQwenModel) {
+    return route.transport === 'featherless' && policy === 'synthetic-research' && slot === 'B' && route.model === featherlessQwenModel
+      && route.mode === 'synthetic-research' && toolChoice === 'auto';
+  }
   const hasZdr = typeof route.zdrEvidenceRef === 'string' && Boolean(route.zdrEvidenceRef.trim());
   if (route.transport === 'cheaperinference') {
     return slot === 'A' && route.model === terraModel && route.mode === 'strict-zdr' && hasZdr;
   }
-  if (route.model === qwen38Max && (route.provider !== 'alibaba' || route.mode !== 'synthetic-research')) {
+  if ((route.model === qwen4Max || route.model === qwen38Max)
+    && (route.provider !== 'alibaba' || route.mode !== 'synthetic-research')) {
     return false;
   }
   if (typeof route.provider !== 'string' || (route.mode !== 'strict-zdr' && route.mode !== 'synthetic-research')) return false;
