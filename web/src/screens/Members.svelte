@@ -8,6 +8,7 @@
   import { type Catalog, type Project } from '../lib/contracts';
   import { describe, id, query, type Api } from '../lib/http';
   import { date, label } from '../lib/format';
+  import { projectStageLabel } from '../lib/project-stages';
   import { projectApi, scopedUrl } from '../lib/workspace';
   import Notice from '../lib/Notice.svelte';
   import ProjectProposals from '../lib/ProjectProposals.svelte';
@@ -186,7 +187,7 @@
   <section class="card">
     <h2>Стадия проекта</h2>
     {#if project.stage}
-      <p>Подтверждённая стадия: {project.stage}</p>
+      <p>{project.stageStatus === 'default' ? 'Стадия по умолчанию' : 'Подтверждённая стадия'}: {projectStageLabel(project.stage)}</p>
       {#if project.stageBasis?.provenanceKind === 'engineer_override'}
         {@const basis = project.stageBasis}
         <span class="pill good">Установлено инженером</span>

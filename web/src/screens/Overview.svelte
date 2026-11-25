@@ -1,6 +1,7 @@
 <script lang="ts">
   import { denied, describe, query, type Api } from '../lib/http';
   import { count, date, label } from '../lib/format';
+  import { projectStageLabel, projectStages } from '../lib/project-stages';
   import { projectV1, scopedUrl, type Assessment, type OpenEvidence, type Projection, type WorkspaceProps } from '../lib/workspace';
   import { workReceiptFilters, workSliceApi, type WorkReceiptFilter, type WorkSlice } from '../lib/work-slice';
   import Notice from '../lib/Notice.svelte';
@@ -83,6 +84,21 @@
 </script>
 
 <WorkProgress slice={workSlice} />
+
+{#if facadeMode}
+  <section class="card" aria-labelledby="project-stages-title">
+    <h2 id="project-stages-title">Стадии проекта</h2>
+    <ul class="plain-list">
+      {#each projectStages as stage (stage.code)}
+        {@const current = stage.available && context.project.stage === stage.code}
+        <li aria-current={current ? 'step' : undefined}>
+          <strong>{projectStageLabel(stage.code)}</strong>
+          <span class={current ? 'pill good' : 'pill'}>{current ? 'Текущая' : stage.available ? 'Доступна' : 'Пока недоступна'}</span>
+        </li>
+      {/each}
+    </ul>
+  </section>
+{/if}
 
 <section class="card" aria-labelledby="collection-title">
   <div class="card-header"><h2 id="collection-title">Сбор исходных данных</h2>

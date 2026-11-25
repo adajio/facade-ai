@@ -1,6 +1,7 @@
 import { contradictoryDeliveryLine, exactDeliveryStatement } from "../../domain/delivery-statement.js";
 import type { CatalogRequirement } from "../access/input.js";
 import { allowsCatalogPair, comparisonSource } from "../access/catalog-comparison.js";
+import { initialProjectStage } from "../access/project-state.js";
 import {
   canonicalJson, isInventoryRole, matchesRequirementSubject, pairProofVersion, requirementSubjectKey,
   type Finding, type Requirement, type Review, type VerifiedPairEvidence,
@@ -99,7 +100,10 @@ export function facadeReview(options: {
   clarification?: Review["clarification"];
 }): Review {
   const { questionId, context, stage, requirement, facts, pairs, coverage, versionIds, supplementReceiptIds } = options;
-  const sameStage = facts.filter((fact) => !(stage && fact.stage && normalize(stage) !== normalize(fact.stage)));
+  const firstIntake = stage === initialProjectStage;
+  const sourceApplies = (sourceStage: string | null) =>
+    firstIntake || Boolean(stage && sourceStage && normalize(stage) === normalize(sourceStage));
+  const sameStage = facts.filter((fact) => !stage || !fact.stage || sourceApplies(fact.stage));
   const approvedSubjects = new Set(approvedEvidenceSubjects(requirement).map(requirementSubjectKey));
   const related = (subject: string) =>
     matchesRequirementSubject(requirement, subject) || approvedSubjects.has(requirementSubjectKey(subject));
@@ -115,7 +119,7 @@ export function facadeReview(options: {
       requirementSubjectKey(property ?? ""), ...(valueRole ? [valueRole] : [])]);
   const reverified = new Set(scoped.flatMap(({ deliveryLocation, finding, stage: sourceStage }) =>
     deliveryLocation && finding.kind === "absence" && finding.applicability === "active" &&
-      stage && sourceStage && normalize(sourceStage) === normalize(stage) ? [deliveryLocation] : []));
+      sourceApplies(sourceStage) ? [deliveryLocation] : []));
   const resolvedCrop = (fact: FacadeFact) => fact.deliveryLocation && reverified.has(fact.deliveryLocation) &&
     fact.finding.citation.deliveryUncertainty === "original_statement_unverified" && inFacadeContext(fact, context);
   let findings: Finding[] = scoped.filter((fact) => !resolvedCrop(fact)).map(({ finding, variant, stage: sourceStage, property }) => ({
@@ -123,8 +127,7 @@ export function facadeReview(options: {
     ...(finding.nonDelivery ? { nonDelivery: { ...finding.nonDelivery, questionId } } : {}),
     format: normalizeFormat(finding.format),
     comparisonKey: comparisonKey(property, variant, finding.valueRole),
-    applicability: finding.applicability === "active" && sourceStage != null && stage != null &&
-      normalize(sourceStage) === normalize(stage) ? "active" as const :
+    applicability: finding.applicability === "active" && sourceApplies(sourceStage) ? "active" as const :
       finding.applicability === "superseded" ? "superseded" as const : "unknown" as const,
   }));
   if (supplementReceiptIds.length) {
@@ -188,8 +191,8 @@ export function facadeReview(options: {
         !proof.revisionA || !proof.revisionB ||
         (left.printedRevision && normalize(left.printedRevision) !== normalize(proof.revisionA)) ||
         (right.printedRevision && normalize(right.printedRevision) !== normalize(proof.revisionB)) ||
-        !stage || !left.stage || !right.stage || normalize(stage) !== normalize(left.stage) ||
-        normalize(stage) !== normalize(right.stage)) return [];
+        !left.stage || !right.stage || !sourceApplies(left.stage) ||
+        normalize(left.stage) !== normalize(right.stage)) return [];
     const prepare = (fact: FacadeFact, id: string, revision: string): Finding | undefined => {
       const finding = findingById.get(id);
       if (!finding || finding.kind !== "value" || finding.applicability === "superseded" ||

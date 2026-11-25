@@ -1,0 +1,755 @@
+{
+  "key": "intake-stage-1",
+  "name": "Каталог приёмки стадии 1",
+  "defaultProfile": {
+    "stage": "Стадия 1",
+    "facadeKinds": [],
+    "approvalReference": "Решение владельца Facade AI от 25.11.2026. Чек-лист приёмки, 16 позиций каталога 1.4."
+  },
+  "requirements": [
+    {
+      "key": "doc.facades",
+      "part": "Фасады",
+      "aliases": [
+        "Чертежи фасадов"
+      ],
+      "formats": [
+        "dwg"
+      ],
+      "equivalents": [
+        "dxf"
+      ],
+      "level": "common",
+      "applicability": "stage:Стадия 1",
+      "sourceRoles": [
+        "drawing",
+        "inventory"
+      ],
+      "completenessCriterion": "Открыть редактируемые чертежи, сверить все требуемые фасады и отметки по описи листов.",
+      "addressee": "Заказчик",
+      "evidenceRule": {
+        "allOf": [
+          {
+            "anyOf": [
+              {
+                "sourceRole": "drawing",
+                "mode": "presence"
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "key": "doc.floor_plans",
+      "part": "Поэтажные планы, включая подвал и кровлю",
+      "aliases": [
+        "Поэтажные планы",
+        "Планы подвала",
+        "План кровли"
+      ],
+      "formats": [
+        "dwg"
+      ],
+      "equivalents": [
+        "dxf"
+      ],
+      "level": "common",
+      "applicability": "stage:Стадия 1",
+      "sourceRoles": [
+        "drawing",
+        "inventory"
+      ],
+      "completenessCriterion": "Сверить перечень этажей по описи и наличие редактируемых планов, включая подвал и кровлю в применимых секциях.",
+      "addressee": "Заказчик",
+      "evidenceRule": {
+        "allOf": [
+          {
+            "anyOf": [
+              {
+                "sourceRole": "drawing",
+                "mode": "presence"
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "key": "doc.sections",
+      "part": "Разрезы",
+      "aliases": [
+        "Разрезы здания",
+        "Архитектурные разрезы"
+      ],
+      "formats": [
+        "dwg"
+      ],
+      "equivalents": [
+        "dxf"
+      ],
+      "level": "common",
+      "applicability": "stage:Стадия 1",
+      "sourceRoles": [
+        "drawing",
+        "inventory"
+      ],
+      "completenessCriterion": "Проверить редактируемые разрезы и их принадлежность к переданному комплекту.",
+      "addressee": "Заказчик",
+      "evidenceRule": {
+        "allOf": [
+          {
+            "anyOf": [
+              {
+                "sourceRole": "drawing",
+                "mode": "presence"
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "key": "doc.architecture",
+      "part": "Раздел АР",
+      "aliases": [
+        "Архитектурные решения",
+        "АР"
+      ],
+      "formats": [
+        "dwg"
+      ],
+      "equivalents": [
+        "dxf"
+      ],
+      "level": "common",
+      "applicability": "stage:Стадия 1",
+      "sourceRoles": [
+        "drawing",
+        "inventory"
+      ],
+      "completenessCriterion": "Проверить состав раздела по оглавлению и адресам листов, включая фасады, планы и разрезы там, где они входят в альбом.",
+      "addressee": "Заказчик",
+      "evidenceRule": {
+        "allOf": [
+          {
+            "anyOf": [
+              {
+                "sourceRole": "drawing",
+                "mode": "presence"
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "key": "doc.architecture_details",
+      "part": "Узлы АР",
+      "aliases": [
+        "Архитектурные узлы",
+        "Конструктивные узлы АР"
+      ],
+      "formats": [
+        "dwg"
+      ],
+      "equivalents": [
+        "dxf"
+      ],
+      "level": "common",
+      "applicability": "stage:Стадия 1",
+      "sourceRoles": [
+        "drawing",
+        "inventory"
+      ],
+      "completenessCriterion": "Проверить адресуемые чертежи узлов АР в редактируемом формате.",
+      "addressee": "Заказчик",
+      "evidenceRule": {
+        "allOf": [
+          {
+            "anyOf": [
+              {
+                "sourceRole": "drawing",
+                "mode": "presence"
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "key": "data.cladding",
+      "part": "Сведения об облицовке",
+      "aliases": [
+        "Облицовка фасадов",
+        "Параметры облицовки"
+      ],
+      "formats": [
+        "pdf",
+        "dwg",
+        "dxf",
+        "doc",
+        "docx",
+        "xls",
+        "xlsx",
+        "csv",
+        "txt",
+        "rvt",
+        "png",
+        "jpg",
+        "jpeg",
+        "tif",
+        "tiff"
+      ],
+      "equivalents": [],
+      "level": "common",
+      "applicability": "stage:Стадия 1",
+      "sourceRoles": [
+        "drawing",
+        "schedule",
+        "specification",
+        "inventory"
+      ],
+      "completenessCriterion": "По каждому применимому варианту проверить материал, толщину, область применения и способ крепления. Сохранить адрес и вариант для каждого значения.",
+      "addressee": "Заказчик",
+      "evidenceRule": {
+        "allOf": [
+          {
+            "anyOf": [
+              {
+                "sourceRole": "drawing",
+                "mode": "value",
+                "subject": "Материал облицовки"
+              },
+              {
+                "sourceRole": "schedule",
+                "mode": "value",
+                "subject": "Материал облицовки"
+              },
+              {
+                "sourceRole": "specification",
+                "mode": "value",
+                "subject": "Материал облицовки"
+              }
+            ]
+          },
+          {
+            "anyOf": [
+              {
+                "sourceRole": "drawing",
+                "mode": "value",
+                "subject": "Толщина облицовки"
+              },
+              {
+                "sourceRole": "schedule",
+                "mode": "value",
+                "subject": "Толщина облицовки"
+              },
+              {
+                "sourceRole": "specification",
+                "mode": "value",
+                "subject": "Толщина облицовки"
+              }
+            ]
+          },
+          {
+            "anyOf": [
+              {
+                "sourceRole": "drawing",
+                "mode": "value",
+                "subject": "Зона применения облицовки"
+              },
+              {
+                "sourceRole": "schedule",
+                "mode": "value",
+                "subject": "Зона применения облицовки"
+              },
+              {
+                "sourceRole": "specification",
+                "mode": "value",
+                "subject": "Зона применения облицовки"
+              }
+            ]
+          },
+          {
+            "anyOf": [
+              {
+                "sourceRole": "drawing",
+                "mode": "value",
+                "subject": "Способ крепления облицовки"
+              },
+              {
+                "sourceRole": "schedule",
+                "mode": "value",
+                "subject": "Способ крепления облицовки"
+              },
+              {
+                "sourceRole": "specification",
+                "mode": "value",
+                "subject": "Способ крепления облицовки"
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "key": "doc.cladding_certificates",
+      "part": "Технические свидетельства на облицовку",
+      "aliases": [
+        "ТС на облицовку",
+        "Техническое свидетельство"
+      ],
+      "formats": [
+        "pdf",
+        "dwg",
+        "dxf",
+        "doc",
+        "docx",
+        "xls",
+        "xlsx",
+        "csv",
+        "txt",
+        "rvt",
+        "png",
+        "jpg",
+        "jpeg",
+        "tif",
+        "tiff"
+      ],
+      "equivalents": [],
+      "level": "common",
+      "applicability": "stage:Стадия 1",
+      "sourceRoles": [
+        "certificate",
+        "specification",
+        "inventory"
+      ],
+      "completenessCriterion": "Сверить техническое свидетельство с фактически применённой облицовкой и областью применения в навесных фасадах.",
+      "addressee": "Заказчик",
+      "evidenceRule": {
+        "allOf": [
+          {
+            "anyOf": [
+              {
+                "sourceRole": "certificate",
+                "mode": "presence"
+              },
+              {
+                "sourceRole": "specification",
+                "mode": "presence"
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "key": "doc.facade_brief",
+      "part": "ТЗ на проектирование НВФ, подписанное",
+      "aliases": [
+        "Подписанное ТЗ НВФ",
+        "Техническое задание НВФ"
+      ],
+      "formats": [
+        "pdf",
+        "dwg",
+        "dxf",
+        "doc",
+        "docx",
+        "xls",
+        "xlsx",
+        "csv",
+        "txt",
+        "rvt",
+        "png",
+        "jpg",
+        "jpeg",
+        "tif",
+        "tiff"
+      ],
+      "equivalents": [],
+      "level": "common",
+      "applicability": "stage:Стадия 1",
+      "sourceRoles": [
+        "brief",
+        "inventory"
+      ],
+      "completenessCriterion": "Проверить назначение для проектирования НВФ и наличие подписи или утверждения в документе.",
+      "addressee": "Заказчик",
+      "evidenceRule": {
+        "allOf": [
+          {
+            "anyOf": [
+              {
+                "sourceRole": "brief",
+                "mode": "presence"
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "key": "doc.customer_brief",
+      "part": "Задание на проектирование объекта от заказчика",
+      "aliases": [
+        "Задание заказчика",
+        "Задание на проектирование объекта"
+      ],
+      "formats": [
+        "pdf",
+        "dwg",
+        "dxf",
+        "doc",
+        "docx",
+        "xls",
+        "xlsx",
+        "csv",
+        "txt",
+        "rvt",
+        "png",
+        "jpg",
+        "jpeg",
+        "tif",
+        "tiff"
+      ],
+      "equivalents": [],
+      "level": "common",
+      "applicability": "stage:Стадия 1",
+      "sourceRoles": [
+        "brief",
+        "inventory"
+      ],
+      "completenessCriterion": "Проверить, что задание относится к объекту целиком и исходит от заказчика.",
+      "addressee": "Заказчик",
+      "evidenceRule": {
+        "allOf": [
+          {
+            "anyOf": [
+              {
+                "sourceRole": "brief",
+                "mode": "presence"
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "key": "doc.concrete",
+      "part": "Раздел КЖ",
+      "aliases": [
+        "Железобетонные конструкции",
+        "КЖ"
+      ],
+      "formats": [
+        "dwg"
+      ],
+      "equivalents": [
+        "dxf"
+      ],
+      "level": "common",
+      "applicability": "stage:Стадия 1",
+      "sourceRoles": [
+        "drawing",
+        "inventory"
+      ],
+      "completenessCriterion": "Проверить редактируемый комплект КЖ и применимые сведения об основании крепления.",
+      "addressee": "Заказчик",
+      "evidenceRule": {
+        "allOf": [
+          {
+            "anyOf": [
+              {
+                "sourceRole": "drawing",
+                "mode": "presence"
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "key": "doc.steel",
+      "part": "Раздел КМ",
+      "aliases": [
+        "Металлические конструкции",
+        "КМ"
+      ],
+      "formats": [
+        "dwg"
+      ],
+      "equivalents": [
+        "dxf"
+      ],
+      "level": "common",
+      "applicability": "stage:Стадия 1",
+      "sourceRoles": [
+        "drawing",
+        "inventory"
+      ],
+      "completenessCriterion": "Проверить редактируемый комплект КМ и применимые элементы подосновы фасада.",
+      "addressee": "Заказчик",
+      "evidenceRule": {
+        "allOf": [
+          {
+            "anyOf": [
+              {
+                "sourceRole": "drawing",
+                "mode": "presence"
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "key": "doc.glazing",
+      "part": "Ведомость и установочные узлы СПК",
+      "aliases": [
+        "СПК",
+        "Светопрозрачные конструкции"
+      ],
+      "formats": [
+        "pdf",
+        "dwg",
+        "dxf",
+        "doc",
+        "docx",
+        "xls",
+        "xlsx",
+        "csv",
+        "txt",
+        "rvt",
+        "png",
+        "jpg",
+        "jpeg",
+        "tif",
+        "tiff"
+      ],
+      "equivalents": [],
+      "level": "common",
+      "applicability": "stage:Стадия 1",
+      "sourceRoles": [
+        "schedule",
+        "drawing",
+        "inventory"
+      ],
+      "completenessCriterion": "Подтвердить отдельно ведомость оконных, витражных и дверных конструкций и применимые установочные чертежи или узлы СПК.",
+      "addressee": "Заказчик",
+      "evidenceRule": {
+        "allOf": [
+          {
+            "anyOf": [
+              {
+                "sourceRole": "schedule",
+                "mode": "presence",
+                "subject": "Ведомость СПК"
+              }
+            ]
+          },
+          {
+            "anyOf": [
+              {
+                "sourceRole": "drawing",
+                "mode": "presence",
+                "subject": "Установочные чертежи и узлы СПК"
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "key": "doc.anchor_tests",
+      "part": "Акты на вырыв или расчётные усилия",
+      "aliases": [
+        "Акты испытаний анкеров на вырыв",
+        "Расчётные усилия на вырыв"
+      ],
+      "formats": [
+        "pdf",
+        "dwg",
+        "dxf",
+        "doc",
+        "docx",
+        "xls",
+        "xlsx",
+        "csv",
+        "txt",
+        "rvt",
+        "png",
+        "jpg",
+        "jpeg",
+        "tif",
+        "tiff"
+      ],
+      "equivalents": [],
+      "level": "common",
+      "applicability": "stage:Стадия 1",
+      "sourceRoles": [
+        "test_report",
+        "calculation",
+        "inventory"
+      ],
+      "completenessCriterion": "Проверить подписанные акты либо письменные расчётные усилия с единицей измерения для применимого основания. Марка или изготовитель анкера сами по себе дают частичные сведения.",
+      "addressee": "Заказчик",
+      "evidenceRule": {
+        "allOf": [
+          {
+            "anyOf": [
+              {
+                "sourceRole": "test_report",
+                "mode": "presence"
+              },
+              {
+                "sourceRole": "calculation",
+                "mode": "value"
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "key": "doc.thermal",
+      "part": "Теплотехнический расчёт",
+      "aliases": [
+        "Теплотехника",
+        "Раздел энергоэффективности"
+      ],
+      "formats": [
+        "pdf",
+        "dwg",
+        "dxf",
+        "doc",
+        "docx",
+        "xls",
+        "xlsx",
+        "csv",
+        "txt",
+        "rvt",
+        "png",
+        "jpg",
+        "jpeg",
+        "tif",
+        "tiff"
+      ],
+      "equivalents": [],
+      "level": "common",
+      "applicability": "stage:Стадия 1",
+      "sourceRoles": [
+        "calculation",
+        "design",
+        "inventory"
+      ],
+      "completenessCriterion": "Проверить теплотехнический расчёт или применимый раздел энергоэффективности с исходными данными по рассматриваемому фасаду.",
+      "addressee": "Заказчик",
+      "evidenceRule": {
+        "allOf": [
+          {
+            "anyOf": [
+              {
+                "sourceRole": "calculation",
+                "mode": "presence"
+              },
+              {
+                "sourceRole": "design",
+                "mode": "presence"
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "key": "doc.revit",
+      "part": "Revit-модель",
+      "aliases": [
+        "Модель здания в Revit",
+        "Модель RVT"
+      ],
+      "formats": [
+        "rvt"
+      ],
+      "equivalents": [],
+      "level": "common",
+      "applicability": "stage:Стадия 1",
+      "sourceRoles": [
+        "model",
+        "inventory"
+      ],
+      "completenessCriterion": "Проверить передачу оригинала RVT, его принадлежность объекту и отдельно зафиксировать доступность чтения.",
+      "addressee": "Заказчик",
+      "evidenceRule": {
+        "allOf": [
+          {
+            "anyOf": [
+              {
+                "sourceRole": "model",
+                "mode": "presence"
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "key": "doc.colors",
+      "part": "Цветовое решение фасада",
+      "aliases": [
+        "Цветовое решение по фасадам",
+        "Колористика фасадов"
+      ],
+      "formats": [
+        "pdf",
+        "dwg",
+        "dxf",
+        "doc",
+        "docx",
+        "xls",
+        "xlsx",
+        "csv",
+        "txt",
+        "rvt",
+        "png",
+        "jpg",
+        "jpeg",
+        "tif",
+        "tiff"
+      ],
+      "equivalents": [],
+      "level": "common",
+      "applicability": "stage:Стадия 1",
+      "sourceRoles": [
+        "drawing",
+        "schedule",
+        "design",
+        "inventory"
+      ],
+      "completenessCriterion": "Проверить коды или обозначения цветов и привязку к фасадам, зонам или вариантам облицовки.",
+      "addressee": "Заказчик",
+      "evidenceRule": {
+        "allOf": [
+          {
+            "anyOf": [
+              {
+                "sourceRole": "drawing",
+                "mode": "presence"
+              },
+              {
+                "sourceRole": "schedule",
+                "mode": "presence"
+              },
+              {
+                "sourceRole": "design",
+                "mode": "presence"
+              }
+            ]
+          }
+        ]
+      }
+    }
+  ]
+}

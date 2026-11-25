@@ -1,7 +1,9 @@
 import { createHash } from "node:crypto";
 import type { PoolClient } from "pg";
 import type { FacadeMention } from "../harness/facade-discovery.js";
-import { catalogOptions, getCatalog, getProject, invariantProfileRequirements, matchesDefaultProfile } from "../access/project-state.js";
+import {
+  catalogOptions, getCatalog, getProject, invariantProfileRequirements, isInitialStageProfile, matchesDefaultProfile,
+} from "../access/project-state.js";
 import { lockIntakeProject } from "../intake/gate.js";
 import { publishProjectEvent } from "../supplements/events.js";
 import { canonicalJson, evaluate, requirementSubjectKey, type ClarificationBasis } from "./domain.js";
@@ -251,7 +253,7 @@ export async function synchronizeFacadeAssessment(tx: PoolClient, projectId: str
   }
   const types = contexts.flatMap(({ facadeId, facadeType }) => facadeId ? [facadeType?.state === "confirmed" ? facadeType.kind : null] : []);
   const knownKinds = [...new Set(types.filter((type): type is string => type !== null))].sort();
-  const staleProfile = project.facadeKindsFromAssignments && (types.includes(null) ||
+  const staleProfile = !isInitialStageProfile(pinned?.defaultProfile) && project.facadeKindsFromAssignments && (types.includes(null) ||
     canonicalJson(knownKinds) !== canonicalJson(project.confirmedFacadeKinds));
   const retained = staleProfile && pinned ? await invariantProfileRequirements(tx, project, pinned, knownKinds) : [];
   const catalog = pinned && (!project.intakeMode || !staleProfile && matchesDefaultProfile(project, pinned)) ? pinned :

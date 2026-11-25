@@ -95,11 +95,12 @@
         <label><input type="checkbox" bind:checked={publishDefault} /> Опубликовать утверждённый рабочий профиль</label>
         {#if publishDefault}
           <label>Код стадии<input required maxlength="200" bind:value={profileStage} /></label>
-          <label>Коды подтверждённых типов фасадов через запятую<input required bind:value={profileFacades} /></label>
+          <label>Коды подтверждённых типов фасадов через запятую<input required={profileStage.trim() !== 'Стадия 1'} bind:value={profileFacades} /></label>
           <label>Ссылка или номер решения об утверждении<input required maxlength="500" bind:value={approvalReference} /></label>
           {#if !requirements.length}<p>Добавьте утверждённые требования для рабочего профиля.</p>{/if}
         {/if}
-        <div class="actions"><button class="primary" disabled={busy || (publishDefault && (!requirements.length || !facadeKinds.length))}>Опубликовать каталог</button></div>
+        <div class="actions"><button class="primary" disabled={busy || (publishDefault &&
+          (!requirements.length || (!facadeKinds.length && profileStage.trim() !== 'Стадия 1')))}>Опубликовать каталог</button></div>
       </form>
     </section>
   </div>

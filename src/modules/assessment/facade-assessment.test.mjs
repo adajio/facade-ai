@@ -75,6 +75,8 @@ test("facade requirements retain partial local cover and demand a proven pair or
   const pairs = [{ a: "A", b: "B", proof: { version: pairProofVersion, variant: "v1",
     revisionA: "r-a", revisionB: "r-b", scope: "f1" } }];
   assert.equal(decide([a, conflict], partial, pairs).outcome, "confirmed_conflict");
+  assert.equal(decide([a, conflict], partial, pairs, [], { stage: "Стадия 1" }).outcome, "confirmed_conflict");
+  assert.equal(decide([a, { ...conflict, stage: "RD" }], partial, pairs, [], { stage: "Стадия 1" }).outcome, "needs_review");
   assert.equal(decide([a, { ...conflict, membership: { kind: "facades", facadeIds: ["f1", "f2"] } }], partial, pairs)
     .outcome, "needs_review");
   const needsTitle = { ...conflict, printedRevision: null, variant: null, addressedValue: true,
@@ -183,8 +185,9 @@ test("ordinary intake publishes a local conflict, then keeps sent history after 
   const assessment = () => request("GET", base + "/facade-assessment").then((response) => response.json());
   const pending = await assessment();
   assert.equal(pending.catalogVersionId, null);
-  assert.equal(pending.profile.state, "stage_unknown");
-  assert.equal(pending.stage, null);
+  assert.equal(pending.profile.state, "no_approved_profile");
+  assert.equal(pending.stage, "Стадия 1");
+  assert.equal(project.stageStatus, "default");
   assert.deepEqual(pending.observations.counts, { common: 0, identified: 0, unclear: 0, unidentified: 0 });
   assert.equal((await request("GET", pending.observations.href)).json().items.length, 0);
   const scope = await db.query("SELECT count(*)::int AS count FROM project_scopes WHERE project_id=$1", [projectId]);

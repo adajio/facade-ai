@@ -1,5 +1,5 @@
 import { allowsCatalogPair } from "../access/catalog-comparison.js";
-import type { Catalog } from "../access/project-state.js";
+import { initialProjectStage, type Catalog } from "../access/project-state.js";
 import { canonicalJson, compareCitationValues, requirementSubjectKey, type Citation } from "./domain.js";
 import type { ComparisonRow } from "./facade-comparison-rows.js";
 import type { ComparisonRead, FacadeObservation } from "./facade-input.js";
@@ -164,7 +164,8 @@ export function comparisonReview(facts: FacadeFact[], observations: FacadeObserv
       const stageB = b.stage ?? viewB?.stage;
       if (!stage) reasons.push("project_stage_unconfirmed");
       if (!stageA || !stageB) reasons.push("source_stage_unproven");
-      else if (stage && [stageA, stageB].some((value) => subjectKey(value) !== subjectKey(stage))) reasons.push("source_stages_differ");
+      else if (subjectKey(stageA) !== subjectKey(stageB) || (stage && stage !== initialProjectStage &&
+        subjectKey(stageA) !== subjectKey(stage))) reasons.push("source_stages_differ");
       if ([a, b].some(({ finding }) => finding.sourceRole === "unknown")) reasons.push("source_role_unproven");
       else if (requirements && catalog) {
         const allowed = requirements.some((requirement) =>

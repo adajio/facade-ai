@@ -137,8 +137,8 @@ test('access v1.1 on Fastify and PostgreSQL', { skip: !enabled, timeout: 240_000
     assert.equal(created.catalogVersionId, null);
     assert.equal(created.catalog, null);
     assert.equal(created.catalogState, 'unassigned');
-    assert.equal(created.stage, null);
-    assert.equal(created.stageStatus, 'unknown');
+    assert.equal(created.stage, 'Стадия 1');
+    assert.equal(created.stageStatus, 'default');
     assert.deepEqual(created.scopes, []);
     assert.deepEqual((await request('/me', { auth: creator })).value.projects.map(({ id, role }) => [id, role]),
       [[first.id, 'project_manager']]);
@@ -314,6 +314,34 @@ test('access v1.1 on Fastify and PostgreSQL', { skip: !enabled, timeout: 240_000
   const projectInput = { name: 'Испытательный проект', catalogVersionId: catalog.id, stage: 'stage-1', scopeName: 'А' };
   const createProject = (body, status = 201) => request('/projects', {
     auth: owner, body, method: 'POST', key: 'project-1', status,
+  });
+
+  await t.test('stage one checklist is assigned before or after intake project creation', async () => {
+    const create = (name) => request('/projects', {
+      auth: owner, method: 'POST', key: name, body: { mode: 'intake', name }, status: 201,
+    });
+    const before = (await create('stage-one-before')).value;
+    assert.equal(before.stageStatus, 'default');
+    assert.equal(before.catalogVersionId, null);
+    const payload = {
+      key: 'stage-one', name: 'Stage one checklist', requirements: [{ ...catalogRule, level: 'common' }],
+      defaultProfile: { stage: 'Стадия 1', facadeKinds: [], approvalReference: 'Synthetic rule' },
+    };
+    await request('/catalogs', {
+      auth: owner, method: 'POST', key: 'invalid-stageless-checklist', status: 422,
+      body: { ...payload, defaultProfile: { ...payload.defaultProfile, stage: 'RD' } },
+    });
+    const { value: catalog } = await request('/catalogs', {
+      auth: owner, method: 'POST', key: 'publish-stage-one', body: payload, status: 201,
+    });
+    const updated = (await request('/projects/' + before.id, { auth: owner })).value;
+    assert.equal(updated.stageBasis, null);
+    assert.equal(updated.catalogVersionId, catalog.id);
+    const after = (await create('stage-one-after')).value;
+    assert.equal(after.stageStatus, 'default');
+    assert.equal(after.catalogState, 'assigned');
+    assert.equal(after.catalogVersionId, catalog.id);
+    assert.deepEqual(after.confirmedFacadeKinds, []);
   });
 
   await t.test('duplicate concurrent commands yield one project, mismatched body yields 409', async () => {

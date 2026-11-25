@@ -12,7 +12,8 @@ import { object, requirements, text } from './input.js';
 import type { CatalogRequirement } from './input.js';
 import {
   assertApplicableCatalog, assignCatalog, catalogColumns, catalogOptions, catalogProfileColumn, catalogState, defaultProfile,
-  getCatalog, getProject, lockProjectApplicability, projectColumns, resolvePublishedProfile, stageStatus, versionHref,
+  getCatalog, getProject, initialProjectStage, lockProjectApplicability, projectColumns, resolveDefault,
+  resolvePublishedProfile, stageStatus, versionHref,
 } from './project-state.js';
 import type { Catalog, Project } from './project-state.js';
 import { registerStages } from './stages.js';
@@ -366,9 +367,9 @@ export function registerProjects(app: FastifyInstance, db: Pool) {
       const legacy = 'catalogVersionId' in input ? input : undefined;
       if (legacy?.catalogVersionId) await getCatalog(tx, actor.organizationId, legacy.catalogVersionId);
       const { rows: [project] } = await tx.query<Project>(
-        `INSERT INTO projects (organization_id, name, catalog_version_id, intake_mode)
-         VALUES ($1, $2, $3, $4) RETURNING ${projectColumns.join(', ')}`,
-        [actor.organizationId, input.name, legacy?.catalogVersionId ?? null, !legacy],
+        `INSERT INTO projects (organization_id, name, catalog_version_id, intake_mode, project_stage)
+         VALUES ($1, $2, $3, $4, $5) RETURNING ${projectColumns.join(', ')}`,
+        [actor.organizationId, input.name, legacy?.catalogVersionId ?? null, !legacy, legacy ? null : initialProjectStage],
       );
       await tx.query(
         `INSERT INTO project_memberships (organization_id, project_id, user_id, role)
@@ -376,9 +377,11 @@ export function registerProjects(app: FastifyInstance, db: Pool) {
         [actor.organizationId, project.id, actor.userId],
       );
       if (!legacy) {
+        const initialized = await resolveDefault(tx, project, [], actor);
+        const catalog = initialized.catalogVersionId ? await getCatalog(tx, actor.organizationId, initialized.catalogVersionId) : null;
         return {
-          status: 201, body: { ...project, catalog: null, catalogState: 'unassigned', stageStatus: 'unknown', scopes: [] },
-          audit: { projectId: project.id, objectId: project.id, version: project.version },
+          status: 201, body: { ...initialized, catalog, catalogState: catalogState(catalog), stageStatus: stageStatus(initialized), scopes: [] },
+          audit: { projectId: project.id, objectId: project.id, version: initialized.version },
         };
       }
       const { rows: [scope] } = await tx.query<ProjectScope>(

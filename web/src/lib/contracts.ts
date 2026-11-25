@@ -38,7 +38,7 @@ export type Project = {
   catalogState?: 'unassigned' | 'legacy_empty' | 'assigned';
   intakeMode?: boolean;
   stage?: string | null;
-  stageStatus?: 'unknown' | 'legacy_unconfirmed' | 'confirmed';
+  stageStatus?: 'default' | 'unknown' | 'legacy_unconfirmed' | 'confirmed';
   stageBasis?: OriginalBasis | { provenanceKind: 'machine_verified'; evidenceIds: string[] } | null;
   confirmedFacadeKinds?: string[];
   updatedAt?: string;
