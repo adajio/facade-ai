@@ -106,6 +106,7 @@ function modelGateway(context: WorkerContext, external: ReturnType<typeof journa
       return {
         ...(openRouter.length && { openRouter: {
           qualification: 'step-15', apiKey: routerKey ?? '', profiles: openRouter,
+          qwen4CustomerApiKey: process.env.FACADE_GATEWAY_OPENROUTER_QWEN4_KEY,
           endpoint: (process.env.FACADE_GATEWAY_OPENROUTER_ENDPOINT ?? 'https://openrouter.ai') as Step15Approval['endpoint'],
         } }),
         ...(cheaperInference.length && { cheaperInference: { apiKey: directKey ?? '', profiles: cheaperInference } }),

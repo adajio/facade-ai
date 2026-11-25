@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import { test } from 'node:test';
-import { featherlessQwenVisionModel, terraModel } from '../gateway/index.js';
+import { qwen4Max, terraModel } from '../gateway/index.js';
 import type { Branch, Citation, ResearchSettings, ResearchTask } from './contracts.js';
 import { validateLivePolicy, type LiveRoute } from './live-policy.js';
 import { loadResearchProfile, profileHold } from './profile.js';
@@ -100,16 +100,15 @@ test('policy, envelope and configuration failures are isolated to the affected b
 
 test('the new defaults require independent approvals and leave saved pilot assignments and lead explicit', () => {
   const defaults = loadResearchProfile({});
-  assert.deepEqual([defaults.A?.model, defaults.B?.model, defaults.lead], ['gpt-6.1-terra', 'Qwen/Qwen3.8-27B', null]);
+  assert.deepEqual([defaults.A?.model, defaults.B?.model, defaults.lead], ['gpt-6.1-terra', qwen4Max, null]);
   assert.deepEqual(loadResearchProfile({ FACADE_HARNESS_PROFILE: JSON.stringify(profile) }), profile);
   assert.equal(profileHold(defaults, task('A'))?.reason, 'research_profile_changed');
   assert.equal(profileHold(defaults, task('B'))?.reason, 'research_profile_changed');
   assert.ok(defaults.A && defaults.B);
-  assert.equal(defaults.B.routeId, 'featherless-qwen38-27b-reader');
-  assert.equal(defaults.B.toolChoice, 'required');
+  assert.equal(defaults.B.routeId, 'openrouter-alibaba-qwen4-max-reader');
   const direct: LiveRoute = { transport: 'cheaperinference', routeId: defaults.A.routeId, model: 'gpt-6.1-terra',
     mode: 'strict-zdr', zdrEvidenceRef: 'fixture', syntheticScopes: [testedScope] };
-  const pinned = { transport: 'featherless', routeId: defaults.B.routeId, model: 'Qwen/Qwen3.8-27B',
+  const pinned = { transport: 'openrouter', provider: 'alibaba', routeId: defaults.B.routeId, model: qwen4Max,
     mode: 'synthetic-research', syntheticScopes: [testedScope] } as const satisfies LiveRoute;
   const synthetic = validateLivePolicy(defaults, [direct, pinned], env);
   assert.equal(synthetic.hold(task('A', defaults.A)), null);
@@ -128,13 +127,12 @@ test('the new defaults require independent approvals and leave saved pilot assig
   const withPrevious = validateLivePolicy(defaults, [direct, pinned, previousQwen], env);
   assert.equal(withPrevious.hold(previousTask)?.reason, 'research_profile_changed');
   assert.equal(withPrevious.hold(previousTask, true), null);
-  const previousFeatherless = { ...pinned, routeId: 'featherless-qwen38-2.4t-a95b-reader', model: 'Qwen/Qwen3.8-2.4T-A95B' } as const;
+  const previousFeatherless = { transport: 'featherless', mode: 'synthetic-research', syntheticScopes: [testedScope], routeId: 'featherless-qwen38-2.4t-a95b-reader', model: 'Qwen/Qwen3.8-2.4T-A95B' } as const;
   const previousFeatherlessTask = task('B', { ...settings(previousFeatherless), toolChoice: 'auto' });
   assert.equal(validateLivePolicy(defaults, [direct, pinned, previousFeatherless], env).hold(previousFeatherlessTask, true), null);
   assert.equal(validateLivePolicy(defaults, [direct, pinned], env).hold(previousFeatherlessTask, true)?.reason,
     'research_profile_changed');
-  assert.deepEqual(validateLivePolicy(defaults, [direct, { ...qwen, routeId: pinned.routeId, model: pinned.model }], env).approvals, [direct]);
-  assert.deepEqual(validateLivePolicy({ ...defaults, B: { ...defaults.B, toolChoice: 'auto' } }, [direct, pinned], env).approvals, [direct]);
+  assert.deepEqual(validateLivePolicy(defaults, [direct, { ...pinned, provider: 'novita' }], env).approvals, [direct]);
   assert.deepEqual(validateLivePolicy({ A: null, B: null, lead: defaults.A }, [direct], env).approvals, []);
 });
 
@@ -188,15 +186,15 @@ test('lead and both verifiers require the approved scope and both originals', ()
   }
 });
 
-test('customer admission is explicit for Terra, Qwen3.8-27B and the Wafer lead and pins original identity', () => {
+test('customer admission is explicit for Terra, Qwen4 Max and the Wafer lead and pins original identity', () => {
   const customerAccess = {
     keyFingerprint: 'f'.repeat(64), evidenceRef: 'qualification/fixture', validUntil: '2099-01-01T00:00:00Z',
     scopes: [{ ...testedScope, allowImages: true }],
   };
   const A = { transport: 'cheaperinference', routeId: 'customer-a', model: terraModel,
     mode: 'strict-zdr', zdrEvidenceRef: 'qualification/zdr', customerAccess } satisfies LiveRoute;
-  const B = { transport: 'featherless', routeId: 'customer-b', model: featherlessQwenVisionModel,
-    mode: 'customer', customerAccess } satisfies LiveRoute;
+  const B = { transport: 'openrouter', routeId: 'customer-b', model: qwen4Max, provider: 'alibaba',
+    mode: 'customer-retention-approved', customerAccess: { ...customerAccess, retentionApproved: true } } satisfies LiveRoute;
   const leader = { ...kimi, routeId: 'customer-lead', model: 'moonshotai/kimi-k3.1-pro', mode: 'strict-zdr',
     customerAccess: { ...customerAccess, guardrailId: randomUUID(), excludesSafetyRetention: true } } satisfies LiveRoute;
   const setting = (route: LiveRoute) => ({ ...settings(route), dataClass: 'customer' });
@@ -206,12 +204,13 @@ test('customer admission is explicit for Terra, Qwen3.8-27B and the Wafer lead a
   const customerEnv = { FACADE_HARNESS_LIVE_POLICY: 'customer' };
   const admitted = validateLivePolicy(configured, all, customerEnv);
   assert.deepEqual(admitted.approvals, all);
+  assert.deepEqual(validateLivePolicy(configured, [A, { ...B, customerAccess: undefined }, leader], customerEnv).approvals, [A, leader]);
   const job = task('B', configured.B);
   assert.equal(admitted.hold(job), null);
   assert.equal(admitted.hold({ ...job, projectId: randomUUID() })?.reason, 'customer_input_not_approved');
   assert.equal(admitted.hold({ ...job, scopeId: randomUUID() })?.reason, 'customer_input_not_approved');
   assert.deepEqual(validateLivePolicy(configured, [A, B, { ...leader, customerAccess: undefined }], customerEnv).approvals, [A, B]);
   assert.deepEqual(validateLivePolicy(configured, [A, { ...B, customerAccess: {
-    ...customerAccess, validUntil: '2000-01-01T00:00:00Z',
+    ...B.customerAccess, validUntil: '2000-01-01T00:00:00Z',
   } }, leader], customerEnv).approvals, [A, leader]);
 });

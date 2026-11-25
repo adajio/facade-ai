@@ -13,8 +13,9 @@ function matchesPolicy(route: LiveRoute, { dataClass, toolChoice }: ResearchSett
     if (policy !== 'customer' || !route.customerAccess || Date.parse(route.customerAccess.validUntil) <= Date.now()) return false;
     if (route.transport === 'cheaperinference') return slot === 'A' && route.model === terraModel
       && route.mode === 'strict-zdr' && Boolean(route.zdrEvidenceRef?.trim());
-    if (route.transport === 'featherless') return slot === 'B' && route.model === featherlessQwenVisionModel
-      && route.mode === 'customer' && (toolChoice ?? 'required') === 'required';
+    if (route.transport === 'featherless') return false;
+    if (slot === 'B') return route.model === qwen4Max && route.provider === 'alibaba'
+      && route.mode === 'customer-retention-approved' && route.customerAccess.retentionApproved === true;
     return slot === 'lead' && route.model === 'moonshotai/kimi-k3.1-pro' && route.provider === 'wafer/us'
       && route.mode === 'strict-zdr' && route.customerAccess.excludesSafetyRetention === true;
   }

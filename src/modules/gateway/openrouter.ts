@@ -33,10 +33,13 @@ export type OpenRouterProfile = {
   model: string;
   provider: string;
   expectedResponseProvider: string;
-  mode: 'synthetic-research' | 'strict-zdr';
+  mode: 'synthetic-research' | 'strict-zdr' | 'customer-retention-approved';
   zdrEvidenceRef?: string;
   syntheticScopes?: readonly SyntheticScope[];
-  customerAccess?: CustomerAccess & { guardrailId: string; excludesSafetyRetention: true };
+  customerAccess?: CustomerAccess & (
+    | { guardrailId: string; excludesSafetyRetention: true; retentionApproved?: never }
+    | { retentionApproved: true; guardrailId?: never; excludesSafetyRetention?: never }
+  );
   boundEvidenceRef: string;
   validUntil: string;
   reasoningEffort?: 'low';
@@ -58,6 +61,7 @@ export type QualifiedOpenRouterProfile = OpenRouterProfile & OpenRouterPricingQu
 export type Step15Approval = {
   qualification: 'step-15';
   apiKey: string;
+  qwen4CustomerApiKey?: string;
   endpoint: 'https://openrouter.ai' | 'https://eu.openrouter.ai' | 'https://us.openrouter.ai';
   profiles: readonly OpenRouterProfile[];
 };
@@ -173,6 +177,14 @@ function approvedProfile(profile: OpenRouterProfile): boolean {
   const qwen = profile.model.startsWith('qwen/');
   if ((kimi && !matchesKimiEndpoint(profile.model, profile.provider, profile.mode))
     || (requireZdr(profile) && !profile.zdrEvidenceRef?.trim())) return false;
+  if (profile.mode === 'customer-retention-approved') {
+    return profile.model === qwen4Max && profile.provider === 'alibaba'
+      && profile.expectedResponseProvider === 'Alibaba' && profile.customerAccess?.retentionApproved === true
+      && profile.syntheticScopes === undefined && profile.completionParameter === 'max_tokens'
+      && profile.inputTokenUpperBound >= 1_000_000
+      && profile.promptNanosPerToken >= 1_500 && profile.completionNanosPerToken >= 4_500
+      && (profile.cacheReadNanosPerToken ?? -1) >= 75 && (profile.cacheWriteNanosPerToken ?? -1) >= 3_000;
+  }
   if (profile.customerAccess && (profile.mode !== 'strict-zdr' || !isWaferKimiK31Pro(profile)
     || profile.expectedResponseProvider !== 'Wafer' || profile.customerAccess.excludesSafetyRetention !== true
     || typeof profile.customerAccess.guardrailId !== 'string'
@@ -320,6 +332,7 @@ function requestBody(profile: QualifiedOpenRouterProfile, value: unknown, route:
   const wire = {
     ...approved, messages, [profile.completionParameter]: tokens, stream: false, usage: { include: true },
     ...(profile.reasoningEffort === 'low' ? { reasoning_effort: profile.reasoningEffort } : {}),
+    ...(profile.mode === 'customer-retention-approved' ? { reasoning: { enabled: false } } : {}),
     plugins: disabledPlugins,
     ...(!alibaba && !wafer && !decart && parallelTools !== undefined ? { parallel_tool_calls: parallelTools } : {}),
     provider: {
@@ -400,15 +413,18 @@ export function openRouterTransport(approval: Step15Approval): ModelTransport {
     || approval.apiKey.trim().startsWith('ci_live_') || !endpoints.includes(approval.endpoint)) {
     throw new GatewayError('step15_approval_required');
   }
-  const profiles = new Map<string, { profile: QualifiedOpenRouterProfile; fingerprint: string }>();
+  const profiles = new Map<string, { profile: QualifiedOpenRouterProfile; fingerprint: string; apiKey: string }>();
   for (const profile of structuredClone(approval.profiles)) {
     const key = profile.routeId + '/' + profile.revision;
-    if (profiles.has(key) || !validProfile(profile)
-      || (profile.customerAccess !== undefined && !validCustomerAccess(profile.customerAccess, approval.apiKey))) throw new GatewayError('invalid_openrouter_profile');
-    profiles.set(key, { profile, fingerprint: hash([approval.endpoint, profile]) });
+    const apiKey = profile.mode === 'customer-retention-approved' ? approval.qwen4CustomerApiKey?.trim() : approval.apiKey;
+    if (profiles.has(key) || !validProfile(profile) || !apiKey || apiKey.startsWith('ci_live_')
+      || (profile.mode === 'customer-retention-approved' && apiKey === approval.apiKey.trim())
+      || (profile.customerAccess !== undefined && !validCustomerAccess(profile.customerAccess, apiKey))) {
+      throw new GatewayError('invalid_openrouter_profile');
+    }
+    profiles.set(key, { profile, apiKey, fingerprint: hash([approval.endpoint, profile]) });
   }
   if (!profiles.size) throw new GatewayError('step15_profile_required');
-  const apiKey = approval.apiKey;
   const url = approval.endpoint + '/api/v1/chat/completions';
   const profileFor = (route: RoutePolicy) => profiles.get(route.id + '/' + route.revision);
   return {
@@ -435,7 +451,11 @@ export function openRouterTransport(approval: Step15Approval): ModelTransport {
       if (!profile) return false;
       if (context.dataClass === 'customer') {
         const scope = customerScope(profile.customerAccess, context.projectId, context.scopeId);
-        return Boolean(scope && record(context.payload)?.mode === 'lead' && await verifyApprovedResearchInputs(tx, context, scope));
+        const task = record(context.payload);
+        const roleAllowed = profile.mode === 'customer-retention-approved'
+          ? task?.branch === 'B' && (task.mode === 'primary' || task.mode === 'verify')
+          : task?.mode === 'lead';
+        return Boolean(scope && roleAllowed && await verifyApprovedResearchInputs(tx, context, scope));
       }
       if (profile.mode === 'strict-zdr' && profile.syntheticScopes === undefined) return true;
       const scope = syntheticScope(profile.syntheticScopes, context.projectId, context.scopeId);
@@ -459,12 +479,17 @@ export function openRouterTransport(approval: Step15Approval): ModelTransport {
       }
       if (attempt.dataClass === 'customer') {
         const scope = customerScope(profile.customerAccess, attempt.projectId, attempt.scopeId);
-        if (attempt.purpose !== 'review' || !scope || (!scope.allowImages && requestHasImages(request))) {
+        const purposeAllowed = attempt.purpose === 'review'
+          || (profile.mode === 'customer-retention-approved' && attempt.purpose === 'primary_b');
+        if (!purposeAllowed || !scope || (!scope.allowImages && requestHasImages(request))) {
           return { receipt: { state: 'rejected', code: 'route_data_unapproved', evidenceRef: 'gateway:no-network' } };
         }
       }
       const alibaba = isAlibabaQwenMax(profile);
-      if (alibaba || isDecartKimiK31Pro(profile.model, profile.provider)) {
+      if (profile.mode === 'customer-retention-approved' && attempt.dataClass !== 'customer') {
+        return { receipt: { state: 'rejected', code: 'route_data_unapproved', evidenceRef: 'gateway:no-network' } };
+      }
+      if (profile.mode !== 'customer-retention-approved' && (alibaba || isDecartKimiK31Pro(profile.model, profile.provider))) {
         const scope = syntheticScope(profile.syntheticScopes, attempt.projectId, attempt.scopeId);
         const block = attempt.dataClass === 'synthetic' && scope
           ? (alibaba ? retentionBlock(scope) : null) : 'route_data_unapproved';
@@ -473,7 +498,7 @@ export function openRouterTransport(approval: Step15Approval): ModelTransport {
       const response = await fetch(url, {
         method: 'POST', redirect: 'error', signal,
         headers: {
-          authorization: 'Bearer ' + apiKey, 'content-type': 'application/json', 'X-OpenRouter-Metadata': 'enabled',
+          authorization: 'Bearer ' + selected.apiKey, 'content-type': 'application/json', 'X-OpenRouter-Metadata': 'enabled',
         },
         body: JSON.stringify({ ...body.wire, trace: { trace_id: attempt.id } }),
       });
