@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import { test } from 'node:test';
 import type { PoolClient } from 'pg';
-import { cheaperInferenceTransport, terraModel, type CheaperInferenceProfile } from './cheaperinference.js';
+import { cheaperInferenceTransport, qwen38FlashModel, terraModel, type CheaperInferenceProfile } from './cheaperinference.js';
 import { hash, type Attempt, type ModelAuthorization, type RoutePolicy } from './types.js';
 
 const sha256 = 'a'.repeat(64);
@@ -126,4 +126,53 @@ test('direct HTTP verifies settled billing and model identity without retrying u
 
   assert.equal((await send({ ...attempt, pricingFingerprint: sha256 })).receipt.state, 'rejected');
   assert.equal(fetcher.mock.callCount(), 5);
+});
+
+test('Alibaba Flash on CheaperInference verifies vision, branch B, and settled billing', async t => {
+  const { syntheticScopes: _, ...base } = profile;
+  const flash = {
+    ...base, routeId: 'flash', model: qwen38FlashModel, validUntil: null,
+    inputNanosPerToken: 200, outputNanosPerToken: 470,
+    customerAccess: { keyFingerprint: hash(key), evidenceRef: 'fixture:customer-zdr', validUntil: null,
+      scopes: [{ ...scope, allowImages: true }] },
+  } satisfies CheaperInferenceProfile;
+  const transport = cheaperInferenceTransport({ apiKey: key, profiles: [profile, flash] });
+  const flashRoute = { ...route, id: flash.routeId };
+  const input = { ...request, model: flash.model, tool_choice: 'auto' };
+  const quote = transport.quote!(flashRoute, input);
+  assert.equal(quote?.ceilingUsdNanos, 200_963_560);
+  assert.equal(transport.quote!(flashRoute, { ...input, tool_choice: 'required' }), null);
+  assert.throws(() => cheaperInferenceTransport({ apiKey: key, profiles: [{ ...flash, inputNanosPerToken: 150 }] }),
+    { code: 'invalid_cheaperinference_profile' });
+
+  const source = { projectId: scope.projectId, versionId: randomUUID(), documentId: randomUUID(), sha256 };
+  const context: ModelAuthorization = { ...source, scopeId: null, jobId: randomUUID(), generationId: randomUUID(),
+    dataClass: 'customer', payload: { mode: 'primary', branch: 'B', place: { source } }, inputRefs: [] };
+  const db = { query: async () => ({ rows: [{ authorized: true }] }) } as unknown as PoolClient;
+  assert.equal(await transport.authorize!(db, flashRoute, context), true);
+  assert.equal(await transport.authorize!(db, flashRoute, {
+    ...context, payload: { mode: 'primary', branch: 'A', place: { source } },
+  }), false);
+  assert.equal(await transport.authorize!(db, flashRoute, { ...context, projectId: randomUUID() }), false);
+
+  const attempt: Attempt = { ...context, ...quote!, id: randomUUID(), purpose: 'primary_b',
+    effectKey: 'fixture-flash', requestHash: sha256, routeId: flashRoute.id, revision: flashRoute.revision,
+    previousRejectedId: null };
+  const id = randomUUID();
+  const fetcher = t.mock.method(globalThis, 'fetch', async (url: string, options: RequestInit) => {
+    assert.equal(url, 'https://api.cheaperinference.com/v1/chat/completions');
+    assert.equal(new Headers(options.headers).get('x-ci-model-lock'), '1');
+    const { parallel_tool_calls: _omitted, ...expected } = input;
+    assert.deepEqual(JSON.parse(String(options.body)), {
+      ...expected, zdr: true, min_discount_percent: 0, reasoning: { enabled: false },
+    });
+    return Response.json({ request_id: id, model: flash.model, usage: { prompt_tokens: 73, completion_tokens: 2 },
+      billing: { status: 'settled', currency: 'USD', billed_cost_usd: '0.000012' }, choices: [{}] });
+  });
+  const signal = new AbortController().signal;
+  assert.equal((await transport.send({ ...attempt, purpose: 'primary_a' }, flashRoute, input, signal)).receipt.state, 'rejected');
+  const outcome = await transport.send(attempt, flashRoute, input, signal);
+  assert.equal(outcome.receipt.state === 'paid' && outcome.receipt.routeVerified, true);
+  assert.deepEqual(outcome.output, { choices: [{}] });
+  assert.equal(fetcher.mock.callCount(), 1);
 });
