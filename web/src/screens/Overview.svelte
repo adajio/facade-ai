@@ -118,7 +118,7 @@
     </details>
     <details open={current === 2} class:active-step={current === 2}>
       <summary aria-current={current === 2 ? 'step' : undefined}>{#if current === 2}<span class="step-label">Текущий шаг</span>{/if}2. Подготовка и чтение · {workSlice.files ? 'Карт ' + workSlice.files.prepared + ' из ' + workSlice.files.accepted : 'Состав уточняется'}</summary>
-      <WorkProgress slice={selected} />
+      <WorkProgress slice={selected} {api} canEdit={context.canEdit} refresh={() => refreshSlice?.()} />
       {#if receipt}<a class="button" href={receiptUrl('all', receipt.receiptId)}>Открыть опись поступления №{receipt.number}</a>{/if}
     </details>
     <details open={current === 3} class:active-step={current === 3}>

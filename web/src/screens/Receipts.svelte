@@ -761,7 +761,7 @@
 </script>
 
 <a href={openInventoryLink} bind:this={navigationLink} hidden>К описи</a>
-<WorkProgress slice={progressSlice} />
+<WorkProgress slice={progressSlice} {api} canEdit={context.canEdit} refresh={renew} />
 <div class="actions receipt-actions">
   {#if context.canEdit}<button type="button" class="primary" disabled={pending} onclick={() => startNew()}>Загрузить комплект</button>{/if}
   {#if continuation && continuation !== activeReceipt}

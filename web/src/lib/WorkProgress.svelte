@@ -1,9 +1,39 @@
 <script lang="ts">
-  import { scopedUrl } from './workspace';
+  import { projectApi, scopedUrl } from './workspace';
+  import { Commands } from './commands';
+  import { describe, query, type Api } from './http';
+  import Notice from './Notice.svelte';
   import { bytes, count, label } from './format';
-  import { chooseWorkArea, readingStatus, requirementsUrl, type WorkSlice } from './work-slice';
+  import { chooseWorkArea, readingStatus, requirementsUrl, type ResearchContinuation, type WorkSlice } from './work-slice';
 
-  let { slice }: { slice?: WorkSlice } = $props();
+  let { slice, api, canEdit, refresh }: {
+    slice?: WorkSlice; api: Api; canEdit: boolean; refresh: () => void;
+  } = $props();
+  const commands = new Commands(() => api);
+  let continuing = $state(false);
+  let error = $state('');
+  let result = $state.raw<{ slice: WorkSlice; continuation: ResearchContinuation; requested: number }>();
+  const continuation = $derived(result && result.slice === slice ? result.continuation : slice?.continuation);
+
+  async function continueAvailable() {
+    if (!slice || continuing || !continuation?.available) return;
+    const { projectId, scopeId } = slice;
+    continuing = true;
+    error = '';
+    try {
+      const outcome = await commands.send<{ requested: number; continuation: ResearchContinuation }>(
+        query(projectApi(projectId) + '/research-stops/resume', { scopeId }), 'POST', {},
+      );
+      if (slice?.projectId === projectId && slice.scopeId === scopeId) {
+        result = { slice, ...outcome };
+        refresh();
+      }
+    } catch (problem) {
+      error = describe(problem);
+    } finally {
+      continuing = false;
+    }
+  }
   let now = $state(Date.now());
   $effect(() => { const timer = setInterval(() => now = Date.now(), 1000); return () => clearInterval(timer); });
   const files = $derived(slice?.files);
@@ -54,6 +84,21 @@
   </div>
   {#if slice}
     <p role="status">{readingStatus(slice, now)}</p>
+    {#if continuation && (continuation.available || continuation.queued || continuation.needsAction)}
+      <div class="actions">
+        {#if canEdit && continuation.available}
+          <button type="button" disabled={continuing} onclick={continueAvailable}>
+            Продолжить доступные задания · {count(continuation.available)}
+          </button>
+        {/if}
+        {#if continuation.queued}<span>Ожидают продолжения в очереди · {count(continuation.queued)}</span>{/if}
+        {#if continuation.needsAction}<span>Требуют отдельного действия · {count(continuation.needsAction)}</span>{/if}
+      </div>
+    {/if}
+    <Notice kind="error" message={error} />
+    <Notice kind="success" message={result && result.slice.projectId === slice.projectId && result.slice.scopeId === slice.scopeId
+      ? result.requested ? 'К продолжению принято заданий · ' + count(result.requested) : 'Доступных для продолжения заданий больше нет.'
+      : ''} />
     {#if slice.stops?.length}
       <ul class="plain-list" aria-label="Остановленные задания">
         {#each slice.stops as stop (stop.jobId)}

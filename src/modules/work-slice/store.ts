@@ -4,6 +4,7 @@ import type { PoolClient } from 'pg';
 import { invalid } from '../access/errors.js';
 import { synchronizeFacadeAssessment } from '../assessment/facade-store.js';
 import { getLockedGate, getRevision, snapshot, synchronize } from '../assessment/store.js';
+import { researchContinuation, waitingForResearchSlot } from '../harness/stops.js';
 import { readProjectionPosition } from '../supplements/events.js';
 import { SupplementError } from '../supplements/errors.js';
 
@@ -93,7 +94,8 @@ async function captureAssessment(tx: PoolClient, projectId: string, intakeMode: 
 export const inventoryRevision = `(SELECT concat(coalesce(max(e.id),0),':',count(*))
   FROM intake_events e WHERE e.receipt_id=r.id)`;
 
-const currentReadingJobs = `SELECT j.id,j.purpose,j.state,j.payload,j.reason,j.next_action FROM gateway_jobs j JOIN gateway_generations g USING(generation_id)
+const currentReadingJobs = `SELECT j.id,j.purpose,j.state,j.payload,j.reason,j.next_action,
+  (j.state='held' AND ${waitingForResearchSlot('j')}) AS queued_for_slot FROM gateway_jobs j JOIN gateway_generations g USING(generation_id)
   WHERE j.project_id=$1 AND g.current AND j.kind='harness_research'
     AND (j.payload->'packageWindow' IS NULL OR EXISTS (
       SELECT 1 FROM harness_package_branches b JOIN harness_package_windows w ON w.id=b.window_id
@@ -119,7 +121,7 @@ async function capture(tx: PoolClient, projectId: string, scopeId?: string) {
         CROSS JOIN LATERAL unnest(ARRAY[
           j.payload#>'{place,source}', j.payload#>'{dispute,a,place,source}', j.payload#>'{dispute,b,place,source}'
         ]) AS source(address)
-        WHERE j.state IN ('ready','leased') AND address IS NOT NULL
+        WHERE (j.state IN ('ready','leased') OR j.queued_for_slot) AND address IS NOT NULL
       ),
       active_receipts AS (
         SELECT o.receipt_id FROM intake_occurrences o JOIN active_versions v ON v.id=o.version_id::text
@@ -150,7 +152,7 @@ async function capture(tx: PoolClient, projectId: string, scopeId?: string) {
   );
   const { rows: readings } = await tx.query<ReadingStatus>(
     `WITH jobs AS (${currentReadingJobs})
-     SELECT state,CASE purpose WHEN 'primary_a' THEN 'A' WHEN 'primary_b' THEN 'B' END AS branch,count(*)::int AS total
+     SELECT CASE WHEN queued_for_slot THEN 'ready' ELSE state END AS state,CASE purpose WHEN 'primary_a' THEN 'A' WHEN 'primary_b' THEN 'B' END AS branch,count(*)::int AS total
      FROM jobs GROUP BY 1,2 ORDER BY 2,1`, [projectId],
   );
   const stops = readings.some(row => row.state === 'held') ? (await tx.query<{
@@ -163,7 +165,7 @@ async function capture(tx: PoolClient, projectId: string, scopeId?: string) {
         WHERE project_id=$1 AND state='accepted' AND version_id::text=coalesce(
           j.payload#>>'{place,source,versionId}',j.payload#>>'{dispute,a,place,source,versionId}')
         ORDER BY created_at,id LIMIT 1) o ON true
-      WHERE j.state='held' ORDER BY (j.reason='unknown_charge') DESC NULLS LAST,j.id LIMIT 9`, [projectId])).rows : [];
+      WHERE j.state='held' AND NOT j.queued_for_slot ORDER BY (j.reason='unknown_charge') DESC NULLS LAST,j.id LIMIT 9`, [projectId])).rows : [];
   const totals = {
     all: rows.length,
     open: rows.filter((row) => includes(row, 'open')).length,
@@ -227,7 +229,8 @@ export async function summarizeCurrentReader(tx: PoolClient, payload: WorkSlice,
     `SELECT transport_enabled AS enabled, observed_at AS "observedAt", valid_until AS "validUntil"
      FROM reader_availability ORDER BY (valid_until > statement_timestamp()) DESC,
        CASE WHEN valid_until > statement_timestamp() THEN transport_enabled END DESC, observed_at DESC LIMIT 1`);
-  return { ...summarizeWorkSlice(payload, workSliceId), readingService: readingService ?? null };
+  const continuation = await researchContinuation(tx, payload.projectId, payload.scopeId);
+  return { ...summarizeWorkSlice(payload, workSliceId), readingService: readingService ?? null, continuation };
 }
 
 export function summarizeWorkSlice(slice: WorkSlice, workSliceId: string) {
