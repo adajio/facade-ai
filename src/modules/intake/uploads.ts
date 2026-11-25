@@ -410,6 +410,48 @@ export async function lockUploadTransaction(tx: PoolClient, uploadId: string): P
   await tx.query(`SELECT pg_advisory_xact_lock(${uploadLock})`, [uuid(uploadId)]);
 }
 
+// Repeated delivery of the same loose package file preserves its edition and map.
+// A declared replacement, another inventory path, or an explicit scope has its own provenance.
+async function repeatedEdition(tx: PoolClient, upload: UploadRow, originalId: string) {
+  const { rows: [edition] } = await tx.query<{ documentId: string; versionId: string; jobId: string }>(
+    `SELECT v.document_id AS "documentId", v.id AS "versionId", job.id AS "jobId"
+       FROM projects p JOIN intake_document_versions v ON v.project_id=p.id AND v.original_id=$2
+       JOIN intake_reader_jobs job ON job.version_id=v.id
+       JOIN intake_occurrences before ON before.version_id=v.id AND before.state='accepted'
+       JOIN intake_occurrences incoming ON incoming.id=$3 AND incoming.project_id=p.id
+       JOIN intake_uploads previous ON previous.occurrence_id=before.id
+      WHERE p.id=$1 AND p.intake_mode AND before.relative_path=incoming.relative_path
+        AND before.declared_media_type=incoming.declared_media_type
+        AND before.import_id IS NULL AND incoming.import_id IS NULL
+        AND before.parent_occurrence_id IS NULL AND incoming.parent_occurrence_id IS NULL
+        AND NOT EXISTS (SELECT 1 FROM intake_document_versions newer WHERE newer.replaces_version_id=v.id)
+        AND NOT EXISTS (SELECT 1 FROM intake_events e WHERE e.project_id=p.id
+          AND e.receipt_id IN (before.receipt_id,incoming.receipt_id)
+          AND e.type IN ('intake.held','intake.hold_narrowed')
+          AND coalesce(e.data->>'holdId',e.data->>'id') IN (previous.hold_id::text,$4::text)
+          AND jsonb_typeof(e.data->'scopeIds')='array')
+      ORDER BY v.created_at DESC,v.id LIMIT 1`,
+    [upload.project_id, originalId, upload.occurrence_id, upload.hold_id],
+  );
+  return edition;
+}
+
+async function createEdition(tx: PoolClient, upload: UploadRow, originalId: string, mediaType: string) {
+  const document = upload.replaces_version_id
+    ? await tx.query<{ id: string }>(
+        "SELECT document_id AS id FROM intake_document_versions WHERE id = $1 AND project_id = $2",
+        [upload.replaces_version_id, upload.project_id],
+      )
+    : await tx.query<{ id: string }>("INSERT INTO intake_documents (project_id) VALUES ($1) RETURNING id", [upload.project_id]);
+  const { id: documentId } = document.rows[0];
+  const { rows: [{ id: versionId }] } = await tx.query<{ id: string }>(
+    `INSERT INTO intake_document_versions (project_id, document_id, original_id, media_type, replaces_version_id)
+     VALUES ($1,$2,$3,$4,$5) RETURNING id`,
+    [upload.project_id, documentId, originalId, mediaType, upload.replaces_version_id],
+  );
+  return { documentId, versionId };
+}
+
 export async function publishPreparedOriginal(tx: PoolClient, input: UploadContext, prepared: Prepared | undefined) {
   await lockUploadTransaction(tx, input.uploadId);
   await lockIntakeProject(tx, input.projectId);
@@ -433,18 +475,8 @@ export async function publishPreparedOriginal(tx: PoolClient, input: UploadConte
       [originalId, upload.project_id, prepared.objectKey, prepared.size, prepared.sha256],
     );
   }
-  const document = upload.replaces_version_id
-    ? await tx.query<{ id: string }>(
-        "SELECT document_id AS id FROM intake_document_versions WHERE id = $1 AND project_id = $2",
-        [upload.replaces_version_id, upload.project_id],
-      )
-    : await tx.query<{ id: string }>("INSERT INTO intake_documents (project_id) VALUES ($1) RETURNING id", [upload.project_id]);
-  const { id: documentId } = document.rows[0];
-  const { rows: [{ id: versionId }] } = await tx.query<{ id: string }>(
-    `INSERT INTO intake_document_versions (project_id, document_id, original_id, media_type, replaces_version_id)
-     VALUES ($1,$2,$3,$4,$5) RETURNING id`,
-    [upload.project_id, documentId, originalId, prepared.mediaType, upload.replaces_version_id],
-  );
+  const repeated = original.rowCount && !upload.replaces_version_id ? await repeatedEdition(tx, upload, originalId) : undefined;
+  const { documentId, versionId } = repeated ?? await createEdition(tx, upload, originalId, prepared.mediaType);
   const { rows: [occurrence] } = await tx.query<{ relative_path: string }>(
     `UPDATE intake_occurrences SET state = 'accepted', version_id = $2
       WHERE id = $1 RETURNING relative_path`,
@@ -459,11 +491,11 @@ export async function publishPreparedOriginal(tx: PoolClient, input: UploadConte
   if (inventoryPending) {
     await tx.query("UPDATE intake_occurrences SET inventory_pending = true WHERE id = $1", [upload.occurrence_id]);
   }
-  const { rows: [{ id: jobId }] } = await tx.query<{ id: string }>(
+  const jobId = repeated?.jobId ?? (await tx.query<{ id: string }>(
     `INSERT INTO intake_reader_jobs (project_id, receipt_id, document_id, version_id, original_id)
      VALUES ($1,$2,$3,$4,$5) RETURNING id`,
     [upload.project_id, upload.receipt_id, documentId, versionId, originalId],
-  );
+  )).rows[0].id;
   await tx.query("UPDATE intake_uploads SET state = 'complete' WHERE id = $1", [upload.id]);
   const result = {
     receiptId: upload.receipt_id, uploadId: upload.id, occurrenceId: upload.occurrence_id,

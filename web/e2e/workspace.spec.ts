@@ -70,7 +70,8 @@ test.describe('Рабочее место на штатном API', () => {
       await expect(engineering.getByRole('heading', { name: 'Поступления', exact: true })).toBeVisible();
       await expect(engineering.getByRole('link', { name: 'Участники' })).toHaveCount(0);
       await engineering.getByRole('link', { name: 'Письма' }).click();
-      await expect(engineering.getByText('Пока нет подтверждённых замечаний для письма.', { exact: false })).toBeVisible();
+      await expect(engineering.getByText('Оснований для письма пока нет.', { exact: false })).toBeVisible();
+      await expect(engineering.getByRole('link', { name: 'Проверить комплектность' })).toBeVisible();
       expect((await command(engineerContext, origin, '/api/v1/projects/' + projectId + '/letters', 'POST', {
         scopeId, recipient: 'Синтетический адресат', items: [],
       })).status()).toBe(422);

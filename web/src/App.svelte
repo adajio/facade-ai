@@ -204,7 +204,9 @@
 
   function navigate(path: string) {
     if (path === window.location.pathname + window.location.search) return true;
-    if (!window.dispatchEvent(new Event('facade:navigate', { cancelable: true }))) return false;
+    if (!window.dispatchEvent(new CustomEvent('facade:navigate', {
+      cancelable: true, detail: { proceed: () => navigate(path) },
+    }))) return false;
     history.pushState(null, '', path);
     routeChanged();
     window.scrollTo(0, 0);
@@ -246,7 +248,9 @@
     };
     const pop = () => {
       const previous = activeLocation;
-      if (!window.dispatchEvent(new Event('facade:navigate', { cancelable: true }))) {
+      if (!window.dispatchEvent(new CustomEvent('facade:navigate', {
+        cancelable: true, detail: { proceed: () => history.back() },
+      }))) {
         history.pushState(null, '', previous);
         return;
       }

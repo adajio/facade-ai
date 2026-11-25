@@ -4,11 +4,12 @@
   import { Commands } from '../lib/commands';
   import { conflictMessage } from '../lib/conflict';
   import { date, label } from '../lib/format';
-  import { ApiError, describe, endpoint, id, interrupted, issue, query, type Api } from '../lib/http';
+  import { ApiError, denied, describe, endpoint, id, interrupted, issue, query, type Api } from '../lib/http';
   import { V1, projectApi, projectV1, scopedUrl, type Assessment, type Citation, type OpenEvidence, type Page, type WorkspaceProps } from '../lib/workspace';
   import EvidenceButtons from '../lib/EvidenceButtons.svelte';
   import ClarificationDetails from '../lib/ClarificationDetails.svelte';
   import type { ClarificationBasis } from '../lib/workspace';
+  import type { FacadeAssessment } from '../lib/facade-assessment';
   import Notice from '../lib/Notice.svelte';
   import WordingReviewForm from '../lib/WordingReview.svelte';
   import { managedWording, wordingFields, type WordingReview, type WordingSource } from '../lib/wording';
@@ -56,6 +57,8 @@
   let wording = $state<Record<string, string>>({});
   let basedOn = $state<number>();
   let draftDirty = $state(false);
+  let leaveDialog: HTMLDialogElement;
+  let continueNavigation: (() => void) | undefined;
   let marks = $state<Record<string, WordingReview>>({});
   let sentBasis = $state<Revision>();
   let sentText = $state('');
@@ -78,8 +81,22 @@
   let historical = $derived(Boolean(context.revision || sentId || activeResponse));
   let activeId = $derived(context.objectId ?? '');
   let base = $derived(projectV1(context.project.id) + '/letters');
+  let facade = $state<FacadeAssessment>();
+  let areaError = $state('');
+  const packageMode = $derived(context.project.intakeMode && !context.scopeId && !context.project.scopeId);
+  $effect(() => {
+    if (!packageMode || activeId) return;
+    void context.refreshKey;
+    const stop = new AbortController();
+    const projectId = context.project.id;
+    api.json<FacadeAssessment>(projectV1(projectId) + '/facade-assessment', { signal: stop.signal })
+      .then((result) => { if (!stop.signal.aborted) { facade = result; areaError = ''; } })
+      .catch((error) => { if (!stop.signal.aborted) { facade = undefined; areaError = describe(error); } });
+    return () => stop.abort();
+  });
   let assessmentContextId = $derived(context.params.get('context') ||
-    (letter?.id === activeId ? letter?.assessmentContextId : undefined) || undefined);
+    (letter?.id === activeId ? letter?.assessmentContextId : undefined) ||
+    (!activeId && packageMode && facade?.contexts.length === 1 ? facade.contexts[0].assessmentContextId : undefined));
   let target = $derived(assessmentContextId ? { assessmentContextId } : { scopeId: context.scopeId || undefined });
   let current = $derived(letter?.id === activeId ? letter : undefined);
   let currentRevision = $derived(revision && current && revision.id === (context.revision ?? current.revisionId) ? revision : undefined);
@@ -171,9 +188,9 @@
     return () => stop.abort();
   });
 
+  const editorTarget = $derived(JSON.stringify([context.project.id, activeId, context.revision, sentId, activeResponse]));
   $effect(() => {
-    void activeId;
-    void context.revision;
+    void editorTarget;
     draftDirty = false;
     marks = {};
     basedOn = undefined;
@@ -214,7 +231,10 @@
           }
         }
       } catch (error) {
-        if (!interrupted(error)) { letter = undefined; detailError = describe(error); }
+        if (!interrupted(error)) {
+          if (denied(error) || !draftDirty || letter?.id !== letterId) letter = undefined;
+          detailError = describe(error);
+        }
       }
     }
     void load();
@@ -232,7 +252,10 @@
       }
     };
     const guard = (event: Event) => {
-      if ((draftDirty || sentBasis) && !window.confirm('Несохранённые правки. Покинуть страницу?')) event.preventDefault();
+      if (!draftDirty && !sentBasis) return;
+      event.preventDefault();
+      continueNavigation = (event as CustomEvent<{ proceed: () => void }>).detail.proceed;
+      if (!leaveDialog.open) leaveDialog.showModal();
     };
     window.addEventListener('beforeunload', beforeUnload);
     window.addEventListener('facade:navigate', guard);
@@ -271,12 +294,13 @@
   }
 
   async function run(task: () => Promise<void>, version?: number, recheck = true) {
-    if (busy) return;
+    if (busy) return false;
     problem = '';
     status = '';
     busy = true;
     try {
       await task();
+      return true;
     } catch (error) {
       problem = conflictMessage(error, version);
       if (error instanceof ApiError && error.code === 'letter_wording_basis_mismatch') {
@@ -285,6 +309,7 @@
         problem = [error.message, subject, field].filter(Boolean).join(' · ');
       }
       if (error instanceof ApiError && [409, 412, 422].includes(error.status)) preview = '';
+      return false;
     } finally {
       busy = false;
       if (recheck) renew();
@@ -303,13 +328,13 @@
     });
   }
 
-  function save(event: SubmitEvent) {
-    event.preventDefault();
+  async function save(event?: SubmitEvent) {
+    event?.preventDefault();
     const head = current;
     const selected = currentRevision;
-    if (!head || !selected) return;
+    if (!head || !selected) return false;
     const version = basedOn ?? head.version;
-    void run(async () => {
+    return run(async () => {
       await commands.send(path(head.id), 'PATCH', {
         layout, recipient: draftRecipient,
         items: selected.items.filter((item) => typeof wording[item.questionId] === 'string').map((item) => ({
@@ -321,6 +346,15 @@
       basedOn = undefined;
       status = 'Редакция сохранена и ожидает подтверждения.';
     }, version);
+  }
+
+  async function leaveLetter(saveChanges: boolean) {
+    if (busy) return;
+    if (saveChanges && !await save()) return;
+    draftDirty = false;
+    sentBasis = undefined;
+    leaveDialog.close();
+    continueNavigation?.();
   }
 
   function confirmRevision() {
@@ -416,22 +450,46 @@
     });
   }
 </script>
+<dialog bind:this={leaveDialog} aria-labelledby="leave-letter-title">
+  <h2 id="leave-letter-title">Сохранить изменения перед переходом?</h2>
+  {#if sentBasis}<p>Факт отправки ещё не зарегистрирован.</p>{/if}
+  <Notice kind="error" message={problem} />
+  <div class="actions">
+    <button type="button" onclick={() => leaveDialog.close()} disabled={busy}>Вернуться к редактированию</button>
+    {#if draftDirty && !sentBasis}<button class="primary" type="button" onclick={() => leaveLetter(true)} disabled={busy}>Сохранить черновик и перейти</button>{/if}
+    <button type="button" onclick={() => leaveLetter(false)} disabled={busy}>Уйти без сохранения</button>
+  </div>
+</dialog>
+
 
 <Notice kind="error" message={listError} />
 <Notice kind="error" message={problem} />
 <Notice kind="success" message={status} />
+{#if packageMode && !activeId}
+  {#if areaError}<Notice kind="error" message={areaError} />
+  {:else if !facade}<p role="status">Загружаем области проверки…</p>
+  {:else if facade.contexts.length > 1}
+    <nav class="actions" aria-label="Область письма">{#each facade.contexts as area (area.assessmentContextId)}
+      <a class="button" aria-current={assessmentContextId === area.assessmentContextId ? 'page' : undefined}
+        href={scopedUrl(context.project.id, 'letters', { context: area.assessmentContextId })}>{area.kind === 'common' ? 'Весь комплект' : area.name}</a>
+    {/each}</nav>
+    {#if !assessmentContextId}<p>Выберите область, чтобы увидеть допустимые пункты и подготовить письмо.</p>{/if}
+  {:else if !facade.contexts.length}<p>Пока нет области проверки. <a href={assessmentUrl()}>Открыть комплектность</a></p>{/if}
+{/if}
 {#if (context.scopeId || assessmentContextId) && !activeId}
   <section class="card">
     <h2>Пункты к запросу</h2>
     <Notice kind="error" message={eligibleError} />
     {#if eligible?.holds.length}
       <Notice message="Разбор поступивших материалов удерживает актуальную выдачу для этой области." />
+      <a href={assessmentUrl()}>Проверить основания по оригиналам</a>
     {:else if eligible && !eligible.items.length}
-      <p>{assessmentOutcome === 'sufficient'
+      <p>{(assessmentOutcome || facade?.contexts.find((c) => c.assessmentContextId === assessmentContextId)?.outcome) === 'sufficient'
         ? 'Письмо не требуется. Комплект достаточен для выбранной области.'
         : interfaceCopy.noLetterItems}</p>
       <a href={assessmentUrl()}>Проверить комплектность</a>
     {:else if eligible?.items.length}
+      <p>Доступно для запроса · {eligible.items.length}</p>
       {#if context.canEdit}
         <form onsubmit={create}>
           <label>Адресат<select bind:value={recipient} required onchange={() => checked = []}>
@@ -449,7 +507,8 @@
               </li>
             {/each}
           </ul>
-          <div class="actions"><button class="primary" disabled={busy || !recipient || !checked.length}>Сформировать черновик</button></div>
+          <p class="meta">Выбрано пунктов · {checked.length}. При создании письмо получит номер.</p>
+          <div class="actions"><button class="primary" disabled={busy || !recipient || !checked.length}>Создать письмо из выбранных пунктов</button></div>
         </form>
       {:else}
         <ul class="plain-list">{#each eligible.items as item (item.questionId)}

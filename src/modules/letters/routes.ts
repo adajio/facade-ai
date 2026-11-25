@@ -5,7 +5,7 @@ import { accessConfig, authorize, checkCsrf, checkOrigin, readCookie, readSessio
 import type { AccessActor, AccessRequirement } from '../access/auth.js';
 import { executeCommand, lockOrganization, lockSession, transaction } from '../access/commands.js';
 import { AccessError, sendAccessError, unavailable } from '../access/errors.js';
-import { facadeAssessmentHref, getLockedFacadeContext } from '../assessment/facade-store.js';
+import { facadeAssessmentHref, getLockedFacadeContext, synchronizeFacadeAssessment } from '../assessment/facade-store.js';
 import { lockIntakeProject } from '../intake/gate.js';
 import { contentTypes, hashText, renderDocument, renderText } from './content.js';
 import type { Ground, LetterItem, Selection } from './content.js';
@@ -116,12 +116,19 @@ export function registerLetterRoutes(app: FastifyInstance, deps: LetterDependenc
     else await lockIntakeProject(tx, projectId);
   }
 
-  async function targetHolds(tx: PoolClient, projectId: string, target: LetterTarget) {
-    return target.assessmentContextId ? (await getLockedFacadeContext(tx, projectId, target.assessmentContextId)).gate.holds :
-      deps.getHolds(tx, projectId, target.scopeId!);
+  async function targetHolds(tx: PoolClient, projectId: string, target: LetterTarget | Letter) {
+    if (!target.assessmentContextId) return deps.getHolds(tx, projectId, target.scopeId!);
+    if (!('id' in target)) return (await getLockedFacadeContext(tx, projectId, target.assessmentContextId)).gate.holds;
+
+    // The letter still exists when its facade temporarily disappears during re-reading.
+    const current = await synchronizeFacadeAssessment(tx, projectId);
+    if (!current.gate.holds.length && !current.active.some(({ context }) => context.id === target.assessmentContextId)) {
+      stale(target);
+    }
+    return current.gate.holds;
   }
 
-  async function checkHolds(tx: PoolClient, letter: LetterResources) {
+  async function checkHolds(tx: PoolClient, letter: LetterResources | Letter) {
     const holds = await targetHolds(tx, letter.projectId, letter);
     if (holds.length) scopeError(holds);
   }
@@ -138,9 +145,10 @@ export function registerLetterRoutes(app: FastifyInstance, deps: LetterDependenc
     const selections = revision.items.map(({ questionId, questionVersion, decisionId }) => ({ questionId, questionVersion, decisionId }));
     const { recipient, layout, items, text, textSha256 } = revision;
     const grounds = await selectedGrounds(tx, { ...letter, recipient, selections });
-    // Earlier revisions were saved without a stage line. Check their original text as stored.
+    // Verify the saved revision against the template used when it was issued.
     const matchesText = renderText(recipient, layout, items) === text
-      || renderText(recipient, layout, items, false) === text;
+      || renderText(recipient, layout, items, 'before-clarification-label') === text
+      || renderText(recipient, layout, items, 'before-stage') === text;
     if (grounds.length !== revision.items.length
       || grounds.some((ground, index) => !wordingIsCurrent(items[index], ground))
       || !matchesText

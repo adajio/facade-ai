@@ -75,6 +75,8 @@ test("facade requirements retain partial local cover and demand a proven pair or
   const pairs = [{ a: "A", b: "B", proof: { version: pairProofVersion, variant: "v1",
     revisionA: "r-a", revisionB: "r-b", scope: "f1" } }];
   assert.equal(decide([a, conflict], partial, pairs).outcome, "confirmed_conflict");
+  assert.equal(decide([a, conflict], partial, pairs, [], { stage: "Стадия 1" }).outcome, "confirmed_conflict");
+  assert.equal(decide([a, { ...conflict, stage: "RD" }], partial, pairs, [], { stage: "Стадия 1" }).outcome, "needs_review");
   assert.equal(decide([a, { ...conflict, membership: { kind: "facades", facadeIds: ["f1", "f2"] } }], partial, pairs)
     .outcome, "needs_review");
   const needsTitle = { ...conflict, printedRevision: null, variant: null, addressedValue: true,
@@ -136,7 +138,7 @@ const runDatabase = process.env.FACADE_ASSESSMENT_PACKAGE_TEST === "1" && proces
   process.env.FACADE_DATA_DIR && process.env.FACADE_S3_ENDPOINT && process.env.FACADE_S3_BUCKET;
 
 test("ordinary intake publishes a local conflict, then keeps sent history after point replacement", {
-  skip: !runDatabase, timeout: 240_000,
+  skip: !runDatabase, timeout: process.env.FACADE_PACKAGE_BROWSER === "1" ? 720_000 : 420_000,
 }, async (t) => {
   const { bootstrapAdmin } = await built("access/bootstrap");
   const { createRuntimePdfService } = await built("pdf/index");
@@ -150,7 +152,16 @@ test("ordinary intake publishes a local conflict, then keeps sent history after 
   const { publication } = await built("harness/publication");
   const { researchKind } = await built("harness/runner");
   const { passwordHash } = await built("access/auth");
-  const origin = "http://localhost:3000";
+  const withBrowser = process.env.FACADE_PACKAGE_BROWSER === "1";
+  const withD8Browser = process.env.FACADE_D8_BROWSER === "1";
+  let browserRoute;
+  let origin = "http://localhost:3000";
+  if (withBrowser || withD8Browser) {
+    const { openPackageBrowser } = await import("../../../web/e2e/package-browser.mjs");
+    browserRoute = await openPackageBrowser();
+    t.after(() => browserRoute.close());
+    origin = browserRoute.origin;
+  }
   process.env.FACADE_PUBLIC_ORIGIN = origin;
   const db = new pg.Pool({ connectionString: process.env.DATABASE_URL });
   const app = Fastify();
@@ -167,7 +178,7 @@ test("ordinary intake publishes a local conflict, then keeps sent history after 
   const { userId, organizationId } = await bootstrapAdmin(db, { organization: "Synthetic", login, password });
   let session = {};
   const request = async (method, url, payload, options = {}) => {
-    const headers = { origin, host: "localhost:3000", ...session, "idempotency-key": randomUUID(), ...options.headers };
+    const headers = { origin, host: new URL(origin).host, ...session, "idempotency-key": randomUUID(), ...options.headers };
     if (options.version !== undefined) headers["if-match"] = `"${options.version}"`;
     const response = await app.inject({ method, url, payload, headers });
     assert.equal(response.statusCode, options.status ?? 200, `${method} ${url}: ${response.body}`);
@@ -177,14 +188,17 @@ test("ordinary intake publishes a local conflict, then keeps sent history after 
     return { cookie: response.headers["set-cookie"].split(";")[0], "x-csrf-token": response.json().csrfToken };
   }
   session = credentials(await request("POST", "/api/sessions", { login, password }));
-  const project = (await request("POST", "/api/projects", { mode: "intake", name: "Synthetic facades" }, { status: 201 })).json();
+  const project = withBrowser
+    ? await browserRoute.createProject(login, password, "Synthetic facades")
+    : (await request("POST", "/api/projects", { mode: "intake", name: "Synthetic facades" }, { status: 201 })).json();
   const projectId = project.id;
   const base = `/api/v1/projects/${projectId}`;
   const assessment = () => request("GET", base + "/facade-assessment").then((response) => response.json());
   const pending = await assessment();
   assert.equal(pending.catalogVersionId, null);
-  assert.equal(pending.profile.state, "stage_unknown");
-  assert.equal(pending.stage, null);
+  assert.equal(pending.profile.state, "no_approved_profile");
+  assert.equal(pending.stage, "Стадия 1");
+  assert.equal(project.stageStatus, "default");
   assert.deepEqual(pending.observations.counts, { common: 0, identified: 0, unclear: 0, unidentified: 0 });
   assert.equal((await request("GET", pending.observations.href)).json().items.length, 0);
   const scope = await db.query("SELECT count(*)::int AS count FROM project_scopes WHERE project_id=$1", [projectId]);
@@ -201,7 +215,7 @@ test("ordinary intake publishes a local conflict, then keeps sent history after 
   const catalog = (await request("POST", "/api/catalogs", {
     key: "synthetic", name: "Synthetic matrix",
     defaultProfile: { stage: "P", facadeKinds: ["panel"], approvalReference: "Synthetic rule" },
-    requirements: [thickness, fields("width", "Width", "facade"), fields("clearance", "Clearance", "common")],
+    requirements: [thickness, { ...thickness, key: "mount", part: "Mount spacing" }, fields("width", "Width", "facade"), fields("clearance", "Clearance", "common")],
   }, { status: 201 })).json();
   const gateway = createGateway(db, { replayOnly: true });
   const profile = { lead: null };
@@ -222,7 +236,7 @@ test("ordinary intake publishes a local conflict, then keeps sent history after 
       const itemId = randomUUID();
       fixtures.set(sha(data), place);
       return { place, data, item: { itemId, kind: "file", relativePath: place.filename, size: data.length,
-        mediaType: "application/pdf", sha256: sha(data) } };
+        mediaType: "application/pdf", sha256: sha(data), replacesVersionId: place.replacesVersionId } };
     });
     const { receiptId } = (await request("POST", `/api/projects/${targetProjectId}/receipts`, {
       mode: "open", items: manifest.map(({ item }) => item),
@@ -339,13 +353,14 @@ test("ordinary intake publishes a local conflict, then keeps sent history after 
   const drawing = (filename, attribute, value, revision, facade = "F1", role = "drawing") => {
     const roleQuote = role === "drawing" ? "Drawing" : "Schedule";
     return { filename, attribute, value, revision, facade, role, roleQuote,
-      ...(attribute === "Thickness" ? { valueRole: { kind: "design", quote: "Design value" } } : {}),
+      ...(["Thickness", "Mount spacing"].includes(attribute) ? { valueRole: { kind: "design", quote: "Design value" } } : {}),
       quote: `${roleQuote} ${attribute} ${value} mm | Design value | Stage P | Revision ${revision} current | Variant V1 | Scope: ${facade} | Project facade id: ${facade}` };
   };
   // A persisted result from the earlier publisher retained only the negative part of a contradictory line.
   const savedQuote = "Width not delivered | Stage P | Revision R9 current | Scope: F2 | Project facade id: F2 | Inventory";
   const initial = await uploadReceipt([
     drawing("first.pdf", "Thickness", "10", "R1"), drawing("second.pdf", "Thickness", "20", "R2", "F1", "schedule"),
+    drawing("mount-plan.pdf", "Mount spacing", "11", "R1"), drawing("mount-schedule.pdf", "Mount spacing", "13", "R2", "F1", "schedule"),
     drawing("width.pdf", "Width", "100", "R3"),
     drawing("south.pdf", "Thickness", "200", "R4", "F2"),
     { filename: "common.pdf", attribute: "Clearance", value: "17", revision: "R5", common: true,
@@ -356,6 +371,7 @@ test("ordinary intake publishes a local conflict, then keeps sent history after 
     { filename: "inventory.pdf", attribute: "Width", facade: "F2", revision: "R9", role: "inventory", roleQuote: "Inventory",
       quote: `Width delivered, ${savedQuote}`, savedQuote, statement: { status: "not_delivered", item: "Width" } },
   ]);
+  if (withBrowser) await browserRoute.openInventory(projectId, initial);
   await finishReading();
   const observed = await assessment();
   assert.equal(observed.catalogVersionId, null);
@@ -365,23 +381,25 @@ test("ordinary intake publishes a local conflict, then keeps sent history after 
   assert.ok(kindBasis?.facadeKindSourceVerified);
   const firstFacade = observed.contexts.find(({ name }) => name === "F1");
   const secondFacade = observed.contexts.find(({ name }) => name === "F2");
+  const stage = (await request("PUT", `/api/projects/${projectId}/stage`, {
+    stage: "P", reason: "Stage P appears on the current drawing", evidenceIds: [kindBasis.evidenceId],
+  }, { version: project.version })).json();
   const typeCommand = { kind: "panel", observationId: kindBasis.id, reason: "Exact project classification" };
   await request("PUT", base + `/facade-assessment/facades/${secondFacade.facadeId}/kind`, typeCommand,
-    { version: project.version, status: 422 });
+    { version: stage.version, status: 422 });
   const assigned = (await request("PUT", base + `/facade-assessment/facades/${firstFacade.facadeId}/kind`, typeCommand,
-    { version: project.version })).json();
+    { version: stage.version })).json();
   assert.equal(assigned.facadeType.state, "confirmed");
   assert.equal(assigned.facadeType.basis.versionId, kindBasis.versionId);
-  const kinds = (await request("PUT", base + "/facade-assessment/facade-kinds", {
+  await request("PUT", base + "/facade-assessment/facade-kinds", {
     facadeKinds: ["panel"], reason: "Synthetic original",
-  }, { version: assigned.version })).json();
-  await request("PUT", `/api/projects/${projectId}/stage`, { stage: "P", reason: "Synthetic title" }, { version: kinds.version });
+  }, { version: assigned.version });
   const beforeVerification = await assessment();
   assert.equal(beforeVerification.profile.state, "active");
   assert.equal(beforeVerification.contexts.find(({ name }) => name === "F1").counts.confirmed_conflict, 0);
   const oldObservations = (await request("GET", beforeVerification.observations.href)).json().items;
   assert.ok(oldObservations.every(({ basis }) => basis.revisionEvidence === undefined));
-  const schedule = oldObservations.filter(({ sourceRole }) => sourceRole === "schedule");
+  const schedule = oldObservations.filter(({ sourceRole, attribute }) => sourceRole === "schedule" && attribute === "Thickness");
   assert.equal(schedule.length, 2);
   const bind = (fact, state, version) => request("POST", `/api/projects/${projectId}/package-facts/${fact.id}/binding`, {
     state, candidateIds: [firstFacade.facadeId], reason: "Controlled check of the printed project identifier",
@@ -407,7 +425,7 @@ test("ordinary intake publishes a local conflict, then keeps sent history after 
   const untypedFacade = early.contexts.find(({ name }) => name === "F2");
   assert.equal(untypedFacade.facadeType.state, "unconfirmed");
   assert.equal(untypedFacade.counts.covered, 1);
-  assert.equal(untypedFacade.counts.needs_review, 1);
+  assert.equal(untypedFacade.counts.needs_review, 2);
   const f2Width = early.contexts.find(({ name }) => name === "F2").questions.find(({ requirement }) => requirement.positionId === "width");
   assert.ok(f2Width.machine.citations.length > 0);
   assert.ok(f2Width.machine.citations.every(({ deliveryUncertainty }) => deliveryUncertainty === "contradictory_original"));
@@ -415,7 +433,7 @@ test("ordinary intake publishes a local conflict, then keeps sent history after 
   await request("POST", `/api/v1/questions/${f2Width.id}/decisions`, {
     action: "confirm", reason: "Contradictory inventory cannot enter a letter", requestExternal: true,
   }, { version: f2Width.version, status: 422 });
-  assert.equal(early.contexts.find(({ name }) => name === "F1").counts.confirmed_conflict, 1);
+  assert.equal(early.contexts.find(({ name }) => name === "F1").counts.confirmed_conflict, 2);
   assert.ok(!early.comparisonReview.items.some(({ reasons }) => reasons.includes("facade_link_unproven")));
   const historicalGap = (await request("GET", base + `/facade-assessment/${unclear.version}`)).json();
   assert.deepEqual(historicalGap.comparisonReview, unclear.comparisonReview);
@@ -432,23 +450,31 @@ test("ordinary intake publishes a local conflict, then keeps sent history after 
   }, { version: q.version, status: 201 })).json();
   const conflict = question(early, "thickness");
   assert.ok(conflict.machine.citations.every(({ valueRoleBasis }) => valueRoleBasis?.kind === "design"));
-  const confirmed = await decision(conflict, true);
+  const confirmed = withBrowser ? await browserRoute.reviewConflict(projectId, context(early).assessmentContextId, conflict) : await decision(conflict, true);
+  const mount = question(early, "mount");
+  const mountDecision = withBrowser ? await browserRoute.reviewConflict(projectId, context(early).assessmentContextId, mount) : await decision(mount, true);
   const nearby = await decision(question(early, "width"));
   const decided = await assessment();
   const assessmentContextId = context(decided).assessmentContextId;
-  await request("POST", base + "/conclusions", {
-    assessmentContextId, startWork: "cannot_start", reason: "Synthetic start decision",
+  if (withBrowser) await browserRoute.conclude(projectId, assessmentContextId, conflict.machine.citations[0].evidenceId);
+  else await request("POST", base + "/conclusions", {
+    assessmentContextId, startWork: "cannot_start", reason: "Synthetic start decision", basis: { kind: "citation", evidenceId: conflict.machine.citations[0].evidenceId },
   }, { version: context(decided).version, status: 201 });
-  const letter = (await request("POST", base + "/letters", {
-    assessmentContextId, recipient, items: [{ questionId: conflict.id, questionVersion: confirmed.version, decisionId: confirmed.id }],
-  }, { status: 201 })).json();
+  const savedConclusion = await assessment();
+  assert.equal((await assessment()).version, savedConclusion.version, "Reading the saved conclusion must be side-effect free");
+  const letter = withBrowser
+    ? await browserRoute.createLetter(projectId, assessmentContextId, recipient, [conflict, mount], secondFacade.assessmentContextId)
+    : (await request("POST", base + "/letters", {
+        assessmentContextId, recipient, items: [{ questionId: conflict.id, questionVersion: confirmed.version, decisionId: confirmed.id },
+          { questionId: mount.id, questionVersion: mountDecision.version, decisionId: mountDecision.id }],
+      }, { status: 201 })).json();
   const letterPath = `/api/v1/letters/${letter.id}`;
   const saved = (await request("GET", letterPath + `/revisions/${letter.revisionId}`)).json();
   const text = (await request("GET", letterPath + "/current-text", undefined, { version: letter.version })).json();
   assert.match(text.text, /first.pdf/u);
   assert.match(text.text, /second.pdf/u);
   const exported = (await request("POST", letterPath + "/exports", { format: "txt" }, { status: 201, version: letter.version })).json();
-  const sent = (await request("POST", letterPath + "/sent", {
+  const sent = withBrowser ? await browserRoute.recordSending(projectId, assessmentContextId, letter, text.text) : (await request("POST", letterPath + "/sent", {
     revisionId: letter.revisionId, itemIds: saved.items.map(({ id }) => id), recipient, text: text.text,
     sentAt: new Date().toISOString(),
   }, { status: 201 })).json();
@@ -457,7 +483,7 @@ test("ordinary intake publishes a local conflict, then keeps sent history after 
     drawing("supplement-a.pdf", "Thickness", "15", "R6"), drawing("supplement-b.pdf", "Thickness", "15", "R7"),
   ]);
   await request("POST", base + "/supplements/links", {
-    receiptId: supplement, letterId: letter.id, sentId: sent.id, itemId: saved.items[0].id,
+    receiptId: supplement, letterId: letter.id, sentId: sent.id, itemId: saved.items.find(({questionId}) => questionId === conflict.id).id,
   }, { status: 201 });
   await request("POST", `/api/receipts/${supplement}/seal`, { manifestVersion: 1 });
   await finishReading();
@@ -470,13 +496,18 @@ test("ordinary intake publishes a local conflict, then keeps sent history after 
   const candidates = row.machine.citations.filter(({ receiptId }) => receiptId === supplement);
   const old = conflict.machine.citations.map(refers);
   const selected = [candidates.find(({ branch }) => branch === "A"), candidates.find(({ branch }) => branch === "B")].map(refers);
-  await request("POST", `/api/v1/questions/${row.id}/source-replacements`, { replacements: selected, replaced: old,
+  if (withBrowser) await browserRoute.replaceSources(projectId, assessmentContextId, row, selected, old);
+  else await request("POST", `/api/v1/questions/${row.id}/source-replacements`, { replacements: selected, replaced: old,
     reason: "Same project identifier and compatible new originals",
   }, { version: row.version, status: 201 });
   const updated = await assessment();
   assert.equal(question(updated, "thickness").machine.outcome, "covered");
+  const eligibleAfter = (await request("GET", base + "/letters/eligible?assessmentContextId=" + assessmentContextId)).json();
+  assert.deepEqual(eligibleAfter.items.map(({ questionId }) => questionId), [mount.id]);
+  assert.deepEqual(saved.items.map(({ questionId }) => questionId).sort(), [conflict.id, mount.id].sort());
   assert.equal(question(updated, "width").decision.id, nearby.id);
   assert.equal(context(updated).questionHolds.length, 0);
+  if (withBrowser) await browserRoute.checkHistory(projectId, assessmentContextId, letter, sent, text.text);
   assert.equal((await request("GET", sent.url)).json().text, text.text);
   assert.equal((await request("GET", exported.historicalUrl)).body, text.text);
   assert.equal((await request("GET", base + `/facade-assessment/${early.version}`)).json().outcome, early.outcome);
@@ -501,7 +532,7 @@ test("ordinary intake publishes a local conflict, then keeps sent history after 
   assert.ok(incompatible.limitations.includes("catalog_not_applicable"));
   assert.deepEqual((await request("GET", base + `/letters/eligible?assessmentContextId=${assessmentContextId}`)).json().items, []);
 
-  await t.test("an individually evidenced facade selects its matrix and an independently proven omission enters a letter", async () => {
+  await t.test("an individually evidenced facade selects its matrix and an independently proven omission enters a letter", async (omission) => {
     const next = (await request("POST", "/api/projects", { mode: "intake", name: "Synthetic non-delivery" }, { status: 201 })).json();
     const target = `/api/v1/projects/${next.id}`;
     const anchor = { ...fields("anchor", "Anchor plan", "facade"), applicability: "stage:RD", facadeKinds: ["panel"] };
@@ -600,7 +631,9 @@ test("ordinary intake publishes a local conflict, then keeps sent history after 
     const clarificationPath = "/api/v1/letters/" + clarificationLetter.id;
     const textExport = (await request("POST", clarificationPath + "/exports", { format: "txt" }, { status: 201, version: clarificationLetter.version })).json();
     const wordExport = (await request("POST", clarificationPath + "/exports", { format: "docx" }, { status: 201, version: clarificationLetter.version })).json();
-    assert.match((await request("GET", textExport.url)).body, /Просим направить документ или указать, где приведены данные/u);
+    const beforeText = await request("GET", textExport.url);
+    assert.match(beforeText.body, /Запрос на уточнение\./u);
+    assert.match(beforeText.body, /Просим направить документ или указать, где приведены данные/u);
     const word = await request("GET", wordExport.url);
     assert.match(word.headers["content-type"], /officedocument/u);
     const xml = execFileSync("python3", ["-c", "import io,sys,zipfile; print(zipfile.ZipFile(io.BytesIO(sys.stdin.buffer.read())).read('word/document.xml').decode())"],
@@ -609,6 +642,191 @@ test("ordinary intake publishes a local conflict, then keeps sent history after 
     const inventoryQuestion = questionAt(proven, "inventory");
     assert.equal(inventoryQuestion.machine.outcome, "covered");
     const inventoryDecision = await decision(inventoryQuestion);
+    if (process.env.FACADE_FACT_REVIEW_BROWSER_SEED === "1") return;
+    const beforeExclusion = (await request("GET", target + "/facade-assessment")).json();
+    const address = questionAt(beforeExclusion, "anchor").machine.citations[0];
+    const factPath = `${target}/package-facts/${address.observationId}/reviews`;
+    const exclusion = { action: "exclude", reason: "Engineering review invalidates the saved nondelivery reading" };
+    await request("POST", factPath, exclusion, { version: proven.version, status: 412 });
+    const excluded = (await request("POST", factPath, exclusion, { version: beforeExclusion.version })).json();
+    const afterExclusion = (await request("GET", target + "/facade-assessment")).json();
+    const heldAnchor = questionAt(afterExclusion, "anchor");
+    assert.equal(afterExclusion.version, excluded.version);
+    assert.equal(heldAnchor.machine.outcome, "needs_review");
+    assert.ok(heldAnchor.machine.limitations.includes("engineer_fact_review_required"));
+    assert.equal(questionAt(afterExclusion, "inventory").decision.id, inventoryDecision.id);
+    const remainingGrounds = (await request("GET", target + "/letters/eligible?assessmentContextId=" + context.assessmentContextId)).json();
+    assert.equal(remainingGrounds.items.some(({ questionId }) => questionId === q.id), false);
+    assert.equal(remainingGrounds.items.find(({ questionId }) => questionId === silence.id)?.kind, "clarification");
+    const readObservation = async (snapshot) => (await request("GET", snapshot.observations.href)).json().items
+      .find(({ id }) => id === address.observationId);
+    const currentObservation = await readObservation(afterExclusion);
+    const historicalObservation = await readObservation(beforeExclusion);
+    assert.equal(currentObservation.engineeringReview.state, "review_required");
+    assert.equal(currentObservation.engineeringReview.authorId, userId);
+    assert.equal(currentObservation.engineeringReview.reason, exclusion.reason);
+    assert.equal(historicalObservation.engineeringReview, undefined);
+    assert.equal(currentObservation.quote, historicalObservation.quote);
+    assert.deepEqual(currentObservation.address, historicalObservation.address);
+    await omission.test("D8 accepts its first positive evidence from a linked supplement", async () => {
+      const savedAnchor = external.json();
+      const anchorPath = "/api/v1/letters/" + savedAnchor.id;
+      const { items: [anchorItem], text: anchorText } = (await request("GET", anchorPath + "/revisions/" + savedAnchor.revisionId)).json();
+      const { items: [d8Item], text: d8Text } = (await request("GET", clarificationPath + "/revisions/" + clarificationLetter.revisionId)).json();
+      const sentAt = new Date().toISOString();
+      const d8Sent = (await request("POST", clarificationPath + "/sent", {
+        revisionId: clarificationLetter.revisionId, itemIds: [d8Item.id], recipient, text: d8Text, sentAt,
+      }, { status: 201 })).json();
+      const anchorSent = (await request("POST", anchorPath + "/sent", {
+        revisionId: savedAnchor.revisionId, itemIds: [anchorItem.id], recipient, text: anchorText, sentAt,
+      }, { status: 201 })).json();
+      const d8Property = "Variable profile clearance";
+      const corrected = await uploadReceipt([
+        { filename: "clearance-E1.pdf", attribute: d8Property, stage: "RD", revision: "RD2", facade: "E1", value: "21",
+          quote: `Drawing | ${d8Property} 21 mm | Stage: RD | Revision: RD2 current | Scope: E1 | Project facade id: E1` },
+        { filename: "clearance-E9.pdf", attribute: d8Property, stage: "RD", revision: "RD2", facade: "E9", value: "21",
+          quote: `Drawing | ${d8Property} 21 mm | Facade type: panel | Stage: RD | Revision: RD2 current | Scope: E9 | Project facade id: E9` },
+      ], next.id);
+      for (const [letterId, sentId, itemId] of [[clarificationLetter.id, d8Sent.id, d8Item.id],
+        [savedAnchor.id, anchorSent.id, anchorItem.id]]) {
+        await request("POST", target + "/supplements/links", { receiptId: corrected, letterId, sentId, itemId }, { status: 201 });
+      }
+      await request("POST", `/api/receipts/${corrected}/seal`, { manifestVersion: 1 });
+      await finishReading(true);
+      const otherFacade = (await request("GET", target + "/facade-assessment")).json();
+      const other = otherFacade.contexts.find(({ name }) => name === "E9");
+      assert.ok(other);
+      const otherType = (await request("GET", otherFacade.observations.href + "?proposal=facadeKind&facadeId=" + other.facadeId)).json().items[0];
+      assert.ok(otherType?.facadeKindSourceVerified);
+      const { version: projectVersion } = (await request("GET", "/api/projects/" + next.id)).json();
+      await request("PUT", target + `/facade-assessment/facades/${other.facadeId}/kind`, {
+        kind: "panel", observationId: otherType.id, reason: "Verified type of the independent facade",
+      }, { version: projectVersion });
+      const openSupplement = (await request("GET", target + "/facade-assessment")).json();
+      const current = questionAt(openSupplement, "variable");
+      const unrelated = openSupplement.contexts.find(({ facadeId }) => facadeId === other.facadeId).questions
+        .find(({ requirement }) => requirement.positionId === "variable");
+      assert.ok(unrelated.machine.citations.some(({ label }) => label === "clearance-E9.pdf"));
+      assert.equal(current.outcome, "needs_review");
+      assert.equal(current.previousDecisionId, clarification.id);
+      assert.equal(questionAt(openSupplement, "inventory").decision.id, inventoryDecision.id);
+      const replacePath = `/api/v1/questions/${current.id}/source-replacements`;
+      const optionPath = `/api/v1/questions/${current.id}/applicability?supplement=1`;
+      const options = (await request("GET", optionPath)).json().supplement;
+      assert.equal(options.mayAddFirst, true);
+      assert.equal(options.previous.length, 0);
+      assert.ok(options.incoming.every(({ firstEligible, citation }) => firstEligible && citation.label === "clearance-E1.pdf"));
+      const refs = options.incoming.map(({ citation }) => refers(citation));
+      assert.equal(refs.length, 2);
+      const { rows: wrongScope } = await db.query(
+        `SELECT o.id AS "observationId",o.evidence_id AS "evidenceId",o.version_id AS "versionId"
+          FROM reader_observations o JOIN intake_occurrences material ON material.project_id=o.project_id AND material.version_id=o.version_id
+          WHERE o.project_id=$1 AND material.receipt_id=$2 AND material.relative_path='clearance-E9.pdf'`, [next.id, corrected]);
+      assert.equal(wrongScope.length, 2);
+      const submit = (replacements, version, status) => request("POST", replacePath, {
+        replacements, replaced: [], reason: "Verified both readings in the linked supplement",
+      }, { version, status });
+      assert.equal((await submit(wrongScope, current.version, 404)).json().code, "not_found");
+      assert.equal((await submit(refs.slice(0, 1), current.version, 422)).json().code, "independent_support_required");
+      const nonD8 = questionAt(openSupplement, "anchor");
+      assert.equal((await request("POST", `/api/v1/questions/${nonD8.id}/source-replacements`, {
+        replacements: refs, replaced: [], reason: "Only D8 can add first evidence",
+      }, { version: nonD8.version, status: 422 })).json().code, "first_support_unavailable");
+      assert.deepEqual((await request("GET", optionPath)).json().replacements, []);
+      const afterFailures = (await request("GET", target + "/facade-assessment")).json();
+      assert.equal(questionAt(afterFailures, "variable").version, current.version);
+      assert.equal(questionAt(afterFailures, "inventory").decision.id, inventoryDecision.id);
+
+      async function submitInBrowser() {
+        const { chromium, expect: assertBrowser } = await import("../../../web/node_modules/@playwright/test/index.mjs");
+        const expect = assertBrowser.configure({ timeout: 25_000 });
+        const { existsSync } = await import("node:fs");
+        const chrome = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome";
+        const browser = await chromium.launch({ executablePath: process.env.FACADE_CHROME_PATH ?? (existsSync(chrome) ? chrome : undefined) });
+        try {
+          const page = await browser.newPage({ baseURL: origin });
+          const completeness = "/projects/" + next.id + "/completeness/";
+          const path = completeness + current.id + "?context=" + context.assessmentContextId;
+          await page.goto("/login?next=" + encodeURIComponent(path));
+          await page.getByLabel("Логин").fill(login);
+          await page.getByLabel("Пароль", { exact: true }).fill(password);
+          await page.getByRole("button", { name: "Войти", exact: true }).click();
+          await expect(page.getByRole("heading", { name: d8Property, exact: true })).toBeVisible();
+          const review = page.getByRole("region", { name: "Сверка досылки по требованию" });
+          const choices = review.getByRole("group", { name: "Адреса досылки обеих ветвей" });
+          const confirm = review.getByRole("button", { name: "Подтвердить первую опору" });
+          const consent = review.getByRole("checkbox", { name: "Подтверждаю выбранные опоры этого требования" });
+          await expect(choices.getByRole("checkbox")).toHaveCount(2);
+          await expect(choices.getByRole("checkbox", { name: /clearance-E9/ })).toHaveCount(0);
+          await expect(review.getByRole("group", { name: "Прежние опоры для замены" })).toHaveCount(0);
+          await choices.getByRole("checkbox", { name: /clearance-E1.*ветвь A/ }).check();
+          const reason = "Verified both readings in the linked supplement";
+          await review.getByLabel("Причина сверки").fill(reason);
+          await expect(consent).toBeDisabled();
+          await expect(confirm).toBeDisabled();
+          await choices.getByRole("checkbox", { name: /clearance-E1.*ветвь B/ }).check();
+          await consent.check();
+          const [response] = await Promise.all([
+            page.waitForResponse((result) => new URL(result.url()).pathname === replacePath && result.request().method() === "POST"),
+            confirm.click(),
+          ]);
+          assert.equal(response.status(), 201, await response.text());
+          assert.equal(await response.request().headerValue("if-match"), `"${current.version}"`);
+          const payload = response.request().postDataJSON();
+          assert.deepEqual(payload.replaced, []);
+          assert.deepEqual(payload.replacements.map(({ observationId }) => observationId).sort(), refs.map(({ observationId }) => observationId).sort());
+          assert.equal(payload.reason, reason);
+          const saved = await response.json();
+          await expect(review.getByRole("status")).toHaveText("Сверка сохранена. Квитанция " + saved.id);
+          await page.reload();
+          await review.getByText("История сверки досылок (1)", { exact: true }).click();
+          await expect(review.getByText("Квитанция " + saved.id)).toBeVisible();
+          await expect(review.getByText(reason, { exact: true })).toBeVisible();
+          await expect(review.getByRole("button", { name: /^Опора досылки/ })).toHaveCount(2);
+          await expect(confirm).toHaveCount(0);
+          await review.getByRole("button", { name: /^Опора досылки/ }).first().click();
+          const evidence = page.getByRole("region", { name: "Оригинал и основание" });
+          await expect(evidence.getByText("clearance-E1.pdf", { exact: true })).toBeVisible();
+          await evidence.getByRole("button", { name: "Закрыть просмотр оригинала" }).click();
+          const artifacts = process.env.FACADE_D8_BROWSER_ARTIFACTS;
+          if (artifacts) {
+            const { mkdir } = await import("node:fs/promises");
+            const { join } = await import("node:path");
+            await mkdir(artifacts, { recursive: true });
+            await page.screenshot({ path: join(artifacts, "d8-receipt.png") });
+          }
+          await page.goto(completeness + unrelated.id + "?context=" + other.assessmentContextId);
+          await expect(page.getByRole("heading", { name: d8Property, exact: true })).toBeVisible();
+          await expect(page.getByText("Квитанция " + saved.id)).toHaveCount(0);
+          assert.equal(new URL(page.url()).searchParams.get("context"), other.assessmentContextId);
+          return saved;
+        } finally {
+          await browser.close();
+        }
+      }
+
+      const receipt = withD8Browser ? await submitInBrowser() : (await submit(refs, current.version, 201)).json();
+      assert.deepEqual(receipt.receiptIds, [corrected]);
+      const close = (await request("GET", target + "/facade-assessment")).json();
+      assert.equal(questionAt(close, "variable").outcome, "covered");
+      assert.equal(questionAt(close, "inventory").decision.id, inventoryDecision.id);
+      assert.equal(questionAt(close, "anchor").version, nonD8.version);
+      assert.equal(close.contexts.find(({ facadeId }) => facadeId === other.facadeId).questions
+        .find(({ id }) => id === unrelated.id).version, unrelated.version);
+      assert.equal((await request("GET", target + "/letters/eligible?assessmentContextId=" + context.assessmentContextId))
+        .json().items.some(({ questionId }) => questionId === current.id), false);
+      const { replacements: [history] } = (await request("GET", optionPath)).json();
+      assert.equal(history.id, receipt.id);
+      assert.deepEqual(history.replaced, []);
+      assert.deepEqual(history.replacements.map(refers).sort((a, b) => a.observationId.localeCompare(b.observationId)),
+        refs.sort((a, b) => a.observationId.localeCompare(b.observationId)));
+      const historical = (await request("GET", d8Sent.url)).json();
+      assert.equal(historical.text, d8Text);
+      assert.equal(historical.items[0].decisionId, clarification.id);
+      assert.deepEqual(historical.items[0].basis, d8Item.basis);
+      assert.equal(historical.items[0].basis.clarification.inventories[0].receiptId, docs);
+      assert.match((await request("GET", textExport.historicalUrl)).body, /по описи №\d+/u);
+    });
     await uploadReceipt([{ filename: "new-facade.pdf", attribute: "Designation", stage: "RD", revision: "RD2", facade: "E2",
       quote: "Drawing | Designation | Stage: RD | Revision: RD2 current | Scope: E2 | Project facade id: E2" }], next.id);
     await finishReading(true);
@@ -622,6 +840,36 @@ test("ordinary intake publishes a local conflict, then keeps sent history after 
     assert.equal(heldExport.json().code, "scope_held");
     assert.match((await request("GET", textExport.historicalUrl)).body, /по описи №\d+/u);
     assert.equal(questionAt(partial, "anchor").machine.outcome, "needs_review");
+    // New editions can temporarily remove all recognized sources of the former facade.
+    const accepted = (await request("GET", target + "/confirmation-originals")).json().originals;
+    const previousSources = accepted.filter(({ label }) => ["register.pdf", "transmittal.pdf", "clearance-E1.pdf"].includes(label));
+    assert.equal(previousSources.length, 3);
+    await uploadReceipt(previousSources.map(({ label, id }) => ({
+      filename: label, replacesVersionId: id, quote: "Awaiting engineering review of revision RD3: " + label,
+    })), next.id);
+    const awaitingReading = (await request("GET", target + "/facade-assessment")).json();
+    assert.ok(!awaitingReading.contexts.some(({ assessmentContextId }) => assessmentContextId === context.assessmentContextId));
+    const formats = [[textExport, beforeText.rawPayload], [wordExport, word.rawPayload]];
+    const waiting = (await request("GET", clarificationPath + "/current-text", undefined,
+      { status: 409, version: clarificationLetter.version })).json();
+    assert.equal(waiting.code, "scope_held");
+    assert.ok(waiting.holds.length);
+    await request("GET", target + "/letters/eligible?assessmentContextId=" + randomUUID(), undefined, { status: 404 });
+    for (const [exported, bytes] of formats) {
+      assert.equal((await request("GET", exported.url, undefined, { status: 409 })).json().code, "scope_held");
+      assert.deepEqual((await request("GET", exported.historicalUrl)).rawPayload, bytes);
+    }
+    // Close intake holds through their domain service while the former facade still has no current source.
+    const { resolveIntakeHold } = await built("intake/gate");
+    await transaction(db, async (tx) => {
+      for (const { id, version, generation } of waiting.holds) {
+        await resolveIntakeHold(tx, { projectId: next.id, holdId: id, version, generation, scopeIds: null });
+      }
+    });
+    for (const [exported, bytes] of formats) {
+      assert.equal((await request("GET", exported.url, undefined, { status: 412 })).json().code, "letter_basis_stale");
+      assert.deepEqual((await request("GET", exported.historicalUrl)).rawPayload, bytes);
+    }
     const savedLetter = external.json();
     await request("GET", `/api/v1/letters/${savedLetter.id}/revisions/${savedLetter.revisionId}`);
     const { rows: [ledger] } = await db.query("SELECT count(*)::int AS attempts FROM gateway_attempts WHERE project_id=$1", [next.id]);

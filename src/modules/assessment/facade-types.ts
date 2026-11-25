@@ -10,10 +10,12 @@ type TypeBasis = Pick<FacadeObservation, "id" | "evidenceId" | "evidenceHref" | 
   provenanceKind?: "machine_verified";
 };
 
-type Assignment = { contextId: string; version: number; kind: string; basis: TypeBasis | OriginalBasis };
+type Assignment = { contextId: string; version: number; kind: string; basis: TypeBasis | OriginalBasis;
+  authorId?: string; authorName?: string; reason?: string };
 
 export type FacadeType = { state: "unconfirmed"; kind: null; basis: null; version: null } |
-  { state: "confirmed" | "stale"; kind: string; basis: TypeBasis | OriginalBasis; version: number };
+  { state: "confirmed" | "stale"; kind: string; basis: TypeBasis | OriginalBasis; version: number;
+    authorId?: string; authorName?: string; reason?: string };
 
 function verifiedTypeSource(fact: FacadeObservation | undefined, facadeId: string, kind: string, stage: string | null) {
   return fact && fact.proposedFacadeKind && fact.facadeKindSourceVerified && fact.revisionStatus === "current" && fact.revision &&
@@ -33,20 +35,23 @@ export function conflictingFacadeTypes(facts: FacadeObservation[], facadeId: str
 export function facadeTypeView(assignment: Assignment | undefined, fact: FacadeObservation | undefined, facadeId: string,
   stage: string | null, conflicted = false, currentOriginal?: boolean): FacadeType {
   if (!assignment) return { state: "unconfirmed", kind: null, basis: null, version: null };
-  const { basis, kind, version } = assignment;
+  const { basis, kind, version, authorId, authorName, reason } = assignment;
+  const details = { basis, kind, version, authorId, authorName, reason };
   if (basis.provenanceKind === "engineer_override") {
-    return { state: currentOriginal ? "confirmed" : "stale", kind, basis, version };
+    return { state: currentOriginal ? "confirmed" : "stale", ...details };
   }
   const current = !conflicted && fact && verifiedTypeSource(fact, facadeId, kind, stage) && fact.id === basis.id &&
     fact.evidenceId === basis.evidenceId && fact.versionId === basis.versionId &&
     fact.binding.version === basis.bindingVersion && fact.revision === basis.revision;
-  return { state: current ? "confirmed" : "stale", kind, basis, version };
+  return { state: current ? "confirmed" : "stale", ...details };
 }
 
 export async function readFacadeTypes(tx: PoolClient, projectId: string) {
   const { rows } = await tx.query<Assignment>(
-    `SELECT DISTINCT ON (context_id) context_id AS "contextId", version, kind, basis
-       FROM facade_type_assignments WHERE project_id=$1 ORDER BY context_id,version DESC`, [projectId],
+    `SELECT DISTINCT ON (a.context_id) a.context_id AS "contextId", a.version, a.kind, a.basis,
+        a.author_id AS "authorId", u.login AS "authorName", a.reason
+       FROM facade_type_assignments a JOIN users u ON u.id=a.author_id
+       WHERE a.project_id=$1 ORDER BY a.context_id,a.version DESC`, [projectId],
   );
   return new Map(rows.map((row) => [row.contextId, row]));
 }

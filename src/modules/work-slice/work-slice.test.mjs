@@ -9,6 +9,16 @@ const databaseUrl = process.env.FACADE_WORK_SLICE_TEST_DB;
 const dist = process.env.FACADE_WORK_SLICE_TEST_DIST ?? resolve('dist');
 const compiled = (name) => import(pathToFileURL(resolve(dist, name)).href);
 
+test('work-slice counts distinguish checked requirements from grounds admitted to a letter', async () => {
+  const { countRequirements } = await compiled('src/modules/work-slice/store.js');
+  const row = (outcome, letterEligible) => ({ outcome, letterEligible, machine: { outcome, citations: [] } });
+  const output = countRequirements([...Array.from({length:5}, () => row('covered', false)), row('confirmed_missing', true),
+    ...Array.from({length:10}, () => row('needs_review', false))]);
+  assert.deepEqual([output.total, output.checked, output.review, output.letter, output.ready], [16,6,10,1,5]);
+  const d8 = countRequirements([row('needs_review', true), row('needs_review', false)]);
+  assert.deepEqual([d8.total, d8.checked, d8.review, d8.letter, d8.ready], [2,0,1,1,0]);
+});
+
 test('the authorized work slice freezes totals, receipt pages and sealed inventory coordinates', { skip: !databaseUrl }, async (t) => {
   const url = new URL(databaseUrl);
   assert.equal(url.hostname, '127.0.0.1');
@@ -78,7 +88,37 @@ test('the authorized work slice freezes totals, receipt pages and sealed invento
   const openOnly = receipts[8].id;
   const heldOnly = receipts[119].id;
 
-  const initial = await success('/current');
+  // A physical page counts as a prepared map. A saved original-only placeholder does not.
+  for (const [entry, unit] of [[mapped[0], { id: '1', locator: { page: 1 } }],
+    [mapped[1], { id: 'original', locator: { coverage: 'original_only', place: 'original' } }]]) {
+    await db.query(`INSERT INTO reader_maps(project_id, document_id, version_id, reader_version, receipt_id,
+      original_sha256, format, units) VALUES($1,$2,$3,'test-map',$4,$5,'pdf',$6)`,
+      [project, entry.document, entry.version, entry.receipt, entry.hash, JSON.stringify([unit])]);
+  }
+  await db.query("UPDATE gateway_jobs SET reason='unknown_charge',next_action='operator_reconcile_attempt' WHERE id=$1", [mapped[70].job]);
+  const guard = await db.connect();
+  let requests;
+  try {
+    await guard.query('BEGIN');
+    await guard.query("SELECT pg_advisory_xact_lock(hashtextextended('intake/project/' || $1::text, 0))", [project]);
+    requests = Promise.all([success('/current'), success('/current', viewer)]);
+    // Wait until both repeatable-read snapshots have reached the locked project.
+    for (let i = 0; ; i++) {
+      const { rows: [locks] } = await guard.query(`SELECT count(*)::int AS waiters FROM pg_locks
+        WHERE locktype='advisory' AND NOT granted AND database=(SELECT oid FROM pg_database WHERE datname=current_database())`);
+      if (locks.waiters >= 2) break;
+      assert.ok(i < 100, 'Both readers reached the protected snapshot');
+      await new Promise(resolve => setTimeout(resolve, 25));
+    }
+  } finally {
+    await guard.query('ROLLBACK');
+    guard.release();
+  }
+  const [initial, concurrent] = await requests;
+  assert.equal(concurrent.workSliceId, initial.workSliceId);
+  assert.deepEqual(initial.files, { accepted: 71, prepared: 1 });
+  assert.deepEqual(initial.stops, [{ jobId: mapped[70].job, branch: 'A', reason: 'unknown_charge',
+    nextAction: 'operator_reconcile_attempt', receiptId: mapped[70].receipt, versionId: mapped[70].version, label: 'synthetic.pdf' }]);
   assert.deepEqual(initial.totals, { all: 135, open: 90, processing: 70 });
   assert.ok(Number(initial.cursor) > 0, 'The assessment publication is inside the same slice');
   assert.equal(initial.confirmedBytes, 7_100);

@@ -1,7 +1,8 @@
-import type { BrowserContext } from '@playwright/test';
+import { expect, type BrowserContext } from '@playwright/test';
 import { createHash, randomUUID } from 'node:crypto';
 import { resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
+import type { PoolClient } from 'pg';
 import type { Assessment } from '../src/lib/workspace';
 import { accepted, command, unique } from './synthetic';
 
@@ -12,12 +13,19 @@ export type Publication = {
   receiptId: string; holdId: string; sha256: string;
 };
 type Hold = { id: string; generation: number; version: number };
+type PrimaryReviewChange = {
+  questionId: string;
+  expectedDependencyVersion: number | undefined;
+  review: { inputGeneration: string; findings: []; remaining: string[]; completenessChecked: false };
+};
 
 export async function addressedFixture(build: string, context: BrowserContext, origin: string, parts: string[]) {
   const compiled = (name: string) => import(pathToFileURL(resolve(build, 'src', name + '.js')).href);
-  const [{ openPool }, { readConfig }, { transaction }, { createIntakeStorage }, { createRuntimePdfService }, supplements, questions] = await Promise.all([
+  const [{ openPool }, { readConfig }, { transaction }, { createIntakeStorage }, uploads,
+    { createRuntimePdfService }, supplements, questions, assessment] = await Promise.all([
     compiled('platform/db'), compiled('platform/config'), compiled('modules/access/commands'), compiled('modules/intake/blob'),
-    compiled('modules/pdf/index'), compiled('modules/supplements/index'), compiled('modules/questions/index'),
+    compiled('modules/intake/uploads'), compiled('modules/pdf/index'), compiled('modules/supplements/index'),
+    compiled('modules/questions/index'), compiled('modules/assessment/index'),
   ]);
   const catalog = await accepted<{ id: string }>(await command(context, origin, '/api/catalogs', 'POST', {
     key: unique('web-addressed'), name: 'Каталог адресной замены',
@@ -38,8 +46,9 @@ export async function addressedFixture(build: string, context: BrowserContext, o
   const storage = createIntakeStorage(config.dataDir);
   const reader = createRuntimePdfService(db, config, { storage });
   const ports = questions.createRuntimeInquiryPorts(db, reader, storage.objects);
-  const getAssessment = () => context.request.get(base + '/assessments/current?scopeId=' + scopeId)
-    .then((response) => accepted<Assessment>(response, 'Комплектность'));
+  const getAssessment = (version: number | 'current' = 'current') =>
+    context.request.get(base + '/assessments/' + version + '?scopeId=' + scopeId)
+      .then((response) => accepted<Assessment>(response, 'Комплектность'));
 
   async function upload(file: FileInput): Promise<Publication> {
     const sha256 = createHash('sha256').update(file.buffer).digest('hex');
@@ -56,9 +65,16 @@ export async function addressedFixture(build: string, context: BrowserContext, o
     await accepted(await context.request.put(path + '/parts/1', {
       data: file.buffer, headers: { Origin: origin, 'X-CSRF-Token': csrfToken, 'Content-Type': 'application/octet-stream', 'X-Part-SHA256': sha256 },
     }), 'Часть');
-    const result = await accepted<Pick<Publication, 'documentId' | 'versionId' | 'jobId'>>(
-      await command(context, origin, path + '/complete', 'POST', {}), 'Финализация',
-    );
+    const input = { projectId: project.id, uploadId: declared.uploadId };
+    const prepared = await uploads.prepareOriginal(db, storage, input);
+    const result = await transaction(db, async (tx: PoolClient): Promise<Pick<Publication, 'documentId' | 'versionId' | 'jobId'>> => {
+      // The fixture owns primary publication for these jobs. Claim them in the
+      // finalization transaction so the background dispatcher cannot see them pending.
+      const publication = await uploads.publishPreparedOriginal(tx, input, prepared);
+      await tx.query('UPDATE intake_reader_jobs SET dispatched_at=clock_timestamp() WHERE project_id=$1 AND id=$2',
+        [project.id, publication.jobId]);
+      return publication;
+    });
     await accepted(await command(context, origin, '/api/receipts/' + receiptId + '/seal', 'POST', {}), 'Запечатать опись');
     return { ...result, projectId: project.id, receiptId, holdId: declared.holdId, sha256 };
   }
@@ -102,12 +118,22 @@ export async function addressedFixture(build: string, context: BrowserContext, o
 
   return {
     project, base, scopeId, catalogVersionId: catalog.id, recipient, getAssessment, upload, observe, resolveHold,
+    publishPrimaryReview(change: PrimaryReviewChange) {
+      return transaction(db, (tx: PoolClient) => assessment.applyAssessmentUpdate(tx, {
+        projectId: project.id, scopeId, eventId: randomUUID(), reason: 'primary_research_update', changes: [change],
+      })) as Promise<{ assessmentVersion: number }>;
+    },
     async drain() {
-      const signal = new AbortController().signal;
-      for (let job = 0; job < 30; job++) {
-        if (!await questions.processNextInquiry(db, ports, signal)) return;
-      }
-      throw new Error('Очередь вопросов синтетического проекта не опустела');
+      const signal = AbortSignal.timeout(30_000);
+      const pending = () => db.query(
+        'SELECT 1 FROM inquiry_jobs j JOIN inquiries i ON i.id=j.inquiry_id WHERE i.project_id=$1 LIMIT 1',
+        [project.id],
+      );
+      await expect.poll(async () => {
+        if (!(await pending()).rowCount) return 0;
+        await questions.processNextInquiry(db, ports, signal);
+        return (await pending()).rowCount;
+      }, { message: 'Очередь поиска синтетического проекта', timeout: 30_000 }).toBe(0);
     },
     async close() {
       storage.objects.close();

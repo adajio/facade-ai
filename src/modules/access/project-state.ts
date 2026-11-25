@@ -30,6 +30,12 @@ export interface DefaultProfile {
   approvalReference: string;
 }
 
+export const initialProjectStage = 'Стадия 1';
+
+export function isInitialStageProfile(profile?: DefaultProfile | null) {
+  return profile?.stage === initialProjectStage && profile.facadeKinds.length === 0;
+}
+
 export interface Catalog {
   id: string;
   key: string;
@@ -56,10 +62,11 @@ export function facadeKindSet(value: unknown): string[] {
 
 export function defaultProfile(value: unknown): DefaultProfile {
   const input = object(value);
+  const stage = text(input.stage, 'stage');
   const facadeKinds = facadeKindSet(input.facadeKinds);
-  if (!facadeKinds.length) throw invalid('invalid_facade_kinds');
+  if (!facadeKinds.length && stage !== initialProjectStage) throw invalid('invalid_facade_kinds');
   return {
-    stage: text(input.stage, 'stage'),
+    stage,
     facadeKinds,
     approvalReference: text(input.approvalReference, 'approvalReference', 500),
   };
@@ -67,7 +74,8 @@ export function defaultProfile(value: unknown): DefaultProfile {
 
 export function versionHref(projectId: string) { return `/api/projects/${projectId}`; }
 
-export function stageStatus(project: Project) {
+export function stageStatus(project: Pick<Project, 'stage' | 'stageBasis' | 'intakeMode'>) {
+  if (project.intakeMode && project.stage === initialProjectStage && !project.stageBasis) return 'default';
   if (project.stage !== null) return 'confirmed';
   return project.intakeMode ? 'unknown' : 'legacy_unconfirmed';
 }
@@ -101,14 +109,16 @@ export async function lockProjectApplicability(tx: PoolClient, projectId: string
 }
 
 export async function catalogOptions(db: Pool | PoolClient, project: Project, after: string | null = null) {
-  const { rows } = await db.query<Pick<Catalog, 'id' | 'key' | 'name' | 'revision'>>(
-    `SELECT id, catalog_key AS key, name, revision FROM catalog_versions WHERE organization_id = $1
-       AND (NOT $2::boolean OR (default_stage = $3 AND default_facade_kinds = $4 AND jsonb_array_length(requirements) > 0))
+  const { rows } = await db.query<Catalog>(
+    `SELECT ${catalogColumns}, ${catalogProfileColumn} FROM catalog_versions WHERE organization_id = $1
+       AND (NOT $2::boolean OR (default_stage = $3 AND jsonb_array_length(requirements) > 0
+         AND (default_facade_kinds = $4 OR ($3 = $6 AND cardinality(default_facade_kinds) = 0))))
        AND ($5::uuid IS NULL OR id > $5) ORDER BY id LIMIT 101`,
-    [project.organizationId, project.intakeMode, project.stage, project.confirmedFacadeKinds, after],
+    [project.organizationId, project.intakeMode, project.stage, project.confirmedFacadeKinds, after, initialProjectStage],
   );
   const reason = !project.intakeMode ? 'legacy' : !project.stage ? 'stage_unknown'
-    : !project.confirmedFacadeKinds.length ? 'facades_unconfirmed' : !rows.length && !after ? 'no_approved_profile'
+    : project.stage !== initialProjectStage && !project.confirmedFacadeKinds.length ? 'facades_unconfirmed'
+    : !rows.length && !after ? 'no_approved_profile'
     : rows.length > 1 ? 'multiple_profiles' : 'applicable_profile';
   return { reason, catalogs: rows.slice(0, 100), nextCursor: rows.length > 100 ? rows[99].id : null };
 }
@@ -123,8 +133,9 @@ export async function assertApplicableCatalog(tx: PoolClient, project: Project, 
 export function matchesDefaultProfile(project: Project, catalog: Catalog) {
   const profile = catalog.defaultProfile;
   return Boolean(profile && catalog.requirements.length && project.stage === profile.stage &&
-    profile.facadeKinds.length === project.confirmedFacadeKinds.length &&
-    profile.facadeKinds.every((kind, index) => kind === project.confirmedFacadeKinds[index]));
+    (isInitialStageProfile(profile) || (
+      profile.facadeKinds.length === project.confirmedFacadeKinds.length &&
+      profile.facadeKinds.every((kind, index) => kind === project.confirmedFacadeKinds[index]))));
 }
 
 export async function invariantProfileRequirements(tx: PoolClient, project: Project, pinned: Catalog, knownKinds: string[]) {
@@ -160,8 +171,9 @@ export async function assignCatalog(tx: PoolClient, project: Project, scopes: Pr
   return saved;
 }
 
-async function resolveDefault(tx: PoolClient, project: Project, scopes: ProjectScope[], actor: AccessActor) {
-  if (!project.intakeMode || project.catalogVersionId !== null || !project.stage || !project.confirmedFacadeKinds.length) return project;
+export async function resolveDefault(tx: PoolClient, project: Project, scopes: ProjectScope[], actor: AccessActor) {
+  if (!project.intakeMode || project.catalogVersionId !== null || !project.stage ||
+      (project.stage !== initialProjectStage && !project.confirmedFacadeKinds.length)) return project;
   const options = await catalogOptions(tx, project);
   if (options.catalogs.length !== 1) return project;
   const saved = await assignCatalog(tx, project, scopes, options.catalogs[0].id);
@@ -187,8 +199,8 @@ export async function setProjectStage(
 export async function resolvePublishedProfile(tx: PoolClient, profile: DefaultProfile, actor: AccessActor) {
   const { rows } = await tx.query<{ id: string }>(
     `SELECT id FROM projects WHERE organization_id = $1 AND intake_mode AND catalog_version_id IS NULL
-       AND project_stage = $2 AND confirmed_facade_kinds = $3 ORDER BY id`,
-    [actor.organizationId, profile.stage, profile.facadeKinds],
+       AND project_stage = $2 AND ($4::boolean OR confirmed_facade_kinds = $3) ORDER BY id`,
+    [actor.organizationId, profile.stage, profile.facadeKinds, isInitialStageProfile(profile)],
   );
   for (const { id } of rows) {
     const { project, scopes } = await lockProjectApplicability(tx, id);

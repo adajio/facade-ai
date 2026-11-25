@@ -1,14 +1,18 @@
 import { createHash } from "node:crypto";
 import type { PoolClient } from "pg";
 import type { FacadeMention } from "../harness/facade-discovery.js";
-import { catalogOptions, getCatalog, getProject, invariantProfileRequirements, matchesDefaultProfile } from "../access/project-state.js";
+import {
+  catalogOptions, getCatalog, getProject, invariantProfileRequirements, isInitialStageProfile, matchesDefaultProfile,
+} from "../access/project-state.js";
 import { lockIntakeProject } from "../intake/gate.js";
 import { publishProjectEvent } from "../supplements/events.js";
-import { canonicalJson, evaluate, requirementSubjectKey, type ClarificationBasis } from "./domain.js";
+import { canonicalJson, evaluate, normalizeFactValue, requirementSubjectKey, type ClarificationBasis } from "./domain.js";
+import { matchingDocumentFacadeLink, publicDocumentFacadeLink } from './document-facades.js';
 import { comparisonReview, type ComparisonReview } from "./facade-comparison.js";
 import { readFacadeInput, type FacadeObservation } from "./facade-input.js";
 import { approvedEvidenceSubjects } from "./facade-rule.js";
 import { assessSemanticRemainder, facadeVerdict, type SemanticRemainder } from "./facade-semantic.js";
+import { factEquivalenceKey, holdReviewedEvidence, type FactReviewView } from "./fact-review.js";
 import { conflictingFacadeTypes, facadeTypeView, readFacadeTypes, type FacadeType } from "./facade-types.js";
 import {
   facadeReview, requirementsFor, type CoverageBoundary, type FacadeCandidate, type FacadeContext,
@@ -136,9 +140,9 @@ async function synchronizeContext(tx: PoolClient, projectId: string, context: Fa
         address: { unitId: place.unitId, ...(place.box ? { box: place.box } : {}) },
       })),
     } : undefined;
-    const review = facadeReview({ questionId: id, context, stage, requirement, facts,
+    const review = holdReviewedEvidence(facadeReview({ questionId: id, context, stage, requirement, facts,
       pairs: input.evidence.pairs, coverage, versionIds: input.versionIds, supplementReceiptIds,
-      knownSubjectKeys, semanticBasisIds: semantic.basisIds, clarification });
+      knownSubjectKeys, semanticBasisIds: semantic.basisIds, clarification }), input.factReviews);
     const machine = evaluate(requirement, review);
     const expired = old?.decision?.exclusion?.until && Date.parse(old.decision.exclusion.until) <= now;
     if (old?.active && !expired && existing?.catalog_version_id === catalog?.id &&
@@ -161,7 +165,10 @@ async function synchronizeContext(tx: PoolClient, projectId: string, context: Fa
 
   const scope = { id: context.id, name: context.name, stage: stage ?? "" };
   const typeBasis = context.facadeType?.version ? [context.facadeType.version, context.facadeType.state] : [];
-  const token = canonicalJson([scope, catalog?.id ?? null, limitations, ...typeBasis]);
+  const documentScope = context.facadeId ? input.links.filter(({ facadeId }) => facadeId === context.facadeId)
+    .map(({ versionId, version }) => [versionId, version]) : [];
+  const token = canonicalJson([scope, catalog?.id ?? null, limitations, ...typeBasis,
+    ...(documentScope.length ? [documentScope] : [])]);
   const revision = existing && !changed.length && existing.source_token === token ? existing :
     await writeRevision(tx, { scope_id: context.id, catalog_version_id: catalog?.id ?? null,
       source_token: token, scope, limitations }, (existing?.version ?? 0) + 1, gate, change);
@@ -176,6 +183,8 @@ type FacadeSummary = Omit<ContextSnapshot, "scope" | "questions"> & {
   kind: FacadeContext["kind"];
   facadeId: string | null;
   facadeType?: FacadeType;
+  documentFacadeLinks?: ReturnType<typeof publicDocumentFacadeLink>[];
+  previousConclusion?: { assessmentVersion: number; startWork: string; basedOnVersion: number; reason: string };
   conflictingTypes?: { kind: string; citation: Pick<FacadeObservation, "evidenceId" | "versionId" | "documentId" | "sha256" | "address"> &
     { quote?: string } }[];
   identity?: { state: "independent" | "one_branch" | "engineer"; sources: MentionSource[] };
@@ -204,6 +213,7 @@ async function summarize(tx: PoolClient, active: ActiveContext, gate: Gate): Pro
 }
 
 type FacadeSnapshot = {
+  acceptedVersions?: number;
   projectId: string;
   catalogVersionId: string | null;
   catalog: Pick<Catalog, "id" | "key" | "name" | "revision"> | null;
@@ -246,12 +256,16 @@ export async function synchronizeFacadeAssessment(tx: PoolClient, projectId: str
     const conflicts = conflictingFacadeTypes(typesByFacade.get(context.facadeId) ?? [], context.facadeId, project.stage);
     if (conflicts.length) conflicted.set(context.facadeId, conflicts);
     const basis = assignment?.basis;
-    context.facadeType = facadeTypeView(assignment, basis && "id" in basis ? observationsById.get(basis.id) : undefined,
-      context.facadeId, project.stage, Boolean(conflicts.length), basis && currentVersions.has(basis.versionId));
+    const originalLink = basis?.provenanceKind === 'engineer_override' ?
+      matchingDocumentFacadeLink(input.linksByVersion.get(basis.versionId), basis.address) : undefined;
+    const currentOriginal = basis && currentVersions.has(basis.versionId) && (!originalLink || originalLink.facadeId === context.facadeId);
+    const machineBasis = basis && "id" in basis && input.factReviews.get(basis.id)?.state !== "review_required" ?
+      observationsById.get(basis.id) : undefined;
+    context.facadeType = facadeTypeView(assignment, machineBasis, context.facadeId, project.stage, Boolean(conflicts.length), currentOriginal);
   }
   const types = contexts.flatMap(({ facadeId, facadeType }) => facadeId ? [facadeType?.state === "confirmed" ? facadeType.kind : null] : []);
   const knownKinds = [...new Set(types.filter((type): type is string => type !== null))].sort();
-  const staleProfile = project.facadeKindsFromAssignments && (types.includes(null) ||
+  const staleProfile = !isInitialStageProfile(pinned?.defaultProfile) && project.facadeKindsFromAssignments && (types.includes(null) ||
     canonicalJson(knownKinds) !== canonicalJson(project.confirmedFacadeKinds));
   const retained = staleProfile && pinned ? await invariantProfileRequirements(tx, project, pinned, knownKinds) : [];
   const catalog = pinned && (!project.intakeMode || !staleProfile && matchesDefaultProfile(project, pinned)) ? pinned :
@@ -287,11 +301,31 @@ export async function synchronizeFacadeAssessment(tx: PoolClient, projectId: str
     row.part, ...row.aliases ?? [],
     ...row.evidenceRule?.allOf.flatMap(({ anyOf }) => anyOf.flatMap(({ subject }) => subject ? [subject] : [])) ?? [],
   ]).map(requirementSubjectKey));
+  const documentLinks = Map.groupBy(input.links, ({ facadeId }) => facadeId);
+  const previousByContext = new Map(latest?.payload.contexts.map((item) => [item.assessmentContextId, item]));
   for (const context of contexts) {
     const result = await synchronizeContext(tx, projectId, context, project.stage, catalog, input, coverage, gate,
       catalogLimitations, knownSubjectKeys, checkedInventory);
     active.push(result);
     const summary = await summarize(tx, result, gate);
+    const previous = previousByContext.get(context.id);
+    if (!summary.conclusion && previous?.conclusion && latest) {
+      const { basis, startWork, basedOnVersion } = previous.conclusion;
+      const basisVersion = basis?.kind === 'original' ? basis.original.versionId : basis?.kind === 'citation' ? basis.citation.versionId : basis?.versionId;
+      const sourceChanged = basisVersion && !currentVersions.has(basisVersion);
+      const reassigned = basis?.kind === 'original' && context.facadeId && matchingDocumentFacadeLink(
+        input.linksByVersion.get(basis.original.versionId), basis.original.address,
+      );
+      const reason = sourceChanged ? 'Редакция исходного документа выбыла из действующего комплекта.' :
+        reassigned && reassigned.facadeId !== context.facadeId ? 'Место исходного решения связано с другим фасадом.' :
+        result.revision.change.reason === 'engineer_decision' ? 'Инженерское решение по одному из требований изменилось.' :
+        'Основания или применимость изменились при обновлении оценки.';
+      summary.previousConclusion = { assessmentVersion: latest.version, startWork, basedOnVersion, reason };
+    } else if (!summary.conclusion && previous?.previousConclusion) {
+      summary.previousConclusion = previous.previousConclusion;
+    }
+    const links = context.facadeId ? documentLinks.get(context.facadeId) : undefined;
+    if (links?.length) summary.documentFacadeLinks = links.map(publicDocumentFacadeLink);
     const identity = context.facadeId ? input.discovery.identity.get(context.facadeId) : undefined;
     if (identity && identity.identity !== "unresolved") summary.identity = {
       state: identity.identity, sources: identity.mentions.slice(0, 8).flatMap((mention) => mentionSource(mention, observationsById)),
@@ -305,11 +339,11 @@ export async function synchronizeFacadeAssessment(tx: PoolClient, projectId: str
   const questions = summaries.flatMap(({ questions }) => questions);
   if (questions.some(({ semanticRemainder }) => semanticRemainder.state === "open")) limitations.push("semantic_remainder_open");
   if (catalog && project.stage && !questions.length) limitations.push("no_applicable_requirements");
-  const observations = input.observations.map((fact) => ({
-    ref: `${fact.id}:${createHash("sha256").update(canonicalJson(fact)).digest("hex")}`,
-    id: fact.id,
-    payload: fact,
-  }));
+  const observations = input.observations.map((fact) => {
+    const engineeringReview = input.factReviews.get(fact.id);
+    const payload = { ...fact, equivalenceKey: factEquivalenceKey(fact), ...(engineeringReview ? { engineeringReview } : {}) };
+    return { ref: `${fact.id}:${createHash("sha256").update(canonicalJson(payload)).digest("hex")}`, id: fact.id, payload };
+  });
   const counts = { identified: 0, common: 0, unclear: 0, unidentified: 0 };
   const proposalCounts = { stage: 0, facadeKind: 0 };
   for (const observation of input.observations) {
@@ -319,9 +353,10 @@ export async function synchronizeFacadeAssessment(tx: PoolClient, projectId: str
   }
   const catalogView = catalog ? { id: catalog.id, key: catalog.key, name: catalog.name, revision: catalog.revision } : null;
   const payload: FacadeSnapshot = {
+    acceptedVersions: input.versions.length,
     projectId, catalogVersionId: project.catalogVersionId, catalog: catalogView, stage: project.stage, coverage, limitations, contexts: summaries,
     profile: { state: profileState, confirmedKinds: staleProfile ? knownKinds : project.confirmedFacadeKinds },
-    comparisonReview: comparisonReview(input.evidence.facts, input.observations, contexts, catalog, project.stage, input.evidence.pairs,
+    comparisonReview: comparisonReview(input.evidence.facts, input.observations, contexts, catalog, project, input.evidence.pairs,
       input.discovery.unresolved, input.comparisonReads, input.comparisonRows),
     unresolvedMentions: { limited: input.discovery.unresolved.length > 24,
       items: input.discovery.unresolved.slice(0, 24).flatMap((mention) => mentionSource(mention, observationsById)) },
@@ -330,7 +365,9 @@ export async function synchronizeFacadeAssessment(tx: PoolClient, projectId: str
     observations: { counts, proposalCounts, refs: observations.map(({ ref }) => ref).sort() },
     outcome: facadeVerdict(coverage, limitations, questions),
   };
-  if (latest && canonicalJson(latest.payload) === canonicalJson(payload)) return { ...latest, gate, active, input, conflicted };
+  // PostgreSQL JSONB drops undefined object members. Compare the same serialized
+  // representation that is stored, otherwise every read can publish an identical version.
+  if (latest && canonicalJson(latest.payload) === canonicalJson(JSON.parse(JSON.stringify(payload)))) return { ...latest, gate, active, input, conflicted };
   const previous = new Set(latest?.payload.observations.refs);
   const newObservations = observations.filter(({ ref }) => !previous.has(ref));
   if (newObservations.length) {
@@ -358,24 +395,27 @@ export async function readFacadeSnapshot(tx: PoolClient, projectId: string, vers
 
 export async function readFacadeObservationPage(tx: PoolClient, projectId: string, version: number, options: {
   binding?: FacadeObservation["binding"]["state"]; facadeId?: string; after?: string; limit: number;
-  proposal?: "stage" | "facadeKind";
+  proposal?: "stage" | "facadeKind"; grouped?: boolean; observationId?: string;
 }) {
   const current = await readFacadeSnapshot(tx, projectId, version);
   if (!current) throw new AssessmentError(404, "assessment_not_found", "Версия оценки недоступна.");
-  const { rows } = await tx.query<{ payload: FacadeObservation }>(
+  const { rows } = await tx.query<{ payload: FacadeObservation & { engineeringReview?: FactReviewView } }>(
     `SELECT o.payload FROM facade_assessment_observations o
      WHERE o.project_id=$1 AND o.ref=ANY($2::text[])
        AND ($3::text IS NULL OR o.payload#>>'{binding,state}'=$3)
        AND ($4::uuid IS NULL OR o.payload#>'{binding,candidates}' @> jsonb_build_array(jsonb_build_object('id',$4::text)))
+       AND ($9::uuid IS NULL OR o.observation_id=$9)
        AND ($5::uuid IS NULL OR o.observation_id>$5)
+       AND ($9::uuid IS NOT NULL OR NOT $8::boolean OR o.payload#>>'{engineeringReview,mergedInto}' IS NULL)
        AND ($7::text IS NULL OR ($7='stage' AND o.payload->>'designStage' IS NOT NULL AND o.payload#>>'{basis,stage}' IS NOT NULL
           AND o.payload->>'revisionStatus'<>'superseded')
          OR ($7='facadeKind' AND o.payload->>'proposedFacadeKind' IS NOT NULL))
      ORDER BY o.observation_id LIMIT $6`,
     [projectId, current.payload.observations.refs, options.binding ?? null, options.facadeId ?? null,
-      options.after ?? null, options.limit + 1, options.proposal ?? null],
+      options.after ?? null, options.limit + 1, options.proposal ?? null, options.grouped ?? false, options.observationId ?? null],
   );
-  const items = rows.slice(0, options.limit).map(({ payload }) => payload);
+  const items = rows.slice(0, options.limit).map(({ payload }) => payload.normalized === undefined ?
+    { ...payload, normalized: normalizeFactValue(payload.value, payload.unit) } : payload);
   return { version, items, nextCursor: rows.length > options.limit ? items.at(-1)!.id : null };
 }
 

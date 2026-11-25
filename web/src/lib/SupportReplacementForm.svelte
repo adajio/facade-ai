@@ -6,7 +6,10 @@
 
   type Choice = { source: InquirySupport; blocked?: string };
 
-  let { version, subject, scope, catalog, formats, incoming, previous, pending, problem, result, open, save }: {
+  let {
+    assessmentVersion, version, subject, scope, catalog, formats, incoming, previous, pending, problem, result, reviewHref, open, save,
+  }: {
+    assessmentVersion: number;
     version: number;
     subject: string;
     scope: string;
@@ -17,6 +20,7 @@
     pending: boolean;
     problem: string;
     result: string;
+    reviewHref: string;
     open: OpenEvidence;
     save: (input: { next: string[]; prior: string[]; reason: string; version: number }) => Promise<boolean>;
   } = $props();
@@ -75,11 +79,12 @@
     <dt>Область</dt><dd>{scope}</dd>
     <dt>Закреплённый каталог</dt><dd>{catalog}</dd>
     {#if formats.length}<dt>Допустимые формы по каталогу</dt><dd>{formats.map((format) => format.toUpperCase()).join(', ')}</dd>{/if}
-    <dt>Версия для подтверждения</dt><dd>{basedOn ?? version}</dd>
+    <dt>Версия оценки</dt><dd>{assessmentVersion}</dd>
+    <dt>Версия строки для подтверждения</dt><dd>{basedOn ?? version}</dd>
   </dl>
   <Notice kind="error" message={problem} />
   <Notice kind="success" message={result} />
-  {#if incoming.length && previous.length}
+  {#if incoming.length}
     <form onsubmit={submit}>
       <fieldset>
         <legend>Новые опоры обеих ветвей</legend>
@@ -96,6 +101,10 @@
       </fieldset>
       <fieldset>
         <legend>Прежние опоры, которые нужно заменить</legend>
+        {#if !previous.length}
+          <Notice message="В текущей версии оценки прежние опоры отсутствуют. Повторно сверьте эту строку, чтобы продолжить замену." />
+          <p><a href={reviewHref}>Открыть строку для сверки</a></p>
+        {/if}
         {#each previousChoices as source (source.observationId)}
           <label><input type="checkbox" bind:group={prior} value={source.observationId} onchange={selectionChanged} disabled={pending} /> {info(source)}{source.branch ? ' · ветвь ' + source.branch : ''}</label>
           <details>

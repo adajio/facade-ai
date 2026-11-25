@@ -45,7 +45,10 @@ export async function createApi(config: AppConfig): Promise<FastifyInstance> {
       ? error as Error & { statusCode?: number; code?: string }
       : undefined
     const status = failure?.statusCode && failure.statusCode >= 400 ? failure.statusCode : 500
-    if (status >= 500) request.log.error({ status }, 'Request failed')
+    if (status >= 500) {
+      const sqlState = failure?.code && /^[0-9A-Z]{5}$/.test(failure.code) ? failure.code : undefined
+      request.log.error({ status, method: request.method, route: request.routeOptions.url, sqlState }, 'Request failed')
+    }
     return reply.code(status).send({
       code: status < 500 ? failure?.code ?? 'bad_request' : 'internal_error',
       message: status < 500 ? failure?.message : 'Internal server error',

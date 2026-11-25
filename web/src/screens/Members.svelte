@@ -1,4 +1,5 @@
 <script lang="ts">
+  import CatalogSummary from '../lib/CatalogSummary.svelte';
   import OriginalBasisFields from '../lib/OriginalBasisFields.svelte';
   import { originalUrl, renderAddress } from '../lib/copilot';
   import { copy } from '../lib/copy';
@@ -8,6 +9,7 @@
   import { type Catalog, type Project } from '../lib/contracts';
   import { describe, id, query, type Api } from '../lib/http';
   import { date, label } from '../lib/format';
+  import { projectStageLabel } from '../lib/project-stages';
   import { projectApi, scopedUrl } from '../lib/workspace';
   import Notice from '../lib/Notice.svelte';
   import ProjectProposals from '../lib/ProjectProposals.svelte';
@@ -178,6 +180,8 @@
             {#each catalogs as catalog (catalog.id)}<option value={catalog.id}>{catalog.name} · {catalog.revision}</option>{/each}
           </select>
         </label>
+        {#each catalogs as option (option.id)}<CatalogSummary catalog={option} />{/each}
+        {#if catalogVersionId && project.catalogVersionId !== catalogVersionId}<p>Текущая оценка будет пересчитана по выбранным правилам. В истории сохранятся прежние оценки и письма.</p>{/if}
         {#if catalogCursor}<button type="button" disabled={busy} onclick={() => loadCatalogOptions(catalogCursor ?? undefined)}>Ещё версии</button>{/if}
         <div class="actions"><button class="primary" disabled={busy || catalogVersion == null || !catalogVersionId}>Назначить рабочий каталог</button></div>
       </form>
@@ -186,7 +190,7 @@
   <section class="card">
     <h2>Стадия проекта</h2>
     {#if project.stage}
-      <p>Подтверждённая стадия: {project.stage}</p>
+      <p>{project.stageStatus === 'default' ? 'Стадия по умолчанию' : 'Подтверждённая стадия'}: {projectStageLabel(project.stage)}</p>
       {#if project.stageBasis?.provenanceKind === 'engineer_override'}
         {@const basis = project.stageBasis}
         <span class="pill good">Установлено инженером</span>

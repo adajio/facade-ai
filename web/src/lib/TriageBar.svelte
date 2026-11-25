@@ -1,22 +1,24 @@
 <script lang="ts">
   import { triageOptions, type Triage } from './triage';
-  let { value, counts, choose, letterUrl }: {
-    value: Triage; counts: Record<Triage, number>; choose: (value: Triage) => void; letterUrl: string;
+  let { value, counts, checked, choose, letterUrl }: {
+    value: Triage; counts: Record<'review' | 'letter' | 'done', number>; checked: number; choose: (value: Triage) => void; letterUrl: string;
   } = $props();
-  const labels = { review: 'Требует проверки', letter: 'Для письма клиенту', done: 'Готово / Покрыто' };
+  const labels = { all: 'Все требования', checked: 'Проверено', review: 'Требуют проверки', letter: 'Для письма', done: 'Готово' };
+  let totals = $derived({ ...counts, all: counts.review + counts.letter + counts.done, checked });
+  const options: Triage[] = ['all', 'checked', ...triageOptions];
   const name = $props.id();
 </script>
 
 <div class="triage-actions">
   <fieldset aria-label="Состояние позиций">
-    {#each triageOptions as item (item)}
+    {#each options as item (item)}
       <label class:active={item === value}>
         <input type="radio" {name} value={item} checked={item === value} onchange={() => choose(item)} />
-        {labels[item]} <strong>{counts[item]}</strong>
+        {labels[item]} <strong>{totals[item]}</strong>
       </label>
     {/each}
   </fieldset>
-  {#if value === 'letter'}<a class="button" href={letterUrl}>Перейти к письму</a>{/if}
+  {#if value === 'letter'}<a class="button" href={letterUrl}>Открыть основания для письма</a>{/if}
 </div>
 
 <style>

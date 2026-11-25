@@ -79,7 +79,9 @@ test("durable intake, replay, project holds and private Range over HTTP", { time
     "INSERT INTO intake_receipts(project_id,created_by,source) VALUES ($1,$2,'upload') RETURNING id",
     [project, owner.id],
   );
-  await db.query(await readFile(new URL("db/migrations/03_intake_zz_manifest.sql", root), "utf8"));
+  for (const file of ["03_intake_zz_manifest.sql", "04_pdf_evidence.sql", "13_access_intake_projects.sql"]) {
+    await db.query(await readFile(new URL(`db/migrations/${file}`, root), "utf8"));
+  }
   let origin;
   async function startApi() {
     const app = Fastify();

@@ -82,3 +82,24 @@ test("only checked full PDF lines can turn already stored text into external non
   assert.equal(assess({ mode: "single" }, { mode: "pair", claimContext: true }, [written("A", { old: true, frame: false, body: contradiction })])
     .outcome, "needs_review");
 });
+
+test("manual sheet stage applies to the addressed PDF page or spreadsheet cell only", async () => {
+  const { convertFact } = await built("assessment/facade-input");
+  const { canonicalJson } = await built("assessment/domain");
+  const { fact, evidence, issued } = written("A");
+  const accepted = new Map([[source.versionId, { id: source.versionId, ...source, label: "test" }]]);
+  for (const [format, key, here, adjacent] of [
+    ["pdf", [source.versionId, "pdf-page", "1"], { unitId: "1" }, { unitId: "2" }],
+    ["xlsx", [source.versionId, "xlsx-cell", "1", "A", "I3"],
+      { unitId: "1", locator: { sheet: "A", cell: "I3" } }, { unitId: "1", locator: { sheet: "B", cell: "I3" } }],
+  ]) {
+    const basis = { versionId: source.versionId, address: here, provenanceKind: "engineer_override" };
+    const stages = new Map([[canonicalJson(key), { stage: "П", originalBasis: basis }]]);
+    const read = (address) => convertFact({ ...fact, observation: { ...fact.observation, address } },
+      accepted, new Map([["window", format]]), stages, evidence, [issued], true);
+    assert.equal(read(here).stage, "П");
+    assert.deepEqual(read(here).finding.citation.stageConfirmation.originalBasis, basis);
+    assert.equal(read(adjacent).stage, "RD");
+    assert.equal(read(adjacent).finding.citation.stageConfirmation, undefined);
+  }
+});

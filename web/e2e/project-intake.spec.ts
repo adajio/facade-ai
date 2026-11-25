@@ -15,10 +15,13 @@ test.describe('Рабочее место на штатном API', () => {
     await expect(page.getByRole('navigation', { name: 'Путь к проекту' }).getByText(name)).toBeVisible();
     const path = new URL(page.url()).pathname.replace(/\/overview$/, '');
     const project = await accepted(await page.request.get('/api' + path), 'Первичный проект');
-    expect(project).toMatchObject({ stage: null, catalog: null, catalogVersionId: null, scopes: [], role: 'project_manager' });
+    await expect(page.getByRole('link', { name: 'Все проекты', exact: true })).toBeVisible();
+    await expect(page.getByRole('link', { name: 'Настройки проекта', exact: true })).toBeVisible();
+    await expect(page.getByRole('link', { name: 'Загрузить первый комплект' })).toBeVisible();
+    expect(project).toMatchObject({ stage: 'Стадия 1', catalog: null, catalogVersionId: null, scopes: [], role: 'project_manager' });
     await page.getByRole('link', { name: 'Участники' }).click();
     await expect(page.getByText('Нет рабочего каталога.', { exact: true })).toBeVisible();
-    await expect(page.getByText('Стадия уточняется.')).toBeVisible();
+    await expect(page.getByText('Стадия по умолчанию: Стадия 1. Распознавание входящих документов')).toBeVisible();
     await expect(page.getByLabel('Код стадии')).toBeVisible();
     await expect(page.getByRole('button', { name: 'Подтвердить стадию проекта' })).toBeDisabled();
     await page.getByRole('link', { name: 'Поступления' }).click();

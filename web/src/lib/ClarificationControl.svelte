@@ -1,6 +1,6 @@
 <script lang="ts">
   import { Commands } from './commands';
-  import { conflictMessage } from './conflict';
+  import { conflictMessage, conflictVersion } from './conflict';
   import { date } from './format';
   import { id, type Api } from './http';
   import { V1, type AssessmentQuestion } from './workspace';
@@ -34,6 +34,7 @@
       refresh();
     } catch (error) {
       problem = conflictMessage(error, expected);
+      if (conflictVersion(error)) { checked = false; refresh(); }
     } finally {
       pending = false;
     }
@@ -55,7 +56,7 @@
           <textarea required maxlength="2000" bind:value={reason} oninput={() => version ??= question.version}></textarea>
         </label>
         <div class="actions">
-          <button class="primary" disabled={pending || !checked || !reason.trim()}>Подтвердить запрос на уточнение</button>
+          <button class="primary" disabled={pending || !checked || !reason.trim() || (version !== undefined && version !== question.version)}>Подтвердить запрос на уточнение</button>
           {#if version !== undefined && version !== question.version}
             <button type="button" onclick={() => { version = question.version; checked = false; problem = ''; }}>Уточнить по текущей проверке</button>
           {/if}

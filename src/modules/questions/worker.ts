@@ -7,6 +7,7 @@ import { checkLocalApplicability, compareMeasurements, makePair, matchReason } f
 import type { Candidate, ObservationPublication, Pair, QuestionSearchPorts } from "./domain.js";
 import { transaction } from "../access/commands.js";
 import type { InquiryRow, SearchResult } from "./store.js";
+import { packageSearch, searchPackageInquiry } from "./package-inquiry.js";
 import { resolveNextVerifiedSupplement } from "./supplement.js";
 import { refreshCompletedSemanticReview, scheduleSemanticReview } from "./semantic-review.js";
 
@@ -40,6 +41,7 @@ async function claim(db: Pool): Promise<Job | undefined> {
 }
 
 async function search(db: Pool, job: Job, ports: QuestionSearchPorts, signal: AbortSignal): Promise<SearchResult> {
+  if (!job.scope_id) return transaction(db, (tx) => searchPackageInquiry(tx, job, ports, signal));
   const found = await db.query<{ source: ObservationPublication; superseded: boolean }>(
     `SELECT o.source, (o.superseded OR EXISTS (
        SELECT 1 FROM inquiry_replaced_places x
@@ -136,7 +138,7 @@ async function release(tx: PoolClient, job: Job) {
 
 async function complete(db: Pool, job: Job, result: SearchResult) {
   await transaction(db, async (tx) => {
-    await lockScopes(tx, job.project_id, [job.scope_id]);
+    await lockScopes(tx, job.project_id, job.scope_id ? [job.scope_id] : []);
     const current = await tx.query(
       `SELECT 1 FROM inquiries i JOIN inquiry_jobs j ON j.inquiry_id = i.id AND j.search_version = i.search_version
        WHERE i.id = $1 AND j.search_version = $2 AND j.lease_token = $3 AND j.lease_until > now()
@@ -144,11 +146,12 @@ async function complete(db: Pool, job: Job, result: SearchResult) {
       [job.id, job.search_version, job.token],
     );
     if (!current.rowCount) return;
+    const packageResult = result.packageResult ?? packageSearch(job) ?? null;
     await tx.query(
-      `INSERT INTO inquiry_search_results (inquiry_id, search_version, state, limitations, candidates, pairs)
-       VALUES ($1,$2,$3,$4,$5::jsonb,$6::jsonb)`,
+      `INSERT INTO inquiry_search_results (inquiry_id, search_version, state, limitations, candidates, pairs, package_result)
+       VALUES ($1,$2,$3,$4,$5::jsonb,$6::jsonb,$7)`,
       [job.id, job.search_version, result.state, result.limitations,
-        JSON.stringify(result.candidates), JSON.stringify(result.pairs)],
+        JSON.stringify(result.candidates), JSON.stringify(result.pairs), packageResult],
     );
     const prior = await tx.query<{ candidate_ids: string[]; candidates: Candidate[] }>(
       `SELECT d.candidate_ids, r.candidates FROM inquiry_decisions d JOIN inquiry_search_results r
@@ -167,10 +170,11 @@ async function complete(db: Pool, job: Job, result: SearchResult) {
     );
     await tx.query("UPDATE inquiries SET version = version + 1, needs_review = needs_review OR $2 WHERE id = $1",
       [job.id, needsReview]);
-    await scheduleSemanticReview(db, tx, job, result);
+    if (job.scope_id) await scheduleSemanticReview(db, tx, job, result);
     await tx.query("DELETE FROM inquiry_jobs WHERE inquiry_id = $1", [job.id]);
     await publishProjectEvent(tx, job.project_id, {
-      type: "inquiries.changed", payload: { scopeId: job.scope_id, inquiryIds: [job.id] },
+      type: "inquiries.changed", payload: { ...(job.scope_id ? { scopeId: job.scope_id } : { assessmentContextId: job.assessment_context_id }),
+        inquiryIds: [job.id] },
     });
   });
 }

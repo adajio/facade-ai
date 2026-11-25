@@ -237,6 +237,14 @@ export async function startWorker(context: WorkerContext, test?: ManagedTestOpti
     let nextLocal=0;
     const copilot={db,gateway,workerId:randomUUID(),route:copilotRoute??null,
       memory:createCopilotMemory(db,()=>service),research:createCopilotResearch(db,service)};
+    lanes.push(poll('reader availability', async () => {
+      await db.query(`INSERT INTO reader_availability (transport_enabled, observed_at, valid_until)
+        VALUES ($1, statement_timestamp(), statement_timestamp() + interval '30 seconds')
+        ON CONFLICT (transport_enabled) DO UPDATE SET observed_at=EXCLUDED.observed_at, valid_until=EXCLUDED.valid_until`,
+        [hasTransport]);
+      await delay(10_000, undefined, { signal }).catch(() => undefined);
+      return false;
+    }));
     lanes.push(
       poll('local reader and index',async()=>{
         for(let index=0;index<localReads.length;index++) {

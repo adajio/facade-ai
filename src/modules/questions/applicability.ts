@@ -1,8 +1,8 @@
 import { randomUUID } from "node:crypto";
 import type { FastifyInstance } from "fastify";
 import type { Pool, PoolClient } from "pg";
-import { requireAccess, uuid } from "../access/auth.js";
-import { executeCommand } from "../access/commands.js";
+import { authorize, readSession, requireAccess, uuid } from "../access/auth.js";
+import { executeCommand, transaction } from "../access/commands.js";
 import { AccessError, invalid, unavailable } from "../access/errors.js";
 import { canonicalJson, type Finding, type Review } from "../assessment/domain.js";
 import { facadeAssessmentHref } from "../assessment/facade-store.js";
@@ -16,7 +16,7 @@ import { deliveredLines, readAttributeAliases } from "./attribute-aliases.js";
 import { normalize } from "./domain.js";
 import type { ObservationPublication, QuestionSearchPorts } from "./domain.js";
 import { createReaderSupportOpener, createRuntimeInquiryPorts } from "./reader.js";
-import { getReplacementQuestion, replaceFacadeSources } from "./facade-replacement.js";
+import { facadeSupplementOptions, getReplacementQuestion, replaceFacadeSources } from "./facade-replacement.js";
 import { refreshAssessmentInquiries } from "./store.js";
 import { hasAddressedSubject, isAttributeAlias } from "./subject-evidence.js";
 
@@ -37,8 +37,8 @@ function record(value: unknown): Record<string, unknown> {
   return value as Record<string, unknown>;
 }
 
-function references(value: unknown): Reference[] {
-  if (!Array.isArray(value) || !value.length || value.length > 16) throw invalid();
+function references(value: unknown, allowEmpty = false): Reference[] {
+  if (!Array.isArray(value) || (!allowEmpty && !value.length) || value.length > 16) throw invalid();
   const entries = value.map((element) => {
     const item = record(element);
     return { observationId: uuid(item.observationId), evidenceId: uuid(item.evidenceId), versionId: uuid(item.versionId) };
@@ -159,19 +159,28 @@ export async function registerApplicability(app: FastifyInstance) {
 
   for (const prefix of ["/api", "/api/v1"]) {
     const path = `${prefix}/questions/:id`;
-    app.get<{ Params: { id: string } }>(`${path}/applicability`, async (request, reply) => {
+    app.get<{ Params: { id: string }; Querystring: { supplement?: string } }>(`${path}/applicability`, async (request, reply) => {
       const id = uuid(request.params.id);
       const ref = await locate(app.db, id);
       await requireAccess(app.db, request, {
         projectId: ref.projectId, scopeId: ref.assessmentContextId ? undefined : ref.scopeId, action: "project:read",
       });
       if (ref.assessmentContextId) {
-        const { rows } = await app.db.query(
+        const readHistory = async (db: Pool | PoolClient) => (await db.query(
           `SELECT id,catalog_version_id AS "catalogVersionId", author_id AS "authorId",reason,replaced,replacements,
             receipt_ids AS "receiptIds",created_at AS "createdAt"
            FROM facade_source_replacements WHERE question_id=$1 ORDER BY created_at DESC,id LIMIT 100`, [id],
-        );
-        return reply.header("Cache-Control", "no-store").send({ aliases: [], replacements: rows });
+        )).rows;
+        const { projectId, assessmentContextId } = ref;
+        if (request.query.supplement === "1") {
+          const body = await transaction(app.db, async (tx) => {
+            await authorize(tx, await readSession(tx, request), { projectId, action: "project:engineer" });
+            const state = await getReplacementQuestion(tx, projectId, assessmentContextId, id);
+            return { aliases: [], replacements: await readHistory(tx), supplement: await facadeSupplementOptions(tx, state, projectId) };
+          });
+          return reply.header("Cache-Control", "no-store").send(body);
+        }
+        return reply.header("Cache-Control", "no-store").send({ aliases: [], replacements: await readHistory(app.db) });
       }
       const [aliases, replacements] = await Promise.all([
         app.db.query(
@@ -196,7 +205,7 @@ export async function registerApplicability(app: FastifyInstance) {
         const alias = operation === "attribute-aliases" ? text(body.alias, 256) : undefined;
         const reason = text(body.reason, 2000);
         const selected = references(alias === undefined ? body.replacements : body.proof);
-        const retired = alias === undefined ? references(body.replaced) : [];
+        const retired = alias === undefined ? references(body.replaced, Boolean(ref.assessmentContextId)) : [];
         if (ref.assessmentContextId) {
           if (alias !== undefined) throw unavailable();
           const { projectId, assessmentContextId } = ref;
