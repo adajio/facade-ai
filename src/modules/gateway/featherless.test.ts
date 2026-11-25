@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { featherlessQwenModel, featherlessTransport, type FeatherlessProfile } from './featherless.js';
+import { featherlessQwenModel, featherlessQwenVisionModel, featherlessTransport, type FeatherlessProfile } from './featherless.js';
 import type { Attempt, RoutePolicy } from './types.js';
 
 const projectId = '12300000-0000-4000-8000-000000000001';
@@ -79,4 +79,39 @@ test('Featherless rejects image inputs, route mismatches and understated price b
   assert.equal(transport.quote!({ ...route, ceilingUsdNanos: 10 }, request), null);
   assert.throws(() => featherlessTransport({ ...credential, profiles: [{ ...profile, inputNanosPerToken: 999 }] }),
     /invalid_featherless_profile/);
+});
+
+test('only the pinned multimodal Featherless profile can send a bounded inline PNG', async (t) => {
+  const visionProfile: FeatherlessProfile = {
+    ...profile, model: featherlessQwenVisionModel, inputNanosPerToken: 150, outputNanosPerToken: 500,
+    images: { count: 1, maxImageWidth: 256, maxImageHeight: 256, maxImagePixels: 65_536, maxImageBytes: 4096 },
+  };
+  const transport = featherlessTransport({ ...credential, profiles: [visionProfile] });
+  const png = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAACklEQVQIHWP4DwABAQEAG7buVgAAAABJRU5ErkJggg==';
+  const text = { type: 'text', text: 'Synthetic drawing' };
+  const image = { type: 'image_url', image_url: { url: png } };
+  const messages = [{ role: 'user', content: [text, image] }];
+  const input = { ...request, model: visionProfile.model, messages };
+  const quote = transport.quote!(route, input);
+  assert.ok(quote);
+  assert.equal(quote.ceilingUsdNanos, 39_822_600);
+  assert.equal(transport.quote!(route, { ...input, messages: [{ role: 'user', content: [text, image, image] }] }), null);
+  assert.equal(transport.quote!(route, { ...input, messages: [{
+    role: 'user', content: [text, { ...image, image_url: { url: 'https://example.invalid/source.png' } }],
+  }] }), null);
+  assert.throws(() => featherlessTransport({ ...credential, profiles: [{ ...profile, images: visionProfile.images }] }),
+    /invalid_featherless_profile/);
+  const outbound = t.mock.method(globalThis, 'fetch', async () => Response.json({
+    id: 'vision-receipt', model: visionProfile.model, usage: { cost: 0.000002, prompt_tokens: 8, completion_tokens: 2 }, choices: [],
+  }));
+  const attempt: Attempt = {
+    id: 'attempt', jobId: 'job', generationId: 'generation', projectId, scopeId, purpose: 'primary_b',
+    effectKey: 'fixture', requestHash: 'sha', routeId: route.id, revision: route.revision,
+    previousRejectedId: null, dataClass: 'synthetic', ...quote,
+  };
+  const outcome = await transport.send(attempt, route, input, new AbortController().signal);
+  assert.equal(outcome.receipt.state, 'paid');
+  assert.equal(outbound.mock.callCount(), 1);
+  const args = outbound.mock.calls[0].arguments as unknown as [string, RequestInit];
+  assert.deepEqual(JSON.parse(String(args[1].body)).messages, messages);
 });

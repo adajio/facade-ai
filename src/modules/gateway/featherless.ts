@@ -1,8 +1,25 @@
-import { record, syntheticScope, validSyntheticScopes, verifySyntheticInputs, type SyntheticScope } from './admission.js';
+import { pngBase64Length, record, syntheticScope, validSyntheticScopes, verifySyntheticInputs, type SyntheticScope } from './admission.js';
 import { BUDGET_USD_NANOS, GatewayError, hash, positiveInteger,
   type ModelTransport, type ProviderOutcome, type RoutePolicy } from './types.js';
 
 export const featherlessQwenModel = 'Qwen/Qwen3.8-2.4T-A95B';
+export const featherlessQwenVisionModel = 'Qwen/Qwen3.8-Flash-Next';
+const minimumRates = {
+  [featherlessQwenModel]: { input: 1_000, output: 4_000 },
+  [featherlessQwenVisionModel]: { input: 150, output: 500 },
+} as const;
+
+export function isFeatherlessQwen(model: string): model is keyof typeof minimumRates {
+  return Object.hasOwn(minimumRates, model);
+}
+
+type ImageLimits = {
+  count: number;
+  maxImageWidth: number;
+  maxImageHeight: number;
+  maxImagePixels: number;
+  maxImageBytes: number;
+};
 const endpoint = 'https://api.featherless.ai/v1/chat/completions';
 const requestFields = new Set(['model', 'messages', 'tools', 'tool_choice', 'parallel_tool_calls', 'max_tokens', 'stream']);
 const messageFields = new Set(['role', 'name', 'content', 'tool_call_id', 'tool_calls', 'reasoning', 'reasoning_details']);
@@ -14,7 +31,8 @@ export type FeatherlessProfile = {
   transport: 'featherless';
   routeId: string;
   revision: string;
-  model: typeof featherlessQwenModel;
+  model: keyof typeof minimumRates;
+  images?: ImageLimits;
   mode: 'synthetic-research';
   syntheticScopes: readonly SyntheticScope[];
   boundEvidenceRef: string;
@@ -30,14 +48,21 @@ function hasText(value: unknown): value is string {
 }
 
 function validProfile(profile: FeatherlessProfile) {
-  return profile.transport === 'featherless' && profile.model === featherlessQwenModel
+  if (!isFeatherlessQwen(profile.model)) return false;
+  const rates = minimumRates[profile.model];
+  const images = profile.images;
+  if (images && (profile.model !== featherlessQwenVisionModel
+    || !positiveInteger(images.count, 32)
+    || ![images.maxImageWidth, images.maxImageHeight, images.maxImagePixels, images.maxImageBytes]
+      .every(bound => positiveInteger(bound, 20_000_000)))) return false;
+  return profile.transport === 'featherless'
     && profile.mode === 'synthetic-research' && validSyntheticScopes(profile.syntheticScopes)
     && [profile.routeId, profile.revision, profile.boundEvidenceRef].every(hasText)
     && Number.isFinite(Date.parse(profile.validUntil))
     && positiveInteger(profile.contextTokens, 262_144)
     && positiveInteger(profile.outputTokenLimit, 32_768) && profile.outputTokenLimit < profile.contextTokens
-    && positiveInteger(profile.inputNanosPerToken, BUDGET_USD_NANOS) && profile.inputNanosPerToken >= 1_000
-    && positiveInteger(profile.outputNanosPerToken, BUDGET_USD_NANOS) && profile.outputNanosPerToken >= 4_000;
+    && positiveInteger(profile.inputNanosPerToken, BUDGET_USD_NANOS) && profile.inputNanosPerToken >= rates.input
+    && positiveInteger(profile.outputNanosPerToken, BUDGET_USD_NANOS) && profile.outputNanosPerToken >= rates.output;
 }
 
 function localFunction(value: unknown) {
@@ -57,6 +82,7 @@ function prepare(profile: FeatherlessProfile, route: RoutePolicy, request: unkno
     || typeof tokens !== 'number' || !positiveInteger(tokens, profile.outputTokenLimit)) return null;
 
   const messages = [];
+  let imageCount = 0;
   for (const value of body.messages) {
     const message = record(value);
     if (!message || typeof message.role !== 'string' || !roles.has(message.role)
@@ -68,12 +94,21 @@ function prepare(profile: FeatherlessProfile, route: RoutePolicy, request: unkno
       continue;
     }
     const text: string[] = [];
+    let hasImage = false;
     for (const value of content) {
       const part = record(value);
-      if (!part || Object.keys(part).length !== 2 || part.type !== 'text' || typeof part.text !== 'string') return null;
-      text.push(part.text);
+      if (!part || Object.keys(part).length !== 2) return null;
+      if (part.type === 'text' && typeof part.text === 'string') {
+        text.push(part.text);
+        continue;
+      }
+      const image = record(part.image_url);
+      const limits = profile.images;
+      if (message.role !== 'user' || part.type !== 'image_url' || !image || Object.keys(image).length !== 1
+        || !limits || ++imageCount > limits.count || pngBase64Length(image.url, limits) === null) return null;
+      hasImage = true;
     }
-    messages.push({ ...message, content: text.join('\n') });
+    messages.push({ ...message, content: hasImage ? content : text.join('\n') });
   }
 
   const { parallel_tool_calls: _sequential, ...approved } = body;

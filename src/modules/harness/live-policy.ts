@@ -1,4 +1,4 @@
-import { featherlessQwenModel, matchesKimiEndpoint, qwen38Max, qwen4Max, terraModel, type CheaperInferenceProfile, type FeatherlessProfile, type OpenRouterProfile } from '../gateway/index.js';
+import { isFeatherlessQwen, matchesKimiEndpoint, qwen38Max, qwen4Max, terraModel, type CheaperInferenceProfile, type FeatherlessProfile, type OpenRouterProfile } from '../gateway/index.js';
 import type { ResearchSettings, ResearchSuspension, ResearchTask } from './contracts.js';
 import { profileHold, researchSlot, researchSlots, type ResearchProfile, type ResearchSlot } from './profile.js';
 
@@ -12,8 +12,8 @@ function matchesPolicy(route: LiveRoute, { dataClass, toolChoice }: ResearchSett
   // current profile has no attestation binding ZDR only to that key.
   if (dataClass !== 'synthetic' || (policy !== 'strict-zdr' && policy !== 'synthetic-research')) return false;
   if (!Array.isArray(route.syntheticScopes) || !route.syntheticScopes.length) return false;
-  if (route.transport === 'featherless' || route.model === featherlessQwenModel) {
-    return route.transport === 'featherless' && policy === 'synthetic-research' && slot === 'B' && route.model === featherlessQwenModel
+  if (route.transport === 'featherless' || isFeatherlessQwen(route.model)) {
+    return route.transport === 'featherless' && policy === 'synthetic-research' && slot === 'B' && isFeatherlessQwen(route.model)
       && route.mode === 'synthetic-research' && toolChoice === 'auto';
   }
   const hasZdr = typeof route.zdrEvidenceRef === 'string' && Boolean(route.zdrEvidenceRef.trim());
