@@ -20,6 +20,26 @@ test('only an explicit null gives a customer route an approval without expiratio
   assert.equal(validRouteLifetime({ validUntil: '2000-01-01', syntheticScopes: [scope] }), true);
 });
 
+test('the default customer scope resolves new native projects and preserves explicit project scopes', () => {
+  const projectId = randomUUID();
+  const scopeId = randomUUID();
+  const explicit = { projectId, scopeId, approvalRef: 'explicit', allowImages: false, originalSha256s: ['a'.repeat(64)] };
+  const defaultProjectScope = { approvalRef: 'owner-default', allowImages: true };
+  const access = { keyFingerprint: hash('fixture'), evidenceRef: 'fixture', validUntil: null,
+    scopes: [explicit], defaultProjectScope };
+  assert.ok(validCustomerAccess(access, 'fixture'));
+  assert.ok(validCustomerAccess({ ...access, scopes: [] }, 'fixture'));
+  assert.equal(validCustomerAccess({ ...access, validUntil: '2099-01-01' }, 'fixture'), false);
+  assert.equal(validRouteLifetime({ validUntil: '2099-01-01', customerAccess: access }), false);
+  assert.equal(customerScope(access, projectId, scopeId), explicit);
+  assert.equal(customerScope(access, projectId, null), undefined);
+  const fresh = randomUUID();
+  assert.equal(customerScope(access, fresh, scopeId), undefined);
+  assert.deepEqual(customerScope(access, fresh, null), {
+    ...defaultProjectScope, projectId: fresh, scopeId: null, acceptedProjectOriginals: true,
+  });
+});
+
 test('customer intake access checks the current accepted version in its approved project', async () => {
   const projectId = randomUUID();
   const versionId = randomUUID();
