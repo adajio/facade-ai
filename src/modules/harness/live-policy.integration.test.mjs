@@ -106,8 +106,9 @@ test('partial live configuration uses only independently admitted routes with th
   const { loadResearchProfile } = await import('../../../dist/src/modules/harness/profile.js');
   const defaults = loadResearchProfile({});
   const terra = { ...defaults.A, direct: true };
-  const defaultQwen = { ...defaults.B, featherless: true };
-  for (const [cfg, transport, ceilingUsdNanos] of [[terra, 'cheaperinference', 3_000_000_000], [defaultQwen, 'featherless', 2_000_000_000]]) {
+  const defaultQwen = { ...fixture.B, ...defaults.B };
+  const visualQwen = { ...defaults.B, routeId: 'fixture-featherless-qwen38-27b', model: 'Qwen/Qwen3.8-27B', toolChoice: 'required', featherless: true };
+  for (const [cfg, transport, ceilingUsdNanos] of [[terra, 'cheaperinference', 3_000_000_000], [defaultQwen, 'openrouter', 2_000_000_000], [visualQwen, 'featherless', 2_000_000_000]]) {
     await gateway.configureRoute({
       id: cfg.routeId, revision: 'local-test', transport, enabled: true,
       maxRequestBytes: 2 * 1024 * 1024, ceilingUsdNanos, timeoutMs: 8000,
@@ -149,7 +150,7 @@ test('partial live configuration uses only independently admitted routes with th
         assert.equal(String(url), featherlessEndpoint);
         assert.equal(options.headers.authorization, 'Bearer ' + featherlessKey);
         assert.equal(input.provider, undefined);
-        assert.equal(input.max_tokens, defaults.B.maxTokens);
+        assert.equal(input.max_tokens, activeCase.review ? 512 : defaults.B.maxTokens);
       } else {
         assert.equal(String(url), endpoint);
         assert.equal(options.headers.authorization, 'Bearer local-fixture-key');
@@ -157,10 +158,16 @@ test('partial live configuration uses only independently admitted routes with th
         assert.deepEqual(input.provider.order, [selected.provider]);
         assert.equal(input.provider.allow_fallbacks, false);
         assert.equal(input.provider.require_parameters, true);
-        assert.equal(input.provider.data_collection, 'deny');
+        assert.equal(input.provider.data_collection, selected.model === 'qwen/qwen4-max' ? 'allow' : 'deny');
         assert.equal(input.provider.zdr, branch !== 'B');
       }
-      assert.equal(input.tool_choice, selected.toolChoice ?? 'required');
+      if (selected.featherless) {
+        assert.equal(input.tools, undefined);
+        assert.equal(input.tool_choice, undefined);
+        assert.match(input.messages[0].content, /Available tools:/);
+      } else {
+        assert.equal(input.tool_choice, selected.toolChoice ?? 'required');
+      }
       const projectId = (assignment.place ?? assignment.dispute.a.place).source.projectId;
       const image = input.messages.flatMap(({ content }) => Array.isArray(content) ? content : [])
         .find(({ type }) => type === 'image_url');
@@ -169,7 +176,10 @@ test('partial live configuration uses only independently admitted routes with th
         return Response.json({ error: { code: 404, metadata: { error_type: 'not_found' } },
           openrouter_metadata: { attempt: 0 } }, { status: 404 });
       }
-      const outputs = input.messages.filter(({ role }) => role === 'tool').map(({ content }) => JSON.parse(content));
+      const outputs = selected.featherless
+        ? input.messages.filter(({ role, content }) => role === 'user' && typeof content === 'string' && content.startsWith('Local tool result for '))
+          .map(({ content }) => JSON.parse(content.slice(content.indexOf('\n') + 1)))
+        : input.messages.filter(({ role }) => role === 'tool').map(({ content }) => JSON.parse(content));
       if (revoke?.projectId === projectId && revoke.branch === branch && outputs.length === 0) {
         await grant(projectId, branch, false);
       }
@@ -264,6 +274,10 @@ test('partial live configuration uses only independently admitted routes with th
         name = 'finish_reading';
         args = { status: 'covered', explanation: 'Checked a synthetic line.' };
       }
+      if (selected.featherless) {
+        return Response.json({ ...receipt, choices: [{ finish_reason: 'stop',
+          message: { role: 'assistant', content: JSON.stringify({ name, arguments: args }) } }] });
+      }
       return Response.json({ ...receipt, choices: [{ finish_reason: 'tool_calls', message: { role: 'assistant', content: null,
           tool_calls: [{ id: randomUUID(), type: 'function', function: { name, arguments: JSON.stringify(args) } }] } }] });
     } catch (error) {
@@ -296,7 +310,7 @@ test('partial live configuration uses only independently admitted routes with th
     const strict = testCase.customer || testCase.extraOriginal;
     process.env.FACADE_HARNESS_LIVE_POLICY = strict ? 'strict-zdr' : 'synthetic-research';
     selectedA = testCase.mixed || testCase.review ? terra : testCase.comparison ?? fixture.A;
-    selectedB = testCase.mixed || testCase.review ? defaultQwen : fixture.B;
+    selectedB = testCase.review ? visualQwen : testCase.mixed ? defaultQwen : fixture.B;
     const sources = { A: selectedA, B: selectedB };
     const project = await post('/api/projects', { name: testCase.name, catalogVersionId: catalog.id, scopeName: 'F-A', stage: 'P' });
     const scopeId = project.scopes[0].id;
@@ -314,6 +328,11 @@ test('partial live configuration uses only independently admitted routes with th
         ...authorized, ...(testCase.wrongScope === branch && { scopeId: randomUUID() }),
       });
       if (strict) return { ...profile, mode: 'strict-zdr' };
+      if (testCase.mixed && branch === 'B') return { ...profile, outputTokenLimit: defaults.B.maxTokens,
+        syntheticScopes: profile.syntheticScopes.map(scope => ({ ...scope, retentionApproval: {
+          approvalRef: 'fixture-retention', noTrainingEvidenceRef: 'fixture-no-training', validUntil: '2099-01-01T00:00:00Z',
+        } })),
+      };
       if (testCase.visual && branch === 'A') return { ...profile,
         maxImages: 1, maxImagePixels: 16_000_000, maxImageWidth: 4_000, maxImageHeight: 4_000, maxImageBytes: 1_000_000 };
       return profile;
@@ -331,7 +350,7 @@ test('partial live configuration uses only independently admitted routes with th
     }
     if (testCase.mixed || testCase.review) {
       if (testCase.review) {
-        process.env.FACADE_HARNESS_PROFILE = JSON.stringify({ A: defaults.A, B: defaults.B, lead: settings(lead) });
+        process.env.FACADE_HARNESS_PROFILE = JSON.stringify({ A: defaults.A, B: settings(visualQwen), lead: settings(lead) });
       } else {
         delete process.env.FACADE_HARNESS_PROFILE;
       }
@@ -344,14 +363,20 @@ test('partial live configuration uses only independently admitted routes with th
         inputNanosPerToken: 2500, outputNanosPerToken: 7500, outputTokenLimit: defaults.A.maxTokens,
         maxImages: 0, maxImageWidth: 1, maxImageHeight: 1, maxImagePixels: 1, maxImageBytes: 1,
       }]);
-      process.env.FACADE_GATEWAY_FEATHERLESS_KEY = featherlessKey;
-      process.env.FACADE_GATEWAY_FEATHERLESS_PROFILES = JSON.stringify([{
-        transport: 'featherless', routeId: defaultQwen.routeId, model: defaultQwen.model,
-        revision: 'local-test', mode: 'synthetic-research', contextTokens: 262_144,
-        boundEvidenceRef: 'fixture-featherless-rates', validUntil: '2099-01-01T00:00:00Z',
-        syntheticScopes: [{ ...authorized, approvalRef: 'fixture' }],
-        inputNanosPerToken: 1000, outputNanosPerToken: 4000, outputTokenLimit: defaults.B.maxTokens,
-      }]);
+      if (testCase.review) {
+        process.env.FACADE_GATEWAY_FEATHERLESS_KEY = featherlessKey;
+        process.env.FACADE_GATEWAY_FEATHERLESS_PROFILES = JSON.stringify([{
+          transport: 'featherless', routeId: selectedB.routeId, model: selectedB.model,
+          revision: 'local-test', mode: 'synthetic-research', contextTokens: 262_144,
+          boundEvidenceRef: 'fixture-featherless-rates', validUntil: '2099-01-01T00:00:00Z',
+          syntheticScopes: [{ ...authorized, approvalRef: 'fixture' }],
+          inputNanosPerToken: 400, outputNanosPerToken: 3000,
+          outputTokenLimit: 512,
+        }]);
+      } else {
+        delete process.env.FACADE_GATEWAY_FEATHERLESS_KEY;
+        delete process.env.FACADE_GATEWAY_FEATHERLESS_PROFILES;
+      }
     } else {
       delete process.env.FACADE_GATEWAY_FEATHERLESS_KEY;
       delete process.env.FACADE_GATEWAY_FEATHERLESS_PROFILES;
@@ -409,7 +434,7 @@ test('partial live configuration uses only independently admitted routes with th
       const expected = [
         { mode: 'lead', step: null, route_id: lead.routeId, route_revision: 'local-test', model: lead.model, provider: 'Wafer' },
         { mode: 'verify', step: 'A', route_id: terra.routeId, route_revision: 'local-test', model: terra.model, provider: 'CheaperInference' },
-        { mode: 'verify', step: 'B', route_id: defaultQwen.routeId, route_revision: 'local-test', model: defaultQwen.model, provider: 'Featherless' },
+        { mode: 'verify', step: 'B', route_id: selectedB.routeId, route_revision: 'local-test', model: selectedB.model, provider: 'Featherless' },
       ].filter(({ mode, step }) => testCase.calls.includes(step ? `verify-${step}` : mode)
         && !(mode === 'lead' && testCase.unavailableLead));
       assert.deepEqual(receipts, expected);
@@ -440,7 +465,7 @@ test('partial live configuration uses only independently admitted routes with th
          FROM gateway_attempts WHERE project_id=$1 AND state='paid' ORDER BY purpose`, [project.id]);
       assert.deepEqual(receipts, [
         { purpose: 'primary_a', model: terra.model, provider: 'CheaperInference' },
-        { purpose: 'primary_b', model: defaultQwen.model, provider: 'Featherless' },
+        { purpose: 'primary_b', model: defaultQwen.model, provider: 'Alibaba' },
       ]);
     }
     if (testCase.comparison) {
@@ -572,7 +597,7 @@ test('partial live configuration uses only independently admitted routes with th
         held('b', 'research_route_not_approved'), held('b', 'research_route_not_approved')] });
     await runCase({ name: 'PNG allowed for A and held for B', approvals: ['A', 'B'], visual: true,
       calls: ['A', 'A', 'B'], expected: [done('a'), held('b', 'route_bound_unavailable')] });
-    await runCase({ name: 'Default Terra and Featherless Qwen3.8', mixed: true, approvals: ['A', 'B'],
+    await runCase({ name: 'Default Terra and Qwen4 Max through Alibaba', mixed: true, approvals: ['A', 'B'],
       calls: ['A', 'A', 'A', 'B', 'B', 'B'], expected: [done('a'), done('b')] });
     await runCase({ name: 'Only A', approvals: ['A'], malformed: 'B', calls: ['A', 'A', 'A'],
       expected: [done('a'), held('b', 'research_route_not_approved')] });

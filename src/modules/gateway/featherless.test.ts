@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { featherlessQwenModel, featherlessTransport, type FeatherlessProfile } from './featherless.js';
-import type { Attempt, RoutePolicy } from './types.js';
+import { featherlessQwenModel, featherlessQwenVisionModel, featherlessTransport, type FeatherlessProfile } from './featherless.js';
+import { hash, type Attempt, type RoutePolicy } from './types.js';
 
 const projectId = '12300000-0000-4000-8000-000000000001';
 const scopeId = '12300000-0000-4000-8000-000000000002';
@@ -67,6 +67,12 @@ test('Featherless uses the direct text endpoint and settles only the reported an
   assert.equal(mismatch.output, undefined);
   assert.equal(mismatch.receipt.state, 'paid');
   assert.equal(mismatch.receipt.routeVerified, false);
+  reply.mock.mockImplementation(async () => Response.json({ error: { code: 'model_gated_needs_oauth' } }, { status: 403 }));
+  assert.deepEqual((await transport.send(attempt, route, request, signal)).receipt, {
+    state: 'rejected', code: 'model_gated_needs_oauth', evidenceRef: 'featherless:preflight:model_gated_needs_oauth',
+  });
+  reply.mock.mockImplementation(async () => new Response(null, { status: 403 }));
+  assert.equal((await transport.send(attempt, route, request, signal)).receipt.state, 'unknown');
 });
 
 test('Featherless rejects image inputs, route mismatches and understated price before the request', () => {
@@ -79,4 +85,99 @@ test('Featherless rejects image inputs, route mismatches and understated price b
   assert.equal(transport.quote!({ ...route, ceilingUsdNanos: 10 }, request), null);
   assert.throws(() => featherlessTransport({ ...credential, profiles: [{ ...profile, inputNanosPerToken: 999 }] }),
     /invalid_featherless_profile/);
+});
+
+test('only the pinned multimodal Featherless profile can send a bounded inline PNG', async (t) => {
+  const visionProfile: FeatherlessProfile = {
+    ...profile, model: featherlessQwenVisionModel, inputNanosPerToken: 400, outputNanosPerToken: 3000,
+    images: { count: 1, maxImageWidth: 256, maxImageHeight: 256, maxImagePixels: 65_536, maxImageBytes: 4096 },
+  };
+  const transport = featherlessTransport({ ...credential, profiles: [visionProfile] });
+  const png = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAACklEQVQIHWP4DwABAQEAG7buVgAAAABJRU5ErkJggg==';
+  const text = { type: 'text', text: 'Synthetic drawing' };
+  const image = { type: 'image_url', image_url: { url: png } };
+  const messages = [{ role: 'user', content: [text, image] }];
+  const input = { ...request, model: visionProfile.model, tool_choice: 'required', messages };
+  const quote = transport.quote!(route, input);
+  assert.ok(quote);
+  assert.equal(quote.ceilingUsdNanos, 107_858_600);
+  assert.equal(transport.quote!(route, { ...input, messages: [{ role: 'user', content: [text, image, image] }] }), null);
+  assert.equal(transport.quote!(route, { ...input, messages: [{
+    role: 'user', content: [text, { ...image, image_url: { url: 'https://example.invalid/source.png' } }],
+  }] }), null);
+  assert.throws(() => featherlessTransport({ ...credential, profiles: [{ ...profile, images: visionProfile.images }] }),
+    /invalid_featherless_profile/);
+  const name = request.tools[0].function.name;
+  const toolResult = { name, arguments: { value: '15' } };
+  let finishReason = 'stop';
+  let content = JSON.stringify(toolResult);
+  const outbound = t.mock.method(globalThis, 'fetch', async () => Response.json({
+    id: 'vision-receipt', model: visionProfile.model, usage: { cost: 0.000002, prompt_tokens: 8, completion_tokens: 2 },
+    choices: [{ finish_reason: finishReason, message: { role: 'assistant', content } }],
+  }));
+  const attempt: Attempt = {
+    id: 'attempt', jobId: 'job', generationId: 'generation', projectId, scopeId, purpose: 'primary_b',
+    effectKey: 'fixture', requestHash: 'sha', routeId: route.id, revision: route.revision,
+    previousRejectedId: null, dataClass: 'synthetic', ...quote,
+  };
+  const outcome = await transport.send(attempt, route, input, new AbortController().signal);
+  assert.equal(outcome.receipt.state, 'paid');
+  assert.equal(outbound.mock.callCount(), 1);
+  const args = outbound.mock.calls[0].arguments as unknown as [string, RequestInit];
+  const wire = JSON.parse(String(args[1].body));
+  assert.match(wire.messages[0].content, /Available tools:/);
+  assert.deepEqual(wire.messages.slice(1), messages);
+  assert.deepEqual(wire.chat_template_kwargs, { enable_thinking: false });
+  assert.deepEqual(wire.response_format, { type: 'json_object' });
+  assert.equal(wire.temperature, 0);
+  assert.equal(wire.tool_choice, undefined);
+  assert.equal(wire.tools, undefined);
+  assert.deepEqual(outcome.output, { choices: [{
+    index: 0, finish_reason: 'tool_calls', message: { role: 'assistant', content: null, tool_calls: [{
+      id: 'call_' + hash('featherless:vision-receipt').slice(0, 24), type: 'function',
+      function: { name, arguments: JSON.stringify(toolResult.arguments) },
+    }] },
+  }] });
+  for (content of [
+    JSON.stringify({ ...toolResult, name: 'unknown' }),
+    JSON.stringify({ ...toolResult, extra: true }),
+    'A tool call: ' + JSON.stringify(toolResult),
+  ]) {
+    const invalid = await transport.send(attempt, route, input, new AbortController().signal);
+    assert.equal(invalid.receipt.state, 'paid');
+    assert.deepEqual(invalid.output, { choices: [] });
+  }
+  content = JSON.stringify(toolResult);
+  finishReason = 'length';
+  const truncated = await transport.send(attempt, route, input, new AbortController().signal);
+  assert.deepEqual(truncated.output, { choices: [] });
+});
+
+test('a customer Featherless profile binds the inference credential and rejects images for a text-only scope', async (t) => {
+  const { syntheticScopes, ...base } = profile;
+  const customer: FeatherlessProfile = {
+    ...base, model: featherlessQwenVisionModel, mode: 'customer',
+    images: { count: 1, maxImageWidth: 256, maxImageHeight: 256, maxImagePixels: 65_536, maxImageBytes: 4096 },
+    customerAccess: {
+      keyFingerprint: hash(credential.apiKey), evidenceRef: 'fixture-policy', validUntil: '2099-01-01T00:00:00Z',
+      scopes: syntheticScopes.map(scope => ({ ...scope, allowImages: false })),
+    },
+  };
+  assert.throws(() => featherlessTransport({ apiKey: 'swapped-key', profiles: [customer] }), /invalid_featherless_profile/);
+  const transport = featherlessTransport({ ...credential, profiles: [customer] });
+  const imageInput = {
+    ...request, model: customer.model, tool_choice: 'required', messages: [{ role: 'user', content: [{
+      type: 'image_url', image_url: { url: 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAACklEQVQIHWP4DwABAQEAG7buVgAAAABJRU5ErkJggg==' },
+    }] }],
+  };
+  const quote = transport.quote!(route, imageInput);
+  assert.ok(quote);
+  const attempt: Attempt = {
+    id: 'attempt', jobId: 'job', generationId: 'generation', projectId, scopeId, purpose: 'primary_b',
+    effectKey: 'fixture', requestHash: 'sha', routeId: route.id, revision: route.revision,
+    previousRejectedId: null, dataClass: 'customer', ...quote,
+  };
+  const outbound = t.mock.method(globalThis, 'fetch', () => assert.fail('Image reached the provider'));
+  assert.equal((await transport.send(attempt, route, imageInput, new AbortController().signal)).receipt.state, 'rejected');
+  assert.equal(outbound.mock.callCount(), 0);
 });

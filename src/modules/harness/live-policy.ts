@@ -1,20 +1,31 @@
-import { featherlessQwenModel, matchesKimiEndpoint, qwen38Max, qwen4Max, terraModel, type CheaperInferenceProfile, type FeatherlessProfile, type OpenRouterProfile } from '../gateway/index.js';
+import { featherlessQwenVisionModel, isFeatherlessQwen, matchesKimiEndpoint, qwen38Max, qwen4Max, terraModel, type CheaperInferenceProfile, type FeatherlessProfile, type OpenRouterProfile } from '../gateway/index.js';
+import { customerScope, scopeAllowsOriginal } from '../gateway/admission.js';
 import type { ResearchSettings, ResearchSuspension, ResearchTask } from './contracts.js';
 import { profileHold, researchSlot, researchSlots, type ResearchProfile, type ResearchSlot } from './profile.js';
 
 export type LiveRoute = (Pick<OpenRouterProfile,
-  'routeId' | 'model' | 'provider' | 'mode' | 'zdrEvidenceRef' | 'syntheticScopes'> & { transport?: 'openrouter' })
-  | Pick<CheaperInferenceProfile, 'transport' | 'routeId' | 'model' | 'mode' | 'zdrEvidenceRef' | 'syntheticScopes'>
-  | Pick<FeatherlessProfile, 'transport' | 'routeId' | 'model' | 'mode' | 'syntheticScopes'>;
+  'routeId' | 'model' | 'provider' | 'mode' | 'zdrEvidenceRef' | 'syntheticScopes' | 'customerAccess'> & { transport?: 'openrouter' })
+  | Pick<CheaperInferenceProfile, 'transport' | 'routeId' | 'model' | 'mode' | 'zdrEvidenceRef' | 'syntheticScopes' | 'customerAccess'>
+  | Pick<FeatherlessProfile, 'transport' | 'routeId' | 'model' | 'mode' | 'syntheticScopes' | 'customerAccess'>;
 
 function matchesPolicy(route: LiveRoute, { dataClass, toolChoice }: ResearchSettings, policy: string, slot: ResearchSlot) {
-  // A per-request ZDR flag follows the key's account or guardrail settings. The
-  // current profile has no attestation binding ZDR only to that key.
-  if (dataClass !== 'synthetic' || (policy !== 'strict-zdr' && policy !== 'synthetic-research')) return false;
+  if (dataClass === 'customer') {
+    if (policy !== 'customer' || !route.customerAccess || Date.parse(route.customerAccess.validUntil) <= Date.now()) return false;
+    if (route.transport === 'cheaperinference') return slot === 'A' && route.model === terraModel
+      && route.mode === 'strict-zdr' && Boolean(route.zdrEvidenceRef?.trim());
+    if (route.transport === 'featherless') return false;
+    if (slot === 'B') return route.model === qwen4Max && route.provider === 'alibaba'
+      && route.mode === 'customer-retention-approved' && route.customerAccess.retentionApproved === true;
+    return slot === 'lead' && route.model === 'moonshotai/kimi-k3.1-pro' && route.provider === 'wafer/us'
+      && route.mode === 'strict-zdr' && route.customerAccess.excludesSafetyRetention === true;
+  }
+  if (dataClass !== 'synthetic' || !['strict-zdr', 'synthetic-research', 'customer'].includes(policy)) return false;
+  const syntheticResearch = policy !== 'strict-zdr';
   if (!Array.isArray(route.syntheticScopes) || !route.syntheticScopes.length) return false;
-  if (route.transport === 'featherless' || route.model === featherlessQwenModel) {
-    return route.transport === 'featherless' && policy === 'synthetic-research' && slot === 'B' && route.model === featherlessQwenModel
-      && route.mode === 'synthetic-research' && toolChoice === 'auto';
+  if (route.transport === 'featherless' || isFeatherlessQwen(route.model)) {
+    return route.transport === 'featherless' && syntheticResearch && slot === 'B' && isFeatherlessQwen(route.model)
+      && route.mode === 'synthetic-research'
+      && (toolChoice ?? 'required') === (route.model === featherlessQwenVisionModel ? 'required' : 'auto');
   }
   const hasZdr = typeof route.zdrEvidenceRef === 'string' && Boolean(route.zdrEvidenceRef.trim());
   if (route.transport === 'cheaperinference') {
@@ -30,7 +41,7 @@ function matchesPolicy(route: LiveRoute, { dataClass, toolChoice }: ResearchSett
   }
   if (route.provider === 'decart/mxfp4' && toolChoice !== 'auto') return false;
   if (policy === 'strict-zdr' && (route.mode !== 'strict-zdr' || !hasZdr)) return false;
-  return policy !== 'synthetic-research' || !route.model.startsWith('qwen/')
+  return !syntheticResearch || !route.model.startsWith('qwen/')
     || /^alibaba(?:\/|$)/.test(route.provider);
 }
 
@@ -67,13 +78,14 @@ export function validateLivePolicy<T extends LiveRoute>(
         reason: 'research_route_not_approved',
         nextAction: `Подтвердить маршрут для ${slot}.`,
       };
-      const approved = route.syntheticScopes?.find(({ projectId, scopeId }) =>
-        task.projectId === projectId && task.scopeId === scopeId);
+      const customer = actual.dataClass === 'customer';
+      const approved = customer ? customerScope(route.customerAccess, task.projectId, task.scopeId)
+        : route.syntheticScopes?.find(({ projectId, scopeId }) => task.projectId === projectId && task.scopeId === scopeId);
       const places = task.job.mode === 'primary' ? [task.job.place] : [task.job.dispute.a.place, task.job.dispute.b.place];
       if (approved && places.every(({ source }) =>
-        source.projectId === task.projectId && approved.originalSha256s.includes(source.sha256))) return null;
+        source.projectId === task.projectId && scopeAllowsOriginal(approved, source.sha256))) return null;
       return {
-        reason: 'synthetic_input_not_approved',
+        reason: customer ? 'customer_input_not_approved' : 'synthetic_input_not_approved',
         nextAction: `Сверить проект, область и SHA-256 оригиналов с допуском ${slot}.`,
       };
     },

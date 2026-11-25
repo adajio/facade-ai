@@ -1,5 +1,6 @@
 import { gzipSync } from 'node:zlib';
-import { pngBase64Length, record, syntheticScope, validSyntheticScopes, verifySyntheticInputs, type SyntheticScope } from './admission.js';
+import { customerScope, pngBase64Length, record, requestHasImages, syntheticScope, validCustomerAccess,
+  validSyntheticScopes, verifyApprovedResearchInputs, type CustomerAccess, type SyntheticScope } from './admission.js';
 import { BUDGET_USD_NANOS, GatewayError, hash, positiveInteger, type ModelTransport, type ProviderOutcome, type RoutePolicy } from './types.js';
 
 export const terraModel = 'gpt-6.1-terra';
@@ -27,7 +28,8 @@ export type CheaperInferenceProfile = {
   model: typeof terraModel;
   mode: 'strict-zdr';
   zdrEvidenceRef: string;
-  syntheticScopes: readonly SyntheticScope[];
+  syntheticScopes?: readonly SyntheticScope[];
+  customerAccess?: CustomerAccess;
   boundEvidenceRef: string;
   validUntil: string;
   inputNanosPerToken: number;
@@ -155,11 +157,12 @@ export function cheaperInferenceTransport(approval: Approval): ModelTransport {
   const key = (id: string, revision: string) => JSON.stringify([id, revision]);
   for (const profile of structuredClone(approval.profiles)) {
     const id = key(profile.routeId, profile.revision);
-    if (!validProfile(profile) || profiles.has(id)) throw new GatewayError('invalid_cheaperinference_profile');
+    if (!validProfile(profile) || profiles.has(id)
+      || (profile.customerAccess !== undefined && !validCustomerAccess(profile.customerAccess, apiKey))) throw new GatewayError('invalid_cheaperinference_profile');
     profiles.set(id, { profile, fingerprint: hash([endpoint, profile]) });
   }
   if (!profiles.size) throw new GatewayError('cheaperinference_profile_required');
-  const selected = (route: RoutePolicy) => route.transport === 'cheaperinference' && profiles.get(key(route.id, route.revision));
+  const selected = (route: RoutePolicy) => route.transport === 'cheaperinference' ? profiles.get(key(route.id, route.revision)) : undefined;
   return {
     kind: 'cheaperinference',
     quote(route, request) {
@@ -170,18 +173,23 @@ export function cheaperInferenceTransport(approval: Approval): ModelTransport {
     },
     async authorize(tx, route, context) {
       const configuration = selected(route);
-      const scope = configuration && syntheticScope(configuration.profile.syntheticScopes, context.projectId, context.scopeId);
+      const profile = configuration?.profile;
+      const scope = context.dataClass === 'customer'
+        ? customerScope(profile?.customerAccess, context.projectId, context.scopeId)
+        : context.dataClass === 'synthetic' ? syntheticScope(profile?.syntheticScopes, context.projectId, context.scopeId) : undefined;
       const job = record(context.payload);
-      if (!scope || context.dataClass !== 'synthetic'
-        || (job?.mode !== 'primary' && job?.mode !== 'verify') || job.branch !== 'A') return false;
-      return verifySyntheticInputs(tx, context, scope);
+      if (!scope || (job?.mode !== 'primary' && job?.mode !== 'verify') || job.branch !== 'A') return false;
+      return verifyApprovedResearchInputs(tx, context, scope);
     },
     async send(attempt, route, request, signal) {
       const configuration = selected(route);
       const body = configuration && prepare(configuration.profile, route, request);
-      if (!configuration || !body || attempt.routeId !== route.id || attempt.revision !== route.revision
-        || attempt.purpose === 'primary_b' || attempt.dataClass !== 'synthetic'
-        || !syntheticScope(configuration.profile.syntheticScopes, attempt.projectId, attempt.scopeId)
+      const customer = customerScope(configuration?.profile.customerAccess, attempt.projectId, attempt.scopeId);
+      const permitted = attempt.dataClass === 'customer'
+        ? customer && (customer.allowImages || !requestHasImages(request))
+        : attempt.dataClass === 'synthetic' && syntheticScope(configuration?.profile.syntheticScopes, attempt.projectId, attempt.scopeId);
+      if (!configuration || !body || !permitted || attempt.routeId !== route.id || attempt.revision !== route.revision
+        || (attempt.purpose !== 'primary_a' && attempt.purpose !== 'review')
         || attempt.pricingFingerprint !== configuration.fingerprint || attempt.ceilingUsdNanos !== body.ceilingUsdNanos) {
         return { receipt: { state: 'rejected', code: 'invalid_request', evidenceRef: 'gateway:no-network' } };
       }

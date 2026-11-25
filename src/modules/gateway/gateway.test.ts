@@ -12,8 +12,8 @@ import { resumeInterruptedResearch } from '../harness/runner.js';
 import { registerOperatorRoutes } from './operator.js';
 import { Gateway } from './gateway.js';
 import { PostgresIntentJournal } from './journal.js';
-import { estimateOpenRouterRequest, openRouterTransport, qwen38Max, type OpenRouterProfile } from './openrouter.js';
-import { BUDGET_USD_NANOS, transaction, type Attempt, type CallInput, type CallResult,
+import { estimateOpenRouterRequest, openRouterTransport, qwen38Max, qwen4Max, type OpenRouterProfile } from './openrouter.js';
+import { BUDGET_USD_NANOS, hash, transaction, type Attempt, type CallInput, type CallResult,
   type GenerationRef, type ModelTransport, type Obligation, type RoutePolicy } from './types.js';
 
 const appUrl = process.env.DATABASE_URL;
@@ -180,6 +180,60 @@ test('OpenRouter requires an explicit qualification and rejects unbounded reques
     { type: 'image_url', image_url: { url: 'https://example.invalid/unbounded.png' } },
   ] }] }), false);
   assert.equal(transport.validate?.({ ...baseRoute, ceilingUsdNanos: 1 }, valid), false);
+});
+
+test('Qwen4 Max uses a separate key and customer retention approval for branch B only', async (t) => {
+  const ref = project();
+  const apiKey = 'kimi-zdr-fixture';
+  const qwen4CustomerApiKey = 'qwen-retention-fixture';
+  const profile: OpenRouterProfile = {
+    ...fixtureRates, routeId: 'fixture-customer-qwen4', revision: 'v1', model: qwen4Max,
+    provider: 'alibaba', expectedResponseProvider: 'Alibaba', mode: 'customer-retention-approved',
+    customerAccess: {
+      keyFingerprint: hash(qwen4CustomerApiKey), evidenceRef: 'test:owner-authorization', retentionApproved: true,
+      validUntil: '2099-01-01T00:00:00Z',
+      scopes: [{ projectId: ref.projectId, scopeId: ref.scopeId, approvalRef: 'test:project',
+        originalSha256s: ['a'.repeat(64)], allowImages: true }],
+    },
+    boundEvidenceRef: 'test:rates', validUntil: '2099-01-01T00:00:00Z', knownNoChargeStatuses: [],
+    inputTokenUpperBound: 1_000_000, promptNanosPerToken: 1_500, completionNanosPerToken: 4_500,
+    cacheReadNanosPerToken: 75, cacheWriteNanosPerToken: 3_000,
+  };
+  const options = { qualification: 'step-15', endpoint: 'https://openrouter.ai', apiKey,
+    qwen4CustomerApiKey, profiles: [profile] } as const;
+  assert.throws(() => openRouterTransport({ ...options, qwen4CustomerApiKey: undefined }), /invalid_openrouter_profile/);
+  assert.throws(() => openRouterTransport({ ...options, qwen4CustomerApiKey: apiKey }), /invalid_openrouter_profile/);
+  assert.throws(() => openRouterTransport({ ...options, profiles: [{ ...profile, provider: 'novita' }] }), /invalid_openrouter_profile/);
+  const transport = openRouterTransport(options);
+  const route: RoutePolicy = { ...baseRoute, id: profile.routeId, transport: 'openrouter', ceilingUsdNanos: 4_000_000_000 };
+  const request = { model: qwen4Max, max_tokens: 300, tool_choice: 'required', messages: [{ role: 'user', content: [onePixel] }] };
+  const quote = transport.quote!(route, request);
+  assert.ok(quote);
+  const attempt: Attempt = { ...ref, ...quote, id: randomUUID(), jobId: randomUUID(), purpose: 'primary_b',
+    effectKey: 'fixture', requestHash: 'sha', routeId: route.id, revision: route.revision,
+    previousRejectedId: null, dataClass: 'customer' };
+  const outbound = t.mock.method(globalThis, 'fetch', async (_url: string, options: RequestInit) => {
+    assert.equal(new Headers(options.headers).get('authorization'), 'Bearer ' + qwen4CustomerApiKey);
+    const body = JSON.parse(String(options.body));
+    assert.deepEqual(body.provider.only, ['alibaba']);
+    assert.equal(body.provider.allow_fallbacks, false);
+    assert.equal(body.provider.zdr, false);
+    assert.equal(body.provider.data_collection, 'allow');
+    assert.deepEqual(body.reasoning, { enabled: false });
+    return Response.json({ id: 'gen-fixture-qwen4', model: qwen4Max, provider: 'Alibaba', usage: { cost: 0 } });
+  });
+  const signal = new AbortController().signal;
+  for (const bad of [{ ...attempt, purpose: 'primary_a' }, { ...attempt, dataClass: 'synthetic' },
+    { ...attempt, projectId: randomUUID() }] as const) {
+    assert.equal((await transport.send(bad, route, request, signal)).receipt.state, 'rejected');
+  }
+  assert.equal(outbound.mock.callCount(), 0);
+  for (const purpose of ['primary_b', 'review'] as const) {
+    const result = await transport.send({ ...attempt, purpose }, route, request, signal);
+    assert.equal(result.receipt.state, 'paid');
+    assert.equal(result.receipt.routeVerified, true);
+  }
+  assert.equal(outbound.mock.callCount(), 2);
 });
 
 test('both OpenRouter route families quote bounded synthetic image tool turns without a key', () => {
