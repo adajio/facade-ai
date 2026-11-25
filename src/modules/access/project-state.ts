@@ -74,7 +74,7 @@ export function defaultProfile(value: unknown): DefaultProfile {
 
 export function versionHref(projectId: string) { return `/api/projects/${projectId}`; }
 
-export function stageStatus(project: Project) {
+export function stageStatus(project: Pick<Project, 'stage' | 'stageBasis' | 'intakeMode'>) {
   if (project.intakeMode && project.stage === initialProjectStage && !project.stageBasis) return 'default';
   if (project.stage !== null) return 'confirmed';
   return project.intakeMode ? 'unknown' : 'legacy_unconfirmed';
@@ -109,8 +109,8 @@ export async function lockProjectApplicability(tx: PoolClient, projectId: string
 }
 
 export async function catalogOptions(db: Pool | PoolClient, project: Project, after: string | null = null) {
-  const { rows } = await db.query<Pick<Catalog, 'id' | 'key' | 'name' | 'revision'>>(
-    `SELECT id, catalog_key AS key, name, revision FROM catalog_versions WHERE organization_id = $1
+  const { rows } = await db.query<Catalog>(
+    `SELECT ${catalogColumns}, ${catalogProfileColumn} FROM catalog_versions WHERE organization_id = $1
        AND (NOT $2::boolean OR (default_stage = $3 AND jsonb_array_length(requirements) > 0
          AND (default_facade_kinds = $4 OR ($3 = $6 AND cardinality(default_facade_kinds) = 0))))
        AND ($5::uuid IS NULL OR id > $5) ORDER BY id LIMIT 101`,

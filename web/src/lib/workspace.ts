@@ -72,7 +72,12 @@ export type Projection = Position & {
 };
 export type Page<T> = { items: T[]; nextCursor?: string | null; sliceId?: string; total?: number };
 
+export type ConclusionInput = { kind: 'citation'; evidenceId: string } | { kind: 'original'; versionId: string; anchor: string } |
+  { kind: 'inventory'; occurrenceId: string; inventoryRevision: string };
+export type InventoryLimitation = { occurrenceId: string; receiptId: string; number: number; label: string; restriction: string; inventoryRevision: string };
+
 export type Assessment = {
+  hasAcceptedMaterials?: boolean;
   scope?: { id: string; name: string; stage: string };
   catalogVersionId: string;
   version: number;
@@ -82,7 +87,8 @@ export type Assessment = {
   outcome: string;
   questions: AssessmentQuestion[];
   conclusion?: {
-    id?: string; startWork: string; reason: string; authorId?: string; createdAt?: string; outcome?: string;
+    id?: string; startWork: string; reason: string; authorId?: string; createdAt?: string; outcome?: string; basedOnVersion?: number;
+    basis?: { kind: 'original'; original: import('./facade-assessment').OriginalBasis } | { kind: 'citation'; citation: Citation } | ({ kind: 'inventory' } & InventoryLimitation);
   };
   change?: { reason?: string; questionIds?: string[] };
 };
@@ -96,6 +102,7 @@ export type ClarificationBasis = {
 
 export type AssessmentQuestion = {
   id: string;
+  letterEligible?: boolean;
   version: number;
   dependencyVersion?: number;
   outcome: string;
@@ -117,7 +124,7 @@ export type AssessmentQuestion = {
   }[];
   requirement: {
     positionId: string; partId: string; subject: string; part: string;
-    formats: string[]; applicability?: string; recipient?: string; requestedAction?: string;
+    formats: string[]; requiredFormats?: string[]; equivalentFormats?: string[]; completeness?: string; applicability?: string; recipient?: string; requestedAction?: string;
   };
   machine: {
     outcome: string; citations: Citation[]; receiptIds: string[]; delivery?: string;
@@ -127,6 +134,7 @@ export type AssessmentQuestion = {
   decision?: {
     id: string; action: string; outcome: string; reason: string; authorId: string; createdAt: string;
     startWorkCritical?: boolean; requestExternal?: boolean; clarification?: ClarificationBasis;
+    exclusion?: { kind: 'not_required' | 'work_without_data'; until: string | null };
   };
   clarification?: ClarificationBasis;
   history?: AssessmentQuestion['decision'][];

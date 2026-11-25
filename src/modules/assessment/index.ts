@@ -5,13 +5,16 @@ import { executeCommand, requireAccess } from "../access/index.js";
 import { transaction } from "../access/commands.js";
 import { AccessError, sendAccessError } from "../access/errors.js";
 import { accessConfig, authorize, checkCsrf, checkOrigin, readCookie, readSession, touchSession } from "../access/auth.js";
-import { facadeKindSet, getProject, updateConfirmedFacadeKinds } from "../access/project-state.js";
+import { facadeKindSet, getProject, initialProjectStage, updateConfirmedFacadeKinds } from "../access/project-state.js";
 import { object } from "../access/input.js";
 import { lockIntakeProject } from "../intake/gate.js";
 import { acceptedOriginals, verifyOriginalBasis } from "../intake/accepted-originals.js";
+import { conclusionBasis, conclusionBasisVersions, inventoryLimits } from './conclusion-basis.js';
 import { recordDecision } from "./commands.js";
 import { facadeAssessmentHref, getLockedFacadeContext, readFacadeObservationPage, readFacadeSnapshot, synchronizeFacadeAssessment } from "./facade-store.js";
+import { registerFactReviews } from "./fact-review.js";
 import { recordFacadeType } from "./facade-types.js";
+import { findDocumentFacadeLink, registerDocumentFacades } from "./document-facades.js";
 import { identifier, parseConclusion, parseDecision, shortText, versionNumber } from "./inputs.js";
 import {
   AssessmentError, announceAssessment, assertAvailable, assessmentHref, getLockedGate, getQuestions, invalidInput,
@@ -70,23 +73,28 @@ export async function register(app: FastifyInstance): Promise<void> {
 
 function registerRoutes(app: FastifyInstance, prefix: string) {
   const db = app.db;
+  registerDocumentFacades(app, prefix, synchronizeFacadeAssessment);
   const facadePath = `${prefix}/projects/:projectId/facade-assessment`;
+  registerFactReviews(app, prefix);
   async function approvedKinds(tx: PoolClient, project: Awaited<ReturnType<typeof getProject>>) {
     const { rows } = await tx.query<{ kind: string }>(`
       SELECT DISTINCT unnest(default_facade_kinds) AS kind FROM catalog_versions
       WHERE organization_id=$1 AND approval_reference IS NOT NULL AND jsonb_array_length(requirements)>0
-        AND ($2::text IS NULL OR default_stage=$2) ORDER BY kind`, [project.organizationId, project.stage]);
+        AND ($2::text IS NULL OR $2=$3 OR default_stage=$2) ORDER BY kind`, [project.organizationId, project.stage, initialProjectStage]);
     return rows.map(({ kind }) => kind);
   }
 
-  app.get<{ Params: Project; Querystring: { after?: string } }>(`${prefix}/projects/:projectId/confirmation-originals`, async (request) => {
+  app.get<{ Params: Project; Querystring: { after?: string; assessmentContextId?: string } }>(`${prefix}/projects/:projectId/confirmation-originals`, async (request) => {
     const projectId = identifier(request.params.projectId);
     const after = request.query.after === undefined ? undefined : identifier(request.query.after);
     return transaction(db, async (tx) => {
       const session = await readSession(tx, request);
       await authorize(tx, session, { action: "project:engineer", projectId });
       const project = await getProject(tx, projectId);
-      const originals = await acceptedOriginals(tx, projectId, { after, limit: 101 });
+      const area = request.query.assessmentContextId ? await getLockedFacadeContext(tx, projectId, identifier(request.query.assessmentContextId)) : null;
+      const allowed = area ? conclusionBasisVersions(area) : undefined;
+      const originals = area && allowed ? area.input.versions.filter(({ id }) => (!after || id > after) && allowed.includes(id)).slice(0, 101) :
+        await acceptedOriginals(tx, projectId, { after, limit: 101 });
       const kinds = after ? undefined : await approvedKinds(tx, project);
       await touchSession(tx, session);
       return { originals: originals.slice(0, 100), nextCursor: originals.length > 100 ? originals[99].id : null, kinds };
@@ -117,11 +125,11 @@ function registerRoutes(app: FastifyInstance, prefix: string) {
   app.get<{ Params: FacadeParams }>(`${facadePath}/:version`, readFacade);
   app.get<{
     Params: Project & { version: string };
-    Querystring: { binding?: string; facadeId?: string; after?: string; limit?: string; proposal?: string };
+    Querystring: { binding?: string; facadeId?: string; after?: string; limit?: string; grouped?: string; observationId?: string; proposal?: string };
   }>(`${facadePath}/:version/observations`, async (request, reply) => {
     const projectId = identifier(request.params.projectId);
     const version = versionNumber(request.params.version);
-    const { binding, facadeId, after, limit, proposal } = request.query;
+    const { binding, facadeId, after, limit, proposal, grouped, observationId } = request.query;
     if (binding !== undefined && binding !== "identified" && binding !== "common" &&
         binding !== "unclear" && binding !== "unidentified") invalidInput("Неизвестный тип привязки.");
     if (proposal !== undefined && proposal !== "stage" && proposal !== "facadeKind") {
@@ -131,7 +139,8 @@ function registerRoutes(app: FastifyInstance, prefix: string) {
       const session = await readSession(tx, request);
       await authorize(tx, session, { action: "project:read", projectId });
       const items = await readFacadeObservationPage(tx, projectId, version, {
-        binding, proposal, facadeId: facadeId === undefined ? undefined : identifier(facadeId),
+        binding, proposal, grouped: grouped === "1", observationId: observationId === undefined ? undefined : identifier(observationId),
+        facadeId: facadeId === undefined ? undefined : identifier(facadeId),
         after: after === undefined ? undefined : identifier(after),
         limit: limit === undefined ? 50 : Math.min(versionNumber(limit), 100),
       });
@@ -213,6 +222,10 @@ function registerRoutes(app: FastifyInstance, prefix: string) {
         throw new AssessmentError(422, "facade_type_not_approved", "Выберите тип из утверждённого каталога.");
       }
       const original = documentVersionId && pageOrAnchor ? await verifyOriginalBasis(tx, projectId, documentVersionId, pageOrAnchor) : undefined;
+      const originalFacade = original && await findDocumentFacadeLink(tx, projectId, original);
+      if (originalFacade && originalFacade.facadeId !== facadeId) {
+        throw new AssessmentError(422, "facade_type_basis_invalid", "Указанное место связано с другим фасадом.");
+      }
       await recordFacadeType(tx, { projectId, contextId: facade.id, facadeId, kind, reason, actorId: actor.userId,
         stage: project.stage, original, fact: current.input.observations.find(({ id }) => id === observationId) });
 
@@ -241,8 +254,11 @@ function registerRoutes(app: FastifyInstance, prefix: string) {
         const scopeId = await scopeFromQuery(tx, request, projectId, request.query);
         const actor = await authorize(tx, await readSession(tx, request), { action: "project:read", projectId, scopeId });
         const gate = await getLockedGate(tx, projectId, scopeId);
-        return snapshot(tx, await synchronize(tx, projectId, scopeId, gate), gate,
-          actor.role === "engineer" || actor.role === "project_manager");
+        const editable = actor.role === "engineer" || actor.role === "project_manager";
+        const result = await snapshot(tx, await synchronize(tx, projectId, scopeId, gate), gate, editable);
+        if (!editable) return result;
+        const accepted = await tx.query("SELECT 1 FROM intake_occurrences WHERE project_id=$1 AND state='accepted' LIMIT 1", [projectId]);
+        return { ...result, hasAcceptedMaterials: Boolean(accepted.rowCount) };
       });
       return reply.header("ETag", `"${result.version}"`).send(result);
     },
@@ -323,19 +339,41 @@ function registerRoutes(app: FastifyInstance, prefix: string) {
     },
   );
 
+  app.get<{ Params: Project; Querystring: { after?: string; assessmentContextId?: string } }>(`${prefix}/projects/:projectId/inventory-limitations`, async (request) => {
+    const projectId = identifier(request.params.projectId);
+    const after = request.query.after === undefined ? undefined : identifier(request.query.after);
+    return transaction(db, async (tx) => {
+      const session = await readSession(tx, request);
+      await authorize(tx, session, { action: 'project:engineer', projectId });
+      const area = request.query.assessmentContextId ? await getLockedFacadeContext(tx, projectId, identifier(request.query.assessmentContextId)) : null;
+      const rows = await inventoryLimits(tx, projectId, after, undefined, area ? conclusionBasisVersions(area, true) : undefined);
+      return { items: rows.slice(0, 100), nextCursor: rows.length > 100 ? rows[99].occurrenceId : null };
+    });
+  });
+
   app.post<{ Params: Project }>(
     `${prefix}/projects/:projectId/conclusions`,
     async (request, reply) => {
       const projectId = identifier(request.params.projectId);
-      const { scopeId, assessmentContextId, startWork, reason } = parseConclusion(request.body);
+      const { scopeId, assessmentContextId, startWork, reason, basis } = parseConclusion(request.body);
+      let common = false;
+      let facadeId: string | undefined;
       let revision: Awaited<ReturnType<typeof synchronize>>;
       let gate: Gate;
       const result = await executeCommand(db, request, {
         operation: "assessment.conclude",
         requirement: { action: "project:engineer", projectId, scopeId },
-        input: { scopeId, assessmentContextId, startWork, reason },
+        input: { scopeId, assessmentContextId, startWork, reason, ...(basis && { basis }) },
         async version(tx) {
           const facade = assessmentContextId ? await getLockedFacadeContext(tx, projectId, assessmentContextId) : null;
+          if (facade && !basis) {
+            throw new AssessmentError(422, 'conclusion_basis_required', 'Укажите место в оригинале или ограничение описи.');
+          }
+          if (facade && !facade.input.versionIds.length) {
+            throw new AssessmentError(422, 'conclusion_materials_required', 'Сначала примите материалы для проверки.');
+          }
+          common = facade?.context.kind === 'common';
+          facadeId = facade?.context.facadeId ?? undefined;
           gate = facade?.gate ?? await getLockedGate(tx, projectId, scopeId!);
           assertAvailable(gate);
           if (facade?.questions.some(({ active, review }) => active && review?.supplementReceiptIds?.length)) {
@@ -349,7 +387,8 @@ function registerRoutes(app: FastifyInstance, prefix: string) {
         const current = await snapshot(tx, revision, gate);
         const conclusion: Conclusion = {
           id: randomUUID(), startWork, reason, authorId: actor.userId, createdAt: new Date().toISOString(),
-          basedOnVersion: revision.version,
+          basedOnVersion: revision.version, outcome: current.outcome,
+          ...(basis && { basis: await conclusionBasis(tx, projectId, basis, current, { common, scopeId, facadeId }) }),
           criticalQuestionIds: current.questions.filter(({ decision }) => decision?.startWorkCritical)
             .map(({ id }) => id),
         };

@@ -1,6 +1,13 @@
 const ruNumber = new Intl.NumberFormat('ru', { maximumFractionDigits: 2 });
 const ruDate = new Intl.DateTimeFormat('ru', { dateStyle: 'medium', timeStyle: 'short' });
 const labels: Record<string, string> = {
+  budget_exhausted: 'Лимит чтения исчерпан',
+  budget_reserve_wait: 'Часть бюджета зарезервирована',
+  budget_frozen: 'Расходы требуют сверки',
+  inspect_budget_and_unresolved_reserves: 'Оператор проверяет остаток бюджета и открытые резервы',
+  operator_review_ledger: 'Оператор сверяет журнал расходов',
+  wait_for_reserve_settlement: 'Система ожидает расчёта по открытым резервам',
+  restore_external_journal: 'Оператор восстанавливает связь с журналом расходов',
   queued: 'В очереди',
   leased: 'В работе',
   done: 'Завершено',

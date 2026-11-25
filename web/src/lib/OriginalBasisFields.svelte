@@ -6,8 +6,8 @@
 
   type Original = { id: string; documentId: string; label: string; mediaType: string };
   type Page = { originals: Original[]; nextCursor: string | null; kinds?: string[] };
-  let { api, projectId, versionId = $bindable(), anchor = $bindable(), kinds = $bindable([]), edit }: {
-    api: Api; projectId: string; versionId: string; anchor: string; kinds?: string[]; edit: () => void;
+  let { api, projectId, assessmentContextId, versionId = $bindable(), anchor = $bindable(), kinds = $bindable([]), edit }: {
+    api: Api; projectId: string; assessmentContextId?: string; versionId: string; anchor: string; kinds?: string[]; edit: () => void;
   } = $props();
   let originals = $state<Original[]>([]);
   let nextCursor = $state<string | null>(null);
@@ -21,7 +21,7 @@
     loading = true;
     problem = '';
     try {
-      const result = await api.json<Page>(query(projectV1(projectId) + '/confirmation-originals', { after }), { signal });
+      const result = await api.json<Page>(query(projectV1(projectId) + '/confirmation-originals', { after, assessmentContextId }), { signal });
       if (signal.aborted) return;
       originals = after ? [...originals, ...result.originals] : result.originals;
       nextCursor = result.nextCursor;
@@ -36,6 +36,7 @@
   let requests = $state<AbortController>();
   $effect(() => {
     void projectId;
+    void assessmentContextId;
     const stop = new AbortController();
     requests = stop;
     void load(stop.signal);
@@ -65,5 +66,5 @@
 {#if nextCursor && requests}
   <button type="button" class="quiet" disabled={loading} onclick={() => load(requests!.signal, nextCursor!)}>Ещё оригиналы</button>
 {:else if !originals.length && !loading && !problem}
-  <p class="meta">В проекте пока нет принятых оригиналов.</p>
+  <p class="meta">{assessmentContextId ? 'В выбранной области пока нет оригиналов с установленной принадлежностью.' : 'В проекте пока нет принятых оригиналов.'}</p>
 {/if}

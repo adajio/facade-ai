@@ -7,7 +7,7 @@ import {
 } from "./domain.js";
 import {
   AssessmentError, announceAssessment, assertAvailable, assessmentHref, getLockedGate, getQuestions, invalidInput,
-  makeChange, synchronize, writeQuestion, writeRevision, type Gate, type Question, type Revision,
+  letterGroundKind, makeChange, synchronize, writeQuestion, writeRevision, type Gate, type Question, type Revision,
 } from "./store.js";
 
 type Decide = {
@@ -89,7 +89,10 @@ export async function recordDecision(
     ...(input.exclusion ? { exclusion: input.exclusion } : {}),
     ...(clarification ? { clarification } : {}),
   };
-  const next = await writeRevision(tx, revision, revision.version + 1, gate, makeChange("engineer_decision", [question]));
+  const conclusion = canonicalJson(question.machine) === canonicalJson(machine) &&
+    effectiveOutcome(question.machine, question.decision, now) === effectiveOutcome(machine, decision, now) &&
+    Boolean(question.decision?.startWorkCritical) === Boolean(decision.startWorkCritical) ? revision.conclusion : null;
+  const next = await writeRevision(tx, revision, revision.version + 1, gate, makeChange("engineer_decision", [question]), conclusion);
   const version = question.version + 1;
   await writeQuestion(tx, next, {
     ...question,
@@ -160,12 +163,9 @@ export async function selectConfirmedGrounds(tx: PoolClient, options: GroundsOpt
       !revision.limitations.includes("catalog_rule_invalid")) {
     for (const question of selected) {
       const { decision, requirement } = question;
-      if (question.review?.supplementReceiptIds?.length || !decision?.requestExternal || !requirement.recipient ||
-          (recipient !== undefined && recipient !== requirement.recipient)) continue;
-      const clarification = decision.action === "request_clarification" && decision.clarification && question.review?.clarification &&
-        canonicalJson(decision.clarification) === canonicalJson(question.review.clarification) ? decision.clarification : undefined;
-      const kind = clarification ? "clarification" : effectiveOutcome(question.machine, decision, now);
-      if (kind !== "confirmed_missing" && kind !== "confirmed_conflict" && kind !== "clarification") continue;
+      const kind = letterGroundKind(question, revision, gate, now);
+      if (!kind || !decision || !requirement.recipient || (recipient !== undefined && recipient !== requirement.recipient)) continue;
+      const clarification = kind === "clarification" ? decision.clarification : undefined;
       const citations = [];
       for (const citation of decision.basis.citations) {
         const documentRevision = citation.documentRevision ??

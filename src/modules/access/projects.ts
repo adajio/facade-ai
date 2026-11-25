@@ -1,3 +1,4 @@
+import { inventoryOpen } from '../intake/receipts.js';
 import type { FastifyInstance, FastifyRequest } from 'fastify';
 import type { Pool, PoolClient } from 'pg';
 import {
@@ -188,20 +189,30 @@ function registerMembers(app: FastifyInstance, db: Pool) {
 async function listProjects(db: Pool, request: FastifyRequest) {
   const session = await readSession(db, request);
   await touchSession(db, session);
-  const { cursor } = request.query as { cursor?: string };
+  const { cursor, search } = request.query as { cursor?: string; search?: string };
+  const name = search === undefined ? '' : text(search, 'название проекта');
   const { rows } = await db.query<{
     id: string; name: string; version: number; role: ProjectRole; scopeId: string | null;
   }>(
     `SELECT p.id, p.name, p.version, m.role, m.scope_id AS "scopeId",
+       CASE WHEN m.scope_id IS NULL THEN p.project_stage END AS stage,
+       CASE WHEN m.scope_id IS NULL THEN GREATEST(last_event.created_at, receipt.created_at, receipt.sealed_at) END AS "lastActivityAt",
+       CASE WHEN m.scope_id IS NOT NULL THEN NULL WHEN receipt.id IS NULL THEN 'awaiting_receipt'
+         WHEN receipt.open THEN 'inventory_open' ELSE 'inventory_sealed' END AS "receiptState",
+       receipt.number::float8 AS "receiptNumber",
        CASE WHEN m.scope_id IS NULL THEN p.catalog_version_id END AS "catalogVersionId",
        CASE WHEN m.scope_id IS NULL AND c.id IS NOT NULL THEN
          jsonb_build_object('id', c.id, 'name', c.name, 'revision', c.revision) END AS catalog
      FROM project_memberships m JOIN projects p ON p.id = m.project_id
      LEFT JOIN catalog_versions c ON c.organization_id = p.organization_id AND c.id = p.catalog_version_id
+     LEFT JOIN LATERAL (SELECT e.created_at FROM supplement_project_events e WHERE e.project_id=p.id
+       AND m.scope_id IS NULL ORDER BY e.cursor DESC LIMIT 1) last_event ON true
+     LEFT JOIN LATERAL (SELECT r.id,r.number,r.created_at,r.sealed_at,${inventoryOpen} AS open FROM intake_receipts r WHERE r.project_id=p.id
+       AND m.scope_id IS NULL ORDER BY r.number DESC LIMIT 1) receipt ON true
      WHERE m.organization_id = $1 AND m.user_id = $2
        AND (m.expires_at IS NULL OR m.expires_at > statement_timestamp())
-       AND ($3::uuid IS NULL OR p.id > $3) ORDER BY p.id LIMIT 101`,
-    [session.organizationId, session.id, cursor == null ? null : uuid(cursor)],
+       AND ($3::uuid IS NULL OR p.id > $3) AND ($4::text='' OR strpos(lower(p.name),lower($4))>0) ORDER BY p.id LIMIT 101`,
+    [session.organizationId, session.id, cursor == null ? null : uuid(cursor), name],
   );
   const projects = rows.slice(0, 100).map((project) => ({ ...project, actions: projectActions(project.role) }));
   return {
@@ -405,7 +416,14 @@ export function registerProjects(app: FastifyInstance, db: Pool) {
     const { rows: [snapshot] } = await db.query<Project & { catalog: Catalog | null; scopes: ProjectScope[] }>(
       `SELECT ${projectColumns.map((column) => 'p.' + column).join(', ')},
               CASE WHEN c.id IS NOT NULL THEN jsonb_build_object('id', c.id, 'key', c.catalog_key, 'name', c.name,
-                'revision', c.revision, 'requirements', c.requirements) END AS catalog,
+                'revision', c.revision, 'requirements', c.requirements, 'stage', c.default_stage,
+                'approvalReference', c.approval_reference, 'publishedAt', c.created_at,
+                'publisher', (SELECT u.login FROM users u WHERE u.id=c.created_by)) END AS catalog,
+              (SELECT jsonb_build_object('automatic', a.action='project.catalog.auto_assign', 'at', a.occurred_at, 'actor', u.login)
+               FROM access_audit a LEFT JOIN users u ON u.id=a.actor_id
+               WHERE a.project_id=p.id AND a.action IN ('project.catalog.auto_assign','project.catalog.pin')
+                 AND a.details->>'catalogVersionId'=p.catalog_version_id::text AND a.outcome='ok'
+               ORDER BY a.id DESC LIMIT 1) AS "catalogAssignment",
               COALESCE((
                 SELECT jsonb_agg(to_jsonb(scope) ORDER BY scope.id) FROM (
                   SELECT s.id, s.project_id AS "projectId", s.stage, s.name, s.version

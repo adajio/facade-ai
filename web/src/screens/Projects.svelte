@@ -3,6 +3,7 @@
   import { describe, query, type Api } from '../lib/http';
   import { Commands } from '../lib/commands';
   import { type Project, type Session } from '../lib/contracts';
+  import { projectStageLabel } from '../lib/project-stages';
   import { projectUrl } from '../lib/routes';
   import { scopedUrl } from '../lib/workspace';
   import { date, label } from '../lib/format';
@@ -11,26 +12,59 @@
   let { api, session, refresh }: { api: Api; session: Session; refresh: () => Promise<void> } = $props();
   const commands = new Commands(() => api);
   let name = $state('');
-  let filter = $state('');
+  let filter = $state(new URLSearchParams(location.search).get('search') ?? '');
+  let results = $state<Session>();
+  let refreshSearch = $state(0);
   let extra = $state<Project[]>([]);
   let next = $state<string | null>();
   let paging = $state(false);
-  let pageKey = $derived(next === undefined ? (session.nextCursor ?? null) : next);
+  let firstPage = $derived(filter.trim() ? results : session);
+  let pageKey = $derived(next === undefined ? (firstPage?.nextCursor ?? null) : next);
   let creating = $state(false);
   let pending = $state(false);
   let error = $state('');
-  let projects = $derived([...new Map([...session.projects, ...extra].map((project) => [project.id, project])).values()].filter((project) =>
+  let projects = $derived([...new Map([...(firstPage?.projects ?? session.projects), ...extra].map((project) => [project.id, project])).values()].filter((project) =>
     project.name.toLocaleLowerCase('ru').includes(filter.trim().toLocaleLowerCase('ru'))
   ));
   let canCreate = $derived(session.actions?.includes('organization:create-project') ?? false);
 
 
+  $effect(() => {
+    const search = filter.trim();
+    void refreshSearch;
+    extra = [];
+    results = undefined;
+    next = undefined;
+    error = '';
+    if (!search) return;
+    const cancel = new AbortController();
+    const timer = setTimeout(async () => {
+      try {
+        const found = await api.json<Session>(query('/api/me', { search }), { signal: cancel.signal });
+        if (!cancel.signal.aborted) results = found;
+      } catch (problem) {
+        if (!cancel.signal.aborted) error = describe(problem);
+      }
+    }, 150);
+    return () => { clearTimeout(timer); cancel.abort(); };
+  });
+
+  function updateFilter(value: string) {
+    filter = value;
+    const url = new URL(location.href);
+    if (value.trim()) url.searchParams.set('search', value.trim());
+    else url.searchParams.delete('search');
+    history.replaceState(history.state, '', url);
+  }
+
   async function more() {
     if (!pageKey || paging) return;
+    const search = filter.trim();
     paging = true;
     error = '';
     try {
-      const value = await api.json<Session>(query('/api/me', { cursor: pageKey }));
+      const value = await api.json<Session>(query('/api/me', { cursor: pageKey, search: search || undefined }));
+      if (filter.trim() !== search) return;
       extra = [...extra, ...value.projects];
       next = value.nextCursor ?? null;
     } catch (problem) {
@@ -94,30 +128,40 @@
   <section class="card table-card" aria-labelledby="list-title">
     <div class="card-header">
       <h2 id="list-title">Доступные проекты</h2>
-      <label class="inline-label">Поиск<input type="search" bind:value={filter} placeholder="Название проекта" /></label>
-      <button type="button" class="quiet" onclick={refresh}>Обновить</button>
+      <label class="inline-label">Поиск<input type="search" maxlength="200" value={filter} oninput={(e) => updateFilter(e.currentTarget.value)} placeholder="Название проекта" /></label>
+      <button type="button" class="quiet" onclick={() => { refreshSearch++; void refresh(); }}>Обновить</button>
     </div>
     {#if projects.length}
       <div class="table-wrap">
         <table>
-          <thead><tr><th>Проект</th><th>Роль</th><th>Каталог</th><th>Обновлено</th></tr></thead>
+          <thead><tr><th>Проект</th><th>Стадия проекта</th><th>Последнее поступление</th><th>Роль</th><th>Перечень требований</th></tr></thead>
           <tbody>
             {#each projects as project (project.id)}
               <tr>
                 <td><a class="row-link" href={project.scopeId
                   ? scopedUrl(project.id, 'fragments', { scope: project.scopeId })
-                  : projectUrl(project.id)}>{project.name}</a></td>
+                  : projectUrl(project.id)}>{project.name}<span class="open-project" aria-hidden="true">{project.scopeId ? 'Открыть фрагменты' : 'Открыть проект'} →</span></a></td>
+                <td>{project.scopeId ? 'Опубликованный фрагмент' : project.stage ? projectStageLabel(project.stage) : 'Уточняется'}</td>
+                <td>{#if project.scopeId}—{:else}
+                  {#if project.receiptState === 'awaiting_receipt'}Ожидается первый комплект
+                  {:else if project.receiptState}№{project.receiptNumber} · {project.receiptState === 'inventory_open' ? 'Опись открыта' : 'Опись закрыта'}
+                  {:else}Состояние поступления неизвестно{/if}
+                  {#if project.lastActivityAt}<small class="open-project">Последнее изменение · {date(project.lastActivityAt)}</small>{/if}
+                {/if}</td>
                 <td>{label(project.role)}</td>
                 <td>{project.catalog ? project.catalog.name + ' · ' + project.catalog.revision : project.scopeId ? '—' : 'Нет рабочего каталога'}</td>
-                <td>{date(project.updatedAt)}</td>
               </tr>
             {/each}
           </tbody>
         </table>
       </div>
     {:else}
-      <p class="empty">{filter ? 'По этому названию проекты не найдены.' : 'Список проектов пока пуст.'}</p>
+      <p class="empty">{filter.trim() && !results && !error ? 'Выполняется поиск…' : filter.trim() ? 'По этому названию проекты не найдены.' : 'Список проектов пока пуст.'}</p>
     {/if}
     {#if pageKey}<div class="card-header"><button type="button" onclick={more} disabled={paging}>Ещё проекты</button></div>{/if}
   </section>
 </main>
+
+<style>
+  .open-project { display: block; margin-top: .2rem; font-size: .86em; }
+</style>

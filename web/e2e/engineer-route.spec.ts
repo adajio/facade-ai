@@ -1,0 +1,130 @@
+import { expect, test } from '@playwright/test';
+import { readFile } from 'node:fs/promises';
+import { randomUUID } from 'node:crypto';
+import { resolve } from 'node:path';
+import { pathToFileURL } from 'node:url';
+import { accepted, command, pdf, signIn, unique } from './synthetic';
+
+test('От первого комплекта до заключения по оригиналу и объяснения пустого письма', async ({ page, baseURL }, info) => {
+  const build = process.env.FACADE_E2E_BUILD_DIR;
+  test.skip(!build || !process.env.DATABASE_URL || !process.env.FACADE_E2E_STAGE_ONE, 'Нужна отдельная синтетическая БД с подготовленной сборкой');
+  const compiled = (name: string) => import(pathToFileURL(resolve(build!, 'src', name + '.js')).href);
+  const [{ openPool }, { transaction }, { passwordHash }] = await Promise.all([
+    compiled('platform/db'), compiled('modules/access/commands'), compiled('modules/access/auth'),
+  ]);
+  const db = openPool(process.env.DATABASE_URL);
+  const login = unique('route-engineer');
+  const password = randomUUID();
+  try {
+    const hash = await passwordHash(password);
+    await transaction(db, async (tx: import('pg').PoolClient) => {
+      const { rows: [org] } = await tx.query('INSERT INTO organizations(name) VALUES ($1) RETURNING id', [login]);
+      await tx.query("INSERT INTO users(organization_id,login,password_hash,state,org_admin,can_create_project) VALUES($1,$2,$3,'active',true,true)", [org.id, login, hash]);
+    });
+  } finally { await db.end(); }
+  const origin = new URL(baseURL!).origin;
+  await signIn(page, login, password);
+  const create = async () => accepted<{ id: string; catalogVersionId: string | null }>(
+    await command(page.context(), origin, '/api/projects', 'POST', { mode: 'intake', name: unique('Проверка назначения') }), 'Проект');
+  const initial = await create();
+  expect(initial.catalogVersionId).toBeNull();
+  const source = JSON.parse(await readFile(new URL('../../infra/catalogs/intake-stage-1.json', import.meta.url), 'utf8'));
+  const published = await accepted<{ id: string }>(await command(page.context(), origin, '/api/catalogs', 'POST',
+    { ...source, key: unique('intake-profile') }), 'Публикация перечня');
+  expect((await create()).catalogVersionId).toBe(published.id);
+  await accepted(await command(page.context(), origin, '/api/catalogs', 'POST',
+    { ...source, name: 'Второй перечень', key: unique('alternative'),
+      requirements: [{ ...source.requirements[0], completenessCriterion: 'Сверить марки узлов по альтернативному перечню' }] }), 'Второй профиль');
+  const secondName = unique('Искомый второй проект');
+  const secondProject = await accepted<{ id: string }>(await command(page.context(), origin, '/api/projects', 'POST',
+    { name: secondName, mode: 'intake' }), 'Второй проект');
+  await page.goto('/projects');
+  await page.getByRole('searchbox').fill(secondName);
+  const row = page.getByRole('row').filter({ hasText: secondName });
+  await expect(row).toContainText('Ожидается первый комплект');
+  await row.getByRole('link').click();
+  await expect(page).toHaveURL(new RegExp(secondProject.id + '/overview'));
+  await page.goBack();
+  await expect(page.getByRole('searchbox')).toHaveValue(secondName);
+  await expect(page.getByRole('row').filter({hasText: secondName})).toHaveCount(1);
+  await page.getByRole('searchbox').fill('');
+  await page.getByRole('button', { name: 'Создать проект' }).click();
+  await page.getByLabel('Название проекта').fill(unique('Рабочий маршрут'));
+  await page.getByRole('button', { name: 'Сохранить проект' }).click();
+  const settings = page.getByRole('link', { name: 'Настройки проекта', exact: true });
+  await settings.click();
+  const path = new URL(page.url()).pathname.replace(/\/settings$/, '');
+  const project = await accepted<{ id: string; version: number; catalogVersionId: string | null }>(await page.request.get('/api' + path), 'Настройки');
+  expect(project.catalogVersionId).toBeNull();
+  await page.getByRole('link', { name: 'Изменить назначение каталога и участников' }).click();
+  const preview = (name: string) => page.locator('details').filter({has: page.locator('summary').filter({hasText:name})});
+  const primary = preview(source.name);
+  const alternative = preview('Второй перечень');
+  await primary.locator('summary').click();
+  await alternative.locator('summary').click();
+  await expect(primary.locator('li')).toHaveCount(16);
+  await expect(alternative.locator('li')).toHaveCount(1);
+  await expect(alternative).toContainText('Сверить марки узлов по альтернативному перечню');
+  await settings.click();
+  expect((await accepted<{catalogVersionId: string | null}>(await page.request.get('/api' + path), 'После просмотра')).catalogVersionId).toBeNull();
+  await page.getByRole('link', { name: 'Изменить назначение каталога и участников' }).click();
+  await page.getByRole('combobox', { name: 'Версия каталога', exact: true }).selectOption(published.id);
+  await page.getByRole('button', { name: 'Назначить рабочий каталог' }).click();
+  await expect(page.getByText('Версия каталога закреплена.')).toBeVisible();
+  await settings.click();
+  await page.getByText(/Требования каталога.*16/).click();
+  await expect(page.getByText('Раздел АР', { exact: true })).toBeVisible();
+  await page.getByRole('link', { name: 'Обзор', exact: true }).click();
+  await page.getByRole('link', { name: 'Загрузить первый комплект' }).click();
+  const original = pdf('Engineer review sample');
+  await page.getByLabel('Файлы или архивы').setInputFiles(original);
+  await page.getByRole('button', { name: 'Начать передачу' }).click();
+  await expect(page.getByRole('row').filter({ hasText: original.name })).toBeVisible();
+  await page.getByRole('row').filter({ hasText: original.name }).getByRole('link', { name: 'Карточка документа' }).click();
+  await page.getByText('Стадия документа или отдельного места', { exact: true }).click({ timeout: 45_000 });
+  await page.getByLabel('К чему относится стадия').selectOption('place');
+  await page.getByLabel('Страница с указанием стадии').fill('1');
+  await page.getByLabel('Обозначение стадии').fill('РД');
+  await page.getByLabel('Обоснование стадии').fill('Проверен титульный лист выбранной редакции.');
+  await page.getByRole('button', { name: 'Сохранить стадию' }).click();
+  await expect(page.getByText('Стадия сохранена.')).toBeVisible();
+  await page.reload();
+  await page.getByText('Стадия документа или отдельного места', { exact: true }).click();
+  await expect(page.getByText(/Инженер ещё не подтверждал стадию/)).toBeVisible();
+  await page.getByLabel('К чему относится стадия').selectOption('place');
+  await page.getByLabel('Страница с указанием стадии').fill('1');
+  await expect(page.getByText(/Подтверждённая стадия · РД/)).toBeVisible();
+  await page.getByRole('link', { name: 'Обзор', exact: true }).click();
+  await expect(page.getByText(/Автоматическое чтение отключено/)).toBeVisible({ timeout: 45_000 });
+  await page.screenshot({ path: info.outputPath('overview.png') });
+  await page.getByRole('link', { name: 'Посмотреть все 16 требований' }).click();
+  await expect(page.locator('[data-triage-row]')).toHaveCount(16);
+  await page.locator('[data-triage-row]').filter({ hasText: 'Раздел АР' }).first().click();
+  await expect(page.getByRole('heading', { name: 'Раздел АР', exact: true })).toBeFocused();
+  await expect(page.getByText('Критерий достаточности', { exact: true })).toBeVisible();
+  await expect(page.getByText(/Допустимая замена:.*dxf/i)).toBeVisible();
+  await expect(page.getByText(/Формат по каталогу · DWG · Допустимая замена: DXF/)).toBeVisible();
+  await page.screenshot({ path: info.outputPath('requirement.png') });
+  await page.getByText(/^Заключение ·/).click();
+  await page.getByLabel('Можно ли начать работы').selectOption('can_start_with_limitations');
+  await page.locator('.sync-menu > summary').click();
+  const updated = page.waitForResponse((res) => res.url().endsWith('/facade-assessment') && res.ok());
+  await page.getByRole('button', { name: 'Обновить сейчас' }).click();
+  await updated;
+  await page.locator('.sync-menu > summary').click();
+  await expect(page.getByLabel('Можно ли начать работы')).toHaveValue('can_start_with_limitations');
+  await page.locator('form').filter({has: page.getByLabel('Можно ли начать работы')}).getByLabel('Основание решения', { exact: true }).fill('Принята проверенная страница. Остальной состав требует сверки.');
+  await page.getByLabel('Документ-основание').selectOption({ label: original.name });
+  await page.getByLabel('Физическая страница PDF').fill('1');
+  await page.getByRole('button', { name: 'Сохранить заключение' }).click();
+  await expect(page.getByText('Решение сохранено.')).toBeVisible();
+  await page.reload();
+  await page.getByText(/^Заключение ·/).click();
+  await expect(page.getByText(/Принята проверенная страница/)).toBeVisible();
+  await expect(page.locator('a[href*="/content#page=1"]').first()).toBeVisible();
+  await page.getByRole('link', { name: 'Письма', exact: true }).click();
+  await expect(page.getByText(/Оснований для письма пока нет/)).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Создать письмо из выбранных пунктов' })).toHaveCount(0);
+  await expect(page.getByRole('link', { name: 'Проверить комплектность' })).toBeVisible();
+  await page.screenshot({ path: info.outputPath('letters.png') });
+});

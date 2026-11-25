@@ -3,12 +3,16 @@ import { lockScopes } from "../supplements/holds.js";
 import { publishProjectEvent, readProjectionPosition } from "../supplements/events.js";
 import { names, normalize } from "./domain.js";
 import type { Candidate, ObservationPublication, Pair, Subject } from "./domain.js";
+import type { PackageSource, PackageSearch } from "./package-inquiry.js";
 
 export interface InquiryRow {
   id: string;
   project_id: string;
-  scope_id: string;
-  stage: string;
+  scope_id: string | null;
+  stage: string | null;
+  assessment_context_id: string | null;
+  package_snapshot_version: number | null;
+  package_source: PackageSource | null;
   slice_id: string | null;
   catalog_version_id: string | null;
   assessment_question_id: string | null;
@@ -28,6 +32,7 @@ export interface SearchResult {
   candidates: Candidate[];
   pairs: Pair[];
   limitations: string[];
+  packageResult?: PackageSearch;
 }
 
 export async function enqueue(tx: PoolClient, id: string, searchVersion: number) {
@@ -42,18 +47,20 @@ export async function enqueue(tx: PoolClient, id: string, searchVersion: number)
 export async function createInquiry(
   tx: PoolClient,
   input: Subject & {
-    projectId: string; scopeId: string; stage: string; sliceId?: string; catalogVersionId?: string;
+    projectId: string; stage: string | null; sliceId?: string; catalogVersionId?: string | null;
     anchorId?: string; assessmentQuestionId?: string; generationId?: string;
-  },
+  } & ({ scopeId: string } | { assessmentContextId: string; assessmentVersion: number; packageSource: PackageSource }),
 ): Promise<InquiryRow> {
   const subject = { subject: input.subject, aliases: input.aliases, property: input.property, variant: input.variant };
   const result = await tx.query<InquiryRow>(
     `INSERT INTO inquiries
        (project_id, scope_id, stage, slice_id, catalog_version_id, anchor_id, assessment_question_id, generation_id,
-        subject, property_key, variant_key, subject_names)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) RETURNING *`,
-    [input.projectId, input.scopeId, input.stage, input.sliceId, input.catalogVersionId, input.anchorId,
-      input.assessmentQuestionId, input.generationId, subject, normalize(input.property), normalize(input.variant ?? ""), names(subject)],
+        assessment_context_id, package_snapshot_version, package_source, subject, property_key, variant_key, subject_names)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15) RETURNING *`,
+    [input.projectId, "scopeId" in input ? input.scopeId : null, input.stage, input.sliceId, input.catalogVersionId, input.anchorId,
+      input.assessmentQuestionId, input.generationId,
+      "assessmentContextId" in input ? input.assessmentContextId : null,
+      "assessmentVersion" in input ? input.assessmentVersion : null, "packageSource" in input ? input.packageSource : null, subject, normalize(input.property), normalize(input.variant ?? ""), names(subject)],
   );
   const inquiry = result.rows[0];
   await enqueue(tx, inquiry.id, inquiry.search_version);

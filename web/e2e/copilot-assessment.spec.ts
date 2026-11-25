@@ -72,6 +72,7 @@ test('Тип фасада, непроверенное место и опора �
   });
 
   await page.goto('/projects/' + projectId + '/completeness/' + questionId + '?context=' + context);
+  await page.getByText(/^Что вошло в проверку ·/).click();
   await expect(page.getByText('Структура проверена обеими ветвями')).toBeVisible();
   await expect(page.getByText('2 из 4', { exact: true })).toBeVisible();
   await expect(page.getByText('1 из 4 окон · Есть остаток')).toBeVisible();

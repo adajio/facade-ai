@@ -1,8 +1,11 @@
 <script lang="ts">
+  import { versionForCount } from '../lib/assessment-version';
   import { Commands } from '../lib/commands';
   import { tick } from 'svelte';
+  import ConclusionBasis from '../lib/ConclusionBasis.svelte';
+  import type { ConclusionInput } from '../lib/workspace';
   import TriageBar from '../lib/TriageBar.svelte';
-  import { bucket, triageCounts, type Triage } from '../lib/triage';
+  import { matchesSelection, requirementTitle, triageCounts, type Triage } from '../lib/triage';
   import { conflictMessage } from '../lib/conflict';
   import { date, label } from '../lib/format';
   import { describe, id, interrupted, query, type Api } from '../lib/http';
@@ -20,18 +23,21 @@
   let loadError = $state('');
   let selected = $state('');
   let showHistory = $state(false);
-  let historical = $derived(Boolean(context.revision));
+  let countVersion = $state('');
+  let expiredCount = $state(false);
+  let historical = $derived(Boolean(context.revision || countVersion));
   let counts = $derived(triageCounts(snapshot?.questions ?? []));
-  let current = $derived(triage ?? (counts.review ? 'review' : counts.letter ? 'letter' : 'done'));
+  let current = $derived((context.filter || triage || 'all') as Triage);
   let visible = $derived((snapshot?.questions ?? []).filter((item) =>
-    context.filter ? context.filter === item.outcome : item.id === context.objectId && !triage || bucket(item) === current));
-  let row = $derived(visible.find((entry) => entry.id === (selected || context.objectId)) ?? visible[0]);
+    matchesSelection(item, current)));
+  let row = $derived(selected || context.objectId ? visible.find((entry) => entry.id === (selected || context.objectId)) : visible[0]);
   let action = $state('confirm');
   let reason = $state('');
   let correction = $state('covered');
   let exclusion = $state('not_required');
   let critical = $state(false);
   let requestExternal = $state(false);
+  let basis = $state<ConclusionInput>();
   let startWork = $state('can_start');
   let conclusionReason = $state('');
   let basedOn = $state<number>();
@@ -70,15 +76,21 @@
   $effect(() => {
     const scopeId = context.scopeId;
     const version = context.revision ?? 'current';
-    const path = projectV1(context.project.id) + '/assessments/' + id(version);
+    const base = projectV1(context.project.id) + '/assessments/';
+    const path = base + id(version);
+    const seen = context.revision ? null : context.params.get('seen');
     void context.refreshKey;
     if (!scopeId) return;
     const controller = new AbortController();
     loadError = '';
-    api.json<Assessment>(query(path, { scopeId }), { signal: controller.signal }).then((result) => {
-      snapshot = result;
+    api.json<Assessment>(query(path, { scopeId }), { signal: controller.signal }).then(async (fresh) => {
+      const result = await versionForCount(seen, fresh, (v) => api.json<Assessment>(query(base + id(v), { scopeId }), { signal: controller.signal }));
+      if (controller.signal.aborted) return;
+      snapshot = result.snapshot;
+      countVersion = result.historical ?? '';
+      expiredCount = Boolean(result.expired);
     }).catch((error) => {
-      if (!interrupted(error)) loadError = describe(error);
+      if (!controller.signal.aborted && !interrupted(error)) { snapshot = undefined; loadError = describe(error); }
     });
     return () => controller.abort();
   });
@@ -145,7 +157,7 @@
     const version = conclusionBase ?? snapshot.version;
     await run(async () => {
       await commands.send(projectV1(context.project.id) + '/conclusions', 'POST', {
-        scopeId: context.scopeId, startWork, reason: conclusionReason,
+        scopeId: context.scopeId, startWork, reason: conclusionReason, basis,
       }, version);
       conclusionBase = undefined;
       conclusionReason = '';
@@ -174,6 +186,7 @@
   <Notice kind="error" message={loadError} />
   {#if !snapshot && !loadError}<p role="status">Загружаем оценку…</p>{/if}
   {#if snapshot}
+    {#if expiredCount}<p role="status">Прежняя версия недоступна. Показаны строки и числа актуальной оценки №{snapshot.version}.</p>{/if}
     {#if context.canEdit && !historical}
       <ScopeRequirements {api} project={context.project} scopeId={context.scopeId} saved={renew} />
     {/if}
@@ -206,8 +219,8 @@
       {#if snapshot.holds?.length}<Notice message={'Ожидается разбор поступлений · ' + snapshot.holds.length} />{/if}
     </section>
 
-    {#if !context.filter}
-      <TriageBar value={current} {counts} choose={chooseTriage}
+    {#if snapshot}
+      <TriageBar value={current} {counts} checked={snapshot.questions.filter((q) => q.outcome !== 'needs_review').length} choose={chooseTriage}
         letterUrl={scopedUrl(context.project.id, 'letters', { scope: context.scopeId })} />
     {/if}
     <div class="split">
@@ -221,7 +234,7 @@
                 {#each visible as item (item.id)}
                   <tr>
                     <td><button type="button" class="quiet" data-triage-row aria-pressed={row?.id === item.id}
-                      onclick={() => { selected = item.id; basedOn = undefined; reason = ''; }}>{item.requirement.subject} · {item.requirement.part}</button></td>
+                      onclick={() => { selected = item.id; basedOn = undefined; reason = ''; }}>{requirementTitle(item.requirement)}</button></td>
                     <td>{item.requirement.formats.join(', ')}</td>
                     <td><span class="pill">{label(item.outcome)}</span></td>
                     {#if context.canEdit && !historical}
@@ -242,7 +255,7 @@
 
       {#if row}
         <section class="card" aria-labelledby="assessment-row">
-          <h2 id="assessment-row">{row.requirement.subject} · {row.requirement.part}</h2>
+          <h2 id="assessment-row">{requirementTitle(row.requirement)}</h2>
           <dl class="details">
             <dt>Редакция вопроса</dt><dd>{row.version}</dd>
             <dt>Машинный вывод</dt><dd>{label(row.machine.outcome)}</dd>
@@ -339,7 +352,8 @@
     </div>
     <Notice kind="error" message={operationError} />
     <Notice kind="success" message={operationStatus} />
-    {#if context.canEdit && !historical}
+    {#if snapshot.conclusion?.basis}<ConclusionBasis {api} projectId={context.project.id} {open} saved={snapshot.conclusion} />{/if}
+    {#if context.canEdit && !historical && (snapshot.hasAcceptedMaterials ?? snapshot.questions.some((q) => q.machine.citations.length))}
       <section class="card">
         <h2>Заключение по области</h2>
         <form onsubmit={saveConclusion}>
@@ -348,12 +362,13 @@
             <option value="can_start_with_limitations">Можно начать с ограничениями</option>
             <option value="cannot_start">Начинать нельзя</option>
           </select></label>
+          <ConclusionBasis {api} projectId={context.project.id} {open} bind:input={basis} citations={snapshot.questions.flatMap((q) => q.machine.citations)} edit={() => conclusionBase ??= snapshot?.version} />
           <label>Основание заключения<textarea required bind:value={conclusionReason} oninput={() => conclusionBase ??= snapshot?.version}></textarea></label>
           {#if conclusionBase != null && conclusionBase !== snapshot.version}
             <p class="notice">Ввод опирался на версию {conclusionBase}. Сейчас доступна версия {snapshot.version}.</p>
             <button type="button" onclick={() => conclusionBase = snapshot?.version}>Сверил заключение с текущей версией</button>
           {/if}
-          <div class="actions"><button class="primary" disabled={saving}>Сохранить заключение</button></div>
+          <div class="actions"><button class="primary" disabled={saving || !basis || conclusionBase !== undefined && conclusionBase !== snapshot.version}>Сохранить заключение</button></div>
         </form>
       </section>
     {/if}

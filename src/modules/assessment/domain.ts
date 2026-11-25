@@ -61,7 +61,7 @@ export type Citation = {
   deliveryUncertainty?: "contradictory_original" | "original_statement_unverified";
   documentRevision?: DocumentRevision;
   verifiedRevision?: string;
-  stageConfirmation?: { stage: string; evidenceId: string };
+  stageConfirmation?: { stage: string; evidenceId?: string; originalBasis?: import("../intake/accepted-originals.js").OriginalBasis };
   valueRoleBasis?: { kind: ValueRole; quote: string; evidenceId: string; address: Record<string, unknown> };
   components?: ReaderObservationComponent[];
 };
@@ -173,13 +173,27 @@ function numericValue(value: string, unit: string | null): Value | null {
   const match = /^([+-]?)([0-9]{1,48})(?:[.,]([0-9]{1,48}))?$/.exec(value.trim());
   if (!match) return null;
   const normalizedUnit = unit?.trim() ?? "";
-  const [dimension, scale] = measurementUnits.get(normalizedUnit) ?? [normalizedUnit, 0];
+  const [dimension, scale] = measurementUnits.get(normalizedUnit) ?? [`unit:${normalizedUnit}`, 0];
   const fraction = match[3] ?? "";
   return {
     magnitude: BigInt(`${match[1]}${match[2]}${fraction}`),
     exponent: scale - fraction.length,
     dimension,
   };
+}
+
+export function normalizeFactValue(value: string | null, unit: string | null) {
+  if (value === null) return null;
+  const number = numericValue(value, unit);
+  if (!number) return { value: value.trim().normalize("NFC"), unit, numeric: false };
+  const { magnitude, exponent, dimension } = number;
+  const digits = (magnitude < 0n ? -magnitude : magnitude).toString();
+  const padded = exponent < 0 ? digits.padStart(1 - exponent, "0") : digits;
+  const decimal = exponent >= 0 ? digits + "0".repeat(exponent) :
+    padded.slice(0, exponent) + "." + padded.slice(exponent);
+  const canonical = magnitude === 0n ? "0" : exponent < 0 ? decimal.replace(/0+$/u, "").replace(/\.$/u, "") : decimal;
+  const baseUnits: Record<string, string> = { length: "мм", mass: "г", count: "шт" };
+  return { value: (magnitude < 0n ? "-" : "") + canonical, unit: baseUnits[dimension] ?? unit, numeric: true };
 }
 
 export function compareCitationValues(a: Pick<Citation, "value" | "unit">, b: Pick<Citation, "value" | "unit">): "equal" | "different" | "unknown" {

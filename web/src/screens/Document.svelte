@@ -6,6 +6,8 @@
   import type { Occurrence } from '../lib/intake';
   import { V1, scopedUrl, type OpenEvidence, type WorkspaceProps } from '../lib/workspace';
   import Notice from '../lib/Notice.svelte';
+  import DocumentStage from '../lib/DocumentStage.svelte';
+  import DocumentFacadeLink from '../lib/DocumentFacadeLink.svelte';
   import CadDocument from './CadDocument.svelte';
   import type { ReaderMap } from '../lib/cad';
   import WorkJob, { type Job } from './DocumentJob.svelte';
@@ -34,6 +36,7 @@
   let viewer = $state<HTMLHeadingElement>();
   let refreshWork = $state(0);
   let fullPdf = $state(false);
+  let previewAttempt = $state(0);
   let preview = $state<{ key: string; url?: string }>();
 
   const documentId = $derived(occurrence.documentId);
@@ -58,6 +61,7 @@
 
   $effect(() => {
     const key = previewKey;
+    void previewAttempt;
     if (!key) return;
     const stop = new AbortController();
     const generation = pageCache.generation;
@@ -70,12 +74,17 @@
     }
     const signal = AbortSignal.any([stop.signal, AbortSignal.timeout(8000)]);
     const fetchPage = async () => {
-      const response = await api.response(url, { signal }).catch(async (error) => {
-        if (!(error instanceof ApiError) || error.code !== 'reader_resource_wait') throw error;
-        await new Promise<void>((resolve) => setTimeout(resolve, 350));
-        signal.throwIfAborted();
-        return api.response(url, { signal });
-      });
+      async function requestPreview() {
+        for (let retry = 0; ; retry++) {
+          try { return await api.response(url, { signal }); }
+          catch (error) {
+            if (retry >= 4 || !(error instanceof ApiError) || error.code !== 'reader_resource_wait') throw error;
+            await new Promise<void>((resolve) => setTimeout(resolve, 300 * (retry + 1)));
+            signal.throwIfAborted();
+          }
+        }
+      }
+      const response = await requestPreview();
       if (response.headers.get('ETag') !== expected || response.headers.get('Content-Type')?.split(';')[0] !== 'image/png') {
         throw new Error('Неверная версия страницы');
       }
@@ -237,19 +246,24 @@
       {:else if previewKey && preview?.url}
         <img class="page-preview" alt={'Оригинал PDF, страница ' + page} src={preview.url} />
       {:else}
+        {#if previewKey && preview?.key === previewKey && !preview.url}
+          <p>Сейчас открыт полный PDF. <button type="button" class="quiet" onclick={() => { preview = undefined; previewAttempt++; }}>Повторить быстрый просмотр страницы</button></p>
+        {/if}
         {#key pdfUrl}
           <iframe title={'Оригинал PDF, страница ' + page} src={pdfUrl}></iframe>
         {/key}
       {/if}
     </section>
   {/if}
+  {#if occurrence.restriction}<p>Ограничение · {label(occurrence.restriction)}</p>{/if}
+  <details><summary>Технические сведения об оригинале</summary>
   <dl class="details">
     <dt>Версия оригинала</dt><dd class="numeric">{occurrence.versionId}</dd>
     <dt>SHA-256</dt><dd class="numeric">{occurrence.sha256 ?? '—'}</dd>
     <dt>Фактический тип</dt><dd>{occurrence.mediaType ?? '—'}</dd>
-    {#if occurrence.restriction}<dt>Ограничение</dt><dd>{label(occurrence.restriction)}</dd>{/if}
   </dl>
-  <h3>Физические единицы</h3>
+  </details>
+  <h3>{isPdf ? 'Страницы документа' : 'Листы и части документа'}</h3>
   <Notice message={readerError} />
   {#if cadVersion && ready && !context.masked && units.some(unit => unit.locator?.partSha256)}
     <CadDocument {api} {units} readerVersion={cadVersion} endpoint={V1 + path.slice(4) + '/reader/units'}
@@ -269,6 +283,16 @@
         </li>
       {/each}
     </ul>
+  {/if}
+
+  {#if ready && !context.project.scopeId && units.length && (isPdf || occurrence.mediaType === 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')}
+    {@const confirmationPath = '/api/projects/' + id(context.project.id) + '/versions/' + id(versionId)}
+    {#key versionId}
+      <DocumentStage {api} pdf={isPdf} {page} editable={context.canEdit} {renew} path={confirmationPath + '/stage'} />
+      <DocumentFacadeLink {api} projectId={context.project.id} pdf={isPdf} {page} editable={context.canEdit} path={confirmationPath + '/facade-links'} />
+    {/key}
+  {:else if ready && !context.project.scopeId && context.canEdit && !isPdf && occurrence.mediaType !== 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'}
+    <p class="meta">Адресное подтверждение стадии и принадлежности доступно для физических страниц PDF и ячеек XLSX.</p>
   {/if}
 
   <h3>Состояние чтения</h3>

@@ -14,23 +14,48 @@ export type FacadeObservation = Pick<Citation, 'branch' | 'versionId' | 'documen
   quote: string | null;
   value: string | null;
   unit: string | null;
+  normalized?: { value: string; unit: string | null; numeric: boolean } | null;
+  variant?: string | null;
+  sourceRole?: string;
+  engineeringReview?: {
+    id: string; decision: { action: string; variant?: string; value?: string; unit?: string | null };
+    assessmentVersion: number; reason: string; authorId: string; createdAt: string;
+    state: 'applied' | 'review_required' | 'stale';
+    variant?: string | null; normalized?: { value: string; unit: string | null } | null;
+    places: (Pick<FacadeObservation, 'id' | 'evidenceId' | 'branch' | 'documentId' | 'versionId' | 'sha256' | 'address' |
+      'quote' | 'value' | 'unit' | 'variant' | 'revision'>)[];
+  };
   evidenceHref: string;
   evidenceId?: string;
   proposedFacadeKind?: string | null;
+  designStage?: string | null;
   facadeKindSourceVerified?: boolean;
   revision?: string | null;
   revisionStatus?: string;
   binding: { state: Binding; reason: string; candidates: { id: string; label: string }[] };
 };
 
+export type FactEquivalentsPage = {
+  version: number;
+  nextCursor: string | null;
+  items: (Pick<FacadeObservation, 'id' | 'branch' | 'quote' | 'attribute' | 'revision' | 'documentId' | 'versionId'> &
+    { label: string | null; address: SourceAddress })[];
+};
+
 export type FacadeType = {
   state: 'confirmed' | 'unconfirmed' | 'stale'; kind: string | null;
+  version?: number | null; authorId?: string; authorName?: string; reason?: string;
   basis: { provenanceKind?: 'machine_verified'; id: string; evidenceId: string; versionId: string;
     address: SourceAddress; quote?: string | null; revision: string } | OriginalBasis | null;
 };
 
 export type OriginalBasis = {
   provenanceKind: 'engineer_override'; label: string; documentId: string; versionId: string; address: SourceAddress;
+};
+
+export type DocumentFacadeLink = {
+  version: number; target: 'document' | 'place'; facadeId: string; facadeLabel: string; assessmentContextId: string; basis: OriginalBasis;
+  reason: string; authorId: string; authorName: string;
 };
 
 export type Boundary = { complete: boolean; reason: string | null; basisIds: string[] };
@@ -42,6 +67,8 @@ export type FacadeContext = Omit<Assessment, 'scope' | 'catalogVersionId'> & {
   name: string;
   counts: Record<string, number>;
   facadeType?: FacadeType;
+  documentFacadeLinks?: DocumentFacadeLink[];
+  previousConclusion?: { assessmentVersion: number; startWork: string; basedOnVersion: number; reason: string };
   conflictingTypes?: { kind: string; citation: Citation }[];
   identity?: { state: 'independent' | 'one_branch' | 'engineer'; sources: MentionSource[] };
   questionHolds: { questionId: string; receiptIds: string[] }[];
@@ -50,6 +77,7 @@ export type FacadeAssessment = {
   projectId: string;
   version: number;
   catalogVersionId: string | null;
+  acceptedVersions?: number;
   catalog?: { name: string; revision: number } | null;
   profile?: { state: string; confirmedKinds: string[] };
   comparisonReview?: { limited: boolean; items: {
@@ -111,6 +139,7 @@ export const assessmentReasons: Record<string, string> = {
   supplement_membership_unknown: 'Необходим разбор применимости досылки',
   supplement_review_required: 'Необходим пересмотр с учётом досылки',
   no_applicable_requirements: 'Применимых требований пока нет',
+  engineer_fact_review_required: 'Инженер изменил или исключил опору. Проверьте зависимый вывод.',
   requirement_not_proven: 'Доказательства по требованию неполны',
   required_evidence_incomplete: 'Комплект обязательных доказательств по требованию неполон',
   alternatives_unverified: 'Проверка возможных альтернатив не завершена',

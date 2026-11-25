@@ -4,7 +4,7 @@
   import { conflictMessage } from '../lib/conflict';
   import { date } from '../lib/format';
   import { ApiError, describe, id, interrupted, query, type Api } from '../lib/http';
-  import { V1, projectV1, type Assessment, type AssessmentQuestion, type OpenEvidence, type WorkspaceProps } from '../lib/workspace';
+  import { V1, projectV1, scopedUrl, type Assessment, type AssessmentQuestion, type OpenEvidence, type WorkspaceProps } from '../lib/workspace';
   import type { InquirySupport } from '../lib/inquiry-supports';
   import EvidenceButtons from '../lib/EvidenceButtons.svelte';
   import Notice from '../lib/Notice.svelte';
@@ -137,8 +137,9 @@
 </script>
 
 <Notice kind="error" message={loadError} />
-{#if editable && question && (previous.length || incoming.length || result)}
-  <SupportReplacementForm version={question.version} subject={question.requirement.subject}
+{#if editable && assessment && question && (previous.length || incoming.length || result)}
+  <SupportReplacementForm assessmentVersion={assessment.version} version={question.version} subject={question.requirement.subject}
+    reviewHref={scopedUrl(context.project.id, 'completeness', { scope: context.scopeId }, question.id)}
     {scope} {catalog} {formats} {incoming} {previous} {pending} problem={error} {result} {open} {save} />
 {/if}
 

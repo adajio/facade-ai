@@ -184,7 +184,7 @@ export async function completeOccurrenceInventory(tx: PoolClient, input: Receipt
   if (rowCount) await appendIntakeEvent(tx, projectId, receiptId, "intake.occurrence_inventory_complete", { occurrenceId });
 }
 
-const inventoryOpen = `(r.sealed_at IS NULL OR EXISTS (
+export const inventoryOpen = `(r.sealed_at IS NULL OR EXISTS (
     SELECT 1 FROM intake_occurrences o WHERE o.receipt_id = r.id AND (o.state = 'declared' OR o.inventory_pending)
   ) OR EXISTS (
     SELECT 1 FROM intake_imports i WHERE i.receipt_id = r.id AND i.state IN ('queued', 'running', 'paused')

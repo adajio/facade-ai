@@ -127,7 +127,10 @@
 </script>
 
 {#if !context.scopeId}
-  <p class="card">Для публикации нужна область проекта.</p>
+  <section class="card"><h2>Опубликованные фрагменты</h2>
+    <p>Здесь участнику можно открыть отдельную цитату или участок страницы PDF. Для выдачи фрагмента нужна область проекта с настроенным доступом.</p>
+    <a href={scopedUrl(context.project.id, 'receipts', {})}>Открыть оригиналы в поступлениях</a>
+  </section>
 {:else}
   {#if context.canEdit}
     <details class="card" open={Boolean(context.params.get('document'))}>

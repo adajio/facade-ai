@@ -93,14 +93,23 @@ export function parseDecision(value: unknown) {
   return base;
 }
 
+function parseConclusionBasis(value: unknown) {
+  const basis = fields(value, ["kind", "versionId", "anchor", "evidenceId", "occurrenceId", "inventoryRevision"]);
+  if (basis.kind === "original") return { kind: "original" as const, versionId: identifier(basis.versionId), anchor: shortText(basis.anchor, 200) };
+  if (basis.kind === "citation") return { kind: "citation" as const, evidenceId: identifier(basis.evidenceId) };
+  if (basis.kind === "inventory") return { kind: "inventory" as const, occurrenceId: identifier(basis.occurrenceId), inventoryRevision: shortText(basis.inventoryRevision, 100) };
+  return invalidInput("Выберите исходное место или ограничение описи.");
+}
+
 export function parseConclusion(value: unknown) {
-  const input = fields(value, ["scopeId", "assessmentContextId", "startWork", "reason"]);
+  const input = fields(value, ["scopeId", "assessmentContextId", "startWork", "reason", "basis"]);
   if ((input.scopeId === undefined) === (input.assessmentContextId === undefined)) {
     invalidInput("Укажите область или контекст оценки.");
   }
   return {
     scopeId: input.scopeId === undefined ? undefined : identifier(input.scopeId),
     assessmentContextId: input.assessmentContextId === undefined ? undefined : identifier(input.assessmentContextId),
+    ...(input.basis !== undefined ? { basis: parseConclusionBasis(input.basis) } : {}),
     startWork: choice(input.startWork, ["can_start", "cannot_start", "can_start_with_limitations"] as const),
     reason: shortText(input.reason, 2000),
   };

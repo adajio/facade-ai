@@ -5,7 +5,7 @@ import { AccessError, invalid, sendAccessError, unavailable } from '../access/er
 import { getInventory } from '../intake/receipts.js';
 import { inProjectionSnapshot } from '../supplements/events.js';
 import { optionalIdentifier, pageLimit } from '../supplements/inputs.js';
-import { currentWorkSlice, inventoryRevision, inventoryUnavailable, loadWorkSlice, parseFilter, receiptPage, snapshotRequired, summarizeWorkSlice } from './store.js';
+import { currentWorkSlice, inventoryRevision, inventoryUnavailable, loadWorkSlice, parseFilter, receiptPage, snapshotRequired, summarizeCurrentReader } from './store.js';
 
 const base = '/api/projects/:projectId/work-slices';
 type Current = { Params: { projectId: string }; Querystring: { scopeId?: string } };
@@ -37,7 +37,13 @@ export async function register(app: FastifyInstance) {
         await touchSession(db, session);
         return result;
       } catch (error) {
-        if ((error as { code?: string }).code !== '40001') throw error;
+        const conflict = error as { code?: string; constraint?: string };
+        // Two repeatable-read transactions may each see the same last assessment
+        // even after the second obtains the project lock. Retry that allocation.
+        const versionConflict = conflict.code === '23505' && [
+          'facade_assessment_snapshots_pkey', 'assessment_revisions_pkey', 'assessment_question_revisions_pkey',
+        ].includes(conflict.constraint ?? '');
+        if (conflict.code !== '40001' && !versionConflict) throw error;
       }
     }
     throw snapshotRequired();
@@ -51,7 +57,7 @@ export async function register(app: FastifyInstance) {
       await authorize(tx, session, { action: 'project:read', projectId });
       const slice = await loadWorkSlice(tx, projectId, workSliceId);
       if (slice.scopeId) await authorize(tx, session, { action: 'project:read', projectId, scopeId: slice.scopeId });
-      return { result: summarizeWorkSlice(slice, workSliceId), session };
+      return { result: await summarizeCurrentReader(tx, slice, workSliceId), session };
     });
     await touchSession(db, session);
     return result;

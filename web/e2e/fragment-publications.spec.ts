@@ -66,7 +66,15 @@ async function editFragment(
   await page.getByLabel('Вид фрагмента').selectOption(quote === undefined ? 'crop' : 'quote');
   if (quote !== undefined) await page.getByLabel('Точная цитата', { exact: true }).fill(quote);
   await page.getByLabel('Основание подготовки').fill('Синтетическая проверка адреса');
-  await page.getByRole('button', { name: 'Сохранить черновик' }).click();
+  // Preparing an exact crop shares its reader slot with background map building.
+  await expect.poll(async () => {
+    const [reply] = await Promise.all([
+      page.waitForResponse(r => r.request().method() === 'POST' && new URL(r.url()).pathname.endsWith('/fragment-publications')),
+      page.getByRole('button', { name: 'Сохранить черновик' }).click(),
+    ]);
+    if (reply.status() !== 503) return true;
+    return (await reply.json()).code !== 'reader_resource_wait';
+  }, { timeout: 30_000, intervals: [500, 1000, 2000] }).toBe(true);
 }
 
 async function grant(page: Page) {

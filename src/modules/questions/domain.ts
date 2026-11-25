@@ -57,7 +57,13 @@ export interface InquirySearchContext {
   generationId: string | null;
 }
 
+export type PackageSupport = Pick<ObservationPublication, "projectId" | "observationId" | "receiptId" | "evidenceId" |
+  "originalId" | "documentId" | "versionId" | "sha256" | "quote" | "measurement" | "components" | "address"> & {
+  scopeId: string | null;
+};
+
 export interface QuestionSearchPorts {
+  openPackageSupport?: (source: PackageSupport, signal: AbortSignal) => Promise<OpenSupport | null>;
   openSupport(source: ObservationPublication, signal: AbortSignal): Promise<OpenSupport | null>;
   checkMeaning(
     question: Subject,

@@ -15,6 +15,11 @@ export type Catalog = {
   key?: string;
   requirements?: unknown;
   description?: string;
+  stage?: string;
+  approvalReference?: string;
+  publishedAt?: string;
+  publisher?: string;
+  defaultProfile?: { stage: string; approvalReference: string; facadeKinds: string[] } | null;
 };
 
 export type Scope = {
@@ -35,6 +40,7 @@ export type Project = {
   scopes: Scope[];
   catalog?: Catalog | null;
   catalogVersionId?: string | null;
+  catalogAssignment?: { automatic: boolean; at: string; actor?: string } | null;
   catalogState?: 'unassigned' | 'legacy_empty' | 'assigned';
   intakeMode?: boolean;
   stage?: string | null;
@@ -42,6 +48,9 @@ export type Project = {
   stageBasis?: OriginalBasis | { provenanceKind: 'machine_verified'; evidenceIds: string[] } | null;
   confirmedFacadeKinds?: string[];
   updatedAt?: string;
+  lastActivityAt?: string | null;
+  receiptState?: 'awaiting_receipt' | 'inventory_open' | 'inventory_sealed' | null;
+  receiptNumber?: number | null;
 };
 
 export type Session = {

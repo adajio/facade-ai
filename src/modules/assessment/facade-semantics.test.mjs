@@ -191,20 +191,22 @@ test("an addressed mark without identity does not silently join or become a conf
   const b = sample("b", "B", "60", { kind: "ambiguous" }, null);
   const oa = { id: "a", revision: "RA", revisionStatus: "current", binding: fact("a").binding };
   const ob = { id: "b", revision: null, revisionStatus: "unknown", binding: { state: "unidentified", candidates: [] } };
-  const view = comparisonReview([a, b], [oa, ob], [], null, "P", [], [loose]);
+  const unconfirmed = { stage: null, intakeMode: true };
+  const confirmed = { stage: "P", intakeMode: true };
+  const view = comparisonReview([a, b], [oa, ob], [], null, confirmed, [], [loose]);
   assert.equal(view.items.length, 1);
   assert.deepEqual(view.items[0].reasons, ["facade_link_unproven", "variant_unproven", "revisions_unproven", "comparison_rule_unproven"]);
   assert.deepEqual(view.items[0].sources.map(({ citation }) => citation.evidenceId), ["e-A", "e-B"]);
   const other = { ...ob, revision: "RB", revisionStatus: "current", binding: { state: "identified",
     candidates: [{ id: "other-facade", label: "F1" }] } };
   const distinct = comparisonReview([a, { ...b, membership: { kind: "facades", facadeIds: ["other-facade"] }, variant: "V1" }],
-    [oa, other], [], null, "P", []);
+    [oa, other], [], null, confirmed, []);
   assert.equal(distinct.items[0].reasons[0], "facades_differ");
   assert.deepEqual(comparisonReview([a, { ...b, finding: { ...b.finding, applicability: "superseded" } }],
-    [oa, ob], [], null, "P", [], [loose]).items, []);
+    [oa, ob], [], null, confirmed, [], [loose]).items, []);
   const unknown = { ...b, membership: { kind: "unidentified" }, stage: null,
     finding: { ...b.finding, sourceRole: "unknown" } };
-  const diagnostic = comparisonReview([a, unknown], [oa, ob], [], null, null, []);
+  const diagnostic = comparisonReview([a, unknown], [oa, ob], [], null, unconfirmed, []);
   assert.equal(diagnostic.items.length, 1);
   assert.equal(diagnostic.items[0].facadeId, null);
   for (const reason of ["facade_link_unproven", "variant_unproven", "project_stage_unconfirmed", "source_stage_unproven", "value_role_unproven"]) {
@@ -212,8 +214,8 @@ test("an addressed mark without identity does not silently join or become a conf
   }
   assert.deepEqual(diagnostic.items[0].sources.map(({ citation: { evidenceId, versionId } }) => [evidenceId, versionId]),
     [["e-A", "v-A"], ["e-B", "v-B"]]);
-  assert.deepEqual(comparisonReview([a, { ...unknown, property: "Other spacing" }], [oa, ob], [], null, null, []).items, []);
-  assert.deepEqual(comparisonReview([a, { ...unknown, addressedValue: false }], [oa, ob], [], null, null, []).items, []);
+  assert.deepEqual(comparisonReview([a, { ...unknown, property: "Other spacing" }], [oa, ob], [], null, unconfirmed, []).items, []);
+  assert.deepEqual(comparisonReview([a, { ...unknown, addressedValue: false }], [oa, ob], [], null, unconfirmed, []).items, []);
 
   const { facadeReview, requirementsFor } = await built("assessment/facade-model");
   const { evaluate, pairProofVersion } = await built("assessment/domain");

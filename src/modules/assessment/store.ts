@@ -31,6 +31,8 @@ export type Conclusion = {
   createdAt: string;
   basedOnVersion: number;
   criticalQuestionIds: string[];
+  basis?: import('./conclusion-basis.js').ConclusionBasis;
+  outcome?: string;
 };
 
 export type Revision = {
@@ -396,6 +398,16 @@ export function assessmentHref(projectId: string, scopeId: string): string {
   return `/api/v1/projects/${projectId}/assessments/current?scopeId=${scopeId}`;
 }
 
+export function letterGroundKind(question: Question, revision: Revision, gate: Gate, when: Date) {
+  if (gate.holds.length || revision.limitations.some((reason) => reason === "catalog_rule_duplicate" || reason === "catalog_rule_invalid") ||
+      question.review?.supplementReceiptIds?.length || !question.decision?.requestExternal || !question.requirement.recipient) return null;
+  const { decision, review } = question;
+  if (decision.action === "request_clarification" && decision.clarification && review?.clarification &&
+      canonicalJson(decision.clarification) === canonicalJson(review.clarification)) return "clarification";
+  const outcome = effectiveOutcome(question.machine, decision, when);
+  return outcome === "confirmed_missing" || outcome === "confirmed_conflict" ? outcome : null;
+}
+
 export async function snapshot(tx: PoolClient, revision: Revision, gate?: Gate, includeResearchStops = false) {
   const historical = gate === undefined;
   const when = historical ? revision.created_at : new Date();
@@ -411,6 +423,7 @@ export async function snapshot(tx: PoolClient, revision: Revision, gate?: Gate, 
       ...(stops && stops.has(question.id) ? { researchStops: stops.get(question.id)! } : {}),
       decision: question.decision,
       previousDecisionId: question.previous_decision_id,
+      ...(gate && { letterEligible: Boolean(letterGroundKind(question, revision, gate, when)) }),
       outcome: effectiveOutcome(question.machine, question.decision, when),
     }));
   const outcomes = new Set(questions.map((question) => question.outcome));

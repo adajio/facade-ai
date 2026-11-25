@@ -68,12 +68,12 @@ function fixture() {
     add({ id, format: "xlsx", branch, quote, lineId: cellName, attribute: property, binding: facade, building,
       locator: { row: loc[0], column: loc[1], cell: cellName }, value: "26", revision: "U2", revisionStatus: "current", ...overrides });
   }
-  function view() {
+  function view(project = { stage: null, intakeMode: true }) {
     const rows = comparisonRows(facts, formats, evidence, issued, [...profiles.values()], native);
     const observations = facts.map((fact) => facadeObservation(fact));
     const values = facts.map((fact) => convertFact(fact, accepted, formats, new Map(), evidence, undefined, true));
-    const original = comparisonReview(values, observations, [], null, null, []);
-    return { rows, original, items: comparisonReview(values, observations, [], null, null, [], [], new Map(), rows).items, values };
+    const original = comparisonReview(values, observations, [], null, project, []);
+    return { rows, original, items: comparisonReview(values, observations, [], null, project, [], [], new Map(), rows).items, values };
   }
   function canonical(overrides = {}) {
     const { source, readerVersion, lineId } = facts.find(({ id }) => id === "drawing-value").observation;
@@ -208,6 +208,23 @@ test("the composed card cites the sole local mark and printed sheet revision wit
   assert.ok(!item.reasons.includes("revisions_unproven"));
   assert.ok(!item.reasons.includes("source_stage_unproven"));
   assert.ok(item.reasons.includes("project_stage_unconfirmed"));
+});
+
+test("a default intake stage and a legacy scope leave project stage unconfirmed on a composed card", () => {
+  const f = drawingView();
+  const unknown = { stage: null, intakeMode: true, stageBasis: null };
+  const initial = { ...unknown, stage: "Стадия 1" };
+  const explicit = { ...initial, stageBasis: { provenanceKind: "machine_verified", evidenceIds: ["stage-anchor"] } };
+  const [defaultCard] = f.view(initial).items;
+  const [legacyScopeCard] = f.view({ ...unknown, intakeMode: false }).items;
+  const [explicitCard] = f.view(explicit).items;
+  const [oldDesignCard] = f.view({ stage: "RD", intakeMode: true }).items;
+  assert.ok(defaultCard.reasons.includes("project_stage_unconfirmed"));
+  assert.deepEqual(defaultCard, legacyScopeCard);
+  assert.deepEqual(explicitCard.reasons, defaultCard.reasons.filter((reason) => reason !== "project_stage_unconfirmed"));
+  assert.deepEqual(oldDesignCard.reasons, explicitCard.reasons);
+  assert.deepEqual(explicitCard.sources, defaultCard.sources);
+  assert.deepEqual(oldDesignCard.sources, defaultCard.sources);
 });
 
 test("drawing metadata follows semantic fields despite a different title, field order and annotations", () => {

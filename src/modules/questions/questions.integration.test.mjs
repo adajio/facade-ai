@@ -815,3 +815,174 @@ test("engineer confirms a CAD alias and replaces only the selected question's ad
     await request("GET", `/api/v1/evidence/${support.evidenceId}/content`, undefined, 200);
   }
 });
+
+test("package inquiry preserves its address and engineering decisions outside assessment and letters", {
+  skip: !process.env.DATABASE_URL || !process.env.FACADE_S3_ENDPOINT,
+}, async (t) => {
+  const { createApi } = await fromBuild("platform/api");
+  const { readConfig } = await fromBuild("platform/config");
+  const { passwordHash } = await fromBuild("modules/access/auth");
+  const { createRuntimePdfService } = await fromBuild("modules/pdf/index");
+  const { createIntakeStorage } = await fromBuild("modules/intake/blob");
+  const { createRuntimeInquiryPorts, processNextInquiry } = await fromBuild("modules/questions/index");
+  const { transaction } = await fromBuild("modules/access/commands");
+  const config = readConfig();
+  const app = await createApi(config);
+  const storage = createIntakeStorage(config.dataDir);
+  const reader = createRuntimePdfService(app.db, config, { storage });
+  const ports = createRuntimeInquiryPorts(app.db, reader, storage.objects);
+  const signal = new AbortController().signal;
+  t.after(async () => { await reader.close(); await app.close(); });
+
+  const login = `inquiry-${randomUUID()}`;
+  const password = `synthetic-${randomUUID()}`;
+  const userId = await transaction(app.db, async (tx) => {
+    const { rows: [{ id: organizationId }] } = await tx.query("INSERT INTO organizations(name) VALUES($1) RETURNING id", [login]);
+    const { rows: [{ id }] } = await tx.query(
+      `INSERT INTO users(organization_id,login,password_hash,state,org_admin,can_create_project)
+       VALUES($1,$2,$3,'active',true,true) RETURNING id`, [organizationId, login, await passwordHash(password)]);
+    return id;
+  });
+  const origin = process.env.FACADE_PUBLIC_ORIGIN ?? "http://127.0.0.1";
+  const host = new URL(origin).host;
+  let auth = {};
+  async function request(method, url, payload, { status = 200, version, headers = {} } = {}) {
+    const result = await app.inject({ method, url, payload, headers: {
+      origin, host, ...auth, "idempotency-key": randomUUID(), ...(version ? { "if-match": `"${version}"` } : {}), ...headers,
+    } });
+    assert.equal(result.statusCode, status, `${method} ${url}: ${result.body}`);
+    return result;
+  }
+  const json = async (...args) => (await request(...args)).json();
+  const session = await request("POST", "/api/sessions", { login, password });
+  auth = { cookie: session.headers["set-cookie"].split(";")[0], "x-csrf-token": session.json().csrfToken };
+  const { id: projectId } = await json("POST", "/api/projects", { mode: "intake", name: "Unconfirmed facade inquiry" }, { status: 201 });
+  const { id: otherProjectId } = await json("POST", "/api/projects", { mode: "intake", name: "Other package" }, { status: 201 });
+  const base = `/api/v1/projects/${projectId}`;
+  const assess = (project = projectId) => json("GET", `/api/v1/projects/${project}/facade-assessment`);
+  const originalText = "Panel B damage inspect flashing";
+  async function upload(filename, quote, replacesVersionId) {
+    const bytes = pdf(quote);
+    const digest = sha256(bytes);
+    const { receiptId } = await json("POST", "/api/projects/" + projectId + "/receipts", {}, { status: 201 });
+    const { uploadId } = await json("POST", `/api/receipts/${receiptId}/uploads`, {
+      relativePath: filename, mediaType: "application/pdf", size: bytes.length, sha256: digest, replacesVersionId,
+    }, { status: 201 });
+    await request("PUT", `/api/uploads/${uploadId}/parts/1`, bytes, { headers: {
+      "content-type": "application/octet-stream", "content-length": String(bytes.length), "x-part-sha256": digest,
+    } });
+    const completed = await json("POST", `/api/uploads/${uploadId}/complete`, {});
+    await json("POST", `/api/receipts/${receiptId}/seal`, {});
+    const source = { projectId, documentId: completed.documentId, versionId: completed.versionId, sha256: digest };
+    const run = { runId: randomUUID(), branch: "A", operationKey: "native" };
+    const { evidence, bytes: evidenceBytes } = await reader.open(source, run, { representation: "native", address: { unitId: "1" } });
+    const [line] = JSON.parse(evidenceBytes.toString()).lines;
+    // Seed the pin from the ordinary reader's returned evidence, without leasing a model job.
+    const pin = { id: randomUUID(), source, receiptId, readerVersion: evidence.readerVersion, runId: run.runId,
+      branch: run.branch, scope: null, evidenceId: evidence.id, lineId: line.id, quote: line.text, grounding: "text",
+      address: { ...evidence.address, box: line.box, locator: { ...evidence.address.locator, ...line.locator } } };
+    await app.db.query(
+      `INSERT INTO reader_observations(id,project_id,version_id,run_id,branch,operation_key,request_sha256,evidence_id,scope_id,payload)
+       VALUES($1,$2,$3,$4,$5,'fixture-pin',$6,$7,NULL,$8)`,
+      [pin.id, projectId, source.versionId, run.runId, run.branch, digest, evidence.id, pin]);
+    return pin;
+  }
+
+  const pin = await upload("damage-r1.pdf", originalText);
+  const assessment = await assess();
+  const [common] = assessment.contexts;
+  assert.equal(common.kind, "common");
+  assert.equal(assessment.contexts.length, 1);
+  assert.equal((await app.db.query("SELECT 1 FROM project_scopes WHERE project_id=$1", [projectId])).rowCount, 0);
+  const { contexts: [other] } = await assess(otherProjectId);
+  const eligibleUrl = base + "/letters/eligible?assessmentContextId=" + common.assessmentContextId;
+  const letter = await json("GET", eligibleUrl);
+  assert.deepEqual(letter.items, []);
+  const { rows: [head] } = await app.db.query(
+    "SELECT version,payload FROM facade_assessment_snapshots WHERE project_id=$1 ORDER BY version DESC LIMIT 1", [projectId]);
+  assert.equal(head.version, assessment.version);
+
+  // Pin one prepared branch observation into a synthetic assessment slice. Intake, original and reader evidence use ordinary API paths.
+  async function snapshot(version, pins, readingComplete) {
+    const refs = pins.map(({ id }) => id + ":question-fixture");
+    await transaction(app.db, async (tx) => {
+      for (const [index, observation] of pins.entries()) await tx.query(
+        `INSERT INTO facade_assessment_observations(project_id,ref,observation_id,payload) VALUES($1,$2,$3,$4)
+         ON CONFLICT (project_id,ref) DO NOTHING`,
+        [projectId, refs[index], observation.id,
+          { sourceRole: "drawing", revisionStatus: "current", address: observation.address, versionId: observation.source.versionId,
+            binding: { state: "unidentified", candidates: [] } }],
+      );
+      await tx.query("INSERT INTO facade_assessment_snapshots(project_id,version,payload) VALUES($1,$2,$3)", [
+        projectId, version, { ...head.payload, observations: { ...head.payload.observations, refs },
+          coverage: { ...head.payload.coverage, reading: { ...head.payload.coverage.reading, complete: readingComplete } } },
+      ]);
+    });
+  }
+  const assessmentVersion = head.version + 1;
+  await snapshot(assessmentVersion, [pin], false);
+  const body = {
+    assessmentContextId: common.assessmentContextId, assessmentVersion,
+    versionId: pin.source.versionId, anchor: "1", subject: "Panel B", property: "damage",
+  };
+  await request("POST", base + "/inquiries", { ...body, anchor: "2" }, { status: 422 });
+  await request("POST", base + "/inquiries", { ...body, assessmentContextId: other.assessmentContextId }, { status: 404 });
+  await request("POST", base + "/inquiries", { ...body, assessmentVersion: head.version }, { status: 409 });
+  const create = { status: 201, headers: { "idempotency-key": randomUUID() } };
+  const created = await json("POST", base + "/inquiries", body, create);
+  assert.deepEqual(await json("POST", base + "/inquiries", body, create), created);
+  const detailPath = "/api/v1/inquiries/" + created.id;
+  const listUrl = base + "/inquiries?assessmentContextId=" + common.assessmentContextId;
+  assert.equal((await json("GET", listUrl)).inquiries.length, 1);
+  await request("GET", detailPath + "?assessmentContextId=" + other.assessmentContextId, undefined, { status: 404 });
+  const queued = await json("GET", detailPath);
+  assert.equal(queued.state, "queued");
+  assert.equal(queued.internalOnly, true);
+  assert.equal(queued.scopeId, null);
+  assert.equal(queued.source.address.locator.page, 1);
+  assert.equal(await processNextInquiry(app.db, ports, signal), true);
+  const partial = await json("GET", detailPath);
+  assert.equal(partial.state, "partial");
+  assert.deepEqual(partial.limitations, ["package_reading_incomplete"]);
+  assert.deepEqual(partial.candidates.map(({ source }) => [source.quote, source.evidenceId]), [[originalText, pin.evidenceId]]);
+  await request("POST", detailPath + "/decisions", { action: "accept", reason: "wrong support", candidateIds: [randomUUID()] },
+    { status: 422, version: partial.version });
+  const accepted = await json("POST", detailPath + "/decisions",
+    { action: "accept", reason: "Original read", candidateIds: [pin.id] }, { version: partial.version });
+  const corrected = await json("POST", detailPath + "/decisions",
+    { action: "correct", reason: "Checked literally", answer: "Damage at flashing", candidateIds: [pin.id] }, { version: accepted.version });
+  const detail = await json("GET", detailPath);
+  assert.equal(detail.decision.version, corrected.version);
+  assert.equal(detail.decision.authorId, userId);
+  assert.equal(detail.decision.answer, "Damage at flashing");
+  assert.deepEqual((await json("GET", eligibleUrl)).items, []);
+  assert.deepEqual((await json("GET", base + "/facade-assessment/" + assessmentVersion)).contexts[0].questions, common.questions);
+
+  const newPin = await upload("damage-r2.pdf", "Panel B new status not legible", pin.source.versionId);
+  const stale = await json("GET", detailPath);
+  assert.equal(stale.needsReview, true);
+  assert.equal(stale.sourceReplaced, true);
+  await request("POST", detailPath + "/decisions", { action: "reject", reason: "Obsolete" }, { status: 409, version: stale.version });
+  const { rows: [{ nextVersion }] } = await app.db.query(
+    'SELECT max(version)+1 AS "nextVersion" FROM facade_assessment_snapshots WHERE project_id=$1', [projectId]);
+  await snapshot(nextVersion, [newPin], true);
+  await json("POST", detailPath + "/searches", { assessmentVersion: nextVersion, versionId: newPin.source.versionId, anchor: "1" },
+    { version: stale.version });
+  assert.equal(await processNextInquiry(app.db, ports, signal), true);
+  const repeated = await json("GET", detailPath);
+  assert.equal(repeated.state, "empty");
+  assert.equal(repeated.needsReview, true);
+  assert.equal(repeated.source.versionId, newPin.source.versionId);
+  const historical = await json("GET", detailPath + "?searchVersion=1");
+  assert.equal(historical.assessmentVersion, assessmentVersion);
+  assert.equal(historical.source.versionId, pin.source.versionId);
+  assert.equal(historical.candidates[0].source.quote, originalText);
+  assert.equal(historical.decision.answer, "Damage at flashing");
+  const rejected = await json("POST", detailPath + "/decisions", { action: "reject", reason: "No answer in the new revision" },
+    { version: repeated.version });
+  assert.equal((await json("GET", detailPath)).decision.version, rejected.version);
+  assert.equal((await json("GET", detailPath)).needsReview, false);
+  assert.deepEqual((await json("GET", eligibleUrl)).items, []);
+  await app.db.query("DELETE FROM project_memberships WHERE project_id=$1 AND user_id=$2", [projectId, userId]);
+  await request("GET", detailPath + "?searchVersion=1", undefined, { status: 404 });
+});

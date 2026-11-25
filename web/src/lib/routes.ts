@@ -8,6 +8,7 @@ export const sections = {
   questions: 'Вопросы',
   letters: 'Письма',
   members: 'Участники',
+  settings: 'Настройки проекта',
 } as const;
 
 export type Section = keyof typeof sections;

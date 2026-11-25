@@ -1,19 +1,19 @@
 <script lang="ts">
   import { denied, describe, query, type Api } from '../lib/http';
   import { count, date, label } from '../lib/format';
-  import { projectStageLabel, projectStages } from '../lib/project-stages';
+  import { projectStageLabel } from '../lib/project-stages';
   import { projectV1, scopedUrl, type Assessment, type OpenEvidence, type Projection, type WorkspaceProps } from '../lib/workspace';
-  import { workReceiptFilters, workSliceApi, type WorkReceiptFilter, type WorkSlice } from '../lib/work-slice';
+  import { chooseWorkArea, currentOperation, requirementsUrl, workReceiptFilters, workSliceApi, type WorkReceiptFilter, type WorkSlice } from '../lib/work-slice';
   import Notice from '../lib/Notice.svelte';
   import WorkProgress from '../lib/WorkProgress.svelte';
-  import FacadeAssessment from './FacadeAssessment.svelte';
 
   let { api, context, projection, open, renew }: {
     api: Api; context: WorkspaceProps; projection?: Projection; open: OpenEvidence; renew: () => void;
   } = $props();
-  const facadeMode = $derived(context.project.intakeMode && !context.project.scopeId);
+  const facadeMode = $derived(context.project.intakeMode && !context.scopeId && !context.project.scopeId);
   let workSlice = $state<WorkSlice>();
   let error = $state('');
+  let accessDenied = $state(false);
   let scopedAssessment = $state<Assessment>();
   let refreshSlice = $state<() => void>();
 
@@ -33,29 +33,33 @@
         return;
       }
       loading = true;
+      const deadline = AbortSignal.timeout(15_000);
+      const request = { signal: AbortSignal.any([signal, deadline]) };
       clearTimeout(timer);
       try {
         if (accessScope) {
           scopedAssessment = await api.json<Assessment>(
-            query(projectV1(projectId) + '/assessments/current', { scopeId: accessScope }), { signal });
+            query(projectV1(projectId) + '/assessments/current', { scopeId: accessScope }), request);
         } else {
-          workSlice = await api.json<WorkSlice>(query(workSliceApi(projectId), { scopeId }), { signal });
+          workSlice = await api.json<WorkSlice>(query(workSliceApi(projectId), { scopeId }), request);
         }
         error = '';
+        accessDenied = false;
       } catch (problem) {
         if (signal.aborted) return;
-        if (denied(problem)) {
+        accessDenied = denied(problem);
+        if (accessDenied) {
           workSlice = undefined;
           scopedAssessment = undefined;
         }
-        error = describe(problem);
+        error = deadline.aborted ? 'Ответ сервера задерживается. Можно повторить загрузку сводки.' : describe(problem);
       } finally {
         loading = false;
         if (!signal.aborted) {
           if (refreshPending) {
             refreshPending = false;
             void load();
-          } else if (workSlice?.activeReceipt && document.visibilityState === 'visible') {
+          } else if (workSlice && document.visibilityState === 'visible') {
             // Confirmed upload parts can move ahead of the project event stream.
             timer = setTimeout(load, 15_000);
           }
@@ -78,85 +82,97 @@
   }
 
   function assessmentUrl() {
-    return scopedUrl(context.project.id, 'completeness', { scope: context.scopeId, revision: workSlice?.assessment?.version });
+    return scopedUrl(context.project.id, 'completeness', { scope: context.scopeId });
   }
 
 </script>
 
-<WorkProgress slice={workSlice} />
-
-{#if facadeMode}
-  <section class="card" aria-labelledby="project-stages-title">
-    <h2 id="project-stages-title">Стадии проекта</h2>
-    <ul class="plain-list">
-      {#each projectStages as stage (stage.code)}
-        {@const current = stage.available && context.project.stage === stage.code}
-        <li aria-current={current ? 'step' : undefined}>
-          <strong>{projectStageLabel(stage.code)}</strong>
-          <span class={current ? 'pill good' : 'pill'}>{current ? 'Текущая' : stage.available ? 'Доступна' : 'Пока недоступна'}</span>
-        </li>
-      {/each}
-    </ul>
-  </section>
-{/if}
-
-<section class="card" aria-labelledby="collection-title">
-  <div class="card-header"><h2 id="collection-title">Сбор исходных данных</h2>
-    {#if !context.project.scopeId}
-      <div class="actions">
-        {#if context.canEdit}
-          <a class="button primary" href={scopedUrl(context.project.id, 'receipts', { upload: 1 })}>Загрузить комплект</a>
-        {/if}
-        <a class="button" href={receiptUrl('all')}>К поступлениям</a>
-      </div>
-    {/if}
-  </div>
-  {#if !context.project.scopeId && (workSlice?.catalogAssigned === false || !workSlice && context.project.catalogState === 'unassigned')}
-    <p class="muted">Нет рабочего каталога. Комплект можно загрузить и открыть до его назначения.</p>
-  {:else if context.project.scopeId && projection?.holds?.length}
-    <p>Текущие основания ожидают разбора досылки. Открытых причин · {projection.holds.length}</p>
-  {/if}
-  {#if workSlice?.activeReceipt}
-    {@const active = workSlice.activeReceipt}
-    <p>{active.filter === 'processing' ? 'Обрабатывается' : 'Опись формируется'} ·
-      <a href={receiptUrl(active.filter, active.receiptId)}>Поступление №{active.number}</a></p>
-  {/if}
-  {#if !workSlice && !error && !context.project.scopeId}<p role="status">Загружаем данные проекта…</p>{/if}
-  <Notice message={error && 'Состояние проекта · ' + error} />
-</section>
-
 {#if workSlice}
+  {@const selected = chooseWorkArea(workSlice, context.params.get('context'))}
+  {@const assessment = selected.assessment}
+  {@const areas = workSlice.assessment?.contexts}
+  {@const chooseArea = Boolean(areas?.length && !assessment)}
+  {@const accepted = workSlice.files?.accepted ?? workSlice.acceptedOccurrences}
+  {@const receipt = workSlice.activeReceipt ?? workSlice.latestReceipt}
+  {@const area = assessment?.contextId}
+  {@const target = scopedUrl(context.project.id, 'letters', { scope: context.scopeId, context: area })}
+  {@const current = currentOperation(selected)}
+  <section class="card stage-flow" aria-labelledby="project-stages-title">
+    <h2 id="project-stages-title">{projectStageLabel('Стадия 1')}</h2>
+    <p>Определите, достаточно ли материалов для начала работ.</p>
+    {#if context.project.stage && context.project.stage !== 'Стадия 1'}<p>Стадия проектирования · {context.project.stage}</p>{/if}
+    {#if areas && areas.length > 1 || chooseArea}
+      <nav class="actions" aria-label="Область проверки">
+        {#each areas ?? [] as item (item.contextId)}
+          <a class="button" aria-current={item.contextId === area ? 'page' : undefined}
+            href={scopedUrl(context.project.id, 'overview', { context: item.contextId })}>{item.kind === 'common' ? 'Весь комплект' : item.name}</a>
+        {/each}
+      </nav>
+      {#if chooseArea}<p role="status">{context.params.has('context') ? 'Выбранная область проверки недоступна.' : 'Выберите область, чтобы открыть её требования, заключение и письма.'}</p>{/if}
+    {/if}
+    <details open={current === 1} class:active-step={current === 1}>
+      <summary aria-current={current === 1 ? 'step' : undefined}>{#if current === 1}<span class="step-label">Текущий шаг</span>{/if}1. Приём документов · {workSlice.totals.all ? 'Поступлений ' + workSlice.totals.all : 'Материалы ещё не поступили'}</summary>
+      {#if receipt}<a href={receiptUrl('all', receipt.receiptId)}>Поступление №{receipt.number}</a>{/if}
+      {#if context.canEdit}<a class="button" class:primary={!accepted} href={scopedUrl(context.project.id, 'receipts', { upload: 1 })}>{workSlice.totals.all ? 'Добавить поступление' : 'Загрузить первый комплект'}</a>{/if}
+      <a href={receiptUrl('all')}>К поступлениям</a>
+    </details>
+    <details open={current === 2} class:active-step={current === 2}>
+      <summary aria-current={current === 2 ? 'step' : undefined}>{#if current === 2}<span class="step-label">Текущий шаг</span>{/if}2. Подготовка и чтение · {workSlice.files ? 'Карт ' + workSlice.files.prepared + ' из ' + workSlice.files.accepted : 'Состав уточняется'}</summary>
+      <WorkProgress slice={selected} />
+      {#if receipt}<a class="button" href={receiptUrl('all', receipt.receiptId)}>Открыть опись поступления №{receipt.number}</a>{/if}
+    </details>
+    <details open={current === 3} class:active-step={current === 3}>
+      <summary aria-current={current === 3 ? 'step' : undefined}>{#if current === 3}<span class="step-label">Текущий шаг</span>{/if}3. Проверка требований · {accepted && assessment ? (assessment.checked ?? assessment.covered) + ' из ' + assessment.total : 'Ожидает материалов и правил'}</summary>
+      {#if context.project.catalog}<p>{context.project.catalog.name} · версия {context.project.catalog.revision}</p>{/if}
+      {#if assessment}
+        <a class="button" href={requirementsUrl(selected)}>Все требования · {assessment.total}</a>
+        {#if assessment.checked !== undefined}<a href={requirementsUrl(selected, 'checked')}>Проверено · {assessment.checked}</a>{/if}
+        {#if assessment.ready !== undefined}<a href={requirementsUrl(selected, 'done')}>Готово · {assessment.ready}</a>{/if}
+        {#if assessment.review !== undefined}<a href={requirementsUrl(selected, 'review')}>Требуют проверки · {assessment.review}</a>{/if}
+      {:else if !chooseArea}<a href={scopedUrl(context.project.id, 'settings', {})}>Посмотреть правила проверки</a>{/if}
+    </details>
+    <details open={current === 4} class:active-step={current === 4}>
+      <summary aria-current={current === 4 ? 'step' : undefined}>{#if current === 4}<span class="step-label">Текущий шаг</span>{/if}4. Заключение · {assessment?.concluded ? 'Записано' : assessment?.previousConclusion ? 'Нужен пересмотр' : 'Заключение ещё не записано'}</summary>
+      {#if assessment?.previousConclusion && !assessment.concluded}<p>{assessment.previousConclusion.reason}</p>{/if}
+      {#if accepted && !chooseArea}<a class="button" href={scopedUrl(context.project.id, 'completeness', { context: area, scope: context.scopeId, panel: 'conclusion' })}>Открыть заключение по области</a>
+      {:else if !accepted}<p>Сначала примите исходные материалы.</p>{/if}
+    </details>
+    <details open={current === 5} class:active-step={current === 5}>
+      <summary aria-current={current === 5 ? 'step' : undefined}>{#if current === 5}<span class="step-label">Текущий шаг</span>{/if}5. Переписка · {assessment?.letter ? 'Допустимых пунктов ' + assessment.letter : 'Пока нет подтверждённых пунктов'}</summary>
+      {#if assessment?.letter !== undefined}<a href={requirementsUrl(selected, 'letter')}>Основания для письма · {assessment.letter}</a>{/if}
+      {#if !chooseArea}<a class="button" href={target}>Открыть письма и основания</a>{/if}
+    </details>
+    <p class="meta">{projectStageLabel('Стадия 2')} · Пока недоступна</p>
+  </section>
   <div class="metrics" aria-label="Поступления в текущей проверке">
     {#each workSlice.filters as item (item.filter)}
-      <a class="metric" href={receiptUrl(item.filter)}>
-        <span>{workReceiptFilters[item.filter]}</span>
-        <strong>{count(item.total)}</strong>
-      </a>
+      <a class="metric" href={receiptUrl(item.filter)}><span>{workReceiptFilters[item.filter]}</span><strong>{count(item.total)}</strong></a>
     {/each}
   </div>
-{/if}
-
-{#if facadeMode && workSlice?.assessment?.kind === 'facade'}
-  {#key workSlice.assessment.version}
-    <FacadeAssessment {api} {context} {open} {renew} overview overviewVersion={workSlice.assessment.version} />
-  {/key}
-{:else if !facadeMode}
+{:else if scopedAssessment}
+  <section class="card"><h2>Комплектность области</h2><p>{label(scopedAssessment.outcome)}</p><a href={assessmentUrl()}>Открыть оценку</a></section>
+{:else if !accessDenied && !context.project.scopeId}
   <section class="card">
-    <div class="card-header"><h2>Комплектность</h2>
-      {#if context.scopeId}<a href={assessmentUrl()}>Открыть оценку</a>{/if}
-    </div>
-    {#if workSlice?.assessment || scopedAssessment}
-      <dl class="details">
-        <dt>Машинная оценка</dt><dd>{label(workSlice?.assessment?.outcome ?? scopedAssessment?.outcome)}</dd>
-        {#if workSlice?.assessment}
-          <dt>Покрытые требования</dt><dd>{count(workSlice.assessment.covered)} из {count(workSlice.assessment.total)}</dd>
-        {:else}
-          <dt>Начало работ</dt><dd>{label(scopedAssessment?.conclusion?.startWork, 'Ожидает решения')}</dd>
-        {/if}
-      </dl>
-    {:else if workSlice}<p class="muted">Для выбранной области ещё нет версии оценки.</p>{/if}
+    <h2>{projectStageLabel('Стадия 1')}</h2>
+    {#if context.project.catalog}<p>{context.project.catalog.name} · версия {context.project.catalog.revision}</p>{/if}
+    {#if !error}<p role="status">Загружаем сведения о поступлениях и требованиях…</p>{/if}
+    <nav class="actions" aria-label="Продолжить работу">
+      {#if context.canEdit}<a class="button primary" href={scopedUrl(context.project.id, 'receipts', { scope: context.scopeId, upload: 1 })}>Загрузить комплект</a>{/if}
+      <a href={scopedUrl(context.project.id, 'receipts', { scope: context.scopeId })}>Открыть поступления</a>
+      <a href={scopedUrl(context.project.id, 'completeness', { scope: context.scopeId, context: context.params.get('context') })}>Открыть требования</a>
+    </nav>
   </section>
-{/if}
+{:else if !error}<p role="status">Загружаем данные проекта…</p>{/if}
+{#if error}<Notice message={'Состояние проекта · ' + error} /><button onclick={refreshSlice}>Обновить обзор</button>{/if}
+
+<style>
+  .stage-flow > details { margin-block: .5rem; padding: .25rem .8rem; border: 1px solid var(--line); border-radius: .4rem; }
+  .stage-flow > details[open] { padding-bottom: .85rem; }
+  .stage-flow > details.active-step { border-inline-start: .3rem solid var(--accent); }
+  .stage-flow > details > summary { padding-block: .65rem; min-height: 40px; cursor: pointer; font-weight: 600; }
+  .stage-flow > details > a { display: inline-flex; align-items: center; min-height: 40px; margin-inline-end: .6rem; }
+  .step-label { color: var(--accent-text); margin-inline-end: .6rem; font-size: .87em; }
+</style>
 
 {#if projection?.changes?.length}
   <section class="card"><h2>Последние изменения</h2>

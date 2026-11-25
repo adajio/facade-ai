@@ -61,6 +61,29 @@ test('Оба оформления сохраняют произвольную с
   }
 });
 
+test('Название запроса D8 входит в пункт TXT и DOCX и не меняет текст прежних редакций', async () => {
+  const { renderText, renderDocument } = await load('letters/content.js');
+  const body = 'В проверенном комплекте по описи №12 сведения о «Крепление» найти не удалось. Просим направить документ или указать, где приведены данные.';
+  const scope = { stage: 'РД' };
+  const items = [
+    { kind: 'confirmed_missing', basis: { scope }, wording: 'Материал не передан.', editedWording: null },
+    { kind: 'clarification', basis: { scope }, wording: body, editedWording: null },
+  ];
+  for (const [layout, title] of [['formal', 'Запрос исходных данных'], ['brief', 'Запрос']]) {
+    const header = [title, 'Кому: Заказчик'];
+    const first = '1. Материал не передан.';
+    const expected = [...header, 'Стадия РД', first, '2. Запрос на уточнение. ' + body].join('\n\n');
+    const text = renderText('Заказчик', layout, items);
+    assert.equal(text, expected);
+    assert.equal((await renderDocument('txt', text)).toString('utf8'), expected);
+    assert.equal(extractDocx(await renderDocument('docx', text)), expected);
+    assert.equal(renderText('Заказчик', layout, items, 'before-clarification-label'),
+      [...header, 'Стадия РД', first, '2. ' + body].join('\n\n'));
+    assert.equal(renderText('Заказчик', layout, items, 'before-stage'),
+      [...header, first, '2. ' + body].join('\n\n'));
+  }
+});
+
 test('Адрес письма берётся из закреплённой опоры', async () => {
   const { renderGround } = await load('letters/grounds.js');
   const basis = {

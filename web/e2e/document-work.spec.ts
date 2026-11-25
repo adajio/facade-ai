@@ -59,7 +59,7 @@ async function expectRenderedPage(
   }).toPass({ timeout: 12_000 });
 }
 
-test('Комплект без стадии, оригинал PDF, адрес листа и возврат к описи', async ({ page }, testInfo) => {
+test('Первичное поступление, оригинал PDF, адрес листа и возврат к описи', async ({ page }, testInfo) => {
   test.skip(!admin.login || !admin.password, 'Нужна отдельная синтетическая БД');
   test.setTimeout(150_000);
   const fixture = markedPdf();
@@ -69,8 +69,8 @@ test('Комплект без стадии, оригинал PDF, адрес л�
   await page.getByRole('button', { name: 'Создать проект' }).click();
   await page.getByLabel('Название проекта').fill(unique('Синтетический комплект'));
   await page.getByRole('button', { name: 'Сохранить проект' }).click();
-  await expect(page.getByRole('link', { name: 'Загрузить комплект' })).toBeVisible();
-  await page.getByRole('link', { name: 'Загрузить комплект' }).press('Enter');
+  await expect(page.getByRole('link', { name: 'Загрузить первый комплект' })).toBeVisible();
+  await page.getByRole('link', { name: 'Загрузить первый комплект' }).press('Enter');
   await expect(page).toHaveURL(/\/receipts\?upload=1$/);
   await expect(page.getByRole('heading', { name: 'Новое поступление' })).toBeVisible();
   const filename = 'Два синтетических листа.pdf';

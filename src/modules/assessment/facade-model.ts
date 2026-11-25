@@ -8,6 +8,7 @@ import {
 } from "./domain.js";
 import { approvedEvidenceSubjects, facadeEvidenceGroups, proveFacadeRule } from "./facade-rule.js";
 import type { FacadeType } from "./facade-types.js";
+import type { OriginalBasis } from '../intake/accepted-originals.js';
 import { catalogRequirement, normalizeFormat } from "./store.js";
 
 export { exactDeliveryStatement };
@@ -20,6 +21,7 @@ export type FacadeMembership =
 
 export type FacadeFact = {
   membership: FacadeMembership;
+  documentFacadeLink?: { version: number; basis: OriginalBasis; facadeId: string };
   property: string | null;
   materials?: string[];
   variant: string | null;
@@ -122,8 +124,9 @@ export function facadeReview(options: {
       sourceApplies(sourceStage) ? [deliveryLocation] : []));
   const resolvedCrop = (fact: FacadeFact) => fact.deliveryLocation && reverified.has(fact.deliveryLocation) &&
     fact.finding.citation.deliveryUncertainty === "original_statement_unverified" && inFacadeContext(fact, context);
-  let findings: Finding[] = scoped.filter((fact) => !resolvedCrop(fact)).map(({ finding, variant, stage: sourceStage, property }) => ({
+  let findings: Finding[] = scoped.filter((fact) => !resolvedCrop(fact)).map(({ finding, variant, stage: sourceStage, property, documentFacadeLink }) => ({
     ...finding,
+    ...(documentFacadeLink ? { citation: { ...finding.citation, documentFacadeLink } } : {}),
     ...(finding.nonDelivery ? { nonDelivery: { ...finding.nonDelivery, questionId } } : {}),
     format: normalizeFormat(finding.format),
     comparisonKey: comparisonKey(property, variant, finding.valueRole),
@@ -138,13 +141,13 @@ export function facadeReview(options: {
   const positiveOrUncertain = relevant.some((fact) =>
     fact.finding.applicability !== "superseded" && fact.finding.kind !== "absence" &&
     !resolvedCrop(fact) &&
-    (inFacadeContext(fact, context) || ["ambiguous", "unidentified"].includes(fact.membership.kind)) &&
+    (inFacadeContext(fact, context) || fact.documentFacadeLink || ["ambiguous", "unidentified"].includes(fact.membership.kind)) &&
     (fact.finding.sourceRole === "unknown" || requirement.sourceRoles.includes(fact.finding.sourceRole) ||
       fact.finding.citation.deliveryStatement?.status === "delivered" || Boolean(fact.finding.citation.deliveryUncertainty)));
   const plausibleUnknown = sameStage.some((fact) => {
     const { sourceRole, format, applicability, kind } = fact.finding;
     return applicability !== "superseded" && kind !== "absence" && !resolvedCrop(fact) &&
-      (inFacadeContext(fact, context) || fact.membership.kind === "ambiguous" || fact.membership.kind === "unidentified") &&
+      (inFacadeContext(fact, context) || fact.documentFacadeLink || fact.membership.kind === "ambiguous" || fact.membership.kind === "unidentified") &&
       requirement.formats.includes(normalizeFormat(format)) &&
       (sourceRole === "unknown" || requirement.sourceRoles.includes(sourceRole)) &&
       (!fact.property || [fact.property, ...fact.materials ?? []]

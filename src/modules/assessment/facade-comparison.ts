@@ -1,5 +1,5 @@
 import { allowsCatalogPair } from "../access/catalog-comparison.js";
-import { initialProjectStage, type Catalog } from "../access/project-state.js";
+import { initialProjectStage, stageStatus, type Catalog } from "../access/project-state.js";
 import { canonicalJson, compareCitationValues, requirementSubjectKey, type Citation } from "./domain.js";
 import type { ComparisonRow } from "./facade-comparison-rows.js";
 import type { ComparisonRead, FacadeObservation } from "./facade-input.js";
@@ -49,10 +49,12 @@ function* comparisonGroups(groups: Iterable<Map<string, AddressedFact>>, plain: 
 }
 
 export function comparisonReview(facts: FacadeFact[], observations: FacadeObservation[], contexts: FacadeContext[],
-  catalog: Catalog | null, stage: string | null, verifiedPairs: FacadeReadout["pairs"],
+  catalog: Catalog | null, project: Parameters<typeof stageStatus>[0], verifiedPairs: FacadeReadout["pairs"],
   unresolved: { factId: string; label: string }[] = [],
   reads: ReadonlyMap<string, ComparisonRead[]> = new Map(),
   rows: ReadonlyMap<string, ComparisonRow> = new Map()): ComparisonReview {
+  const { stage } = project;
+  const confirmedStage = stageStatus(project) === "confirmed" ? stage : null;
   const byObservation = new Map(observations.map((observation) => [observation.id, observation]));
   const byFact = new Map(facts.map((fact) => [fact.finding.citation.observationId, fact]));
   const requirementsByFacade = new Map(contexts.map((context) =>
@@ -162,10 +164,10 @@ export function comparisonReview(facts: FacadeFact[], observations: FacadeObserv
       else if ((viewA || viewB) && subjectKey(revisionA) !== subjectKey(revisionB)) reasons.push("revision_applicability_unproven");
       const stageA = a.stage ?? viewA?.stage;
       const stageB = b.stage ?? viewB?.stage;
-      if (!stage) reasons.push("project_stage_unconfirmed");
+      if (!confirmedStage) reasons.push("project_stage_unconfirmed");
       if (!stageA || !stageB) reasons.push("source_stage_unproven");
-      else if (subjectKey(stageA) !== subjectKey(stageB) || (stage && stage !== initialProjectStage &&
-        subjectKey(stageA) !== subjectKey(stage))) reasons.push("source_stages_differ");
+      else if (subjectKey(stageA) !== subjectKey(stageB) || (confirmedStage && confirmedStage !== initialProjectStage &&
+        subjectKey(stageA) !== subjectKey(confirmedStage))) reasons.push("source_stages_differ");
       if ([a, b].some(({ finding }) => finding.sourceRole === "unknown")) reasons.push("source_role_unproven");
       else if (requirements && catalog) {
         const allowed = requirements.some((requirement) =>

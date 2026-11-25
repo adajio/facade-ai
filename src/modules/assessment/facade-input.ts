@@ -4,18 +4,28 @@ import { readPackageAnalysis, type PackageAnalysis, type PackageFact } from "../
 import { blockedComparisonReads } from "../harness/package-walk.js";
 import { deliveredLines } from "../questions/attribute-aliases.js";
 import { hasAddressedSubject } from "../questions/subject-evidence.js";
-import { canonicalJson, isInventoryRole, requirementSubjectKey } from "./domain.js";
+import { canonicalJson, isInventoryRole, normalizeFactValue, requirementSubjectKey } from "./domain.js";
 import type { Evidence, ReaderAddress, ReaderLine } from "../pdf/types.js";
 import { comparisonRows, readCanonicalComparisonRows, type IssuedComparisonEvidence } from "./facade-comparison-rows.js";
 import { deliveryEvidenceIds, fullDeliveryLine, type DeliveryEvidence } from "./facade-delivery.js";
 import { nonDeliveryFromOriginal, type FacadeFact, type FacadeReadout } from "./facade-model.js";
 import { completedReaderJob, indexSemanticInput } from "./facade-semantic.js";
 import type { Gate } from "./store.js";
-import { acceptedOriginals } from "../intake/accepted-originals.js";
+import { acceptedOriginals, type OriginalBasis } from "../intake/accepted-originals.js";
+import { readFactReviews } from "./fact-review.js";
+import { matchingDocumentFacadeLink, readDocumentFacadeLinks, readManuallyNamedFacades, type DocumentFacadeLink } from "./document-facades.js";
 
 type AcceptedVersion = { id: string; sha256: string; documentId: string; label: string };
 type Impact = { receiptId: string; questionId: string };
-type ConfirmedStage = { versionId: string; target: ReaderAddress | null; stage: string; evidenceId: string };
+type ConfirmedStage = { versionId: string; target: ReaderAddress | null; stage: string; evidenceId: string | null; originalBasis: OriginalBasis | null };
+function manualPlaceKey(versionId: string, address: ReaderAddress, format: string) {
+  if (format === 'pdf' && /^[1-9]\d*$/.test(address.unitId)) {
+    return canonicalJson([versionId, 'pdf-page', address.unitId]);
+  }
+  const at = address.locator;
+  return format === 'xlsx' && at?.sheet && at.cell ? canonicalJson([versionId, 'xlsx-cell', address.unitId, at.sheet, at.cell]) : undefined;
+}
+
 const typeClause = /^(?:тип фасада|facade (?:kind|type))\s*[:=–—]\s*([\p{L}\p{N}][\p{L}\p{N} _-]{0,99})\s*$/iu;
 type ReplacementReference = { observationId: string; evidenceId: string; versionId: string; address: Record<string, unknown> };
 export type FacadeReplacement = {
@@ -29,7 +39,7 @@ export type FacadeReplacement = {
 
 export function convertFact(fact: PackageFact, accepted: Map<string, AcceptedVersion>, formats: Map<string, string>,
   stages: Map<string, ConfirmedStage>, evidence: Map<string, DeliveryEvidence>, original: ReaderLine[] | undefined,
-  provenFacade: boolean): FacadeFact | null {
+  provenFacade: boolean, links?: ReadonlyMap<string, DocumentFacadeLink>): FacadeFact | null {
   const { source, quote, value, unit, evidenceId, receiptId, runId, lineId, address, components, deliveryStatement } = fact.observation;
   const acceptedOriginal = accepted.get(source.versionId);
   const format = formats.get(fact.windowId);
@@ -40,6 +50,11 @@ export function convertFact(fact: PackageFact, accepted: Map<string, AcceptedVer
     { kind: "facades" as const, facadeIds: candidates.map(({ id }) => id) } :
     state === "common" && anchored ? { kind: "common" as const } :
     { kind: state === "unidentified" ? "unidentified" as const : "ambiguous" as const };
+  // A document or place link applies where membership was open. Existing addressed claims
+  // for another facade or the common level retain their own evidence.
+  const link = membership.kind === 'ambiguous' || membership.kind === 'unidentified' ?
+    matchingDocumentFacadeLink(links, format === 'pdf' && !address.locator?.page && /^[1-9]\d*$/.test(address.unitId) ?
+      { ...address, locator: { page: Number(address.unitId) } } : address) : undefined;
   const attribute = fact.attribute?.trim() || deliveryStatement?.item || null;
   const subjectVerified = attribute && !deliveryStatement && value != null && quote && lineId &&
     hasAddressedSubject({ subject: attribute, property: attribute }, fact.observation,
@@ -79,7 +94,10 @@ export function convertFact(fact: PackageFact, accepted: Map<string, AcceptedVer
       (negativeInOriginal && deliveryStatement?.status === "delivered") ? "contradictory_original" as const :
     deliveryStatement?.status === "not_delivered" && !absence ? "original_statement_unverified" as const : undefined;
   const printedStage = fact.basis.stage ? fact.designStage : null;
+  const key = manualPlaceKey(source.versionId, address, format);
+  const localStage = key ? stages.get(key) : undefined;
   const confirmation = stages.get(canonicalJson([source.versionId, address])) ??
+    (localStage?.originalBasis ? localStage : undefined) ??
     (!printedStage ? stages.get(canonicalJson([source.versionId, null])) : undefined);
   const receivedTitle = fact.basis.revisionEvidence;
   const title = receivedTitle && evidence.get(receivedTitle.evidenceId);
@@ -91,7 +109,8 @@ export function convertFact(fact: PackageFact, accepted: Map<string, AcceptedVer
       { evidenceId: revisionPart.evidenceId, address: revisionPartAddress, quote: fact.basis.revision } :
     quote && fact.basis.revision && quote.includes(fact.basis.revision) ? { evidenceId, address, quote: fact.basis.revision } : null;
   return {
-    membership,
+    membership: link ? { kind: 'facades', facadeIds: [link.facadeId] } : membership,
+    ...(link ? { documentFacadeLink: { version: link.version, basis: link.basis, facadeId: link.facadeId } } : {}),
     property: attribute,
     materials: fact.materials.map(({ label }) => label),
     variant: fact.variant,
@@ -120,7 +139,7 @@ export function convertFact(fact: PackageFact, accepted: Map<string, AcceptedVer
         ...(deliveryStatement ? { deliveryStatement } : {}),
         ...(absence && full?.companion ? { deliveryBasis: full.companion } : {}),
         ...(deliveryUncertainty ? { deliveryUncertainty } : {}),
-        ...(confirmation ? { stageConfirmation: { stage: confirmation.stage, evidenceId: confirmation.evidenceId } } : {}),
+        ...(confirmation ? { stageConfirmation: { stage: confirmation.stage, ...(confirmation.originalBasis ? { originalBasis: confirmation.originalBasis } : { evidenceId: confirmation.evidenceId! }) } } : {}),
         ...(valueRoleBasis ? { valueRoleBasis } : {}),
         ...(fact.revision && revisionBasis ? { documentRevision: {
           label: fact.revision, ...revisionBasis, address: { ...revisionBasis.address },
@@ -136,18 +155,19 @@ function typeInLine(line: string) {
 }
 
 export function facadeObservation(fact: PackageFact, originalLine?: string) {
-  const { observation, id, branch, attribute, sourceRole, designStage, revision, revisionStatus, basis, binding, evidenceHref } = fact;
+  const { observation, id, branch, attribute, sourceRole, designStage, revision, revisionStatus, variant, basis, binding, evidenceHref } = fact;
   const quote = observation.quote ?? null;
   const proposedFacadeKind = quote && basis.role &&
     binding.state === "identified" && revisionStatus !== "superseded" && observation.grounding === "text"
     ? typeInLine(quote) : null;
   const facadeKindSourceVerified = Boolean(proposedFacadeKind && originalLine && quote && originalLine.includes(quote) &&
     typeInLine(originalLine) === proposedFacadeKind);
-  return { id, branch, attribute, sourceRole, designStage, revision, revisionStatus, basis, binding, evidenceHref,
+  return { id, branch, attribute, sourceRole, designStage, revision, revisionStatus, variant, basis, binding, evidenceHref,
     evidenceId: observation.evidenceId, proposedFacadeKind, facadeKindSourceVerified,
     receiptId: observation.receiptId, documentId: observation.source.documentId, versionId: observation.source.versionId,
     sha256: observation.source.sha256, address: observation.address, quote,
     value: observation.value ?? null, unit: observation.unit ?? null,
+    normalized: normalizeFactValue(observation.value ?? null, observation.unit ?? null),
     originalHref: `/api/documents/${observation.source.documentId}/versions/${observation.source.versionId}/content` };
 }
 
@@ -261,12 +281,22 @@ export async function readFacadeInput(tx: PoolClient, projectId: string) {
        WHERE s.project_id=$1 ORDER BY r.created_at,r.id`, [projectId],
   );
   const { rows: stages } = await tx.query<ConfirmedStage>(
-    `SELECT version_id AS "versionId", target, stage, evidence_id AS "evidenceId"
+    `SELECT version_id AS "versionId", target, stage, evidence_id AS "evidenceId", original_basis AS "originalBasis"
      FROM document_stage_confirmations WHERE project_id=$1`, [projectId],
   );
   const stageByAddress = new Map(stages.map((stage) => [canonicalJson([stage.versionId, stage.target]), stage]));
+  for (const stage of stages) {
+    if (!stage.target || !stage.originalBasis) continue;
+    const format = stage.target.locator?.sheet ? 'xlsx' : 'pdf';
+    const key = manualPlaceKey(stage.versionId, stage.target, format);
+    if (key) stageByAddress.set(key, stage);
+  }
   const analysis = await readPackageAnalysis(tx, projectId);
   const accepted = new Map(versions.map((version) => [version.id, version]));
+  const links = (await readDocumentFacadeLinks(tx, projectId)).filter(({ basis, versionId }) => accepted.get(versionId)?.sha256 === basis.sha256);
+  const linksByVersion = new Map([...Map.groupBy(links, ({ versionId }) => versionId)].map(([versionId, items]) =>
+    [versionId, new Map(items.map((item) => [item.targetKey, item]))]));
+  const manualFacades = await readManuallyNamedFacades(tx, projectId);
   const windows = analysis.windows.filter(({ place }) => accepted.get(place.source.versionId)?.sha256 === place.source.sha256);
   const formats = new Map(windows.map(({ id, format }) => [id, format]));
   const activeFacts = analysis.facts.filter(({ observation, windowId }) =>
@@ -303,8 +333,9 @@ export async function readFacadeInput(tx: PoolClient, projectId: string) {
     fact.binding.state === "identified" && !discovery.placed(fact) ? { ...fact, binding: { ...fact.binding, state: "unclear",
       reason: "Адресное упоминание ещё не подтверждает принадлежность фасаду." } } : fact,
     originalLines.get(fact.id)?.find(({ id }) => id === fact.observation.lineId)?.text));
+  const factReviews = await readFactReviews(tx, projectId, observations);
   const facts = activeFacts.flatMap((fact) => convertFact(fact, accepted, formats, stageByAddress, evidenceById,
-    originalLines.get(fact.id), discovery.placed(fact)) ?? []);
+    originalLines.get(fact.id), discovery.placed(fact), linksByVersion.get(fact.observation.source.versionId)) ?? []);
   const coveredWindows = windows.flatMap((window) => {
     const a = completedReaderJob(window, "A");
     const b = completedReaderJob(window, "B");
@@ -319,14 +350,17 @@ export async function readFacadeInput(tx: PoolClient, projectId: string) {
     { versionIds, basisIds: coveredWindows.flat().sort() } : null;
   const evidence: FacadeReadout = {
     facts,
-    facades: [...new Map(activeFacts.filter(discovery.placed)
-      .flatMap(({ binding }) => binding.candidates).map((item) => [item.id, item])).values()],
+    facades: [...new Map([
+      ...links.map(({ facadeId: id, facadeLabel: label }) => ({ id, label })),
+      ...activeFacts.filter(discovery.placed).flatMap(({ binding }) => binding.candidates),
+      ...manualFacades,
+    ].map((item) => [item.id, item])).values()],
     map: analysis.coverage.physicalProof,
     subject: analysis.coverage.subjectProof,
     pairs: analysis.verifiedPairs,
     reading,
   };
-  return { intake, versionIds, versions, evidence, impacts, replacements, holds, semantic, discovery, observations,
+  return { intake, versionIds, versions, evidence, impacts, replacements, holds, semantic, discovery, observations, factReviews, links, linksByVersion,
     comparisonRows: comparisonRows(activeFacts, formats, evidenceById, statements, [...discovery.identity.values()],
       await readCanonicalComparisonRows(tx, projectId, activeFacts, evidenceById)),
     comparisonReads: await comparisonReads(tx, projectId, windows, activeFacts, analysis.comparisonFollowups),

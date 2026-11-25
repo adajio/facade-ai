@@ -14,6 +14,7 @@
   import type { CopilotBudget } from '../lib/copilot';
   import type { EvidenceActions } from '../lib/workspace';
   import { triageOptions, type Triage } from '../lib/triage';
+  import ProjectSettings from './ProjectSettings.svelte';
   import Overview from './Overview.svelte';
   import Receipts from './Receipts.svelte';
   import Completeness from './Completeness.svelte';
@@ -35,7 +36,8 @@
   let projectId = $derived(project.id);
   let scopes = $derived(project.scopes ?? []);
   let requestedScope = $derived(route.params.get('scope') ?? '');
-  let scopeId = $derived(scopes.some((scope) => scope.id === requestedScope) ? requestedScope : (scopes[0]?.id ?? ''));
+  let missingScope = $derived(Boolean(requestedScope && !scopes.some((scope) => scope.id === requestedScope)));
+  let scopeId = $derived(requestedScope || scopes[0]?.id || '');
   let filter = $derived(route.params.get('filter') ?? '');
   let pinnedSlice = $derived(route.params.get('slice') ?? undefined);
   let revision = $derived(route.params.get('revision') ?? undefined);
@@ -66,6 +68,7 @@
   let splitWidth = $state<number>();
   let drawer = $state(false);
   let drawerWidth = $state(62);
+  let bottomHeight = $state(62.5);
   let triage = $state<Triage>();
   let lastMatrix = $state<string>();
   let reviewSection = $derived(section === 'completeness' || section === 'facts' || section === 'questions');
@@ -125,6 +128,13 @@
     }
   });
 
+  function chooseTriage(value: Triage) {
+    triage = value;
+    const url = new URL(window.location.href);
+    url.searchParams.set('filter', value);
+    navigate(url.pathname + url.search);
+  }
+
   function toggleRail() {
     collapsed = !effectiveCollapsed;
     autoCollapsed = false;
@@ -141,23 +151,17 @@
 
   function keyboard(event: KeyboardEvent) {
     if (event.defaultPrevented || event.altKey || event.isComposing ||
-        (event.target instanceof HTMLElement && event.target.closest('input, textarea, select, [contenteditable]'))) return;
+        (event.target instanceof HTMLElement && event.target.closest('input:not([type="radio"]), textarea, select, [contenteditable]'))) return;
     if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'b' && !compact) {
       event.preventDefault();
       toggleRail();
-    } else if (evidenceOpen && !event.metaKey && !event.ctrlKey && ['[', ']'].includes(event.key)) {
-      event.preventDefault();
-      if (compact) {
-        drawer = true;
-        resizeDrawer(drawerWidth + (event.key === ']' ? 5 : -5));
-      } else resizeViewer(width + (event.key === ']' ? 5 : -5));
     } else if (reviewSection && !event.metaKey && !event.ctrlKey) {
       const tab = triageOptions[Number(event.key) - 1];
-      if (tab && section === 'completeness' && !filter && !evidenceOpen) {
+      if (tab && section === 'completeness' && !evidenceOpen && event.target instanceof HTMLElement && event.target.closest('.triage-actions')) {
         event.preventDefault();
-        triage = tab;
+        chooseTriage(tab);
       } else if (!evidenceOpen && ['j', 'k', 'ArrowDown', 'ArrowUp'].includes(event.key) &&
-          (event.target === document.body || event.target instanceof HTMLElement && event.target.closest('#main'))) {
+          (event.target instanceof HTMLElement && event.target.closest('.table-wrap'))) {
         const rows = Array.from(document.querySelectorAll<HTMLElement>('[data-triage-row]'));
         if (!rows.length) return;
         const selected = rows.indexOf(document.activeElement as HTMLElement);
@@ -173,7 +177,7 @@
     return scopedUrl(project.id, next, {
       scope: replacement || undefined,
       ...(sameContext && next === section ? { filter, slice: pinnedSlice } : {}),
-      ...(sameContext && project.intakeMode && !scopeId && reviewSection && (next === 'facts' || next === 'questions')
+      ...(sameContext && project.intakeMode && (!scopeId || route.params.has('context')) && !project.scopeId && (reviewSection || section === 'letters' || section === 'overview') && ['overview','facts','questions','letters','completeness'].includes(next)
         ? { context: route.params.get('context') } : {}),
       ...(next === 'fragments' && section === 'fragments' && isEngineer(project) ? {
         document: route.params.get('document'), version: route.params.get('version'), page: route.params.get('page'),
@@ -189,7 +193,7 @@
   $effect(() => {
     const base = projectApi(projectId);
     const activeScope = scopeId;
-    if (masked || isolatedSection) return;
+    if (masked || isolatedSection || missingScope) return;
     void loopRevision;
     const controller = new AbortController();
     let timer: ReturnType<typeof setTimeout>;
@@ -265,7 +269,7 @@
     void section;
     void scopeId;
     void objectId;
-    const evidence = isolatedSection ? null : evidenceId;
+    const evidence = isolatedSection || missingScope ? null : evidenceId;
     const observation = observationId;
     const component = evidenceComponent;
     untrack(() => {
@@ -354,11 +358,13 @@
 <header class="topbar">
   <nav aria-label="Путь к проекту" class="crumbs">
     <a class="brand" href="/projects"><span class="brand-mark" aria-hidden="true"></span> Facade AI</a>
-    <a class="projects-crumb" href="/projects">Проекты</a>
+    <a class="button projects-crumb" href="/projects"><span aria-hidden="true">←</span> Все проекты</a>
     <span class="project-name" title={project.name}>{project.name}</span>
+    {#if !project.scopeId}<a class="button project-settings" href={scopeLink('settings')}>Настройки проекта</a>{/if}
   </nav>
   {#if section !== 'members' && scopes.length}
     <select class="scope-select" aria-label="Стадия и область" value={scopeId} onchange={chooseScope}>
+      {#if missingScope}<option value={requestedScope} disabled>Область недоступна</option>{/if}
       {#each scopes as scope (scope.id)}<option value={scope.id}>{scope.name} · {scope.stage}</option>{/each}
     </select>
   {/if}
@@ -415,30 +421,33 @@
     {#if reviewSection}
       <nav class="review-nav actions" aria-label="Представление проверки">
         <a class="button quiet" aria-current={section === 'completeness' ? 'page' : undefined}
-          href={lastMatrix ?? scopeLink('completeness')}>Матрица позиций</a>
+          href={lastMatrix ?? scopeLink('completeness')}>Требования</a>
         <a class="button quiet" aria-current={section === 'facts' ? 'page' : undefined}
-          href={scopeLink('facts')}>Все сведения</a>
+          href={scopeLink('facts')}>Найденные сведения</a>
         <a class="button quiet" aria-current={section === 'questions' ? 'page' : undefined}
           href={scopeLink('questions')}>Внутренние вопросы</a>
       </nav>
     {/if}
     <div class:with-evidence={evidenceOpen} class:drawer class="project-content"
-      style:--evidence-share={width / (100 - width) + 'fr'} style:--drawer-width={drawerWidth + 'vw'}>
+      style:--evidence-share={width / (100 - width) + 'fr'} style:--drawer-width={drawerWidth + '%'} style:--bottom-share={bottomHeight / (100 - bottomHeight) + 'fr'}>
       <div class="section-content">
         {#key section + '/' + scopeId}
-          {#if section === 'overview'}
+          {#if missingScope}
+            <Notice message="Указанная область недоступна. Выберите доступную область или вернитесь к проекту." />
+            <a href={scopedUrl(project.id, 'overview', {})}>К обзору проекта</a>
+          {:else if section === 'overview'}
             <Overview {api} {context} {projection} {renew} open={openEvidence} />
           {:else if section === 'receipts'}
             <Receipts {api} {context} {projection} {renew} open={openEvidence} />
           {:else if section === 'completeness'}
             {#if project.intakeMode && (!scopeId || route.params.has('context')) && !project.scopeId}
-              <FacadeAssessment {api} {context} {renew} {triage} chooseTriage={(value) => triage = value}
+              <FacadeAssessment {api} {context} {renew} {triage} {chooseTriage}
                 refreshProject={() => refresh()} open={openEvidence} />
             {:else}
-              <Completeness {api} {context} {renew} {triage} chooseTriage={(value) => triage = value} open={openEvidence} />
+              <Completeness {api} {context} {renew} {triage} {chooseTriage} open={openEvidence} />
             {/if}
           {:else if section === 'questions' || section === 'facts'}
-            {#if project.intakeMode && !scopeId && !project.scopeId}
+            {#if project.intakeMode && (!scopeId || route.params.has('context')) && !project.scopeId}
               <FacadeAssessment {api} {context} {renew} mode={section} refreshProject={() => refresh()} open={openEvidence} />
             {:else}
               <Questions {api} {context} mode={section} {renew} open={openEvidence} />
@@ -449,6 +458,8 @@
             <Copilot {api} {context} {navigate} budget={copilotBudget} />
           {:else if section === 'letters'}
             <Letters {api} {context} {renew} open={openEvidence} />
+          {:else if section === 'settings' && !project.scopeId}
+            <ProjectSettings {project} />
           {:else if section === 'members' && available(project, 'project:manage')}
             <Members {api} {project} {refresh} />
           {:else}
@@ -457,7 +468,8 @@
         {/key}
       </div>
       {#if evidenceOpen}
-        {#if !compact}<SplitHandle value={width} change={resizeViewer} />{/if}
+        {#if !compact}<SplitHandle value={width} change={resizeViewer} />
+        {:else if !drawer}<SplitHandle value={bottomHeight} change={(value) => bottomHeight = Math.max(35, Math.min(68, value))} stacked />{/if}
         <div class="evidence-dock" id="workspace-evidence">
           {#if compact}
             {#if drawer}<SplitHandle value={drawerWidth} change={resizeDrawer} drawer />{/if}
@@ -499,10 +511,14 @@
   .workspace.collapsed { grid-template-columns: 56px minmax(0, 1fr); }
   .work-main { max-width: 1440px; }
   .work-main:has(.with-evidence) { max-width: none; padding-inline: 12px; }
+  .projects-crumb, .project-settings { flex: none; font-size: .9rem; }
+  .project-content { --split-target: 40px; --split-rule: 6px; }
   .section-content { min-width: 0; }
   .review-nav { margin-block: 0 12px; border-bottom: 1px solid var(--line); }
   .review-nav [aria-current] { color: var(--accent-text); border-bottom-color: var(--accent); background: #e5f2ef; }
   .evidence-dock { min-width: 0; }
+  .evidence-dock :global(:is(button, .button, summary)) { min-inline-size: 40px; min-block-size: 40px; }
+  .evidence-dock :global(summary) { padding-block: 8px; }
   @media (min-width: 851px) {
     .work-main:has(.with-evidence) { display: flex; flex-direction: column; height: calc(100dvh - 52px); padding-block: 12px; }
     .with-evidence { flex: 1; min-height: 0; }
@@ -512,20 +528,21 @@
     .evidence-dock > :global(.evidence-panel:not(.full)), .evidence-dock > :global(.comparison:not(.full)) { flex: 1; min-height: 0; max-height: 100%; }
   }
   @media (min-width: 1141px) {
-    .with-evidence { display: grid; grid-template-columns: minmax(0, 1fr) 6px minmax(0, var(--evidence-share)); gap: 8px; }
+    .with-evidence { display: grid; grid-template-columns: minmax(0, 1fr) var(--split-target) minmax(0, var(--evidence-share)); }
     .with-evidence > :global(.handle) { align-self: stretch; }
   }
   @media (min-width: 851px) and (max-width: 1140px) {
-    .with-evidence { display: grid; grid-template-rows: minmax(0, 36fr) minmax(0, 64fr); gap: 8px; }
-    .with-evidence.drawer { display: block; }
-    .drawer .evidence-dock { position: fixed; inset: 64px 12px 12px auto; width: var(--drawer-width); z-index: 8; }
-    .drawer .section-content { height: 100%; margin-right: calc(var(--drawer-width) - 56px); }
+    .with-evidence { display: grid; grid-template-rows: minmax(0, 1fr) var(--split-target) minmax(0, var(--bottom-share)); }
+    .with-evidence.drawer { display: block; position: relative; }
+    .drawer .evidence-dock { position: absolute; inset: 0 0 0 auto; width: var(--drawer-width); }
+    .drawer .section-content { height: 100%; margin-right: calc(var(--drawer-width) + var(--split-target)); }
     .evidence-dock { position: relative; }
     .layout-toggle { align-self: start; background: var(--surface); flex: none; }
   }
   .evidence-dock:has(:global(.full)) { z-index: 12; }
   @media (max-width: 1050px) {
-    .projects-crumb, .user-name { display: none; }
+    .brand, .user-name { display: none; }
+    .crumbs { flex-wrap: wrap; }
   }
   @media (max-width: 850px) {
     .topbar { position: static; flex-wrap: wrap; }

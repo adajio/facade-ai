@@ -1,4 +1,5 @@
 <script lang="ts">
+  import CatalogSummary from '../lib/CatalogSummary.svelte';
   import OriginalBasisFields from '../lib/OriginalBasisFields.svelte';
   import { originalUrl, renderAddress } from '../lib/copilot';
   import { copy } from '../lib/copy';
@@ -179,6 +180,8 @@
             {#each catalogs as catalog (catalog.id)}<option value={catalog.id}>{catalog.name} · {catalog.revision}</option>{/each}
           </select>
         </label>
+        {#each catalogs as option (option.id)}<CatalogSummary catalog={option} />{/each}
+        {#if catalogVersionId && project.catalogVersionId !== catalogVersionId}<p>Текущая оценка будет пересчитана по выбранным правилам. В истории сохранятся прежние оценки и письма.</p>{/if}
         {#if catalogCursor}<button type="button" disabled={busy} onclick={() => loadCatalogOptions(catalogCursor ?? undefined)}>Ещё версии</button>{/if}
         <div class="actions"><button class="primary" disabled={busy || catalogVersion == null || !catalogVersionId}>Назначить рабочий каталог</button></div>
       </form>

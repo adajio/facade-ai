@@ -125,6 +125,51 @@ test('два сеанса, обе гонки допуска, курсор и и�
       await a.ok(`/api/questions/${question.id}/decisions`, post(confirm(true), question.version), 201);
     }
   }
+  await t.test('регистрация отправки и объявление досылки в обоих порядках', async (raceTest) => {
+    const orders = [];
+    for (const [registrationFirst, name] of [[true, 'регистрация отправки первая'], [false, 'объявление досылки первое']]) {
+      await raceTest.test(name, async () => {
+        const subject = await allowedLetter(a, base, scopeA, addressee, 2);
+        const sentRevision = await a.ok(`${subject.path}/revisions/${subject.revisionId}`);
+        const incoming = await newReceipt(b, base);
+        const before = await projectSnapshot();
+        const register = () => a.request(`${subject.path}/sent`, post({
+          revisionId: subject.revisionId, recipient: addressee, itemIds: sentRevision.items.map(({ id }) => id),
+          text: subject.text.text, sentAt: new Date().toISOString(),
+        }));
+        const upload = () => declare(b, incoming, supplementFile, [scopeA]);
+        const [first, second] = await queuedRace(db, projectId, registrationFirst ? register : upload, registrationFirst ? upload : register);
+        const [sent, intake] = registrationFirst ? [first, second] : [second, first];
+        assert.equal(intake.status, 201, JSON.stringify(intake.body));
+
+        let history;
+        const historyUrl = `${subject.path}/sent/${sent.body?.id}`;
+        try {
+          assert.equal(sent.status, 201, JSON.stringify(sent.body));
+          const { events } = await b.ok(`${base}/events?after=${before.cursor}`);
+          const registered = events.find(({ type, payload }) => type === 'letter.sent' && payload.id === sent.body.id);
+          const declared = events.find(({ type, payload }) => type === 'intake.upload_declared' && payload.receiptId === incoming);
+          assert(registered && declared, 'Оба коммита должны быть видны в ленте проекта');
+          assert.equal(BigInt(registered.cursor) < BigInt(declared.cursor), registrationFirst);
+          blocked(await subject.getText(), 409, 'scope_held');
+          history = await b.ok(historyUrl);
+          assert.equal(history.historical, true);
+          assert.equal(history.text, subject.text.text);
+          assert.equal(history.textSha256, sha256(Buffer.from(subject.text.text)));
+          assert.deepEqual(history.items.map(({ id }) => id), sentRevision.items.map(({ id }) => id));
+          orders.push({ registrationFirst, registrationCursor: registered.cursor, intakeCursor: declared.cursor,
+            items: history.items.length, textSha256: history.textSha256 });
+        } finally {
+          await b.ok(`/api/uploads/${intake.body.uploadId}/cancel`, post({}));
+        }
+        assert.equal((await a.ok(`${subject.path}/current-text`, { version: subject.version })).text, subject.text.text);
+        assert.deepEqual(await a.ok(historyUrl), history);
+      });
+    }
+    assert.equal(orders.length, 2);
+    await mkdir(output, { recursive: true });
+    await writeFile(join(output, 'send-order.json'), JSON.stringify(orders, null, 2) + '\n');
+  });
   const oldA = await current(scopeA);
   const oldQuestion = attachment(oldA);
   const letter = await allowedLetter(a, base, scopeA, addressee, 2);
