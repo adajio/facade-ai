@@ -6,6 +6,7 @@
   import { projectOf, type Session, type Project, type ProjectRead, type Scope } from './lib/contracts';
   import { readRoute, returnPath } from './lib/routes';
   import { pageCache } from './lib/page-cache';
+  import { IntakeTransfers, setIntakeTransfers } from './lib/intake-transfers';
   import Projects from './screens/Projects.svelte';
   import Workspace from './screens/Workspace.svelte';
   import Administration from './screens/Administration.svelte';
@@ -27,11 +28,13 @@
   let lease: ReturnType<typeof setTimeout> | undefined;
   let channel: BroadcastChannel | undefined;
   const api = new Api(expired);
+  const transfers = setIntakeTransfers(new IntakeTransfers(new Api(expired)));
 
   function clear() {
     pageCache.clear();
     check?.abort();
     clearTimeout(lease);
+    transfers.clear();
     api.reset();
     session = undefined;
     project = undefined;
@@ -132,10 +135,12 @@
           (project.scopeId !== next.scopeId || JSON.stringify(project.actions) !== JSON.stringify(next.actions))) {
         // Drop the mounted workspace and pending responses when role permissions change.
         pageCache.clear();
+        transfers.clear();
         api.reset();
         api.setCsrf(fresh.csrfToken);
         sessionEpoch += 1;
       }
+      transfers.api.setCsrf(fresh.csrfToken);
       session = fresh;
       project = next;
       screenState = 'ready';
@@ -173,6 +178,7 @@
   async function signOut() {
     if (signingOut) return;
     signingOut = true;
+    transfers.clear();
     check?.abort();
     pageCache.clear();
     masked = true;
@@ -195,7 +201,11 @@
     route = readRoute(window.location);
     if (route.projectId !== last.projectId || route.page !== last.page ||
         (project?.scopeId && (route.section !== last.section || route.params.get('scope') !== last.params.get('scope')))) {
-      lockScreen('checking');
+      // Recheck the destination while the authenticated session and its uploads stay alive.
+      pageCache.clear();
+      clearTimeout(lease);
+      api.reset();
+      screenState = 'checking';
       void verify(true);
     } else if (foreground) {
       void verify();
@@ -237,6 +247,7 @@
     };
     const pageHide = () => {
       masked = true;
+      transfers.clear();
       pageCache.clear();
       check?.abort();
       // Conceal the cached DOM synchronously before bfcache takes its snapshot.

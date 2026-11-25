@@ -7,6 +7,7 @@
     fileChecksum, itemPath, pendingReceipt, receiptPath, relativePath, sendFile, sendManifestFile,
     type Capabilities, type Inventory, type ManifestItem, type NewInput, type Occurrence, type Receipt, type Upload, type UploadProgress,
   } from '../lib/intake';
+  import { getIntakeTransfers } from '../lib/intake-transfers';
   import { projectApi, scopedUrl, type OpenEvidence, type Page, type Projection, type WorkspaceProps } from '../lib/workspace';
   import { workReceiptFilters, workSliceApi, type WorkReceiptFilter, type WorkSlice } from '../lib/work-slice';
   import WorkProgress from '../lib/WorkProgress.svelte';
@@ -14,6 +15,7 @@
   import Document from './Document.svelte';
   import IntakeHolds from './IntakeHolds.svelte';
 
+  type Declaration = { receiptId: string; version?: number; items: NewInput[]; mode: 'once' | 'open' };
   type ReceiptList = { receipts: Receipt[]; nextCursor?: number | string | null };
   type ReceiptSelection = 'present' | 'filtered' | 'missing';
   type WorkReceiptList = ReceiptList & {
@@ -25,6 +27,11 @@
 
   let { api, context, projection, renew, open }: { api: Api; context: WorkspaceProps; projection?: Projection; renew: () => void; open: OpenEvidence } = $props();
   const commands = new Commands(() => api);
+  const transferPhases = {
+    hashing: 'Проверка контрольной суммы',
+    transfer: 'Подтверждено сервером',
+    finalizing: 'Сохраняем оригинал в хранилище',
+  };
   const receiptFilters = Object.entries(workReceiptFilters) as [WorkReceiptFilter, string][];
   let list = $state<Receipt[]>([]);
   let nextCursor = $state<ReceiptList['nextCursor']>(null);
@@ -57,7 +64,7 @@
   let continuation = $state('');
   let navigationLink: HTMLAnchorElement;
   let openInventoryLink = $state('');
-  let draft: { receiptId: string; version?: number; items: NewInput[]; mode: 'once' | 'open' } | undefined;
+  let draft: Declaration | undefined;
   let channel = $state<'file' | 'folder' | 'link'>('file');
   let files = $state<File[]>([]);
   let linkUrl = $state('');
@@ -100,7 +107,7 @@
     const upload = context.params.get('upload');
     if (upload !== priorUpload) {
       priorUpload = upload;
-      if (upload === '1' || upload === 'link') startNew(upload === 'link' ? 'link' : 'file');
+      if ((upload === '1' || upload === 'link') && !transferStatus?.running) startNew(upload === 'link' ? 'link' : 'file');
     }
   });
   $effect(() => {
@@ -117,13 +124,22 @@
       .catch(() => {});
     return () => stop.abort();
   });
-  let pending = $state(false);
-  let progress = $state<Parameters<UploadProgress>[0]>();
-  let workingFile = $state('');
-  let uploadSignal: AbortController | undefined;
+  let projectId = $derived(context.project.id);
+  const transfers = getIntakeTransfers();
+  const transferApi = transfers.api;
+  const transferCommands = new Commands(() => transferApi);
+  let transferStatus = $derived(transfers.status.get(projectId));
+  let mutating = $state(false);
+  let pending = $derived(mutating || Boolean(transferStatus?.running));
+  let wasTransferring = false;
+  $effect(() => {
+    const running = Boolean(transferStatus?.running);
+    if (wasTransferring && !running) untrack(renew);
+    wasTransferring = running;
+  });
+  let mounted = true;
   let batch = new Map<File, string>();
   let finished = new Set<File>();
-  let projectId = $derived(context.project.id);
   let filter = $derived<WorkReceiptFilter>(
     context.filter === 'processing' ? 'processing' : context.filter === 'open' || context.filter === 'uploading' ? 'open' : 'all',
   );
@@ -287,7 +303,7 @@
     return () => stop.abort();
   });
 
-  onDestroy(() => uploadSignal?.abort());
+  onDestroy(() => { mounted = false; });
 
   function intakeStatus(status: string) {
     switch (status) {
@@ -312,26 +328,26 @@
     return (slice ? workSliceApi(project, slice) + '/receipts/' + id(receipt) : receiptPath(receipt)) + '/inventory';
   }
 
-  async function navigateToInventory(href: string) {
+  async function navigateToInventory(href: string, canNavigate = () => true) {
     openInventoryLink = href;
     await tick();
-    navigationLink?.click();
+    if (canNavigate()) navigationLink?.click();
   }
 
-  async function enterInventory(receiptId: string) {
+  async function enterInventory(receiptId: string, canNavigate: () => boolean) {
     if (context.objectId === receiptId) return;
     if (usesWorkSlice) {
       // A newly created receipt belongs to a new slice.
       try {
         const fresh = await currentWorkSlice(projectId, workScope, AbortSignal.timeout(5000));
-        await navigateToInventory(url(receiptId, { workSlice: fresh, filter }));
+        if (canNavigate()) await navigateToInventory(url(receiptId, { workSlice: fresh, filter }), canNavigate);
         return;
       } catch {
-        await navigateToInventory(url(receiptId, { workSlice: '', filter: filter === 'open' ? 'open' : '' }));
+        if (canNavigate()) await navigateToInventory(url(receiptId, { workSlice: '', filter: filter === 'open' ? 'open' : '' }), canNavigate);
         return;
       }
     }
-    await navigateToInventory(url(receiptId));
+    await navigateToInventory(url(receiptId), canNavigate);
   }
 
   async function openCurrentInventory() {
@@ -528,174 +544,192 @@
     form = true;
   }
 
-  async function readInventory(receiptId: string, signal: AbortSignal) {
-    const value = await api.json<Inventory>(inventoryPath(projectId, receiptId), { signal });
-    if (value.projectId !== projectId || value.receiptId !== receiptId) throw new Error('Поступление недоступно.');
-    inventory = value;
-    active = receiptId;
-    return value;
-  }
-
-  async function transferManifest(signal: AbortSignal) {
-    const project = context.project.id;
-    const current = active && inventory?.receiptId === active ? inventory : undefined;
-    const selected = [];
-    for (const file of channel === 'link' ? [] : files) {
-      workingFile = relativePath(file);
-      const sha256 = await fileChecksum(file, signal, (value) => progress = value);
-      selected.push({ file, sha256 });
-    }
-    let view: Inventory;
-    let submittedItems: Set<string> | undefined;
-    if (resumeItems && current) {
-      view = await readInventory(current.receiptId, signal);
-    } else {
-      const scopeIds = declareScope && context.scopeId ? [context.scopeId] : undefined;
-      draft ??= {
-        receiptId: current?.receiptId ?? crypto.randomUUID(),
-        version: current?.manifest?.version,
-        mode: leaveOpen ? 'open' : 'once',
-        items: channel === 'link'
-          ? [{ itemId: crypto.randomUUID(), kind: 'link', url: linkUrl.trim(), scopeIds }]
-          : selected.map(({ file, sha256 }) => ({
-              itemId: crypto.randomUUID(), kind: 'file', relativePath: relativePath(file),
-              size: file.size, mediaType: file.type || undefined, sha256, scopeIds,
-            })),
-      };
-      const declaration = draft;
-      if (declaration.version === undefined) pendingReceipt(project, declaration.receiptId);
-      try {
-        if (declaration.version === undefined) {
-          await api.mutate(projectApi(project) + '/receipts', 'POST', {
-            receiptId: declaration.receiptId, mode: declaration.mode, items: declaration.items,
-          }, { key: declaration.receiptId }, signal);
-        } else {
-          await commands.send(receiptPath(declaration.receiptId) + '/manifest', 'POST', {
-            manifestVersion: declaration.version, items: declaration.items,
-          }, undefined, signal);
-        }
-        view = await readInventory(declaration.receiptId, signal);
-      } catch (problem) {
-        // A read settles the outcome of a declaration whose response didn't arrive.
-        try {
-          view = await readInventory(declaration.receiptId, AbortSignal.timeout(5000));
-        } catch {
-          throw problem;
-        }
-        if (!declaration.items.every(item => view.manifest?.items.some(saved => saved.itemId === item.itemId))) {
-          const committedCreate = declaration.version === undefined && view.manifest;
-          if (!committedCreate) { draft = undefined; throw problem; }
-          draft = undefined;
-          throw new Error('Состав уже сохранён. Продолжите передачу из описи.');
-        }
-        if (signal.aborted) throw signal.reason;
-      }
-      submittedItems = new Set(declaration.items.map(item => item.itemId));
-      draft = undefined;
-    }
-
-    const remaining = view.manifest?.items.filter(item =>
-      item.kind !== 'link' && item.status !== 'excluded' && (!submittedItems || submittedItems.has(item.itemId)),
-    ) ?? [];
-    remaining.sort((a, b) => Number(a.status === 'accepted') - Number(b.status === 'accepted'));
-    for (const { file, sha256 } of selected) {
-      const index = remaining.findIndex(item =>
-        item.relativePath === relativePath(file) && item.size === file.size && item.sha256 === sha256,
-      );
-      if (index < 0) throw new Error('Выбранный файл не совпадает с составом поступления.');
-      const [item] = remaining.splice(index, 1);
-      if (item.status === 'accepted') continue;
-      workingFile = relativePath(file);
-      await sendManifestFile({
-        api, commands, receiptId: view.receiptId, item, file, checksum: sha256, signal,
-        onProgress: (value) => progress = value,
-      });
-    }
-    success = channel === 'link' ? 'Ссылка сохранена. Раскрытие источника выполняется в фоне.'
-      : 'Передача завершена. Принятые оригиналы доступны в описи.';
-  }
-
   async function transfer(event: SubmitEvent) {
     event.preventDefault();
     if (pending) return;
+    const project = projectId;
+    const location = window.location.href;
+    const sameView = () => mounted && window.location.href === location;
+    const startingInventory = inventory;
+    const startingReceipt = active;
+    const selectedFiles = files;
+    const method = channel;
+    const sourceUrl = linkUrl.trim();
+    const scopeId = declareScope ? context.scopeId : undefined;
+    const supplement = { letterId: linkedLetter, sentId: linkedSent, itemId: linkedItem || null };
+    const existingUpload = existing;
+    const replaces = replacements;
+    const attempts = batch;
+    const sent = finished;
+    const resume = resumeItems;
+    const mode = leaveOpen ? 'open' : 'once';
+    let declaration = draft;
+    let receiptId = startingReceipt;
+    const managed = !supplement.letterId && !existingUpload && (!startingReceipt || Boolean(startingInventory?.manifest));
+    const task = transfers.start(project, startingReceipt || undefined);
+    if (!task) return;
+    const { signal, update, isCurrent } = task;
     operationError = '';
     success = '';
-    progress = undefined;
-    const controller = new AbortController();
-    const signal = controller.signal;
-    uploadSignal = controller;
-    pending = true;
-    const managed = !linkedLetter && !existing && (!active || Boolean(inventory?.manifest));
+
+    const showReceipt = (received: string, view?: Inventory) => {
+      receiptId = received;
+      update({ receiptId });
+      if (sameView()) {
+        active = received;
+        if (view) inventory = view;
+      }
+    };
+    const readInventory = async (receipt: string, readSignal: AbortSignal) => {
+      const value = await transferApi.json<Inventory>(inventoryPath(project, receipt), { signal: readSignal });
+      if (value.projectId !== project || value.receiptId !== receipt) throw new Error('Поступление недоступно.');
+      showReceipt(receipt, value);
+      return value;
+    };
+    const rememberDraft = (value?: Declaration) => {
+      declaration = value;
+      if (sameView()) draft = value;
+    };
+    const progress: UploadProgress = (value) => update({ progress: value });
+    const showFile = (file: File) => update({ file: relativePath(file), progress: undefined });
+
     try {
       if (managed) {
-        await transferManifest(signal);
+        await transferManifest();
+      } else {
+        await transferLegacy();
+      }
+      update({ success: method === 'link' ? 'Ссылка принята. Получение источника выполняется в фоне.'
+        : 'Передача завершена. Принятые оригиналы доступны в описи.' });
+      if (sameView()) {
         form = false;
         files = [];
         linkUrl = '';
-        return;
+        existing = '';
+        replacements = '';
       }
-      if (!active) {
-        const result = await commands.send<Receipt>(projectApi(context.project.id) + '/receipts', 'POST', {
-          source: channel === 'link' ? 'import' : 'upload',
-        }, undefined, signal);
-        active = result.receiptId;
-      }
-      const receiptId = active;
-      const base = receiptPath(receiptId);
-      const scopeId = declareScope ? context.scopeId : '';
-      if (linkedLetter && linkedSent) {
-        await commands.send(projectApi(context.project.id) + '/supplements/links', 'POST', {
-          receiptId, letterId: linkedLetter, sentId: linkedSent, itemId: linkedItem || null,
-        }, undefined, signal);
-      }
-      if (channel === 'link') {
-        await commands.send(base + '/imports', 'POST', {
-          url: linkUrl.trim(), scopeIds: scopeId ? [scopeId] : undefined,
-        }, undefined, signal);
-        await commands.send(base + '/seal', 'POST', {}, undefined, signal);
-        linkUrl = '';
-        success = 'Ссылка принята. Загрузка поставлена в очередь.';
-        form = false;
-        return;
-      }
-      const selected = existing ? (inventory?.uploads ?? []).find((upload) => upload.uploadId === existing) : undefined;
-      if (existing && (!selected || files.length !== 1)) throw new Error('Выберите исходный файл для этой передачи.');
-      for (const file of files) {
-        if (finished.has(file)) continue;
-        workingFile = relativePath(file);
-        const recoveredId = batch.get(file);
-        const previous = recoveredId ? await api.json<Upload>('/api/uploads/' + id(recoveredId), { signal }) : selected;
-        let acrossNavigation = previous;
-        if (!acrossNavigation && inventory?.receiptId === receiptId) {
-          const occurrence = inventory.occurrences.find((item) => item.relativePath === relativePath(file));
-          if (occurrence) acrossNavigation = inventory.uploads.find((item) => item.occurrenceId === occurrence.occurrenceId && item.status === 'uploading');
-        }
-        await sendFile({
-          api, commands, receiptId, file, scopeId, previous: acrossNavigation, replacements, signal,
-          remember: (uploadId) => batch.set(file, uploadId),
-          onProgress: (value) => progress = value,
-        });
-        finished.add(file);
-      }
-      success = 'Файлы приняты. Опись доступна до завершения чтения.';
-      existing = '';
-      files = [];
-      form = false;
-      replacements = '';
     } catch (problem) {
-      operationError = interrupted(problem) ? 'Передача приостановлена. Уже принятые части сохранены.'
+      update({ error: interrupted(problem) ? 'Передача приостановлена. Уже принятые части сохранены.'
         : problem instanceof Error && !(problem instanceof TypeError) && !(problem instanceof ApiError)
-          ? problem.message : describe(problem);
+          ? problem.message : describe(problem) });
     } finally {
-      pending = false;
-      workingFile = '';
-      if (managed && active && context.objectId !== active) {
-        const received = active;
+      const settled = task.finish();
+      if (settled && managed && receiptId && sameView() && context.objectId !== receiptId) {
         form = false;
         draft = undefined;
-        await enterInventory(received);
+        await enterInventory(receiptId, sameView);
       }
-      renew();
+    }
+
+    async function transferManifest() {
+      const current = startingReceipt && startingInventory?.receiptId === startingReceipt ? startingInventory : undefined;
+      const selected = [];
+      for (const file of method === 'link' ? [] : selectedFiles) {
+        showFile(file);
+        selected.push({ file, sha256: await fileChecksum(file, signal, progress) });
+      }
+      let view: Inventory;
+      let submittedItems: Set<string> | undefined;
+      if (resume && current) {
+        view = await readInventory(current.receiptId, signal);
+      } else {
+        const scopeIds = scopeId ? [scopeId] : undefined;
+        const request: Declaration = declaration ?? {
+          receiptId: current?.receiptId ?? crypto.randomUUID(),
+          version: current?.manifest?.version,
+          mode,
+          items: method === 'link'
+            ? [{ itemId: crypto.randomUUID(), kind: 'link', url: sourceUrl, scopeIds }]
+            : selected.map(({ file, sha256 }) => ({
+                itemId: crypto.randomUUID(), kind: 'file', relativePath: relativePath(file),
+                size: file.size, mediaType: file.type || undefined, sha256, scopeIds,
+              })),
+        };
+        rememberDraft(request);
+        if (request.version === undefined) pendingReceipt(project, request.receiptId);
+        try {
+          if (request.version === undefined) {
+            await transferApi.mutate(projectApi(project) + '/receipts', 'POST', {
+              receiptId: request.receiptId, mode: request.mode, items: request.items,
+            }, { key: request.receiptId }, signal);
+          } else {
+            await transferCommands.send(receiptPath(request.receiptId) + '/manifest', 'POST', {
+              manifestVersion: request.version, items: request.items,
+            }, undefined, signal);
+          }
+          view = await readInventory(request.receiptId, signal);
+        } catch (problem) {
+          // Resolve an unknown declaration outcome within this transfer's session.
+          if (!isCurrent()) throw problem;
+          try {
+            view = await readInventory(request.receiptId, AbortSignal.timeout(5000));
+          } catch {
+            throw problem;
+          }
+          if (!request.items.every(item => view.manifest?.items.some(saved => saved.itemId === item.itemId))) {
+            rememberDraft();
+            if (request.version !== undefined || !view.manifest) throw problem;
+            throw new Error('Состав уже сохранён. Продолжите передачу из описи.');
+          }
+          signal.throwIfAborted();
+        }
+        submittedItems = new Set(request.items.map(item => item.itemId));
+        rememberDraft();
+      }
+
+      const remaining = view.manifest?.items.filter(item =>
+        item.kind !== 'link' && item.status !== 'excluded' && (!submittedItems || submittedItems.has(item.itemId)),
+      ) ?? [];
+      remaining.sort((a, b) => Number(a.status === 'accepted') - Number(b.status === 'accepted'));
+      for (const { file, sha256 } of selected) {
+        const index = remaining.findIndex(item =>
+          item.relativePath === relativePath(file) && item.size === file.size && item.sha256 === sha256,
+        );
+        if (index < 0) throw new Error('Выбранный файл не совпадает с составом поступления.');
+        const [item] = remaining.splice(index, 1);
+        if (item.status === 'accepted') continue;
+        showFile(file);
+        await sendManifestFile({ api: transferApi, commands: transferCommands, receiptId: view.receiptId, item, file, checksum: sha256, signal, onProgress: progress });
+      }
+    }
+
+    async function transferLegacy() {
+      if (!receiptId) {
+        const result = await transferCommands.send<Receipt>(projectApi(project) + '/receipts', 'POST', {
+          source: method === 'link' ? 'import' : 'upload',
+        }, undefined, signal);
+        showReceipt(result.receiptId);
+      }
+      const base = receiptPath(receiptId);
+      if (supplement.letterId && supplement.sentId) {
+        await transferCommands.send(projectApi(project) + '/supplements/links', 'POST', {
+          receiptId, ...supplement,
+        }, undefined, signal);
+      }
+      if (method === 'link') {
+        await transferCommands.send(base + '/imports', 'POST', {
+          url: sourceUrl, scopeIds: scopeId ? [scopeId] : undefined,
+        }, undefined, signal);
+        await transferCommands.send(base + '/seal', 'POST', {}, undefined, signal);
+        return;
+      }
+      const selected = existingUpload ? startingInventory?.uploads.find((upload) => upload.uploadId === existingUpload) : undefined;
+      if (existingUpload && (!selected || selectedFiles.length !== 1)) throw new Error('Выберите исходный файл для этой передачи.');
+      for (const file of selectedFiles) {
+        if (sent.has(file)) continue;
+        showFile(file);
+        const recoveredId = attempts.get(file);
+        let previous = recoveredId ? await transferApi.json<Upload>('/api/uploads/' + id(recoveredId), { signal }) : selected;
+        if (!previous && startingInventory?.receiptId === receiptId) {
+          const occurrence = startingInventory.occurrences.find((item) => item.relativePath === relativePath(file));
+          if (occurrence) previous = startingInventory.uploads.find((item) => item.occurrenceId === occurrence.occurrenceId && item.status === 'uploading');
+        }
+        await sendFile({
+          api: transferApi, commands: transferCommands, receiptId, file, scopeId, previous, replacements: replaces, signal,
+          remember: (uploadId) => attempts.set(file, uploadId), onProgress: progress,
+        });
+        sent.add(file);
+      }
     }
   }
 
@@ -711,7 +745,7 @@
 
   async function mutate(path: string, message: string, body: unknown = {}) {
     if (pending) return;
-    pending = true;
+    mutating = true;
     operationError = '';
     try {
       await commands.send(path, 'POST', body);
@@ -720,7 +754,7 @@
     } catch (problem) {
       operationError = describe(problem);
     } finally {
-      pending = false;
+      mutating = false;
       renew();
     }
   }
@@ -788,18 +822,37 @@
       {/if}
       {#if resumeItems}<p class="meta">Выберите исходные файлы или папку из сохранённого состава.</p>{/if}
       {#if files.length}<p class="meta">{files.length} файлов · {bytes(files.reduce((sum, file) => sum + file.size, 0))}</p>{/if}
-      {#if progress}
-        <div role="status">
-          <p>{progress.phase === 'hashing' ? 'Проверка контрольной суммы' : 'Подтверждено сервером'} · {workingFile || 'Файл'} · {bytes(progress.bytes)} из {bytes(progress.total)}</p>
-          <progress value={progress.bytes} max={progress.total || 1}></progress>
-        </div>
-      {/if}
       <div class="actions">
         <button class="primary" disabled={pending}>{existing || resumeItems ? 'Продолжить передачу' : channel === 'link' ? 'Принять ссылку' : 'Начать передачу'}</button>
-        {#if pending}<button type="button" onclick={() => uploadSignal?.abort()}>Приостановить</button>
-        {:else if !linkedLetter}<button type="button" class="quiet" onclick={() => { form = false; existing = ''; resumeItems = false; }}>Закрыть</button>{/if}
+        {#if !pending && !linkedLetter}<button type="button" class="quiet" onclick={() => { form = false; existing = ''; resumeItems = false; }}>Закрыть</button>{/if}
       </div>
     </form>
+  </section>
+{/if}
+
+{#if transferStatus && (transferStatus.running || !activeReceipt || transferStatus.receiptId === activeReceipt)}
+  <section class="card" aria-label="Статус передачи">
+    {#if transferStatus.running}
+      <div role="status">
+        {#if transferStatus.progress}
+          {@const progress = transferStatus.progress}
+          <p>{transferPhases[progress.phase]} · {transferStatus.file || 'Файл'} · {bytes(progress.bytes)} из {bytes(progress.total)}</p>
+          <progress aria-label="Прогресс передачи" value={progress.bytes} max={progress.total || 1}></progress>
+        {:else}
+          <p>{transferStatus.file ? 'Подготовка файла · ' + transferStatus.file : 'Подготовка передачи…'}</p>
+        {/if}
+      </div>
+    {/if}
+    <Notice kind="error" message={transferStatus.error ?? ''} />
+    <Notice kind="success" message={transferStatus.success ?? ''} />
+    <div class="actions">
+      {#if transferStatus.receiptId && context.objectId !== transferStatus.receiptId}
+        <a href={url(transferStatus.receiptId, { workSlice: '', slice: '', filter: 'all' })}>Открыть опись передачи</a>
+      {/if}
+      {#if transferStatus.running && context.canEdit}
+        <button type="button" onclick={() => transfers.pause(projectId)}>Приостановить</button>
+      {/if}
+    </div>
   </section>
 {/if}
 
@@ -886,6 +939,9 @@
               {item.status === 'uploading' ? ' · докачка до ' + date(item.expiresAt) : ''}
               {item.reason && item.status !== 'expired' ? ' · ' + label(item.reason) : ''}
             </p>
+            {#if item.status === 'uploading' && item.size}
+              <progress aria-label={'Подтверждённые байты файла ' + item.relativePath} value={item.confirmedBytes} max={item.size}></progress>
+            {/if}
             {#if context.canEdit && !inventory.sealed && !['accepted', 'excluded'].includes(item.status)}
               <div class="actions">
                 {#if item.canRetry}
@@ -923,9 +979,13 @@
       <h3>Передача</h3>
       <ul class="plain-list">
         {#each inventory.uploads as upload (upload.uploadId)}
+          {@const filename = inventory.occurrences.find((item) => item.occurrenceId === upload.occurrenceId)?.relativePath ?? 'Файл'}
           <li>
-            <strong>{inventory.occurrences.find((item) => item.occurrenceId === upload.occurrenceId)?.relativePath ?? 'Файл'}</strong>
+            <strong>{filename}</strong>
             <p class="meta">{label(upload.status)} · {bytes(upload.confirmedBytes)} из {bytes(upload.size)}{upload.status === 'uploading' ? ' · докачка до ' + date(upload.expiresAt) : ''}</p>
+            {#if upload.status === 'uploading' && upload.size}
+              <progress aria-label={'Подтверждённые байты файла ' + filename} value={upload.confirmedBytes} max={upload.size}></progress>
+            {/if}
             {#if context.canEdit && upload.status === 'uploading'}
               <div class="actions">
                 <button type="button" disabled={pending} onclick={() => resume(upload)}>Докачать файл</button>
