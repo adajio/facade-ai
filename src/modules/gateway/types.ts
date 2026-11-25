@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto';
 import type { Pool, PoolClient } from 'pg';
 
 export const BUDGET_USD_NANOS = 10_000_000_000;
+export const MAX_BUDGET_USD_NANOS = 100_000_000_000;
 
 export type BudgetAttribution = {
   initiatedBy: 'background' | 'copilot';

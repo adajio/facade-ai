@@ -86,7 +86,7 @@ export async function verifyGateway({ gatewayEnv, appConnection, journalAdminCon
     };
     app = connectApp();
     external = openJournal();
-    for (const file of ['08_gateway_state.sql', '08_gateway_z_route_isolation.sql', '25_gateway_budget_attribution.sql']) {
+    for (const file of ['08_gateway_state.sql', '08_gateway_z_route_isolation.sql', '25_gateway_budget_attribution.sql', '34_gateway_route_ceiling_multiplier.sql']) {
       await app.query(await readFile('db/migrations/' + file, 'utf8'));
     }
     const ref = { projectId: randomUUID(), scopeId: randomUUID(), generationId: randomUUID() };

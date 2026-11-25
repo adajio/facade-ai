@@ -1,6 +1,6 @@
 import { approvalIsCurrent, customerScope, pngBase64Length, record, requestHasImages, syntheticScope, validCustomerAccess,
   validRouteLifetime, validSyntheticScopes, verifyApprovedResearchInputs, type CustomerAccess, type SyntheticScope } from './admission.js';
-import { BUDGET_USD_NANOS, GatewayError, hash, positiveInteger,
+import { BUDGET_USD_NANOS, MAX_BUDGET_USD_NANOS, GatewayError, hash, positiveInteger,
   type ModelTransport, type ProviderOutcome, type RoutePolicy } from './types.js';
 
 export const featherlessQwenModel = 'Qwen/Qwen3.8-2.4T-A95B';
@@ -170,7 +170,7 @@ function prepare(profile: FeatherlessProfile, route: RoutePolicy, request: unkno
   } : { ...approved, messages });
   const ceilingUsdNanos = profile.contextTokens * profile.inputNanosPerToken + tokens * profile.outputNanosPerToken + 1_000;
   if (Buffer.byteLength(wire) > route.maxRequestBytes
-    || !positiveInteger(ceilingUsdNanos, Math.min(route.ceilingUsdNanos, BUDGET_USD_NANOS))) return null;
+    || !positiveInteger(ceilingUsdNanos, route.ceilingUsdNanos)) return null;
   return { wire, tokens, ceilingUsdNanos, jsonTools };
 }
 
@@ -185,7 +185,7 @@ async function readOutcome(response: Response, profile: FeatherlessProfile, maxO
   }
   const usage = record(result?.usage);
   const cost = typeof usage?.cost === 'number' ? Math.ceil(usage.cost * 1_000_000_000) : NaN;
-  if (!response.ok || !providerId || !Number.isSafeInteger(cost) || cost < 0 || cost > BUDGET_USD_NANOS) {
+  if (!response.ok || !providerId || !Number.isSafeInteger(cost) || cost < 0 || cost > MAX_BUDGET_USD_NANOS) {
     return { receipt: { state: 'unknown', code: response.ok ? 'featherless_billing_unconfirmed' : 'featherless_http_' + response.status,
       providerId } };
   }

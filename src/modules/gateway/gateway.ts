@@ -194,7 +194,8 @@ export class Gateway extends WorkQueue {
 
     const routeResult = await tx.query<RoutePolicy>(
       `SELECT r.id,r.revision,r.transport,r.enabled,r.max_request_bytes AS "maxRequestBytes",
-         r.ceiling_usd_nanos::float8 AS "ceilingUsdNanos",r.timeout_ms AS "timeoutMs",r.min_interval_ms AS "minIntervalMs"
+         (r.ceiling_usd_nanos * r.ceiling_multiplier)::float8 AS "ceilingUsdNanos",
+         r.timeout_ms AS "timeoutMs",r.min_interval_ms AS "minIntervalMs"
        FROM gateway_routes r JOIN gateway_grants g ON g.route_id=r.id AND g.revision=r.revision
        WHERE r.id=$1 AND g.project_id=$2 AND g.data_class=$3 AND g.purpose=$4 AND g.allowed AND r.enabled
        FOR SHARE OF r,g`,

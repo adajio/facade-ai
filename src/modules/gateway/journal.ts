@@ -1,6 +1,6 @@
 import type { Pool, PoolClient } from 'pg';
 import {
-  BUDGET_USD_NANOS, GatewayError, encode, hash, positiveInteger, sameBudget, transaction,
+  BUDGET_USD_NANOS, MAX_BUDGET_USD_NANOS, GatewayError, encode, hash, positiveInteger, sameBudget, transaction,
   type Attempt, type BudgetAttribution, type JournalEntry, type KnownReceipt, type Receipt, type RoutePolicy,
 } from './types.js';
 
@@ -66,7 +66,7 @@ export class PostgresIntentJournal {
     if (!result.rows[0]) throw new GatewayError('journal_identity_mismatch');
     const { frozen, scoped } = result.rows[0];
     const limitUsdNanos = Number(result.rows[0].limitUsdNanos);
-    if (!positiveInteger(limitUsdNanos, BUDGET_USD_NANOS) ||
+    if (!positiveInteger(limitUsdNanos, MAX_BUDGET_USD_NANOS) ||
         (this.expectedLimitUsdNanos !== undefined && this.expectedLimitUsdNanos !== limitUsdNanos)) {
       throw new GatewayError('journal_limit_mismatch');
     }

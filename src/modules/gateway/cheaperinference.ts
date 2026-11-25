@@ -107,7 +107,7 @@ function prepare(profile: CheaperInferenceProfile, route: RoutePolicy, request: 
 
   // Reserve the full possible prompt context, including vision, and the full requested output plus receipt rounding.
   const ceilingUsdNanos = contextTokens * profile.inputNanosPerToken + tokens * profile.outputNanosPerToken + 1_000;
-  if (!positiveInteger(ceilingUsdNanos, Math.min(route.ceilingUsdNanos, BUDGET_USD_NANOS))) return null;
+  if (!positiveInteger(ceilingUsdNanos, route.ceilingUsdNanos)) return null;
   return { wire, compressed, ceilingUsdNanos, tokens };
 }
 
