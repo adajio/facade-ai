@@ -20,23 +20,36 @@ class Program(ctypes.Structure):
 
 
 def deny_sockets():
-    # The stand uses Linux arm64 images. Reject other syscall ABIs in the kernel.
-    if platform.machine() != "aarch64":
+    # Audit architecture and socket, socketpair, bind, listen, accept, connect, accept4.
+    architectures = {
+        "aarch64": (0xC00000B7, (198, 199, 200, 201, 202, 203, 242)),
+        "x86_64": (0xC000003E, (41, 53, 49, 50, 43, 42, 288)),
+    }
+    machine = platform.machine()
+    if machine not in architectures:
         raise RuntimeError("Unsupported syscall ABI for the reader")
+    architecture, socket_syscalls = architectures[machine]
     load_word = 0x20
     jump_equal = 0x15
     result = 0x06
-    arch_aarch64 = 0xC00000B7
     kill_process = 0x80000000
     allow = 0x7FFF0000
     deny = 0x00050000 | errno.EPERM
     code = [
         Instruction(load_word, 0, 0, 4),
-        Instruction(jump_equal, 1, 0, arch_aarch64),
+        Instruction(jump_equal, 1, 0, architecture),
         Instruction(result, 0, 0, kill_process),
         Instruction(load_word, 0, 0, 0),
     ]
-    for syscall in (198, 199, 200, 201, 202, 203, 242):  # socket through connect, accept4
+    if machine == "x86_64":
+        # The x32 ABI shares the x86-64 audit architecture and sets this syscall bit.
+        jump_bit_set = 0x45
+        x32_syscall_bit = 0x40000000
+        code.extend([
+            Instruction(jump_bit_set, 0, 1, x32_syscall_bit),
+            Instruction(result, 0, 0, kill_process),
+        ])
+    for syscall in socket_syscalls:
         code.extend([Instruction(jump_equal, 0, 1, syscall), Instruction(result, 0, 0, deny)])
     code.append(Instruction(result, 0, 0, allow))
     filters = (Instruction * len(code))(*code)
