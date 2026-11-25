@@ -3,7 +3,7 @@ import { randomUUID } from 'node:crypto';
 import { test } from 'node:test';
 import type { PoolClient } from 'pg';
 import { cheaperInferenceTransport, terraModel, type CheaperInferenceProfile } from './cheaperinference.js';
-import type { Attempt, ModelAuthorization, RoutePolicy } from './types.js';
+import { hash, type Attempt, type ModelAuthorization, type RoutePolicy } from './types.js';
 
 const sha256 = 'a'.repeat(64);
 const scope = { projectId: randomUUID(), scopeId: null, approvalRef: 'fixture', originalSha256s: [sha256] };
@@ -22,6 +22,32 @@ const request = { model: terraModel, max_tokens: 2_048, stream: false, parallel_
   tools: [{ type: 'function', function: { name: 'extract', parameters: { type: 'object' } } }] };
 const key = 'ci_' + 'live_' + 'local_fixture';
 const transport = cheaperInferenceTransport({ apiKey: key, profiles: [profile] });
+
+test('a Terra profile can admit only its approved customer project', async () => {
+  const { syntheticScopes: _, ...base } = profile;
+  const customerProfile = {
+    ...base,
+    customerAccess: {
+      keyFingerprint: hash(key), evidenceRef: 'fixture:customer-zdr', validUntil: base.validUntil,
+      scopes: [{ ...scope, allowImages: true }],
+    },
+  } satisfies CheaperInferenceProfile;
+  const customer = cheaperInferenceTransport({ apiKey: key, profiles: [customerProfile] });
+  assert.ok(customer.quote!(route, request));
+  assert.throws(() => cheaperInferenceTransport({ apiKey: key, profiles: [base] }),
+    { code: 'invalid_cheaperinference_profile' });
+  assert.throws(() => cheaperInferenceTransport({ apiKey: key + '-changed', profiles: [customerProfile] }),
+    { code: 'invalid_cheaperinference_profile' });
+
+  const source = { projectId: scope.projectId, versionId: randomUUID(), documentId: randomUUID(), sha256 };
+  const context: ModelAuthorization = { ...source, scopeId: null, jobId: randomUUID(),
+    generationId: randomUUID(), dataClass: 'customer', payload: { mode: 'primary', branch: 'A', place: { source } },
+    inputRefs: [] };
+  const db = { query: async () => ({ rows: [{ authorized: true }] }) } as unknown as PoolClient;
+  assert.equal(await customer.authorize!(db, route, context), true);
+  assert.equal(await customer.authorize!(db, route, { ...context, dataClass: 'synthetic' }), false);
+  assert.equal(await customer.authorize!(db, route, { ...context, projectId: randomUUID() }), false);
+});
 
 test('the direct transport bounds the request and verifies the approved originals and evidence', async () => {
   const quote = transport.quote!(route, request);
