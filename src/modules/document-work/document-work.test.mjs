@@ -117,6 +117,54 @@ test('document work verifies source pairing, role, job revision and unknown effe
   assert.equal(blocked.actions.resume.reason, 'operator_reconcile_attempt');
   assert.equal((await command(target.href, 'POST', engineer, 1, {})).statusCode, 409);
   assert.equal((await db.query('SELECT resume_requested_at FROM harness_research_stops WHERE id=$1', [stopId])).rows[0].resume_requested_at, null);
+  async function heldStop(reason) {
+    const id = randomUUID();
+    const stop = randomUUID();
+    await db.query("INSERT INTO gateway_primary(generation_id,id,branch,place) VALUES($1,$2,'B',$2)", [generation, id]);
+    await db.query(
+      `INSERT INTO gateway_jobs(id,project_id,generation_id,job_key,kind,purpose,subject_id,obligation_id,spec_hash,payload,priority,state,reason)
+       VALUES($1::uuid,$2,$3,$1::uuid::text,'harness_research','primary_b',$4,$1::uuid::text,$5,$6,0,'held',$7)`,
+      [id, project, generation, version, sha, { place: { unitId: '1', page: 1 } }, reason]);
+    await db.query("INSERT INTO harness_research_events(job_id,sequence,event) VALUES($1,1,'{}')", [id]);
+    await db.query('INSERT INTO harness_research_stops(id,job_id,sequence) VALUES($1,$2,1)', [stop, id]);
+    return { id, stop };
+  }
+  const turnLimited = await heldStop('turn_limit');
+  const alsoReady = await heldStop('repeated_rejected_action');
+  const terminal = await heldStop('turn_limit_final');
+  const queued = await heldStop('route_bound_unavailable');
+  await db.query(`WITH next AS (UPDATE gateway_outbox_sequence SET cursor=cursor+1 RETURNING cursor)
+    INSERT INTO gateway_outbox(cursor,job_id,lease_epoch,event_type)
+    SELECT cursor,$1,0,'package_resume_waiting_slot' FROM next`, [queued.id]);
+  const bulkUrl = '/api/projects/' + project + '/research-stops/resume';
+  const before = (await get('/api/projects/' + project + '/work-slices/current')).json();
+  assert.deepEqual(before.continuation, { available: 2, queued: 1, needsAction: 2 });
+  assert.deepEqual(before.readings.filter(row => row.branch === 'B'), [
+    { state: 'held', branch: 'B', total: 3 }, { state: 'ready', branch: 'B', total: 1 },
+  ]);
+  assert.ok(!before.stops.some(stop => stop.jobId === queued.id));
+  const limitedCard = (await get(work)).json().jobs.find(({ id }) => id === turnLimited.id);
+  assert.equal(limitedCard.actions.resume.version, 1);
+
+  const batchKey = randomUUID();
+  assert.equal((await command(bulkUrl, 'POST', viewer, 1, {})).statusCode, 403);
+  assert.equal((await command(bulkUrl, 'POST', foreign, 1, {})).statusCode, 404);
+  const accepted = await command(bulkUrl, 'POST', engineer, 1, {}, batchKey);
+  assert.equal(accepted.statusCode, 202, accepted.payload);
+  assert.deepEqual(accepted.json(), { requested: 2, continuation: { available: 0, queued: 3, needsAction: 2 } });
+  const retry = await command(bulkUrl, 'POST', engineer, 1, {}, batchKey);
+  assert.equal(retry.headers['idempotency-replayed'], 'true');
+  assert.deepEqual(retry.json(), accepted.json());
+  const secondClick = await command(bulkUrl, 'POST', engineer, 1, {});
+  assert.equal(secondClick.json().requested, 0);
+  const requests = await db.query(
+    'SELECT id,resume_requested_by FROM harness_research_stops WHERE id=ANY($1::uuid[]) AND resume_requested_at IS NOT NULL',
+    [[stopId, turnLimited.stop, alsoReady.stop, terminal.stop, queued.stop]]);
+  assert.deepEqual(requests.rows.map(row => row.id).sort(), [turnLimited.stop, alsoReady.stop].sort());
+  assert.ok(requests.rows.every(row => row.resume_requested_by === engineer.id));
+  assert.equal((await db.query('SELECT state FROM gateway_jobs WHERE id=$1', [turnLimited.id])).rows[0].state, 'held');
+  assert.equal((await db.query("SELECT count(*)::int n FROM gateway_attempts WHERE project_id=$1", [project])).rows[0].n, 1);
+
   await db.query("UPDATE gateway_attempts SET state='rejected' WHERE id=$1", [attemptId]);
   const continued = await command(target.href, 'POST', engineer, 1, {});
   assert.equal(continued.statusCode, 202, continued.payload);

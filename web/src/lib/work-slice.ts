@@ -15,11 +15,14 @@ export type AreaCounts = {
 };
 export type WorkArea = AreaCounts & { contextId: string; name: string; kind: string };
 
+export type ResearchContinuation = { available: number; queued: number; needsAction: number };
+
 export type WorkSlice = Position & {
   projectId: string;
   workSliceId: string;
   scopeId: string | null;
   catalogAssigned: boolean;
+  continuation?: ResearchContinuation;
   readingService?: { enabled: boolean; observedAt: string; validUntil: string } | null;
   confirmedBytes: number;
   acceptedOccurrences: number;

@@ -4,9 +4,9 @@ import { authorize, readSession, touchSession, uuid, type AccessDb } from '../ac
 import { executeCommand } from '../access/commands.js';
 import { AccessError, invalid, sendAccessError, unavailable } from '../access/errors.js';
 import { researchKind } from '../harness/runner.js';
+import { resumableResearchReasons } from '../harness/stops.js';
 
 const base = '/api/documents/:documentId/versions/:versionId';
-const stopped = 'repeated_rejected_action';
 const priorityRange = { min: -10, max: 10 };
 
 type DocumentRoute = { Params: { documentId: string; versionId: string } };
@@ -65,7 +65,7 @@ function effectBlock(job: Job) {
 }
 const priorityReason = (job: Job) => effectBlock(job) ?? (job.state !== 'ready' ? 'job_not_waiting' : undefined);
 const resumeReason = (job: Job) => effectBlock(job) ?? (job.resumeRequested ? 'continuation_requested'
-  : job.state === 'held' && job.stopId && job.reason === stopped ? undefined : 'no_resumable_stop');
+  : job.state === 'held' && job.stopId && resumableResearchReasons.includes(job.reason ?? '') ? undefined : 'no_resumable_stop');
 
 async function getJob(db: AccessDb, document: Document, jobId: string, lock = false) {
   const { rows: [job] } = await db.query<Job>(

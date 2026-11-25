@@ -1,5 +1,5 @@
 import type { FastifyInstance } from 'fastify';
-import type { Pool } from 'pg';
+import type { Pool, PoolClient } from 'pg';
 import { AccessError, executeCommand, requireAccess } from '../access/index.js';
 import type { WorkQueue } from '../gateway/queue.js';
 import { packageResumeWaitingSlot } from '../gateway/package-slots.js';
@@ -10,9 +10,44 @@ import { readPackageAnalysis } from './package-analysis.js';
 import { packageBindingEdit } from './package-observation.js';
 import type { ResearchStop } from './session.js';
 
-const reasons = ['repeated_rejected_action','turn_limit'];
+export const resumableResearchReasons = ['repeated_rejected_action', 'turn_limit'];
 const latest = `NOT EXISTS (SELECT 1 FROM harness_research_stops later WHERE later.job_id=s.job_id AND later.sequence>s.sequence)`;
 const unavailable = () => new AccessError(404, 'not_found', 'Остановка исследования недоступна.');
+
+export function waitingForResearchSlot(job: string) {
+  return `EXISTS (SELECT 1 FROM gateway_outbox e WHERE e.job_id=${job}.id
+    AND e.lease_epoch=${job}.lease_epoch AND e.event_type='${packageResumeWaitingSlot}')`;
+}
+
+const heldResearch = `SELECT j.id, s.id AS stop_id,
+  coalesce(j.reason=ANY($3::text[]),false) AS resumable_reason,
+  EXISTS (SELECT 1 FROM gateway_attempts a WHERE a.job_id=j.id AND a.state IN ('sending','unknown')) AS unsettled,
+  (${waitingForResearchSlot('j')} OR
+    (coalesce(j.reason=ANY($3::text[]),false) AND s.resume_requested_at IS NOT NULL)) AS queued
+ FROM gateway_jobs j JOIN gateway_generations g USING(generation_id)
+ LEFT JOIN LATERAL (
+   SELECT id,resume_requested_at FROM harness_research_stops WHERE job_id=j.id ORDER BY sequence DESC LIMIT 1
+ ) s ON true
+ WHERE j.project_id=$1 AND j.scope_id IS NOT DISTINCT FROM $2::uuid AND g.current AND j.state='held'
+   AND j.kind IN ('harness_research','harness_package_followup')
+   AND (j.payload->'packageWindow' IS NULL OR j.kind='harness_package_followup' OR EXISTS (
+     SELECT 1 FROM harness_package_branches b JOIN harness_package_windows w ON w.id=b.window_id
+     JOIN harness_package_maps m ON m.version_id=w.version_id AND m.fingerprint=w.map_fingerprint
+     WHERE b.job_id=j.id AND b.active AND m.active
+   ))`;
+const canRequest = 'stop_id IS NOT NULL AND resumable_reason AND NOT queued AND NOT unsettled';
+
+export async function researchContinuation(tx: PoolClient, projectId: string, scopeId: string | null) {
+  const { rows: [summary] } = await tx.query<{ available: number; queued: number; needsAction: number }>(
+    `WITH held AS (${heldResearch})
+     SELECT count(*) FILTER (WHERE ${canRequest})::int AS available,
+       count(*) FILTER (WHERE queued)::int AS queued,
+       count(*) FILTER (WHERE NOT queued AND NOT (${canRequest}))::int AS "needsAction" FROM held`,
+    [projectId, scopeId, resumableResearchReasons],
+  );
+  return summary;
+}
+
 
 export async function resumeResearchStops(db: Pool, queue: Pick<WorkQueue, 'resume'>): Promise<boolean> {
   return transaction(db, async (tx) => {
@@ -22,8 +57,8 @@ export async function resumeResearchStops(db: Pool, queue: Pick<WorkQueue, 'resu
        WHERE s.resume_requested_at IS NOT NULL AND j.state='held' AND j.reason=ANY($1::text[]) AND g.current AND ${latest}
        AND NOT EXISTS (SELECT 1 FROM gateway_attempts a WHERE a.job_id=j.id AND a.state IN ('sending','unknown'))
        AND NOT EXISTS (SELECT 1 FROM gateway_outbox e WHERE e.job_id=j.id AND e.lease_epoch=j.lease_epoch AND e.event_type=$2)
-       ORDER BY s.resume_requested_at,s.id LIMIT 1 FOR UPDATE OF s SKIP LOCKED`, [reasons, packageResumeWaitingSlot]);
-    return row ? queue.resume(row.job_id, reasons) : false;
+       ORDER BY s.resume_requested_at,s.id LIMIT 1 FOR UPDATE OF s SKIP LOCKED`, [resumableResearchReasons, packageResumeWaitingSlot]);
+    return row ? queue.resume(row.job_id, resumableResearchReasons) : false;
   });
 }
 
@@ -82,9 +117,42 @@ export async function register(app: FastifyInstance) {
               WHEN j.state='held' AND j.reason=ANY($3::text[]) AND ${latest} THEN 'continuation_requested' ELSE 'continued' END AS status
          FROM harness_research_stops s JOIN harness_research_events e USING(job_id,sequence)
          JOIN gateway_jobs j ON j.id=s.job_id JOIN gateway_generations g USING(generation_id)
-         WHERE j.project_id=$1 AND j.scope_id IS NOT DISTINCT FROM $2::uuid ORDER BY e.created_at DESC,s.id LIMIT 100`, [projectId, scopeId, reasons]);
+         WHERE j.project_id=$1 AND j.scope_id IS NOT DISTINCT FROM $2::uuid ORDER BY e.created_at DESC,s.id LIMIT 100`, [projectId, scopeId, resumableResearchReasons]);
       return { items: rows.map(({ stop, ...item }) => ({ ...stop, ...item })) };
     });
+
+  app.post<{ Params: { projectId: string }; Querystring: { scopeId?: string } }>(
+    '/api/projects/:projectId/research-stops/resume', async (request, reply) => {
+      const { projectId } = request.params;
+      const { scopeId } = request.query;
+      if (!isReaderId(projectId) || (scopeId !== undefined && !isReaderId(scopeId))) throw unavailable();
+      const result = await executeCommand(app.db, request, {
+        requirement: { action: 'project:engineer', projectId, scopeId },
+        operation: 'research.stop.resume_batch', input: { scopeId: scopeId ?? null },
+      }, async (tx, actor) => {
+        await lockIntakeProject(tx, projectId);
+        await tx.query(`SELECT generation_id FROM gateway_generations
+          WHERE project_id=$1 AND scope_id IS NOT DISTINCT FROM $2::uuid AND current
+          ORDER BY generation_id FOR UPDATE`, [projectId, scopeId ?? null]);
+        const updated = await tx.query(
+          `WITH held AS (${heldResearch}), eligible AS (
+             SELECT stop_id FROM held JOIN gateway_jobs j USING(id)
+             WHERE ${canRequest} AND j.state='held'
+             ORDER BY j.id FOR UPDATE OF j
+           )
+           UPDATE harness_research_stops s
+           SET resume_requested_at=clock_timestamp(),resume_requested_by=$4
+           FROM eligible WHERE s.id=eligible.stop_id AND s.resume_requested_at IS NULL`,
+          [projectId, scopeId ?? null, resumableResearchReasons, actor.userId],
+        );
+        const requested = updated.rowCount ?? 0;
+        const continuation = await researchContinuation(tx, projectId, scopeId ?? null);
+        return { status: 202, body: { requested, continuation }, audit: { details: { requested, scopeId: scopeId ?? null } } };
+      });
+      if (result.replayed) reply.header('idempotency-replayed', 'true');
+      return reply.code(result.status).send(result.body);
+    },
+  );
 
   app.post<{ Params: { projectId: string; id: string } }>('/api/projects/:projectId/research-stops/:id/resume', async (request, reply) => {
     const { projectId, id } = request.params;
@@ -122,7 +190,7 @@ export async function register(app: FastifyInstance) {
            resume_requested_by=coalesce(s.resume_requested_by,$3)
          FROM gateway_jobs j JOIN gateway_generations g USING(generation_id)
          WHERE s.job_id=j.id AND s.id=$1 AND j.project_id=$2 AND g.current AND ${latest}
-           AND (s.resume_requested_at IS NOT NULL OR j.state='held' AND j.reason=ANY($4::text[]))`, [id, projectId, actor.userId, reasons]);
+           AND (s.resume_requested_at IS NOT NULL OR j.state='held' AND j.reason=ANY($4::text[]))`, [id, projectId, actor.userId, resumableResearchReasons]);
       if (!updated.rowCount) throw new AccessError(409, 'research_stop_not_current', 'Остановка больше не ожидает продолжения.');
       return { status: 202, body: { id, status: 'continuation_requested' }, audit: { objectId: id } };
     });
