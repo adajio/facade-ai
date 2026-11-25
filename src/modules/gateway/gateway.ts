@@ -5,8 +5,12 @@ import { WorkQueue, type LeasedJob } from './queue.js';
 import {
   BUDGET_USD_NANOS, encode, GatewayError, hash, positiveInteger, sameBudget, transaction,
   type Attempt, type BudgetAttribution, type CallInput, type CallResult, type JournalEntry, type ModelPurpose,
-  type ModelTransport, type ProviderOutcome, type Receipt, type RequestQuote, type RouteGrant, type RoutePolicy,
+  type ModelTransport, type ProviderOutcome, type Receipt, type RequestQuote, type RouteGrant, type RoutePolicy, type VisualPolicy,
 } from './types.js';
+
+const routeColumns = `r.id,r.revision,r.transport,r.enabled,r.max_request_bytes AS "maxRequestBytes",
+  (r.ceiling_usd_nanos * r.ceiling_multiplier)::float8 AS "ceilingUsdNanos",
+  r.timeout_ms AS "timeoutMs",r.min_interval_ms AS "minIntervalMs"`;
 
 const actions: Record<string, string> = {
   lease_lost: 'claim_current_lease',
@@ -139,6 +143,18 @@ export class Gateway extends WorkQueue {
     }
   }
 
+  async visualPolicy(routeId: string): Promise<VisualPolicy | undefined> {
+    const { rows: [route] } = await this.db.query<RoutePolicy>(
+      `SELECT ${routeColumns} FROM gateway_routes r WHERE r.id=$1 AND r.enabled`, [routeId],
+    );
+    const transport = route && this.transports.get(route.transport);
+    const limits = transport?.visualLimits?.(route);
+    if (!limits?.maxImages || !transport?.quote) return undefined;
+    const { maxImages, maxImageBytes, maxImageWidth, maxImageHeight, maxImagePixels } = limits;
+    return { maxImages, maxImageBytes, maxImageWidth, maxImageHeight, maxImagePixels,
+      accepts: (request) => !transport.requestBlock?.(route, request) && transport.quote?.(route, request) != null };
+  }
+
   async configureRoute(policy: RoutePolicy): Promise<void> {
     if (!shortRef(policy.id) || !shortRef(policy.revision)
       || !positiveInteger(policy.maxRequestBytes, 32 * 1024 * 1024)
@@ -193,9 +209,7 @@ export class Gateway extends WorkQueue {
     if (work.purpose === 'local') return 'route_denied';
 
     const routeResult = await tx.query<RoutePolicy>(
-      `SELECT r.id,r.revision,r.transport,r.enabled,r.max_request_bytes AS "maxRequestBytes",
-         (r.ceiling_usd_nanos * r.ceiling_multiplier)::float8 AS "ceilingUsdNanos",
-         r.timeout_ms AS "timeoutMs",r.min_interval_ms AS "minIntervalMs"
+      `SELECT ${routeColumns}
        FROM gateway_routes r JOIN gateway_grants g ON g.route_id=r.id AND g.revision=r.revision
        WHERE r.id=$1 AND g.project_id=$2 AND g.data_class=$3 AND g.purpose=$4 AND g.allowed AND r.enabled
        FOR SHARE OF r,g`,

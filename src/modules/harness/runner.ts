@@ -20,7 +20,7 @@ const temporaryHolds = new Set(['primary_barrier', 'route_busy', 'route_rate_lim
 class LostLease extends Error {}
 
 export type ResearchGateway = Pick<WorkQueue, 'claim' | 'heartbeat' | 'checkpoint' | 'finish' | 'suspend'> &
-  Partial<Pick<Gateway, 'backgroundBudget'>> & {
+  Partial<Pick<Gateway, 'backgroundBudget' | 'visualPolicy'>> & {
   call(input: CallInput): Promise<CallResult>;
 };
 
@@ -202,7 +202,9 @@ async function runAssignment(
   }
   const limits = services.localLimits?.(task);
   const workflowTask = limits ? { ...task, job: { ...task.job, settings: { ...task.job.settings, ...limits } } } : task;
-  return runResearchWorkflow(workflowTask, sessionPorts(workflowTask, work, services, signal), signal);
+  const ports = sessionPorts(workflowTask, work, services, signal);
+  ports.visual = await gateway.visualPolicy?.(workflowTask.job.settings.routeId);
+  return runResearchWorkflow(workflowTask, ports, signal);
 }
 
 export async function executeResearch(

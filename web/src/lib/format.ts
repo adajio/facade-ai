@@ -119,6 +119,7 @@ const labels: Record<string, string> = {
   input_size_limit: 'Превышен размер входа',
   effect_conflict: 'Сохранённый запрос требует сверки',
   route_bound_unavailable: 'Предел расходов требует сверки',
+  visual_request_limit: 'Изображение требует меньшего фрагмента',
   analysis_prior_effect: 'Техническому оператору нужно сверить прежнюю отправку по этому месту',
   unknown_charge: 'Исход отправки требует сверки',
   route_receipt_mismatch: 'Квитанция не совпала с маршрутом',

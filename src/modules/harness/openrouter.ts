@@ -250,7 +250,7 @@ export interface ToolReply {
   observation?: { id: string; qualified: boolean };
 }
 
-type Message = AssistantMessage
+export type Message = AssistantMessage
   | { role: 'system' | 'user'; content: string }
   | { role: 'tool'; tool_call_id: string; content: string }
   | { role: 'user'; content: Array<

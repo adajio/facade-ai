@@ -5,6 +5,8 @@ import type {
 } from './contracts.js';
 import { pairConfirmed, pairCriteria, ReaderRefusal, type PairChecks } from './contracts.js';
 import { contains } from '../pdf/types.js';
+import type { VisualPolicy } from '../gateway/types.js';
+import { prepareVisualTurn, type VisualReceipt, type VisualTurn } from './visual-input.js';
 import { canonicalJson, isInventoryRole } from '../assessment/domain.js';
 import { contradictoryDeliveryLine } from '../../domain/delivery-statement.js';
 import { deliveredLines } from '../questions/attribute-aliases.js';
@@ -21,6 +23,7 @@ type AssistantEvent = {
   message: AssistantMessage | null; inputRefs: string[]; requestHash: string;
   compoundContract?: true;
   pairContract?: true;
+  visualReceipts?: VisualReceipt[];
 };
 type RejectionEvent = {
   kind: 'rejected'; turn: number; attemptId: string; code: string; retryable: boolean; retryAt?: string;
@@ -47,6 +50,8 @@ export type FlowState =
 
 export interface SessionPorts {
   reader: ReaderPort;
+  visual?: VisualPolicy;
+  visualTurn?: VisualTurn;
   load(): Promise<ResearchEvent[]>;
   continued?(stopId: string): Promise<boolean>;
   append<T extends ResearchEvent>(
@@ -77,6 +82,7 @@ function restore(task: ResearchTask, events: ResearchEvent[]) {
   const emptyTruncations = new Set<number>();
   const replies = new Map<string, ToolReply>();
   const delivered = new Set<string>();
+  const sentParts = new Map<string, Map<number, VisualReceipt>>();
   const observations: NonNullable<ToolReply['observation']>[] = [];
   const failedActions = new Map<string, { turn: number; code: string; nextAction: string; progress: string }>();
   let stop: ResearchStop | undefined;
@@ -99,7 +105,17 @@ function restore(task: ResearchTask, events: ResearchEvent[]) {
       case 'model': {
         rejections = [];
         latestModel = event.turn;
-        event.inputRefs.forEach((id) => delivered.add(id));
+        if (!event.visualReceipts) {
+          event.inputRefs.forEach((id) => delivered.add(id));
+        } else {
+          for (const id of event.inputRefs) if (!replies.get(id)?.image) delivered.add(id);
+          for (const receipt of event.visualReceipts) {
+            const parts = sentParts.get(receipt.evidenceId) ?? new Map<number, VisualReceipt>();
+            parts.set(receipt.part, receipt);
+            sentParts.set(receipt.evidenceId, parts);
+            if (parts.size === receipt.total) delivered.add(receipt.evidenceId);
+          }
+        }
         const calls = event.message?.tool_calls ?? [];
         if (event.message) {
           const { content, refusal } = event.message;
@@ -165,7 +181,7 @@ function restore(task: ResearchTask, events: ResearchEvent[]) {
   const currentMessages = emptyTruncations.size
     ? previousCurrentMessages.filter((_, index) => !emptyTruncations.has(index)) : previousCurrentMessages;
   return { messages, currentMessages, previousCurrentMessages,
-    roleMessages: render(legacyCorrections), replies, delivered, observations, pending, latestModel, rejections, outcome,
+    roleMessages: render(legacyCorrections), replies, delivered, sentParts, observations, pending, latestModel, rejections, outcome,
     failedActions, stop, limitStop };
 }
 
@@ -710,6 +726,8 @@ export async function advance(task: ResearchTask, ports: SessionPorts): Promise<
     const index = results.length;
     const before = events.length;
     const call = calls[index];
+    const awaitingVisual = ports.visual && ['finish_reading', 'propose_resolution', 'verify_resolution'].includes(call.function.name)
+      && [...state.replies].some(([id, reply]) => reply.image && !state.delivered.has(id));
     const refused = state.failedActions.get(actionKey(call));
     if (model.compoundContract && refused && refused.turn < model.turn && (stableRefusals.has(refused.code)
       || refused.progress === progressKey(state.delivered, state.observations))) {
@@ -729,6 +747,8 @@ export async function advance(task: ResearchTask, ports: SessionPorts): Promise<
       effectKey: `${task.jobId}:tool:${model.turn}:${index}`,
     }));
     const execute = async (tx?: PoolClient): Promise<ToolResult> => {
+      if (awaitingVisual) return { kind: 'tool', turn: model.turn, index,
+        reply: failedTool('visual_delivery_pending', 'Inspect the remaining visual fragments before completing the reading.') };
       try {
         const result = await executeTool(tx, task, ports.reader, intent.effectKey, call, state);
         return { kind: 'tool', turn: model.turn, index, ...result };
@@ -795,7 +815,15 @@ export async function advance(task: ResearchTask, ports: SessionPorts): Promise<
   const toolWire = toolWireFor(task.job);
   const modelRequest = request(task.job, state.currentMessages, toolWire,
     task.earlyPair && task.pairScopeName ? { scopeName: task.pairScopeName } : undefined);
-  let serialized = JSON.stringify(modelRequest);
+  const visual = ports.visual && (ports.visualTurn ??= { policy: ports.visual, fragments: new Map() });
+  const prepared = visual && prepareVisualTurn(modelRequest, visual, state.replies, state.delivered, state.sentParts);
+  if (visual && !prepared) return {
+    status: 'suspended', hold: { reason: 'visual_request_limit',
+      nextAction: 'Откройте меньший участок исходного листа или проверьте профиль визуального чтения.' },
+  };
+  let visualReceipts = prepared ? prepared.receipts : undefined;
+  const currentRequest = prepared ? prepared.request : modelRequest;
+  let serialized = JSON.stringify(currentRequest);
   if (Buffer.byteLength(serialized) > 16 * 1024 * 1024) {
     return {
       status: 'suspended',
@@ -807,7 +835,19 @@ export async function advance(task: ResearchTask, ports: SessionPorts): Promise<
     effectKey: `${task.jobId}:model:${turn}`, request, inputRefs,
     ...(rejected ? { retryRejectedAttemptId: rejected.attemptId } : {}),
   });
-  let result = await send(modelRequest);
+  let result = await send(currentRequest);
+  if (currentRequest !== modelRequest && result.status === 'held' && result.code === 'effect_conflict' && result.attemptId) {
+    // A paid or unsettled attempt from the previous binary keeps its original wire and effect identity.
+    const original = JSON.stringify(modelRequest);
+    if (Buffer.byteLength(original) <= 16 * 1024 * 1024) {
+      const historical = await send(modelRequest);
+      if (historical.status !== 'held' || historical.attemptId) {
+        result = historical;
+        serialized = original;
+        visualReceipts = undefined;
+      }
+    }
+  }
   let compoundContract = true;
   let pairContract = task.earlyPair;
   if (toolWire === 'package-observation-v2' && result.status === 'held' && result.code === 'effect_conflict' && result.attemptId) {
@@ -817,6 +857,7 @@ export async function advance(task: ResearchTask, ports: SessionPorts): Promise<
     if (Buffer.byteLength(previousWire) <= 16 * 1024 * 1024) {
       result = await send(previous);
       serialized = previousWire;
+      visualReceipts = undefined;
     }
   }
   if (task.scopeId !== null && task.earlyPair && result.status === 'held' && result.code === 'effect_conflict' && result.attemptId) {
@@ -825,6 +866,7 @@ export async function advance(task: ResearchTask, ports: SessionPorts): Promise<
     if (Buffer.byteLength(wire) <= 16 * 1024 * 1024) {
       result = await send(previous);
       serialized = wire;
+      visualReceipts = undefined;
     }
   }
   // The unfiltered history is still needed to identify requests already recorded in the gateway.
@@ -841,6 +883,7 @@ export async function advance(task: ResearchTask, ports: SessionPorts): Promise<
     if (Buffer.byteLength(legacyWire) <= 16 * 1024 * 1024) {
       result = await send(legacy);
       serialized = legacyWire;
+      visualReceipts = undefined;
       compoundContract = wire === 'current' || wire === 'compound-v1';
       pairContract = undefined;
     }
@@ -862,6 +905,7 @@ export async function advance(task: ResearchTask, ports: SessionPorts): Promise<
   const decoded = decodeCompletion(result.output);
   await ports.append(events.length, () => ({
     kind: 'model', turn, attemptId: result.attemptId, inputRefs, requestHash: hashBytes(serialized),
+    ...(visualReceipts && { visualReceipts }),
     ...(compoundContract ? { compoundContract: true as const } : {}),
     ...(pairContract ? { pairContract } : {}),
     finishReason: decoded?.finishReason ?? 'invalid_response',

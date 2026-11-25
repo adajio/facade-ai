@@ -4,6 +4,7 @@
   "type": "module",
   "dependencies": {
     "@mastra/core": "1.85.0",
+    "pngjs": "7.0.0",
     "zod": "4.6.7"
   }
 }
