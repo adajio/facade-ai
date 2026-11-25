@@ -40,7 +40,7 @@ export type Capabilities = {
   partSize?: number; maxReceiptBytes?: number; uploadTtlSeconds?: number;
   archiveFormats?: string[]; archiveIsolationConfigured?: boolean; channels?: string[];
 };
-export type UploadProgress = (value: { phase: 'hashing' | 'transfer'; bytes: number; total: number }) => void;
+export type UploadProgress = (value: { phase: 'hashing' | 'transfer' | 'finalizing'; bytes: number; total: number }) => void;
 
 export function receiptPath(receiptId: string) {
   return '/api/receipts/' + id(receiptId);
@@ -111,6 +111,7 @@ export async function sendFile(options: {
     transferred += length;
     onProgress({ phase: 'transfer', bytes: transferred, total: file.size });
   }
+  onProgress({ phase: 'finalizing', bytes: transferred, total: file.size });
   await commands.send(path + '/complete', 'POST', {}, undefined, signal);
 }
 
