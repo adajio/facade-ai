@@ -13,7 +13,7 @@ import { registerOperatorRoutes } from './operator.js';
 import { Gateway } from './gateway.js';
 import { PostgresIntentJournal } from './journal.js';
 import { estimateOpenRouterRequest, openRouterTransport, qwen38Max, qwen4Max, type OpenRouterProfile } from './openrouter.js';
-import { BUDGET_USD_NANOS, hash, transaction, type Attempt, type CallInput, type CallResult,
+import { BUDGET_USD_NANOS, MAX_BUDGET_USD_NANOS, hash, transaction, type Attempt, type CallInput, type CallResult,
   type GenerationRef, type ModelTransport, type Obligation, type RoutePolicy } from './types.js';
 
 const appUrl = process.env.DATABASE_URL;
@@ -74,6 +74,7 @@ async function isolated(t: TestContext, url: string, file?: string): Promise<pg.
   if (file === appSql) {
     await pool.query(await readFile('db/migrations/08_gateway_z_route_isolation.sql', 'utf8'));
     await pool.query(await readFile('db/migrations/25_gateway_budget_attribution.sql', 'utf8'));
+    await pool.query(await readFile('db/migrations/34_gateway_route_ceiling_multiplier.sql', 'utf8'));
   }
   return pool;
 }
@@ -160,6 +161,40 @@ function isHeld(result: CallResult, code: string) {
   assert.ok(result.nextAction);
   return result;
 }
+
+test('scaled route ceiling preserves settlement and the original defaults', sqlCase, async t => {
+  const route = { ...baseRoute, ceilingUsdNanos: 2_750_000_000 };
+  const s = await setup(t, route);
+  const target = project();
+  const budget = { initiatedBy: 'background', packageId: randomUUID() } as const;
+  await s.gateway.openGeneration(target);
+  await s.gateway.sealGeneration(target, manifest);
+  await grant(s.gateway, target, true, route);
+  assert.equal((await s.journal.balance()).limitUsdNanos, BUDGET_USD_NANOS);
+
+  await s.outside.query('UPDATE gateway_external_ledger SET limit_usd_nanos=$1, package_limit_usd_nanos=$1', [MAX_BUDGET_USD_NANOS]);
+  await s.outside.query('ALTER TABLE gateway_external_project_budgets ALTER COLUMN limit_usd_nanos SET DEFAULT 100000000000');
+  await s.outside.query(await readFile(journalSql, 'utf8'));
+  await s.outside.query('INSERT INTO gateway_external_project_budgets(project_id) VALUES ($1)', [target.projectId]);
+  const balances = await s.journal.budgetBalances(target.projectId, budget);
+  assert.deepEqual(balances.map(({ scope, limitUsdNanos }) => [scope, limitUsdNanos]), [
+    ['installation', MAX_BUDGET_USD_NANOS], ['package', MAX_BUDGET_USD_NANOS], ['project', MAX_BUDGET_USD_NANOS],
+  ]);
+
+  await s.db.query('ALTER TABLE gateway_routes ALTER COLUMN ceiling_multiplier SET DEFAULT 10');
+  await s.db.query('UPDATE gateway_routes SET ceiling_multiplier=10 WHERE id=$1', [route.id]);
+  await s.gateway.configureRoute(route);
+  const work = await lease(s.gateway, target, 'scaled-route', obligationA);
+  const input = { ...call(work, route.id), budget };
+  s.setCost(12_000_000_000);
+  const first = await s.gateway.call(input);
+  assert.equal(first.status, 'paid');
+  assert.deepEqual(await s.gateway.call(input), { ...first, replay: true });
+  const { external, provider } = await s.read();
+  assert.equal(provider.length, 1);
+  assert.equal(external[0].metadata.ceilingUsdNanos, 27_500_000_000);
+  assert.equal((await s.journal.balance()).spentUsdNanos, 12_000_000_000);
+});
 
 test('OpenRouter requires an explicit qualification and rejects unbounded requests without network', () => {
   assert.throws(() => openRouterTransport({

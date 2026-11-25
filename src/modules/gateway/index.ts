@@ -5,7 +5,7 @@ import { PostgresIntentJournal } from './journal.js';
 import { cheaperInferenceTransport, type CheaperInferenceProfile } from './cheaperinference.js';
 import { featherlessTransport, type FeatherlessProfile } from './featherless.js';
 import { openRouterTransport, type Step15Approval } from './openrouter.js';
-import { BUDGET_USD_NANOS, GatewayError, positiveInteger, type ModelTransport } from './types.js';
+import { MAX_BUDGET_USD_NANOS, GatewayError, positiveInteger, type ModelTransport } from './types.js';
 import { registerOperatorRoutes } from './operator.js';
 
 export { Gateway } from './gateway.js';
@@ -59,7 +59,7 @@ export function journalFromEnv(env: NodeJS.ProcessEnv = process.env): { journal:
   let expectedLimitUsdNanos: number | undefined;
   if (expectedLimit !== undefined) {
     expectedLimitUsdNanos = Number(expectedLimit);
-    if (!/^[1-9]\d*$/.test(expectedLimit) || !positiveInteger(expectedLimitUsdNanos, BUDGET_USD_NANOS)) {
+    if (!/^[1-9]\d*$/.test(expectedLimit) || !positiveInteger(expectedLimitUsdNanos, MAX_BUDGET_USD_NANOS)) {
       throw new GatewayError('journal_config_invalid');
     }
   }

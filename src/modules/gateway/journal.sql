@@ -4,19 +4,40 @@
 CREATE TABLE IF NOT EXISTS gateway_external_ledger (
   singleton boolean PRIMARY KEY DEFAULT true CHECK (singleton),
   ledger_id uuid NOT NULL,
-  limit_usd_nanos bigint NOT NULL DEFAULT 10000000000 CHECK (limit_usd_nanos BETWEEN 1 AND 10000000000),
+  limit_usd_nanos bigint NOT NULL DEFAULT 10000000000 CHECK (limit_usd_nanos BETWEEN 1 AND 100000000000),
+  package_limit_usd_nanos bigint NOT NULL DEFAULT 10000000000 CHECK (package_limit_usd_nanos BETWEEN 1 AND 100000000000),
   frozen boolean NOT NULL DEFAULT false
 );
 
 ALTER TABLE gateway_external_ledger ADD COLUMN IF NOT EXISTS limit_usd_nanos bigint NOT NULL
-  DEFAULT 10000000000 CHECK (limit_usd_nanos BETWEEN 1 AND 10000000000);
+  DEFAULT 10000000000 CHECK (limit_usd_nanos BETWEEN 1 AND 100000000000);
+
+ALTER TABLE gateway_external_ledger ADD COLUMN IF NOT EXISTS package_limit_usd_nanos bigint NOT NULL
+  DEFAULT 10000000000 CHECK (package_limit_usd_nanos BETWEEN 1 AND 100000000000);
+
+ALTER TABLE gateway_external_ledger DROP CONSTRAINT IF EXISTS gateway_external_ledger_limit_usd_nanos_check;
+ALTER TABLE gateway_external_ledger ADD CONSTRAINT gateway_external_ledger_limit_usd_nanos_check
+  CHECK (limit_usd_nanos BETWEEN 1 AND 100000000000);
 
 CREATE TABLE IF NOT EXISTS gateway_external_project_budgets (
   project_id uuid PRIMARY KEY,
-  limit_usd_nanos bigint NOT NULL DEFAULT 10000000000 CHECK (limit_usd_nanos BETWEEN 1 AND 10000000000)
+  limit_usd_nanos bigint NOT NULL DEFAULT 10000000000 CHECK (limit_usd_nanos BETWEEN 1 AND 100000000000)
 );
 
-ALTER TABLE gateway_external_project_budgets ALTER COLUMN limit_usd_nanos SET DEFAULT 10000000000;
+ALTER TABLE gateway_external_project_budgets DROP CONSTRAINT IF EXISTS gateway_external_project_budgets_limit_usd_nanos_check;
+ALTER TABLE gateway_external_project_budgets ADD CONSTRAINT gateway_external_project_budgets_limit_usd_nanos_check
+  CHECK (limit_usd_nanos BETWEEN 1 AND 100000000000);
+
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_attribute a JOIN pg_attrdef d ON d.adrelid=a.attrelid AND d.adnum=a.attnum
+    WHERE a.attrelid='gateway_external_project_budgets'::regclass AND a.attname='limit_usd_nanos'
+  ) THEN
+    ALTER TABLE gateway_external_project_budgets ALTER COLUMN limit_usd_nanos SET DEFAULT 10000000000;
+  END IF;
+END;
+$$;
 
 CREATE TABLE IF NOT EXISTS gateway_external_attempts (
   id uuid PRIMARY KEY,
@@ -25,7 +46,7 @@ CREATE TABLE IF NOT EXISTS gateway_external_attempts (
   generation_id uuid NOT NULL,
   route_id text NOT NULL,
   purpose text NOT NULL,
-  ceiling_usd_nanos bigint NOT NULL CHECK (ceiling_usd_nanos BETWEEN 1 AND 10000000000),
+  ceiling_usd_nanos bigint NOT NULL CHECK (ceiling_usd_nanos BETWEEN 1 AND 100000000000),
   metadata jsonb NOT NULL,
   state text NOT NULL CHECK (state IN ('prepared','sending','unknown','paid','rejected','cancelled')),
   receipt jsonb,
@@ -34,6 +55,9 @@ CREATE TABLE IF NOT EXISTS gateway_external_attempts (
   started_at timestamptz,
   created_order bigint GENERATED ALWAYS AS IDENTITY UNIQUE
 );
+ALTER TABLE gateway_external_attempts DROP CONSTRAINT IF EXISTS gateway_external_attempts_ceiling_usd_nanos_check;
+ALTER TABLE gateway_external_attempts ADD CONSTRAINT gateway_external_attempts_ceiling_usd_nanos_check
+  CHECK (ceiling_usd_nanos BETWEEN 1 AND 100000000000);
 CREATE UNIQUE INDEX IF NOT EXISTS gateway_external_effect_owner ON gateway_external_attempts(effect_key)
   WHERE state IN ('prepared','sending','unknown','paid');
 CREATE INDEX IF NOT EXISTS gateway_external_attempt_history ON gateway_external_attempts(effect_key,created_order DESC);
@@ -54,8 +78,9 @@ LANGUAGE sql STABLE AS $$
     UNION ALL
     SELECT 'project', p.limit_usd_nanos FROM gateway_external_project_budgets p WHERE p.project_id=target_project
     UNION ALL
-    SELECT 'package', 10000000000 FROM gateway_external_project_budgets p
-    WHERE p.project_id=target_project AND budget->>'packageId' IS NOT NULL
+    SELECT 'package', l.package_limit_usd_nanos
+    FROM gateway_external_project_budgets p CROSS JOIN gateway_external_ledger l
+    WHERE l.singleton AND p.project_id=target_project AND budget->>'packageId' IS NOT NULL
     UNION ALL
     SELECT 'copilot', p.limit_usd_nanos / 10 FROM gateway_external_project_budgets p
     WHERE p.project_id=target_project AND budget->>'initiatedBy'='copilot'
