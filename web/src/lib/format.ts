@@ -20,6 +20,7 @@ const labels: Record<string, string> = {
   operator_reconcile_route: 'Техническому оператору нужно сверить журнал маршрута',
   research_profile_unavailable: 'Ожидается доступный профиль чтения',
   research_route_not_approved: 'Ожидается разрешённый маршрут',
+  customer_input_not_approved: 'Ожидается допуск клиентского оригинала',
   research_gateway_unconfigured: 'Ожидается настройка маршрута чтения',
   route_denied: 'Ожидается разрешение на маршрут',
   original_only: 'Доступен оригинал',

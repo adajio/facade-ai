@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { featherlessQwenModel, featherlessQwenVisionModel, featherlessTransport, type FeatherlessProfile } from './featherless.js';
-import type { Attempt, RoutePolicy } from './types.js';
+import { hash, type Attempt, type RoutePolicy } from './types.js';
 
 const projectId = '12300000-0000-4000-8000-000000000001';
 const scopeId = '12300000-0000-4000-8000-000000000002';
@@ -67,6 +67,12 @@ test('Featherless uses the direct text endpoint and settles only the reported an
   assert.equal(mismatch.output, undefined);
   assert.equal(mismatch.receipt.state, 'paid');
   assert.equal(mismatch.receipt.routeVerified, false);
+  reply.mock.mockImplementation(async () => Response.json({ error: { code: 'model_gated_needs_oauth' } }, { status: 403 }));
+  assert.deepEqual((await transport.send(attempt, route, request, signal)).receipt, {
+    state: 'rejected', code: 'model_gated_needs_oauth', evidenceRef: 'featherless:preflight:model_gated_needs_oauth',
+  });
+  reply.mock.mockImplementation(async () => new Response(null, { status: 403 }));
+  assert.equal((await transport.send(attempt, route, request, signal)).receipt.state, 'unknown');
 });
 
 test('Featherless rejects image inputs, route mismatches and understated price before the request', () => {
@@ -114,4 +120,33 @@ test('only the pinned multimodal Featherless profile can send a bounded inline P
   assert.equal(outbound.mock.callCount(), 1);
   const args = outbound.mock.calls[0].arguments as unknown as [string, RequestInit];
   assert.deepEqual(JSON.parse(String(args[1].body)).messages, messages);
+});
+
+test('a customer Featherless profile binds the inference credential and rejects images for a text-only scope', async (t) => {
+  const { syntheticScopes, ...base } = profile;
+  const customer: FeatherlessProfile = {
+    ...base, model: featherlessQwenVisionModel, mode: 'customer',
+    images: { count: 1, maxImageWidth: 256, maxImageHeight: 256, maxImagePixels: 65_536, maxImageBytes: 4096 },
+    customerAccess: {
+      keyFingerprint: hash(credential.apiKey), evidenceRef: 'fixture-policy', validUntil: '2099-01-01T00:00:00Z',
+      scopes: syntheticScopes.map(scope => ({ ...scope, allowImages: false })),
+    },
+  };
+  assert.throws(() => featherlessTransport({ apiKey: 'swapped-key', profiles: [customer] }), /invalid_featherless_profile/);
+  const transport = featherlessTransport({ ...credential, profiles: [customer] });
+  const imageInput = {
+    ...request, model: customer.model, messages: [{ role: 'user', content: [{
+      type: 'image_url', image_url: { url: 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAACklEQVQIHWP4DwABAQEAG7buVgAAAABJRU5ErkJggg==' },
+    }] }],
+  };
+  const quote = transport.quote!(route, imageInput);
+  assert.ok(quote);
+  const attempt: Attempt = {
+    id: 'attempt', jobId: 'job', generationId: 'generation', projectId, scopeId, purpose: 'primary_b',
+    effectKey: 'fixture', requestHash: 'sha', routeId: route.id, revision: route.revision,
+    previousRejectedId: null, dataClass: 'customer', ...quote,
+  };
+  const outbound = t.mock.method(globalThis, 'fetch', () => assert.fail('Image reached the provider'));
+  assert.equal((await transport.send(attempt, route, imageInput, new AbortController().signal)).receipt.state, 'rejected');
+  assert.equal(outbound.mock.callCount(), 0);
 });

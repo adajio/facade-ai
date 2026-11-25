@@ -1,4 +1,5 @@
-import { pngBase64Length, record, syntheticScope, validSyntheticScopes, verifySyntheticInputs, type SyntheticScope } from './admission.js';
+import { customerScope, pngBase64Length, record, requestHasImages, syntheticScope, validCustomerAccess,
+  validSyntheticScopes, verifyApprovedResearchInputs, type CustomerAccess, type SyntheticScope } from './admission.js';
 import { verifyCopilotInputs } from '../copilot/admission.js';
 import { BUDGET_USD_NANOS, GatewayError, hash, positiveInteger, type ModelTransport, type RoutePolicy, type RouterDiagnostic } from './types.js';
 
@@ -35,6 +36,7 @@ export type OpenRouterProfile = {
   mode: 'synthetic-research' | 'strict-zdr';
   zdrEvidenceRef?: string;
   syntheticScopes?: readonly SyntheticScope[];
+  customerAccess?: CustomerAccess & { guardrailId: string; excludesSafetyRetention: true };
   boundEvidenceRef: string;
   validUntil: string;
   reasoningEffort?: 'low';
@@ -171,6 +173,10 @@ function approvedProfile(profile: OpenRouterProfile): boolean {
   const qwen = profile.model.startsWith('qwen/');
   if ((kimi && !matchesKimiEndpoint(profile.model, profile.provider, profile.mode))
     || (requireZdr(profile) && !profile.zdrEvidenceRef?.trim())) return false;
+  if (profile.customerAccess && (profile.mode !== 'strict-zdr' || !isWaferKimiK31Pro(profile)
+    || profile.expectedResponseProvider !== 'Wafer' || profile.customerAccess.excludesSafetyRetention !== true
+    || typeof profile.customerAccess.guardrailId !== 'string'
+    || !/^[a-f0-9-]{36}$/.test(profile.customerAccess.guardrailId))) return false;
   if (profile.mode === 'strict-zdr') return profile.syntheticScopes === undefined || validSyntheticScopes(profile.syntheticScopes);
   if (profile.mode !== 'synthetic-research' || (!kimi && !qwen)
     || (qwen && !/^alibaba(?:\/|$)/.test(profile.provider))
@@ -397,7 +403,8 @@ export function openRouterTransport(approval: Step15Approval): ModelTransport {
   const profiles = new Map<string, { profile: QualifiedOpenRouterProfile; fingerprint: string }>();
   for (const profile of structuredClone(approval.profiles)) {
     const key = profile.routeId + '/' + profile.revision;
-    if (profiles.has(key) || !validProfile(profile)) throw new GatewayError('invalid_openrouter_profile');
+    if (profiles.has(key) || !validProfile(profile)
+      || (profile.customerAccess !== undefined && !validCustomerAccess(profile.customerAccess, approval.apiKey))) throw new GatewayError('invalid_openrouter_profile');
     profiles.set(key, { profile, fingerprint: hash([approval.endpoint, profile]) });
   }
   if (!profiles.size) throw new GatewayError('step15_profile_required');
@@ -426,6 +433,10 @@ export function openRouterTransport(approval: Step15Approval): ModelTransport {
     async authorize(tx, route, context) {
       const profile = profileFor(route)?.profile;
       if (!profile) return false;
+      if (context.dataClass === 'customer') {
+        const scope = customerScope(profile.customerAccess, context.projectId, context.scopeId);
+        return Boolean(scope && record(context.payload)?.mode === 'lead' && await verifyApprovedResearchInputs(tx, context, scope));
+      }
       if (profile.mode === 'strict-zdr' && profile.syntheticScopes === undefined) return true;
       const scope = syntheticScope(profile.syntheticScopes, context.projectId, context.scopeId);
       if (context.dataClass !== 'synthetic' || !scope) return false;
@@ -436,7 +447,7 @@ export function openRouterTransport(approval: Step15Approval): ModelTransport {
         }
         return verifyCopilotInputs(tx, context, scope.originalSha256s);
       }
-      return verifySyntheticInputs(tx, context, scope, isAlibabaQwenMax(profile) ? retentionBlock : undefined);
+      return verifyApprovedResearchInputs(tx, context, scope, isAlibabaQwenMax(profile) ? retentionBlock : undefined);
     },
     async send(attempt, route, request, signal) {
       const selected = profileFor(route);
@@ -445,6 +456,12 @@ export function openRouterTransport(approval: Step15Approval): ModelTransport {
       if (!selected || !profile || !body || endpointBlock(profile, request, approval.endpoint)
         || selected.fingerprint !== attempt.pricingFingerprint || body.cost.ceilingUsdNanos !== attempt.ceilingUsdNanos) {
         return { receipt: { state: 'rejected', code: 'invalid_request', evidenceRef: 'gateway:no-network' } };
+      }
+      if (attempt.dataClass === 'customer') {
+        const scope = customerScope(profile.customerAccess, attempt.projectId, attempt.scopeId);
+        if (attempt.purpose !== 'review' || !scope || (!scope.allowImages && requestHasImages(request))) {
+          return { receipt: { state: 'rejected', code: 'route_data_unapproved', evidenceRef: 'gateway:no-network' } };
+        }
       }
       const alibaba = isAlibabaQwenMax(profile);
       if (alibaba || isDecartKimiK31Pro(profile.model, profile.provider)) {

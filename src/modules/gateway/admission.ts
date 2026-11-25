@@ -1,5 +1,5 @@
 import type { PoolClient } from 'pg';
-import { positiveInteger, type ModelAuthorization } from './types.js';
+import { hash, positiveInteger, type ModelAuthorization } from './types.js';
 
 export type SyntheticScope = {
   projectId: string;
@@ -11,6 +11,17 @@ export type SyntheticScope = {
     noTrainingEvidenceRef: string;
     validUntil: string;
   };
+};
+
+export type CustomerScope = Omit<SyntheticScope, 'retentionApproval'> & {
+  allowImages: boolean;
+};
+
+export type CustomerAccess = {
+  keyFingerprint: string;
+  evidenceRef: string;
+  validUntil: string;
+  scopes: readonly CustomerScope[];
 };
 
 const uuid = /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/;
@@ -33,6 +44,28 @@ export function validSyntheticScopes(scopes: readonly SyntheticScope[] | undefin
 
 export function syntheticScope(scopes: readonly SyntheticScope[] | undefined, projectId: string, scopeId: string | null) {
   return scopes?.find(item => item.projectId === projectId && item.scopeId === scopeId);
+}
+
+export function validCustomerAccess(access: CustomerAccess | undefined, apiKey: string): boolean {
+  return Boolean(access && access.keyFingerprint === hash(apiKey)
+    && typeof access.evidenceRef === 'string' && access.evidenceRef.trim()
+    && Date.parse(access.validUntil) > Date.now() && validSyntheticScopes(access.scopes)
+    && access.scopes.every(scope => typeof scope.allowImages === 'boolean')
+    && new Set(access.scopes.map(scope => JSON.stringify([scope.projectId, scope.scopeId]))).size === access.scopes.length);
+}
+
+export function customerScope(access: CustomerAccess | undefined, projectId: string, scopeId: string | null) {
+  return access && Date.parse(access.validUntil) > Date.now()
+    ? access.scopes.find(scope => scope.projectId === projectId && scope.scopeId === scopeId)
+    : undefined;
+}
+
+export function requestHasImages(request: unknown): boolean {
+  const messages = record(request)?.messages;
+  return Array.isArray(messages) && messages.some(message => {
+    const content = record(message)?.content;
+    return Array.isArray(content) && content.some(part => record(part)?.type === 'image_url');
+  });
 }
 
 export function pngBase64Length(url: unknown, profile: {
@@ -70,7 +103,7 @@ function assignedSources(payload: unknown): Record<string, unknown>[] {
   return places.map(place => record(record(place)?.source) ?? {});
 }
 
-export async function verifySyntheticInputs(tx: PoolClient, context: ModelAuthorization, scope: SyntheticScope,
+export async function verifyApprovedResearchInputs(tx: PoolClient, context: ModelAuthorization, scope: SyntheticScope,
   policyBlock?: (scope: SyntheticScope) => string | null,
 ) {
   const sources = assignedSources(context.payload);

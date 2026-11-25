@@ -107,7 +107,8 @@ test('partial live configuration uses only independently admitted routes with th
   const defaults = loadResearchProfile({});
   const terra = { ...defaults.A, direct: true };
   const defaultQwen = { ...defaults.B, featherless: true };
-  for (const [cfg, transport, ceilingUsdNanos] of [[terra, 'cheaperinference', 3_000_000_000], [defaultQwen, 'featherless', 2_000_000_000]]) {
+  const visualQwen = { ...defaultQwen, routeId: 'fixture-featherless-flash-next', model: 'Qwen/Qwen3.8-Flash-Next' };
+  for (const [cfg, transport, ceilingUsdNanos] of [[terra, 'cheaperinference', 3_000_000_000], [defaultQwen, 'featherless', 2_000_000_000], [visualQwen, 'featherless', 2_000_000_000]]) {
     await gateway.configureRoute({
       id: cfg.routeId, revision: 'local-test', transport, enabled: true,
       maxRequestBytes: 2 * 1024 * 1024, ceilingUsdNanos, timeoutMs: 8000,
@@ -149,7 +150,7 @@ test('partial live configuration uses only independently admitted routes with th
         assert.equal(String(url), featherlessEndpoint);
         assert.equal(options.headers.authorization, 'Bearer ' + featherlessKey);
         assert.equal(input.provider, undefined);
-        assert.equal(input.max_tokens, defaults.B.maxTokens);
+        assert.equal(input.max_tokens, activeCase.review ? 512 : defaults.B.maxTokens);
       } else {
         assert.equal(String(url), endpoint);
         assert.equal(options.headers.authorization, 'Bearer local-fixture-key');
@@ -296,7 +297,7 @@ test('partial live configuration uses only independently admitted routes with th
     const strict = testCase.customer || testCase.extraOriginal;
     process.env.FACADE_HARNESS_LIVE_POLICY = strict ? 'strict-zdr' : 'synthetic-research';
     selectedA = testCase.mixed || testCase.review ? terra : testCase.comparison ?? fixture.A;
-    selectedB = testCase.mixed || testCase.review ? defaultQwen : fixture.B;
+    selectedB = testCase.review ? visualQwen : testCase.mixed ? defaultQwen : fixture.B;
     const sources = { A: selectedA, B: selectedB };
     const project = await post('/api/projects', { name: testCase.name, catalogVersionId: catalog.id, scopeName: 'F-A', stage: 'P' });
     const scopeId = project.scopes[0].id;
@@ -331,7 +332,7 @@ test('partial live configuration uses only independently admitted routes with th
     }
     if (testCase.mixed || testCase.review) {
       if (testCase.review) {
-        process.env.FACADE_HARNESS_PROFILE = JSON.stringify({ A: defaults.A, B: defaults.B, lead: settings(lead) });
+        process.env.FACADE_HARNESS_PROFILE = JSON.stringify({ A: defaults.A, B: settings(visualQwen), lead: settings(lead) });
       } else {
         delete process.env.FACADE_HARNESS_PROFILE;
       }
@@ -346,11 +347,12 @@ test('partial live configuration uses only independently admitted routes with th
       }]);
       process.env.FACADE_GATEWAY_FEATHERLESS_KEY = featherlessKey;
       process.env.FACADE_GATEWAY_FEATHERLESS_PROFILES = JSON.stringify([{
-        transport: 'featherless', routeId: defaultQwen.routeId, model: defaultQwen.model,
+        transport: 'featherless', routeId: selectedB.routeId, model: selectedB.model,
         revision: 'local-test', mode: 'synthetic-research', contextTokens: 262_144,
         boundEvidenceRef: 'fixture-featherless-rates', validUntil: '2099-01-01T00:00:00Z',
         syntheticScopes: [{ ...authorized, approvalRef: 'fixture' }],
-        inputNanosPerToken: 1000, outputNanosPerToken: 4000, outputTokenLimit: defaults.B.maxTokens,
+        inputNanosPerToken: testCase.review ? 150 : 1000, outputNanosPerToken: testCase.review ? 500 : 4000,
+        outputTokenLimit: testCase.review ? 512 : defaults.B.maxTokens,
       }]);
     } else {
       delete process.env.FACADE_GATEWAY_FEATHERLESS_KEY;
@@ -409,7 +411,7 @@ test('partial live configuration uses only independently admitted routes with th
       const expected = [
         { mode: 'lead', step: null, route_id: lead.routeId, route_revision: 'local-test', model: lead.model, provider: 'Wafer' },
         { mode: 'verify', step: 'A', route_id: terra.routeId, route_revision: 'local-test', model: terra.model, provider: 'CheaperInference' },
-        { mode: 'verify', step: 'B', route_id: defaultQwen.routeId, route_revision: 'local-test', model: defaultQwen.model, provider: 'Featherless' },
+        { mode: 'verify', step: 'B', route_id: selectedB.routeId, route_revision: 'local-test', model: selectedB.model, provider: 'Featherless' },
       ].filter(({ mode, step }) => testCase.calls.includes(step ? `verify-${step}` : mode)
         && !(mode === 'lead' && testCase.unavailableLead));
       assert.deepEqual(receipts, expected);

@@ -69,7 +69,7 @@ export async function resumeInterruptedResearch(
        OR j.payload#>'{packageWindow,followup,comparison}' IS NOT NULL))
        AND j.state='held'
        AND (j.reason IN ('analysis_replay_only','journal_unavailable','research_profile_unavailable','research_route_not_approved',
-                         'research_gateway_unconfigured','synthetic_input_not_approved','research_profile_changed')
+                         'research_gateway_unconfigured','synthetic_input_not_approved','customer_input_not_approved','research_profile_changed')
          OR (j.reason='route_reconciliation' AND j.next_action='operator_reconcile_route'))
        AND NOT EXISTS (
          SELECT 1 FROM gateway_attempts a WHERE a.project_id=j.project_id

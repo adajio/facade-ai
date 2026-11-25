@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import { test } from 'node:test';
+import { featherlessQwenVisionModel, terraModel } from '../gateway/index.js';
 import type { Branch, Citation, ResearchSettings, ResearchTask } from './contracts.js';
 import { validateLivePolicy, type LiveRoute } from './live-policy.js';
 import { loadResearchProfile, profileHold } from './profile.js';
@@ -180,4 +181,32 @@ test('lead and both verifiers require the approved scope and both originals', ()
     assert.equal(hold({ ...review, job: { ...job, settings: { ...job.settings, dataClass: 'customer' } } }, true)?.reason,
       'research_profile_changed');
   }
+});
+
+test('customer admission is explicit for Terra, Flash Next and the Wafer lead and pins original identity', () => {
+  const customerAccess = {
+    keyFingerprint: 'f'.repeat(64), evidenceRef: 'qualification/fixture', validUntil: '2099-01-01T00:00:00Z',
+    scopes: [{ ...testedScope, allowImages: true }],
+  };
+  const A = { transport: 'cheaperinference', routeId: 'customer-a', model: terraModel,
+    mode: 'strict-zdr', zdrEvidenceRef: 'qualification/zdr', customerAccess } satisfies LiveRoute;
+  const B = { transport: 'featherless', routeId: 'customer-b', model: featherlessQwenVisionModel,
+    mode: 'customer', customerAccess } satisfies LiveRoute;
+  const leader = { ...kimi, routeId: 'customer-lead', model: 'moonshotai/kimi-k3.1-pro', mode: 'strict-zdr',
+    customerAccess: { ...customerAccess, guardrailId: randomUUID(), excludesSafetyRetention: true } } satisfies LiveRoute;
+  const setting = (route: LiveRoute) => ({ ...settings(route), dataClass: 'customer' });
+  const configured = { A: setting(A), B: { ...setting(B), toolChoice: 'auto' as const }, lead: setting(leader) };
+  const all = [A, B, leader];
+  assert.deepEqual(validateLivePolicy(configured, all, env).approvals, []);
+  const customerEnv = { FACADE_HARNESS_LIVE_POLICY: 'customer' };
+  const admitted = validateLivePolicy(configured, all, customerEnv);
+  assert.deepEqual(admitted.approvals, all);
+  const job = task('B', configured.B);
+  assert.equal(admitted.hold(job), null);
+  assert.equal(admitted.hold({ ...job, projectId: randomUUID() })?.reason, 'customer_input_not_approved');
+  assert.equal(admitted.hold({ ...job, scopeId: randomUUID() })?.reason, 'customer_input_not_approved');
+  assert.deepEqual(validateLivePolicy(configured, [A, B, { ...leader, customerAccess: undefined }], customerEnv).approvals, [A, B]);
+  assert.deepEqual(validateLivePolicy(configured, [A, { ...B, customerAccess: {
+    ...customerAccess, validUntil: '2000-01-01T00:00:00Z',
+  } }, leader], customerEnv).approvals, [A, leader]);
 });
