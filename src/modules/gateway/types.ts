@@ -33,7 +33,7 @@ export type EnqueueInput = QueueTarget & {
 export type RoutePolicy = {
   id: string;
   revision: string;
-  transport: 'managed' | 'openrouter' | 'cheaperinference';
+  transport: 'managed' | 'openrouter' | 'cheaperinference' | 'featherless';
   enabled: boolean;
   maxRequestBytes: number;
   ceilingUsdNanos: number;

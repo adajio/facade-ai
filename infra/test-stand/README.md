@@ -125,6 +125,11 @@ API и worker получат существующий Unix-сокет броке
 Профили маршрутов и лимиты проверяет сам шлюз.
 
 Только worker получает отдельную сеть до модельного прокси. В него попадают адреса явно настроенных транспортов.
+Прямой маршрут Featherless использует `FACADE_GATEWAY_FEATHERLESS_KEY` и
+`FACADE_GATEWAY_FEATHERLESS_PROFILES`. Для него задайте профиль исходящего proxy
+`featherless` или `cheaperinference+featherless` для совместного запуска Terra и Qwen.
+Разрешён адрес `api.featherless.ai` на порту 443.
+
 Для OpenRouter разрешены `openrouter.ai`, `eu.openrouter.ai`, `us.openrouter.ai`, для CheaperInference —
 `api.cheaperinference.com`. Прокси разрешает HTTPS CONNECT на порт 443. TLS остаётся между worker и провайдером.
 У API, PostgreSQL, S3 и worker сохраняются внутренние сети без прямого внешнего маршрута.

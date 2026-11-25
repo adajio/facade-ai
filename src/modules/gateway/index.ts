@@ -3,12 +3,14 @@ import type { FastifyInstance } from 'fastify';
 import { Gateway, type ReviewAdmission, type ResearchAdmission } from './gateway.js';
 import { PostgresIntentJournal } from './journal.js';
 import { cheaperInferenceTransport, type CheaperInferenceProfile } from './cheaperinference.js';
+import { featherlessTransport, type FeatherlessProfile } from './featherless.js';
 import { openRouterTransport, type Step15Approval } from './openrouter.js';
 import { BUDGET_USD_NANOS, GatewayError, positiveInteger, type ModelTransport } from './types.js';
 import { registerOperatorRoutes } from './operator.js';
 
 export { Gateway } from './gateway.js';
 export { PostgresIntentJournal, type ReconciliationInput, type OperatorAuthorization } from './journal.js';
+export { featherlessQwenModel, type FeatherlessProfile } from './featherless.js';
 export { terraModel, type CheaperInferenceProfile } from './cheaperinference.js';
 export { qwen38Max, qwen4Max, estimateOpenRouterRequest, matchesKimiEndpoint, type OpenRouterCostBound, type OpenRouterInputEnvelope, type OpenRouterProfile, type QualifiedOpenRouterProfile, type Step15Approval } from './openrouter.js';
 export { type LeasedJob } from './queue.js';
@@ -36,13 +38,16 @@ export function createStep15Gateway(
 
 export function createLiveGateway(
   db: Pool, journal: PostgresIntentJournal, approvals: {
-    openRouter?: Step15Approval; cheaperInference?: { apiKey: string; profiles: readonly CheaperInferenceProfile[] };
+    openRouter?: Step15Approval;
+    cheaperInference?: { apiKey: string; profiles: readonly CheaperInferenceProfile[] };
+    featherless?: { apiKey: string; profiles: readonly FeatherlessProfile[] };
   }, reviewAdmission?: ReviewAdmission, policy?: ResearchGatewayPolicy,
 ): Gateway {
   if (process.env.FACADE_GATEWAY_LIVE_MODE !== 'step-15') throw new GatewayError('step15_approval_required');
   const transports: ModelTransport[] = [];
   if (approvals.openRouter) transports.push(openRouterTransport(approvals.openRouter));
   if (approvals.cheaperInference) transports.push(cheaperInferenceTransport(approvals.cheaperInference));
+  if (approvals.featherless) transports.push(featherlessTransport(approvals.featherless));
   if (!transports.length) throw new GatewayError('step15_profile_required');
   return new Gateway(db, journal, transports, reviewAdmission, policy?.researchAdmission, policy?.replayOnly);
 }
