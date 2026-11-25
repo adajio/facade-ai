@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import { test } from 'node:test';
-import { qwen4Max, terraModel } from '../gateway/index.js';
+import { qwen38FlashModel, qwen4Max, terraModel } from '../gateway/index.js';
 import type { Branch, Citation, ResearchSettings, ResearchTask } from './contracts.js';
 import { validateLivePolicy, type LiveRoute } from './live-policy.js';
 import { loadResearchProfile, profileHold } from './profile.js';
@@ -204,6 +204,17 @@ test('customer admission is explicit for Terra, Qwen4 Max and the Wafer lead and
   const customerEnv = { FACADE_HARNESS_LIVE_POLICY: 'customer' };
   const admitted = validateLivePolicy(configured, all, customerEnv);
   assert.deepEqual(admitted.approvals, all);
+  const flash: Extract<LiveRoute, { transport: 'cheaperinference' }> = {
+    ...A, routeId: 'customer-b-flash', model: qwen38FlashModel,
+  };
+  const flashSettings = { ...setting(flash), toolChoice: 'auto' as const };
+  const withFlash = { ...configured, B: flashSettings };
+  const switched = validateLivePolicy(withFlash, [A, B, flash, leader], customerEnv);
+  assert.deepEqual(switched.approvals, [A, flash, leader]);
+  assert.equal(switched.hold(task('B', flashSettings)), null);
+  assert.equal(switched.hold(task('B', configured.B), true), null);
+  assert.deepEqual(validateLivePolicy({ ...withFlash, B: { ...flashSettings, toolChoice: 'required' } },
+    [A, flash, leader], customerEnv).approvals, [A, leader]);
   assert.deepEqual(validateLivePolicy(configured, [A, { ...B, customerAccess: undefined }, leader], customerEnv).approvals, [A, leader]);
   const job = task('B', configured.B);
   assert.equal(admitted.hold(job), null);

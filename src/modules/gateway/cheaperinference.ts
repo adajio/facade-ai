@@ -4,10 +4,16 @@ import { approvalIsCurrent, customerScope, pngBase64Length, record, requestHasIm
 import { BUDGET_USD_NANOS, GatewayError, hash, positiveInteger, type ModelTransport, type ProviderOutcome, type RoutePolicy } from './types.js';
 
 export const terraModel = 'gpt-6.1-terra';
+export const qwen38FlashModel = 'qwen3.8-flash';
+
+// Maker list bounds include cache writes and reasoning output.
+const modelLimits = {
+  [terraModel]: { branch: 'A', purpose: 'primary_a', context: 1_050_000, output: 128_000, inputRate: 2_500, outputRate: 7_500 },
+  [qwen38FlashModel]: { branch: 'B', purpose: 'primary_b', context: 1_000_000, output: 131_072, inputRate: 200, outputRate: 470 },
+} as const;
 const endpoint = 'https://api.cheaperinference.com/v1/chat/completions';
 const maxWireBytes = 4_500_000;
 const maxInflatedBytes = 20_000_000;
-const contextTokens = 1_050_000;
 const requestIdPattern = /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/;
 const requestFields = new Set(['model', 'messages', 'tools', 'tool_choice', 'parallel_tool_calls', 'max_tokens', 'stream']);
 const messageFields = new Set(['role', 'name', 'content', 'tool_call_id', 'tool_calls', 'reasoning', 'reasoning_details']);
@@ -25,7 +31,7 @@ export type CheaperInferenceProfile = {
   transport: 'cheaperinference';
   routeId: string;
   revision: string;
-  model: typeof terraModel;
+  model: keyof typeof modelLimits;
   mode: 'strict-zdr';
   zdrEvidenceRef: string;
   syntheticScopes?: readonly SyntheticScope[];
@@ -49,18 +55,18 @@ function hasText(value: unknown): value is string {
 }
 
 function validProfile(profile: CheaperInferenceProfile) {
-  return profile.transport === 'cheaperinference' && profile.model === terraModel && profile.mode === 'strict-zdr'
+  const limits = modelLimits[profile.model];
+  return Boolean(limits && profile.transport === 'cheaperinference' && profile.mode === 'strict-zdr'
     && !('reasoningEffort' in profile)
     && [profile.routeId, profile.revision, profile.zdrEvidenceRef, profile.boundEvidenceRef].every(hasText)
     && validRouteLifetime(profile)
     && (profile.syntheticScopes === undefined ? profile.customerAccess !== undefined : validSyntheticScopes(profile.syntheticScopes))
-    // Use maker list prices for the largest context tier, including cache writes and reasoning output.
-    && positiveInteger(profile.inputNanosPerToken, BUDGET_USD_NANOS) && profile.inputNanosPerToken >= 2_500
-    && positiveInteger(profile.outputNanosPerToken, BUDGET_USD_NANOS) && profile.outputNanosPerToken >= 7_500
-    && positiveInteger(profile.outputTokenLimit, 128_000)
+    && positiveInteger(profile.inputNanosPerToken, BUDGET_USD_NANOS) && profile.inputNanosPerToken >= limits.inputRate
+    && positiveInteger(profile.outputNanosPerToken, BUDGET_USD_NANOS) && profile.outputNanosPerToken >= limits.outputRate
+    && positiveInteger(profile.outputTokenLimit, limits.output)
     && Number.isSafeInteger(profile.maxImages) && profile.maxImages >= 0
     && [profile.maxImageWidth, profile.maxImageHeight, profile.maxImagePixels, profile.maxImageBytes]
-      .every(bound => positiveInteger(bound, maxInflatedBytes));
+      .every(bound => positiveInteger(bound, maxInflatedBytes)));
 }
 
 function localFunction(value: unknown) {
@@ -73,9 +79,10 @@ function localFunction(value: unknown) {
 function prepare(profile: CheaperInferenceProfile, route: RoutePolicy, request: unknown) {
   const body = record(request);
   const tokens = body?.max_tokens;
+  const flash = profile.model === qwen38FlashModel;
   if (!body || body.model !== profile.model || !approvalIsCurrent(profile.validUntil)
     || Object.keys(body).some(key => !requestFields.has(key)) || body.stream !== false || body.parallel_tool_calls !== false
-    || (body.tool_choice !== 'required' && body.tool_choice !== 'auto')
+    || (body.tool_choice !== 'auto' && (flash || body.tool_choice !== 'required'))
     || !Array.isArray(body.tools) || !body.tools.length || !body.tools.every(localFunction)
     || !Array.isArray(body.messages) || !body.messages.length
     || typeof tokens !== 'number' || !positiveInteger(tokens, profile.outputTokenLimit)) return null;
@@ -99,14 +106,15 @@ function prepare(profile: CheaperInferenceProfile, route: RoutePolicy, request: 
   }
   // The service advertises tool_choice but not parallel_tool_calls. The harness handles returned tool calls sequentially.
   const { parallel_tool_calls: _sequential, ...approved } = body;
-  const wire = JSON.stringify({ ...approved, zdr: true, min_discount_percent: 0 });
+  const wire = JSON.stringify({ ...approved, zdr: true, min_discount_percent: 0,
+    ...(flash && { reasoning: { enabled: false } }) });
   const bytes = Buffer.byteLength(wire);
   if (bytes > route.maxRequestBytes || bytes > maxInflatedBytes) return null;
   const compressed = bytes > maxWireBytes ? gzipSync(wire) : null;
   if (compressed && compressed.length > maxWireBytes) return null;
 
   // Reserve the full possible prompt context, including vision, and the full requested output plus receipt rounding.
-  const ceilingUsdNanos = contextTokens * profile.inputNanosPerToken + tokens * profile.outputNanosPerToken + 1_000;
+  const ceilingUsdNanos = modelLimits[profile.model].context * profile.inputNanosPerToken + tokens * profile.outputNanosPerToken + 1_000;
   if (!positiveInteger(ceilingUsdNanos, route.ceilingUsdNanos)) return null;
   return { wire, compressed, ceilingUsdNanos, tokens };
 }
@@ -115,7 +123,7 @@ function tokenCount(value: unknown): number | undefined {
   return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0 ? value : undefined;
 }
 
-async function readOutcome(response: Response, maxOutput: number, ceiling: number): Promise<ProviderOutcome> {
+async function readOutcome(response: Response, expectedModel: CheaperInferenceProfile['model'], maxOutput: number, ceiling: number): Promise<ProviderOutcome> {
   const headers = ['x-ci-request-id', 'x-cheaper-inference-request-id']
     .map(name => response.headers.get(name)).filter(id => id !== null);
   const result = record(await response.json().catch(() => null));
@@ -141,8 +149,8 @@ async function readOutcome(response: Response, maxOutput: number, ceiling: numbe
   const promptTokens = tokenCount(usage?.prompt_tokens);
   const completionTokens = tokenCount(usage?.completion_tokens);
   const model = typeof result?.model === 'string' ? result.model : undefined;
-  const routeVerified = model === terraModel && !response.headers.has('x-ci-warning')
-    && promptTokens !== undefined && promptTokens <= contextTokens
+  const routeVerified = model === expectedModel && !response.headers.has('x-ci-warning')
+    && promptTokens !== undefined && promptTokens <= modelLimits[expectedModel].context
     && completionTokens !== undefined && completionTokens <= maxOutput && costUsdNanos <= ceiling;
   return {
     receipt: { state: 'paid', costUsdNanos, providerId: matchedId, evidenceRef: matchedId, model,
@@ -180,7 +188,8 @@ export function cheaperInferenceTransport(approval: Approval): ModelTransport {
         ? customerScope(profile?.customerAccess, context.projectId, context.scopeId)
         : context.dataClass === 'synthetic' ? syntheticScope(profile?.syntheticScopes, context.projectId, context.scopeId) : undefined;
       const job = record(context.payload);
-      if (!scope || (job?.mode !== 'primary' && job?.mode !== 'verify') || job.branch !== 'A') return false;
+      if (!profile || !scope || (job?.mode !== 'primary' && job?.mode !== 'verify')
+        || job.branch !== modelLimits[profile.model].branch) return false;
       return verifyApprovedResearchInputs(tx, context, scope);
     },
     async send(attempt, route, request, signal) {
@@ -191,7 +200,7 @@ export function cheaperInferenceTransport(approval: Approval): ModelTransport {
         ? customer && (customer.allowImages || !requestHasImages(request))
         : attempt.dataClass === 'synthetic' && syntheticScope(configuration?.profile.syntheticScopes, attempt.projectId, attempt.scopeId);
       if (!configuration || !body || !permitted || attempt.routeId !== route.id || attempt.revision !== route.revision
-        || (attempt.purpose !== 'primary_a' && attempt.purpose !== 'review')
+        || (attempt.purpose !== modelLimits[configuration.profile.model].purpose && attempt.purpose !== 'review')
         || attempt.pricingFingerprint !== configuration.fingerprint || attempt.ceilingUsdNanos !== body.ceilingUsdNanos) {
         return { receipt: { state: 'rejected', code: 'invalid_request', evidenceRef: 'gateway:no-network' } };
       }
@@ -201,7 +210,7 @@ export function cheaperInferenceTransport(approval: Approval): ModelTransport {
           'x-ci-model-lock': '1', 'x-ci-techniques': 'off', ...(body.compressed && { 'content-encoding': 'gzip' }) },
         body: body.compressed ? new Uint8Array(body.compressed) : body.wire,
       });
-      return readOutcome(response, body.tokens, body.ceilingUsdNanos);
+      return readOutcome(response, configuration.profile.model, body.tokens, body.ceilingUsdNanos);
     },
   };
 }

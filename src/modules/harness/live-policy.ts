@@ -1,4 +1,4 @@
-import { featherlessQwenVisionModel, isFeatherlessQwen, matchesKimiEndpoint, qwen38Max, qwen4Max, terraModel, type CheaperInferenceProfile, type FeatherlessProfile, type OpenRouterProfile } from '../gateway/index.js';
+import { featherlessQwenVisionModel, isFeatherlessQwen, matchesKimiEndpoint, qwen38FlashModel, qwen38Max, qwen4Max, terraModel, type CheaperInferenceProfile, type FeatherlessProfile, type OpenRouterProfile } from '../gateway/index.js';
 import { approvalIsCurrent, customerScope, scopeAllowsOriginal } from '../gateway/admission.js';
 import type { ResearchSettings, ResearchSuspension, ResearchTask } from './contracts.js';
 import { profileHold, researchSlot, researchSlots, type ResearchProfile, type ResearchSlot } from './profile.js';
@@ -8,11 +8,17 @@ export type LiveRoute = (Pick<OpenRouterProfile,
   | Pick<CheaperInferenceProfile, 'transport' | 'routeId' | 'model' | 'mode' | 'zdrEvidenceRef' | 'syntheticScopes' | 'customerAccess'>
   | Pick<FeatherlessProfile, 'transport' | 'routeId' | 'model' | 'mode' | 'syntheticScopes' | 'customerAccess'>;
 
+function matchesCheaperReader(route: Extract<LiveRoute, { transport: 'cheaperinference' }>,
+  toolChoice: ResearchSettings['toolChoice'], slot: ResearchSlot) {
+  return route.mode === 'strict-zdr' && Boolean(route.zdrEvidenceRef?.trim())
+    && (slot === 'A' && route.model === terraModel
+      || slot === 'B' && route.model === qwen38FlashModel && toolChoice === 'auto');
+}
+
 function matchesPolicy(route: LiveRoute, { dataClass, toolChoice }: ResearchSettings, policy: string, slot: ResearchSlot) {
   if (dataClass === 'customer') {
     if (policy !== 'customer' || !route.customerAccess || !approvalIsCurrent(route.customerAccess.validUntil)) return false;
-    if (route.transport === 'cheaperinference') return slot === 'A' && route.model === terraModel
-      && route.mode === 'strict-zdr' && Boolean(route.zdrEvidenceRef?.trim());
+    if (route.transport === 'cheaperinference') return matchesCheaperReader(route, toolChoice, slot);
     if (route.transport === 'featherless') return false;
     if (slot === 'B') return route.model === qwen4Max && route.provider === 'alibaba'
       && route.mode === 'customer-retention-approved' && route.customerAccess.retentionApproved === true;
@@ -29,7 +35,7 @@ function matchesPolicy(route: LiveRoute, { dataClass, toolChoice }: ResearchSett
   }
   const hasZdr = typeof route.zdrEvidenceRef === 'string' && Boolean(route.zdrEvidenceRef.trim());
   if (route.transport === 'cheaperinference') {
-    return slot === 'A' && route.model === terraModel && route.mode === 'strict-zdr' && hasZdr;
+    return matchesCheaperReader(route, toolChoice, slot);
   }
   if ((route.model === qwen4Max || route.model === qwen38Max)
     && (route.provider !== 'alibaba' || route.mode !== 'synthetic-research')) {
