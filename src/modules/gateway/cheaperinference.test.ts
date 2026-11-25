@@ -26,15 +26,15 @@ const transport = cheaperInferenceTransport({ apiKey: key, profiles: [profile] }
 test('a Terra profile can admit only its approved customer project', async () => {
   const { syntheticScopes: _, ...base } = profile;
   const customerProfile = {
-    ...base,
+    ...base, validUntil: null,
     customerAccess: {
-      keyFingerprint: hash(key), evidenceRef: 'fixture:customer-zdr', validUntil: base.validUntil,
+      keyFingerprint: hash(key), evidenceRef: 'fixture:customer-zdr', validUntil: null,
       scopes: [{ ...scope, allowImages: true }],
     },
   } satisfies CheaperInferenceProfile;
   const customer = cheaperInferenceTransport({ apiKey: key, profiles: [customerProfile] });
   assert.ok(customer.quote!(route, request));
-  assert.throws(() => cheaperInferenceTransport({ apiKey: key, profiles: [base] }),
+  assert.throws(() => cheaperInferenceTransport({ apiKey: key, profiles: [{ ...base, validUntil: null }] }),
     { code: 'invalid_cheaperinference_profile' });
   assert.throws(() => cheaperInferenceTransport({ apiKey: key + '-changed', profiles: [customerProfile] }),
     { code: 'invalid_cheaperinference_profile' });

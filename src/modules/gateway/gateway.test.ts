@@ -191,11 +191,11 @@ test('Qwen4 Max uses a separate key and customer retention approval for branch B
     provider: 'alibaba', expectedResponseProvider: 'Alibaba', mode: 'customer-retention-approved',
     customerAccess: {
       keyFingerprint: hash(qwen4CustomerApiKey), evidenceRef: 'test:owner-authorization', retentionApproved: true,
-      validUntil: '2099-01-01T00:00:00Z',
+      validUntil: null,
       scopes: [{ projectId: ref.projectId, scopeId: ref.scopeId, approvalRef: 'test:project',
         originalSha256s: ['a'.repeat(64)], allowImages: true }],
     },
-    boundEvidenceRef: 'test:rates', validUntil: '2099-01-01T00:00:00Z', knownNoChargeStatuses: [],
+    boundEvidenceRef: 'test:rates', validUntil: null, knownNoChargeStatuses: [],
     inputTokenUpperBound: 1_000_000, promptNanosPerToken: 1_500, completionNanosPerToken: 4_500,
     cacheReadNanosPerToken: 75, cacheWriteNanosPerToken: 3_000,
   };

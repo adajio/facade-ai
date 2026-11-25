@@ -9,6 +9,7 @@ import type { WorkerContext } from '../../platform/worker-context.js';
 import { sealManagedTestDatabase, toolHash } from '../../platform/runtime-boundary.js';
 import { createFormatAdapters } from '../formats/index.js';
 import { createGateway, createLiveGateway, journalFromEnv, type CheaperInferenceProfile, type FeatherlessProfile, type OpenRouterProfile, type Step15Approval } from '../gateway/index.js';
+import { approvalIsCurrent } from '../gateway/admission.js';
 import type { ModelTransport } from '../gateway/types.js';
 import { startImports } from '../imports/index.js';
 import { createIntakeStorage } from '../intake/blob.js';
@@ -114,7 +115,7 @@ function modelGateway(context: WorkerContext, external: ReturnType<typeof journa
       };
     }
     const usable = (route: LiveApproval) => {
-      if (!(Date.parse(route.validUntil) > Date.now()) ||
+      if (!approvalIsCurrent(route.validUntil) ||
         approvals.filter(({ routeId, revision }) => routeId === route.routeId && revision === route.revision).length !== 1) {
         return false;
       }

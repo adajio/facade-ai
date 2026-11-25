@@ -188,7 +188,7 @@ test('lead and both verifiers require the approved scope and both originals', ()
 
 test('customer admission is explicit for Terra, Qwen4 Max and the Wafer lead and pins original identity', () => {
   const customerAccess = {
-    keyFingerprint: 'f'.repeat(64), evidenceRef: 'qualification/fixture', validUntil: '2099-01-01T00:00:00Z',
+    keyFingerprint: 'f'.repeat(64), evidenceRef: 'qualification/fixture', validUntil: null,
     scopes: [{ ...testedScope, allowImages: true }],
   };
   const A = { transport: 'cheaperinference', routeId: 'customer-a', model: terraModel,

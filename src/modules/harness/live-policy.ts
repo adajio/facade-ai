@@ -1,5 +1,5 @@
 import { featherlessQwenVisionModel, isFeatherlessQwen, matchesKimiEndpoint, qwen38Max, qwen4Max, terraModel, type CheaperInferenceProfile, type FeatherlessProfile, type OpenRouterProfile } from '../gateway/index.js';
-import { customerScope, scopeAllowsOriginal } from '../gateway/admission.js';
+import { approvalIsCurrent, customerScope, scopeAllowsOriginal } from '../gateway/admission.js';
 import type { ResearchSettings, ResearchSuspension, ResearchTask } from './contracts.js';
 import { profileHold, researchSlot, researchSlots, type ResearchProfile, type ResearchSlot } from './profile.js';
 
@@ -10,7 +10,7 @@ export type LiveRoute = (Pick<OpenRouterProfile,
 
 function matchesPolicy(route: LiveRoute, { dataClass, toolChoice }: ResearchSettings, policy: string, slot: ResearchSlot) {
   if (dataClass === 'customer') {
-    if (policy !== 'customer' || !route.customerAccess || Date.parse(route.customerAccess.validUntil) <= Date.now()) return false;
+    if (policy !== 'customer' || !route.customerAccess || !approvalIsCurrent(route.customerAccess.validUntil)) return false;
     if (route.transport === 'cheaperinference') return slot === 'A' && route.model === terraModel
       && route.mode === 'strict-zdr' && Boolean(route.zdrEvidenceRef?.trim());
     if (route.transport === 'featherless') return false;

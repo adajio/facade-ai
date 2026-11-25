@@ -2,8 +2,23 @@ import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import { test } from 'node:test';
 import type { PoolClient } from 'pg';
-import { validCustomerAccess, verifyApprovedResearchInputs, type CustomerScope } from './admission.js';
+import { approvalIsCurrent, customerScope, validCustomerAccess, validRouteLifetime, verifyApprovedResearchInputs, type CustomerScope } from './admission.js';
 import { hash, type ModelAuthorization } from './types.js';
+
+test('only an explicit null gives a customer route an approval without expiration', () => {
+  const projectId = randomUUID();
+  const scope = { projectId, scopeId: null, allowImages: true, approvalRef: 'fixture', originalSha256s: ['a'.repeat(64)] };
+  const access = { keyFingerprint: hash('fixture'), evidenceRef: 'fixture', validUntil: null, scopes: [scope] };
+  assert.ok(validCustomerAccess(access, 'fixture'));
+  assert.equal(customerScope(access, projectId, null), scope);
+  assert.equal(customerScope(access, randomUUID(), null), undefined);
+  assert.equal(customerScope({ ...access, validUntil: '2000-01-01' }, projectId, null), undefined);
+  assert.equal(approvalIsCurrent('invalid date'), false);
+  assert.equal(validRouteLifetime({ validUntil: null, customerAccess: access }), true);
+  assert.equal(validRouteLifetime({ validUntil: null }), false);
+  assert.equal(validRouteLifetime({ validUntil: null, customerAccess: access, syntheticScopes: [scope] }), false);
+  assert.equal(validRouteLifetime({ validUntil: '2000-01-01', syntheticScopes: [scope] }), true);
+});
 
 test('customer intake access checks the current accepted version in its approved project', async () => {
   const projectId = randomUUID();
