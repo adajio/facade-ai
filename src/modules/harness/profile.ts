@@ -1,4 +1,4 @@
-import { qwen38Max, terraModel } from '../gateway/index.js';
+import { qwen4Max, terraModel } from '../gateway/index.js';
 import { settingsSchema, type ResearchSettings, type ResearchSuspension, type ResearchTask, type ScheduledResearchJob } from './contracts.js';
 
 export const researchSlots = ['A', 'B', 'lead'] as const;
@@ -13,7 +13,7 @@ function defaultResearchProfile(): ResearchProfile {
   const reader = { dataClass: 'synthetic', maxTokens: 2_048, maxTurns: 32, maxKnownRejections: 1 };
   return {
     A: { ...reader, routeId: 'cheaperinference-terra-reader', model: terraModel },
-    B: { ...reader, routeId: 'openrouter-alibaba-qwen38-max-reader', model: qwen38Max },
+    B: { ...reader, routeId: 'openrouter-alibaba-qwen4-max-reader', model: qwen4Max },
     lead: null,
   };
 }

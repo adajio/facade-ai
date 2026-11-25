@@ -105,8 +105,8 @@ test('partial live configuration uses only independently admitted routes with th
   const { loadResearchProfile } = await import('../../../dist/src/modules/harness/profile.js');
   const defaults = loadResearchProfile({});
   const terra = { ...defaults.A, direct: true };
-  const qwen38 = { ...fixture.B, ...defaults.B };
-  for (const [cfg, transport, ceilingUsdNanos] of [[terra, 'cheaperinference', 3_000_000_000], [qwen38, 'openrouter', 1]]) {
+  const defaultQwen = { ...fixture.B, ...defaults.B };
+  for (const [cfg, transport, ceilingUsdNanos] of [[terra, 'cheaperinference', 3_000_000_000], [defaultQwen, 'openrouter', 1]]) {
     await gateway.configureRoute({
       id: cfg.routeId, revision: 'local-test', transport, enabled: true,
       maxRequestBytes: 2 * 1024 * 1024, ceilingUsdNanos, timeoutMs: 8000,
@@ -151,7 +151,7 @@ test('partial live configuration uses only independently admitted routes with th
         assert.deepEqual(input.provider.order, [selected.provider]);
         assert.equal(input.provider.allow_fallbacks, false);
         assert.equal(input.provider.require_parameters, true);
-        assert.equal(input.provider.data_collection, selected === qwen38 ? 'allow' : 'deny');
+        assert.equal(input.provider.data_collection, selected === defaultQwen ? 'allow' : 'deny');
         assert.equal(input.provider.zdr, branch !== 'B');
       }
       assert.equal(input.tool_choice, selected.toolChoice ?? 'required');
@@ -290,7 +290,7 @@ test('partial live configuration uses only independently admitted routes with th
     const strict = testCase.customer || testCase.extraOriginal;
     process.env.FACADE_HARNESS_LIVE_POLICY = strict ? 'strict-zdr' : 'synthetic-research';
     selectedA = testCase.mixed || testCase.review ? terra : testCase.comparison ?? fixture.A;
-    selectedB = testCase.mixed || testCase.review ? qwen38 : fixture.B;
+    selectedB = testCase.mixed || testCase.review ? defaultQwen : fixture.B;
     const sources = { A: selectedA, B: selectedB };
     const project = await post('/api/projects', { name: testCase.name, catalogVersionId: catalog.id, scopeName: 'F-A', stage: 'P' });
     const scopeId = project.scopes[0].id;
@@ -306,10 +306,10 @@ test('partial live configuration uses only independently admitted routes with th
       const source = sources[branch];
       const profile = formatProfile(source, {
         ...authorized, ...(testCase.wrongScope === branch && { scopeId: randomUUID() }),
-        ...(source === qwen38 && { retentionApproval }),
+        ...(source === defaultQwen && { retentionApproval }),
       });
       if (strict) return { ...profile, mode: 'strict-zdr' };
-      if (source === qwen38) return { ...profile, outputTokenLimit: defaults.B.maxTokens };
+      if (source === defaultQwen) return { ...profile, outputTokenLimit: defaults.B.maxTokens };
       if (testCase.visual && branch === 'A') return { ...profile,
         maxImages: 1, maxImagePixels: 16_000_000, maxImageWidth: 4_000, maxImageHeight: 4_000, maxImageBytes: 1_000_000 };
       return profile;
@@ -395,7 +395,7 @@ test('partial live configuration uses only independently admitted routes with th
       const expected = [
         { mode: 'lead', step: null, route_id: lead.routeId, route_revision: 'local-test', model: lead.model, provider: 'Wafer' },
         { mode: 'verify', step: 'A', route_id: terra.routeId, route_revision: 'local-test', model: terra.model, provider: 'CheaperInference' },
-        { mode: 'verify', step: 'B', route_id: qwen38.routeId, route_revision: 'local-test', model: qwen38.model, provider: 'Alibaba' },
+        { mode: 'verify', step: 'B', route_id: defaultQwen.routeId, route_revision: 'local-test', model: defaultQwen.model, provider: 'Alibaba' },
       ].filter(({ mode, step }) => testCase.calls.includes(step ? `verify-${step}` : mode)
         && !(mode === 'lead' && testCase.unavailableLead));
       assert.deepEqual(receipts, expected);
@@ -425,7 +425,7 @@ test('partial live configuration uses only independently admitted routes with th
          FROM gateway_attempts WHERE project_id=$1 AND state='paid' ORDER BY purpose`, [project.id]);
       assert.deepEqual(receipts, [
         { purpose: 'primary_a', model: terra.model, provider: 'CheaperInference' },
-        { purpose: 'primary_b', model: qwen38.model, provider: 'Alibaba' },
+        { purpose: 'primary_b', model: defaultQwen.model, provider: 'Alibaba' },
       ]);
     }
     if (testCase.comparison) {
@@ -557,7 +557,7 @@ test('partial live configuration uses only independently admitted routes with th
         held('b', 'research_route_not_approved'), held('b', 'research_route_not_approved')] });
     await runCase({ name: 'PNG allowed for A and held for B', approvals: ['A', 'B'], visual: true,
       calls: ['A', 'A', 'B'], expected: [done('a'), held('b', 'route_bound_unavailable')] });
-    await runCase({ name: 'Default Terra and Qwen3.8 Max', mixed: true, approvals: ['A', 'B'],
+    await runCase({ name: 'Default Terra and Qwen4 Max', mixed: true, approvals: ['A', 'B'],
       calls: ['A', 'A', 'A', 'B', 'B', 'B'], expected: [done('a'), done('b')] });
     await runCase({ name: 'Only A', approvals: ['A'], malformed: 'B', calls: ['A', 'A', 'A'],
       expected: [done('a'), held('b', 'research_route_not_approved')] });

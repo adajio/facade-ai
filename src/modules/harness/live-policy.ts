@@ -1,4 +1,4 @@
-import { matchesKimiEndpoint, qwen38Max, terraModel, type CheaperInferenceProfile, type OpenRouterProfile } from '../gateway/index.js';
+import { matchesKimiEndpoint, qwen38Max, qwen4Max, terraModel, type CheaperInferenceProfile, type OpenRouterProfile } from '../gateway/index.js';
 import type { ResearchSettings, ResearchSuspension, ResearchTask } from './contracts.js';
 import { profileHold, researchSlot, researchSlots, type ResearchProfile, type ResearchSlot } from './profile.js';
 
@@ -15,7 +15,8 @@ function matchesPolicy(route: LiveRoute, { dataClass, toolChoice }: ResearchSett
   if (route.transport === 'cheaperinference') {
     return slot === 'A' && route.model === terraModel && route.mode === 'strict-zdr' && hasZdr;
   }
-  if (route.model === qwen38Max && (route.provider !== 'alibaba' || route.mode !== 'synthetic-research')) {
+  if ((route.model === qwen4Max || route.model === qwen38Max)
+    && (route.provider !== 'alibaba' || route.mode !== 'synthetic-research')) {
     return false;
   }
   if (typeof route.provider !== 'string' || (route.mode !== 'strict-zdr' && route.mode !== 'synthetic-research')) return false;

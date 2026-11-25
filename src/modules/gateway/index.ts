@@ -10,7 +10,7 @@ import { registerOperatorRoutes } from './operator.js';
 export { Gateway } from './gateway.js';
 export { PostgresIntentJournal, type ReconciliationInput, type OperatorAuthorization } from './journal.js';
 export { terraModel, type CheaperInferenceProfile } from './cheaperinference.js';
-export { qwen38Max, estimateOpenRouterRequest, matchesKimiEndpoint, type OpenRouterCostBound, type OpenRouterInputEnvelope, type OpenRouterProfile, type QualifiedOpenRouterProfile, type Step15Approval } from './openrouter.js';
+export { qwen38Max, qwen4Max, estimateOpenRouterRequest, matchesKimiEndpoint, type OpenRouterCostBound, type OpenRouterInputEnvelope, type OpenRouterProfile, type QualifiedOpenRouterProfile, type Step15Approval } from './openrouter.js';
 export { type LeasedJob } from './queue.js';
 export * from './types.js';
 
