@@ -219,6 +219,10 @@ export function featherlessTransport(approval: { apiKey: string; profiles: reado
   const selected = (route: RoutePolicy) => route.transport === 'featherless' ? profiles.get(revisionKey(route.id, route.revision)) : undefined;
   return {
     kind: 'featherless',
+    visualLimits(route) {
+      const images = selected(route)?.profile.images;
+      return images && { ...images, maxImages: images.count };
+    },
     quote(route, request) {
       const configuration = selected(route);
       const body = configuration && prepare(configuration.profile, route, request);

@@ -166,6 +166,7 @@ export function cheaperInferenceTransport(approval: Approval): ModelTransport {
   const selected = (route: RoutePolicy) => route.transport === 'cheaperinference' ? profiles.get(key(route.id, route.revision)) : undefined;
   return {
     kind: 'cheaperinference',
+    visualLimits: route => selected(route)?.profile,
     quote(route, request) {
       const configuration = selected(route);
       if (!configuration) return null;

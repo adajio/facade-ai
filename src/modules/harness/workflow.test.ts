@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { randomUUID } from 'node:crypto';
+import { PNG } from 'pngjs';
 import { verifiedNativeLineCrops } from '../pdf/native-line.js';
 import type { PoolClient } from 'pg';
 import type { ModelResult, ResearchTask } from './contracts.js';
@@ -71,6 +72,111 @@ function setup() {
   };
   return { events, task, ports, pixels, overviewId, textId, observationId, reads, recorded };
 }
+
+test('visual turns keep seen images as references and deliver every addressed tile losslessly', async () => {
+  const { task, ports, events, overviewId } = setup();
+  const png = new PNG({ width: 8, height: 4 });
+  for (let index = 0; index < png.data.length; index++) png.data[index] = (index * 13) % 251;
+  const preview = new PNG({ width: 2, height: 2 });
+  preview.data.fill(255);
+  const overview = PNG.sync.write(preview);
+  const large = PNG.sync.write(png);
+  const zoomId = randomUUID();
+  const frame = { x: 10, y: 20, width: 4, height: 2 };
+  const activePlace = task.job.mode === 'primary' ? task.job.place : assert.fail();
+  ports.visual = {
+    maxImages: 1, maxImageWidth: 8, maxImageHeight: 4, maxImagePixels: 32, maxImageBytes: large.length - 1,
+    accepts: () => true,
+  };
+  ports.reader.read = async (_, input) => {
+    const zoom = input.kind === 'zoom';
+    const bytes = zoom ? large : overview;
+    return { evidenceId: zoom ? zoomId : overviewId, place: zoom ? { ...activePlace, box: frame } : activePlace,
+      readerVersion: 'test', sha256: hashBytes(bytes), mediaType: 'image/png', bytes,
+      transform: { width: zoom ? 8 : 2, height: zoom ? 4 : 2, pixelsPerPoint: 2, pixelOriginX: 20, pixelOriginY: 40 } };
+  };
+  const witnessed = new Set<string>();
+  const shownParts = new Set<number>();
+  ports.call = async ({ request: input }) => {
+    const messages = input.messages.flatMap(message => Array.isArray(message.content) ? [message.content] : []);
+    assert.ok(messages.length <= 1, 'route can carry one image per turn');
+    const visual = messages[0];
+    if (!visual) return receipt('survey', {});
+    const text = visual.find(part => part.type === 'text');
+    const image = visual.find(part => part.type === 'image_url');
+    assert.ok(text && image);
+    const meta = JSON.parse(text.text);
+    if (meta.evidenceId === overviewId) return receipt('zoom', { box: frame });
+    assert.equal(meta.evidenceId, zoomId);
+    assert.doesNotMatch(JSON.stringify(input.messages), new RegExp(overview.toString('base64')));
+    const tile = meta.visualFragment;
+    assert.ok(tile);
+    assert.ok(!shownParts.has(tile.part), 'recovering from the journal never resends a settled tile');
+    shownParts.add(tile.part);
+    const { x, y, width, height } = tile.pixelBox;
+    assert.equal(tile.sourceBox.x, 10 + x / 2);
+    assert.equal(tile.sourceBox.y, 20 + y / 2);
+    const rendered = PNG.sync.read(Buffer.from(image.image_url.url.split(',')[1], 'base64'));
+    assert.deepEqual([rendered.width, rendered.height], [width, height]);
+    for (let row = 0; row < height; row++) {
+      for (let col = 0; col < width; col++) {
+        const offset = ((y + row) * png.width + x + col) * 4;
+        const crop = (row * width + col) * 4;
+        assert.deepEqual(rendered.data.subarray(crop, crop + 4), png.data.subarray(offset, offset + 4));
+        witnessed.add((x + col) + ':' + (y + row));
+      }
+    }
+    return receipt('finish_reading', { status: 'no_match', explanation: 'Сверены фрагменты.' });
+  };
+  for (let i = 0; i < 8 && shownParts.size === 0; i++) {
+    assert.deepEqual(await advance(task, ports), { status: 'continue' });
+  }
+  assert.equal(shownParts.size, 1);
+  ports.visualTurn = undefined;
+  const result = await runResearchWorkflow(task, ports, new AbortController().signal);
+  assert.equal(result.status, 'done');
+  assert.ok(shownParts.size > 1);
+  assert.equal(witnessed.size, png.width * png.height);
+  assert.ok(events.some(event => event.kind === 'tool' &&
+    (event.reply.body as { code?: string }).code === 'visual_delivery_pending'));
+});
+
+test('a settled visual turn from the previous worker replays the original request identity', async () => {
+  const { task, ports, events, overviewId, pixels } = setup();
+  const key = `${task.jobId}:model:3`;
+  const paid = receipt('save_observation', {});
+  let original: unknown;
+  let compacted = false;
+  ports.call = async ({ effectKey, request }) => {
+    if (effectKey.endsWith(':1')) return receipt('survey', {});
+    if (effectKey.endsWith(':2')) return receipt('extract', {});
+    assert.equal(effectKey, key);
+    if (!original) {
+      original = request;
+      return { status: 'held', code: 'unknown_charge', nextAction: 'reconcile' };
+    }
+    if (!compacted) {
+      const wire = JSON.stringify(request);
+      assert.ok(wire.includes(overviewId));
+      assert.ok(!wire.includes(pixels.toString('base64')));
+      compacted = true;
+      return { status: 'held', code: 'effect_conflict', attemptId: paid.attemptId, nextAction: 'inspect_original_effect' };
+    }
+    assert.deepEqual(request, original);
+    return paid;
+  };
+  assert.equal((await runResearchWorkflow(task, ports, new AbortController().signal)).status, 'suspended');
+  ports.visual = {
+    maxImages: 4, maxImageWidth: 2048, maxImageHeight: 2048, maxImagePixels: 2048 ** 2,
+    maxImageBytes: 1_500_000, accepts: () => true,
+  };
+  assert.deepEqual(await advance(task, ports), { status: 'continue' });
+  const last = events.at(-1);
+  assert.equal(last?.kind, 'model');
+  assert.equal(last.attemptId, paid.attemptId);
+  assert.equal(last.requestHash, hashBytes(JSON.stringify(original)));
+  assert.equal(last.visualReceipts, undefined);
+});
 
 test('Mastra sends exact tool content, holds an unsettled turn and resumes only that turn', async () => {
   const { task, ports, events, pixels, overviewId, textId, observationId, reads, recorded } = setup();

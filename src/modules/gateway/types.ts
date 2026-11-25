@@ -116,9 +116,20 @@ export type ModelAuthorization = QueueTarget & {
 
 export type RequestQuote = { ceilingUsdNanos: number; pricingFingerprint: string };
 
+export type VisualLimits = {
+  maxImages: number;
+  maxImageBytes: number;
+  maxImageWidth: number;
+  maxImageHeight: number;
+  maxImagePixels: number;
+};
+
+export type VisualPolicy = VisualLimits & { accepts(request: unknown): boolean };
+
 export type ModelTransport = {
   kind: RoutePolicy['transport'];
   validate?(route: RoutePolicy, request: unknown): boolean;
+  visualLimits?(route: RoutePolicy): VisualLimits | undefined;
   quote?(route: RoutePolicy, request: unknown): RequestQuote | null;
   requestBlock?(route: RoutePolicy, request: unknown): string | null;
   authorize?(tx: PoolClient, route: RoutePolicy, context: ModelAuthorization): Promise<boolean | string>;

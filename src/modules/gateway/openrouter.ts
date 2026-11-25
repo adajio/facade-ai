@@ -429,6 +429,7 @@ export function openRouterTransport(approval: Step15Approval): ModelTransport {
   const profileFor = (route: RoutePolicy) => profiles.get(route.id + '/' + route.revision);
   return {
     kind: 'openrouter',
+    visualLimits: route => profileFor(route)?.profile,
     requestBlock(route, request) {
       const selected = profileFor(route);
       return selected ? endpointBlock(selected.profile, request, approval.endpoint) : null;
