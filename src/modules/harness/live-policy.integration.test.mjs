@@ -158,7 +158,7 @@ test('partial live configuration uses only independently admitted routes with th
         assert.deepEqual(input.provider.order, [selected.provider]);
         assert.equal(input.provider.allow_fallbacks, false);
         assert.equal(input.provider.require_parameters, true);
-        assert.equal(input.provider.data_collection, 'deny');
+        assert.equal(input.provider.data_collection, selected.model === 'qwen/qwen4-max' ? 'allow' : 'deny');
         assert.equal(input.provider.zdr, branch !== 'B');
       }
       if (selected.featherless) {
