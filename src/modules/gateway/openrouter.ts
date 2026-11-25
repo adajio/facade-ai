@@ -1,5 +1,5 @@
-import { customerScope, pngBase64Length, record, requestHasImages, syntheticScope, validCustomerAccess,
-  validSyntheticScopes, verifyApprovedResearchInputs, type CustomerAccess, type SyntheticScope } from './admission.js';
+import { approvalIsCurrent, customerScope, pngBase64Length, record, requestHasImages, syntheticScope, validCustomerAccess,
+  validRouteLifetime, validSyntheticScopes, verifyApprovedResearchInputs, type CustomerAccess, type SyntheticScope } from './admission.js';
 import { verifyCopilotInputs } from '../copilot/admission.js';
 import { BUDGET_USD_NANOS, GatewayError, hash, positiveInteger, type ModelTransport, type RoutePolicy, type RouterDiagnostic } from './types.js';
 
@@ -41,7 +41,7 @@ export type OpenRouterProfile = {
     | { retentionApproved: true; guardrailId?: never; excludesSafetyRetention?: never }
   );
   boundEvidenceRef: string;
-  validUntil: string;
+  validUntil: string | null;
   reasoningEffort?: 'low';
   inputTokenUpperBound: number;
   inputEnvelope?: OpenRouterInputEnvelope;
@@ -290,7 +290,7 @@ function requestBody(profile: QualifiedOpenRouterProfile, value: unknown, route:
   const body = record(value);
   if (!body || Object.keys(body).some(key => !requestFields.has(key))
     || body.model !== profile.model || (body.stream !== false && body.stream !== undefined)
-    || !Array.isArray(body.messages) || !body.messages.length || Date.parse(profile.validUntil) <= Date.now()
+    || !Array.isArray(body.messages) || !body.messages.length || !approvalIsCurrent(profile.validUntil)
     || (body.tools !== undefined && (!Array.isArray(body.tools) || !body.tools.every(localFunction)))) return null;
   const tokens = body.max_completion_tokens ?? body.max_tokens;
   if (typeof tokens !== 'number' || !positiveInteger(tokens, profile.outputTokenLimit)
@@ -386,7 +386,7 @@ function validReasoningProfile(profile: OpenRouterProfile): boolean {
 function validProfile(profile: OpenRouterProfile): profile is QualifiedOpenRouterProfile {
   return Boolean(profile.routeId && profile.revision && allowedModel.test(profile.model) && allowedProvider.test(profile.provider)
     && profile.expectedResponseProvider?.trim() && approvedProfile(profile) && validInputEnvelope(profile)
-    && profile.boundEvidenceRef?.trim() && Number.isFinite(Date.parse(profile.validUntil))
+    && profile.boundEvidenceRef?.trim() && validRouteLifetime(profile)
     && positiveInteger(profile.inputTokenUpperBound, 10_000_000) && positiveInteger(profile.outputTokenLimit, 1_000_000)
     && validReasoningProfile(profile)
     && (profile.completionParameter === 'max_tokens' || profile.completionParameter === 'max_completion_tokens')
@@ -457,6 +457,7 @@ export function openRouterTransport(approval: Step15Approval): ModelTransport {
           : task?.mode === 'lead';
         return Boolean(scope && roleAllowed && await verifyApprovedResearchInputs(tx, context, scope));
       }
+      if (profile.validUntil === null) return false;
       if (profile.mode === 'strict-zdr' && profile.syntheticScopes === undefined) return true;
       const scope = syntheticScope(profile.syntheticScopes, context.projectId, context.scopeId);
       if (context.dataClass !== 'synthetic' || !scope) return false;
@@ -486,7 +487,7 @@ export function openRouterTransport(approval: Step15Approval): ModelTransport {
         }
       }
       const alibaba = isAlibabaQwenMax(profile);
-      if (profile.mode === 'customer-retention-approved' && attempt.dataClass !== 'customer') {
+      if ((profile.mode === 'customer-retention-approved' || profile.validUntil === null) && attempt.dataClass !== 'customer') {
         return { receipt: { state: 'rejected', code: 'route_data_unapproved', evidenceRef: 'gateway:no-network' } };
       }
       if (profile.mode !== 'customer-retention-approved' && (alibaba || isDecartKimiK31Pro(profile.model, profile.provider))) {

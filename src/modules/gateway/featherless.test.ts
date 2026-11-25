@@ -156,10 +156,10 @@ test('only the pinned multimodal Featherless profile can send a bounded inline P
 test('a customer Featherless profile binds the inference credential and rejects images for a text-only scope', async (t) => {
   const { syntheticScopes, ...base } = profile;
   const customer: FeatherlessProfile = {
-    ...base, model: featherlessQwenVisionModel, mode: 'customer',
+    ...base, model: featherlessQwenVisionModel, mode: 'customer', validUntil: null,
     images: { count: 1, maxImageWidth: 256, maxImageHeight: 256, maxImagePixels: 65_536, maxImageBytes: 4096 },
     customerAccess: {
-      keyFingerprint: hash(credential.apiKey), evidenceRef: 'fixture-policy', validUntil: '2099-01-01T00:00:00Z',
+      keyFingerprint: hash(credential.apiKey), evidenceRef: 'fixture-policy', validUntil: null,
       scopes: syntheticScopes.map(scope => ({ ...scope, allowImages: false })),
     },
   };

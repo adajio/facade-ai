@@ -1,5 +1,5 @@
-import { customerScope, pngBase64Length, record, requestHasImages, syntheticScope, validCustomerAccess,
-  validSyntheticScopes, verifyApprovedResearchInputs, type CustomerAccess, type SyntheticScope } from './admission.js';
+import { approvalIsCurrent, customerScope, pngBase64Length, record, requestHasImages, syntheticScope, validCustomerAccess,
+  validRouteLifetime, validSyntheticScopes, verifyApprovedResearchInputs, type CustomerAccess, type SyntheticScope } from './admission.js';
 import { BUDGET_USD_NANOS, GatewayError, hash, positiveInteger,
   type ModelTransport, type ProviderOutcome, type RoutePolicy } from './types.js';
 
@@ -38,7 +38,7 @@ export type FeatherlessProfile = {
   syntheticScopes?: readonly SyntheticScope[];
   customerAccess?: CustomerAccess;
   boundEvidenceRef: string;
-  validUntil: string;
+  validUntil: string | null;
   contextTokens: number;
   outputTokenLimit: number;
   inputNanosPerToken: number;
@@ -63,7 +63,7 @@ function validProfile(profile: FeatherlessProfile) {
       : profile.mode === 'customer' && profile.model === featherlessQwenVisionModel
         && profile.syntheticScopes === undefined && profile.customerAccess !== undefined)
     && [profile.routeId, profile.revision, profile.boundEvidenceRef].every(hasText)
-    && Number.isFinite(Date.parse(profile.validUntil))
+    && validRouteLifetime(profile)
     && positiveInteger(profile.contextTokens, 262_144)
     && positiveInteger(profile.outputTokenLimit, 32_768) && profile.outputTokenLimit < profile.contextTokens
     && positiveInteger(profile.inputNanosPerToken, BUDGET_USD_NANOS) && profile.inputNanosPerToken >= rates.input
@@ -126,7 +126,7 @@ function decodeJsonTool(choices: unknown[], tools: unknown[], providerId: string
 function prepare(profile: FeatherlessProfile, route: RoutePolicy, request: unknown) {
   const body = record(request);
   const tokens = body?.max_tokens;
-  if (!body || body.model !== profile.model || Date.parse(profile.validUntil) <= Date.now()
+  if (!body || body.model !== profile.model || !approvalIsCurrent(profile.validUntil)
     || Object.keys(body).some(key => !requestFields.has(key)) || body.stream !== false || body.parallel_tool_calls !== false
     || body.tool_choice !== (profile.model === featherlessQwenVisionModel ? 'required' : 'auto') || !Array.isArray(body.tools) || !body.tools.length || !body.tools.every(localFunction)
     || !Array.isArray(body.messages) || !body.messages.length

@@ -26,7 +26,7 @@ export type CustomerScope = {
 export type CustomerAccess = {
   keyFingerprint: string;
   evidenceRef: string;
-  validUntil: string;
+  validUntil: string | null;
   scopes: readonly CustomerScope[];
 };
 
@@ -59,10 +59,24 @@ export function syntheticScope(scopes: readonly SyntheticScope[] | undefined, pr
   return scopes?.find(item => item.projectId === projectId && item.scopeId === scopeId);
 }
 
+export function approvalIsCurrent(validUntil: string | null): boolean {
+  return validUntil === null || (typeof validUntil === 'string' && Date.parse(validUntil) > Date.now());
+}
+
+export function validRouteLifetime(profile: {
+  validUntil: string | null;
+  customerAccess?: CustomerAccess;
+  syntheticScopes?: readonly SyntheticScope[];
+}): boolean {
+  return profile.validUntil === null
+    ? profile.customerAccess != null && profile.syntheticScopes === undefined
+    : typeof profile.validUntil === 'string' && Number.isFinite(Date.parse(profile.validUntil));
+}
+
 export function validCustomerAccess(access: CustomerAccess | undefined, apiKey: string): boolean {
   return Boolean(access && access.keyFingerprint === hash(apiKey)
     && typeof access.evidenceRef === 'string' && access.evidenceRef.trim()
-    && Date.parse(access.validUntil) > Date.now() && Array.isArray(access.scopes) && access.scopes.length > 0
+    && approvalIsCurrent(access.validUntil) && Array.isArray(access.scopes) && access.scopes.length > 0
     && access.scopes.every(scope => validScope(scope) && typeof scope.allowImages === 'boolean'
       && (scope.acceptedProjectOriginals === true
         ? scope.scopeId === null && scope.originalSha256s === undefined
@@ -71,7 +85,7 @@ export function validCustomerAccess(access: CustomerAccess | undefined, apiKey: 
 }
 
 export function customerScope(access: CustomerAccess | undefined, projectId: string, scopeId: string | null) {
-  return access && Date.parse(access.validUntil) > Date.now()
+  return access && approvalIsCurrent(access.validUntil)
     ? access.scopes.find(scope => scope.projectId === projectId && scope.scopeId === scopeId)
     : undefined;
 }

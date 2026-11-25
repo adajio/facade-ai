@@ -1,6 +1,6 @@
 import { gzipSync } from 'node:zlib';
-import { customerScope, pngBase64Length, record, requestHasImages, syntheticScope, validCustomerAccess,
-  validSyntheticScopes, verifyApprovedResearchInputs, type CustomerAccess, type SyntheticScope } from './admission.js';
+import { approvalIsCurrent, customerScope, pngBase64Length, record, requestHasImages, syntheticScope, validCustomerAccess,
+  validRouteLifetime, validSyntheticScopes, verifyApprovedResearchInputs, type CustomerAccess, type SyntheticScope } from './admission.js';
 import { BUDGET_USD_NANOS, GatewayError, hash, positiveInteger, type ModelTransport, type ProviderOutcome, type RoutePolicy } from './types.js';
 
 export const terraModel = 'gpt-6.1-terra';
@@ -31,7 +31,7 @@ export type CheaperInferenceProfile = {
   syntheticScopes?: readonly SyntheticScope[];
   customerAccess?: CustomerAccess;
   boundEvidenceRef: string;
-  validUntil: string;
+  validUntil: string | null;
   inputNanosPerToken: number;
   outputNanosPerToken: number;
   outputTokenLimit: number;
@@ -52,7 +52,7 @@ function validProfile(profile: CheaperInferenceProfile) {
   return profile.transport === 'cheaperinference' && profile.model === terraModel && profile.mode === 'strict-zdr'
     && !('reasoningEffort' in profile)
     && [profile.routeId, profile.revision, profile.zdrEvidenceRef, profile.boundEvidenceRef].every(hasText)
-    && Number.isFinite(Date.parse(profile.validUntil))
+    && validRouteLifetime(profile)
     && (profile.syntheticScopes === undefined ? profile.customerAccess !== undefined : validSyntheticScopes(profile.syntheticScopes))
     // Use maker list prices for the largest context tier, including cache writes and reasoning output.
     && positiveInteger(profile.inputNanosPerToken, BUDGET_USD_NANOS) && profile.inputNanosPerToken >= 2_500
@@ -73,7 +73,7 @@ function localFunction(value: unknown) {
 function prepare(profile: CheaperInferenceProfile, route: RoutePolicy, request: unknown) {
   const body = record(request);
   const tokens = body?.max_tokens;
-  if (!body || body.model !== profile.model || Date.parse(profile.validUntil) <= Date.now()
+  if (!body || body.model !== profile.model || !approvalIsCurrent(profile.validUntil)
     || Object.keys(body).some(key => !requestFields.has(key)) || body.stream !== false || body.parallel_tool_calls !== false
     || (body.tool_choice !== 'required' && body.tool_choice !== 'auto')
     || !Array.isArray(body.tools) || !body.tools.length || !body.tools.every(localFunction)
