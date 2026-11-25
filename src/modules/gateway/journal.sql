@@ -13,8 +13,10 @@ ALTER TABLE gateway_external_ledger ADD COLUMN IF NOT EXISTS limit_usd_nanos big
 
 CREATE TABLE IF NOT EXISTS gateway_external_project_budgets (
   project_id uuid PRIMARY KEY,
-  limit_usd_nanos bigint NOT NULL CHECK (limit_usd_nanos BETWEEN 1 AND 10000000000)
+  limit_usd_nanos bigint NOT NULL DEFAULT 10000000000 CHECK (limit_usd_nanos BETWEEN 1 AND 10000000000)
 );
+
+ALTER TABLE gateway_external_project_budgets ALTER COLUMN limit_usd_nanos SET DEFAULT 10000000000;
 
 CREATE TABLE IF NOT EXISTS gateway_external_attempts (
   id uuid PRIMARY KEY,

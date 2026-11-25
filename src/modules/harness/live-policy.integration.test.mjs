@@ -71,7 +71,7 @@ test('partial live configuration uses only independently admitted routes with th
   const { createApi } = await import('../../../dist/src/platform/api.js');
   const { readConfig } = await import('../../../dist/src/platform/config.js');
   const { bootstrapAdmin } = await import('../../../dist/src/modules/access/bootstrap.js');
-  const { createGateway, Gateway, PostgresIntentJournal } = await import('../../../dist/src/modules/gateway/index.js');
+  const { createGateway, Gateway, PostgresIntentJournal, hash } = await import('../../../dist/src/modules/gateway/index.js');
   const { startWorker } = await import('../../../dist/src/modules/harness/index.js');
   await ledgerPool.query(await readFile(new URL('../gateway/journal.sql', import.meta.url), 'utf8'));
   await ledgerPool.query('INSERT INTO gateway_external_ledger(ledger_id) VALUES($1)', [process.env.FACADE_GATEWAY_LEDGER_ID]);
@@ -623,6 +623,75 @@ test('partial live configuration uses only independently admitted routes with th
     `SELECT count(*) FILTER(WHERE state IN ('prepared','sending','unknown'))::int AS open,
             coalesce(sum(spent_usd_nanos),0)::text AS spent FROM gateway_external_attempts`);
   assert.deepEqual(ledger, { open: 0, spent: '0' });
+  if (process.env.FACADE_HARNESS_COMPOUND_ONLY !== '1') await t.test('customer defaults enroll projects before and after startup without replacing budgets or denials', async () => {
+    const existing = await post('/api/projects', { name: 'Native project before worker', mode: 'intake' });
+    const legacy = await post('/api/projects', { name: 'Synthetic legacy project', catalogVersionId: catalog.id });
+    await ledgerPool.query('INSERT INTO gateway_external_project_budgets(project_id,limit_usd_nanos) VALUES($1,2000000000)', [existing.id]);
+    await gateway.grantRoute({ projectId: existing.id, routeId: terra.routeId, revision: 'local-test',
+      dataClass: 'customer', purpose: 'primary_a', allowed: false });
+
+    const customerKey = 'local-fixture-key';
+    const qwenKey = 'local-fixture-qwen4-key';
+    const access = key => ({ keyFingerprint: hash(key), evidenceRef: 'fixture', validUntil: null, scopes: [],
+      defaultProjectScope: { approvalRef: 'fixture-default', allowImages: true } });
+    const routerProfile = source => {
+      const { syntheticScopes: _, ...base } = formatProfile(source, {
+        projectId: existing.id, scopeId: null, originalSha256s: ['a'.repeat(64)],
+      });
+      return { ...base, validUntil: null };
+    };
+    process.env.FACADE_HARNESS_LIVE_POLICY = 'customer';
+    process.env.FACADE_HARNESS_PACKAGE_EFFECTS = 'enabled';
+    process.env.FACADE_GATEWAY_OPENROUTER_QWEN4_KEY = qwenKey;
+    process.env.FACADE_HARNESS_PROFILE = JSON.stringify(Object.fromEntries(Object.entries({
+      A: settings(terra), B: settings(defaultQwen), lead: settings(lead),
+    }).map(([slot, value]) => [slot, { ...value, dataClass: 'customer' }])));
+    process.env.FACADE_GATEWAY_CHEAPERINFERENCE_KEY = directKey;
+    process.env.FACADE_GATEWAY_CHEAPERINFERENCE_PROFILES = JSON.stringify([{
+      transport: 'cheaperinference', routeId: terra.routeId, model: terra.model,
+      revision: 'local-test', mode: 'strict-zdr', zdrEvidenceRef: 'fixture-zdr-terra',
+      boundEvidenceRef: 'fixture-rates', validUntil: null, customerAccess: access(directKey),
+      inputNanosPerToken: 2500, outputNanosPerToken: 7500, outputTokenLimit: 512,
+      maxImages: 0, maxImageWidth: 1, maxImageHeight: 1, maxImagePixels: 1, maxImageBytes: 1,
+    }]);
+    process.env.FACADE_GATEWAY_STEP15_PROFILES = JSON.stringify([{
+      ...routerProfile(defaultQwen), mode: 'customer-retention-approved',
+      customerAccess: { ...access(qwenKey), retentionApproved: true },
+      inputTokenUpperBound: 1_000_000, promptNanosPerToken: 1500, completionNanosPerToken: 4500,
+      cacheReadNanosPerToken: 75, cacheWriteNanosPerToken: 3000,
+    }, {
+      ...routerProfile(lead), mode: 'strict-zdr',
+      customerAccess: { ...access(customerKey), guardrailId: randomUUID(), excludesSafetyRetention: true },
+    }]);
+
+    const grants = async projectId => (await app.db.query(
+      "SELECT purpose,allowed FROM gateway_grants WHERE project_id=$1 AND data_class='customer' ORDER BY purpose,route_id", [projectId])).rows;
+    stop = new AbortController();
+    worker = startWorker({ db: app.db, config, signal: stop.signal, logger: {
+      info() {}, warn(message) { warnings.push(message); }, error(message) { warnings.push(message); },
+    } });
+    try {
+      const oldGrants = await until(() => grants(existing.id), rows => rows.length === 5);
+      assert.deepEqual(oldGrants.filter(({ allowed }) => !allowed), [{ purpose: 'primary_a', allowed: false }]);
+      const fresh = await post('/api/projects', { name: 'Native project after worker', mode: 'intake' });
+      assert.equal((await until(() => grants(fresh.id), rows => rows.length === 5)).every(({ allowed }) => allowed), true);
+      assert.deepEqual(await grants(existing.id), oldGrants);
+      assert.deepEqual(await grants(legacy.id), []);
+      for (const [projectId, expected] of [[existing.id, '2000000000'], [fresh.id, '10000000000']]) {
+        const { rows: [budget] } = await ledgerPool.query(
+          'SELECT limit_usd_nanos::text AS limit FROM gateway_external_project_budgets WHERE project_id=$1', [projectId]);
+        assert.equal(budget.limit, expected);
+      }
+      const { rows: [ledger] } = await ledgerPool.query(
+        'SELECT limit_usd_nanos::text AS limit FROM gateway_external_ledger WHERE singleton');
+      assert.equal(ledger.limit, '10000000000');
+      assert.equal((await ledgerPool.query(
+        'SELECT 1 FROM gateway_external_attempts WHERE project_id=ANY($1::uuid[])', [[existing.id, fresh.id]])).rowCount, 0);
+    } finally {
+      stop.abort();
+      await worker;
+    }
+  });
   if (process.env.FACADE_HARNESS_COMPOUND_ONLY !== '1') await t.test('profile switch preserves ready and unknown window assignments', async () => {
     const { activatePackageProjects, authorizedPackageWindow, dispatchPackagePair, preparePackageMap } =
       await import('../../../dist/src/modules/harness/package-dispatch.js');

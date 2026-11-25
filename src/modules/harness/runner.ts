@@ -129,10 +129,12 @@ function sessionPorts(
       active.throwIfAborted();
       const hold = services.admit?.(task, true);
       if (hold) return { status: 'held', code: hold.reason, nextAction: hold.nextAction };
-      const result = await gateway.call({
-        ...input, lease, routeId: task.job.settings.routeId, dataClass: task.job.settings.dataClass,
-        budget: await gateway.backgroundBudget?.(task.projectId, task.scopeId === null ? task.projectId : undefined),
-      });
+      const { routeId, dataClass } = task.job.settings;
+      const packageId = task.scopeId === null ? task.projectId : undefined;
+      const budget = dataClass === 'customer'
+        ? { initiatedBy: 'background' as const, ...(packageId ? { packageId } : {}) }
+        : await gateway.backgroundBudget?.(task.projectId, packageId);
+      const result = await gateway.call({ ...input, lease, routeId, dataClass, budget });
       if (result.status === 'rejected') {
         const retryable = /^(429|http_429|rate_limited|provider_rate_limit|provider_429)$/.test(result.receipt.code);
         return {

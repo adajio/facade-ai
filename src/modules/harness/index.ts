@@ -10,6 +10,7 @@ import { sealManagedTestDatabase, toolHash } from '../../platform/runtime-bounda
 import { createFormatAdapters } from '../formats/index.js';
 import { createGateway, createLiveGateway, journalFromEnv, type CheaperInferenceProfile, type FeatherlessProfile, type OpenRouterProfile, type Step15Approval } from '../gateway/index.js';
 import { approvalIsCurrent } from '../gateway/admission.js';
+import { provisionCustomerProjects, type CustomerRouteGrant } from './customer-projects.js';
 import type { ModelTransport } from '../gateway/types.js';
 import { startImports } from '../imports/index.js';
 import { createIntakeStorage } from '../intake/blob.js';
@@ -136,9 +137,15 @@ function modelGateway(context: WorkerContext, external: ReturnType<typeof journa
     const hasTransport = qualified.length > 0;
     const gateway = hasTransport
       ? createLiveGateway(context.db, external.journal, enabled, reviewAdmission, policyOptions) : localGateway();
+    const defaultCustomerGrants = policy.approvals.flatMap<CustomerRouteGrant>(({ routeId, revision, customerAccess }) => {
+      if (!customerAccess?.defaultProjectScope) return [];
+      const primary = routeId === profile.A?.routeId ? 'primary_a' : routeId === profile.B?.routeId ? 'primary_b' : null;
+      const review: CustomerRouteGrant = { routeId, revision, purpose: 'review', access: customerAccess };
+      return primary ? [{ ...review, purpose: primary }, review] : [review];
+    });
     const providers = [...new Set(qualified.map(route => route.transport ?? 'openrouter'))];
     const provider = providers.length > 1 ? 'mixed' : providers[0];
-    return { gateway, admit: policy.hold, hasTransport, copilotRoute: copilotPolicy?.approvals.length ? copilot : null,
+    return { gateway, admit: policy.hold, hasTransport, defaultCustomerGrants, copilotRoute: copilotPolicy?.approvals.length ? copilot : null,
       mode: hasTransport ? provider + (policyOptions.replayOnly ? '-replay' : '-live') : 'disabled' };
   }
   return {
@@ -210,7 +217,7 @@ export async function startWorker(context: WorkerContext, test?: ManagedTestOpti
   }
 
   try {
-    const { gateway, admit, hasTransport, mode, copilotRoute } = modelGateway(context, external, profile, packageEnabled, packageProjects, test);
+    const { gateway, admit, hasTransport, mode, copilotRoute, defaultCustomerGrants } = modelGateway(context, external, profile, packageEnabled, packageProjects, test);
     const allowProfileScans=packageEnabled&&hasTransport&&process.env.FACADE_HARNESS_PACKAGE_EFFECTS==='enabled'&&
       process.env.FACADE_HARNESS_REPLAY_ONLY!=='1';
     if (test) {
@@ -266,6 +273,13 @@ export async function startWorker(context: WorkerContext, test?: ManagedTestOpti
       poll('questions', () => processNextInquiry(db, inquiry, signal)),
       startImports({ ...context, signal }, { storage }),
     );
+    if (allowProfileScans && external && defaultCustomerGrants?.length) {
+      lanes.push(poll('customer project defaults', async () => {
+        await provisionCustomerProjects(db, external.journal, defaultCustomerGrants);
+        await delay(10_000, undefined, { signal }).catch(() => undefined);
+        return false;
+      }));
+    }
     if (packageEnabled) lanes.push(
       poll('package primary scheduler', () => dispatchPackagePair(db, gateway, profile, newWalkJobs)),
       poll('package review scheduler', () => schedulePackageReview(db, gateway, profile)),

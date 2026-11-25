@@ -28,6 +28,7 @@ export type CustomerAccess = {
   evidenceRef: string;
   validUntil: string | null;
   scopes: readonly CustomerScope[];
+  defaultProjectScope?: Pick<CustomerScope, 'approvalRef' | 'allowImages'>;
 };
 
 const uuid = /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/;
@@ -70,13 +71,16 @@ export function validRouteLifetime(profile: {
 }): boolean {
   return profile.validUntil === null
     ? profile.customerAccess != null && profile.syntheticScopes === undefined
-    : typeof profile.validUntil === 'string' && Number.isFinite(Date.parse(profile.validUntil));
+    : profile.customerAccess?.defaultProjectScope === undefined
+      && typeof profile.validUntil === 'string' && Number.isFinite(Date.parse(profile.validUntil));
 }
 
 export function validCustomerAccess(access: CustomerAccess | undefined, apiKey: string): boolean {
   return Boolean(access && access.keyFingerprint === hash(apiKey)
     && typeof access.evidenceRef === 'string' && access.evidenceRef.trim()
-    && approvalIsCurrent(access.validUntil) && Array.isArray(access.scopes) && access.scopes.length > 0
+    && approvalIsCurrent(access.validUntil) && Array.isArray(access.scopes)
+    && (access.defaultProjectScope === undefined ? access.scopes.length > 0
+      : access.validUntil === null && validProjectDefault(access.defaultProjectScope))
     && access.scopes.every(scope => validScope(scope) && typeof scope.allowImages === 'boolean'
       && (scope.acceptedProjectOriginals === true
         ? scope.scopeId === null && scope.originalSha256s === undefined
@@ -84,10 +88,18 @@ export function validCustomerAccess(access: CustomerAccess | undefined, apiKey: 
     && new Set(access.scopes.map(scope => JSON.stringify([scope.projectId, scope.scopeId]))).size === access.scopes.length);
 }
 
-export function customerScope(access: CustomerAccess | undefined, projectId: string, scopeId: string | null) {
-  return access && approvalIsCurrent(access.validUntil)
-    ? access.scopes.find(scope => scope.projectId === projectId && scope.scopeId === scopeId)
-    : undefined;
+function validProjectDefault(scope: NonNullable<CustomerAccess['defaultProjectScope']>) {
+  return scope && typeof scope.approvalRef === 'string' && Boolean(scope.approvalRef.trim())
+    && typeof scope.allowImages === 'boolean';
+}
+
+export function customerScope(access: CustomerAccess | undefined, projectId: string, scopeId: string | null): CustomerScope | undefined {
+  if (!access || !approvalIsCurrent(access.validUntil)) return undefined;
+  const explicit = access.scopes.find(scope => scope.projectId === projectId && scope.scopeId === scopeId);
+  if (explicit) return explicit;
+  if (!access.defaultProjectScope || scopeId !== null || !uuid.test(projectId)
+    || access.scopes.some(scope => scope.projectId === projectId)) return undefined;
+  return { ...access.defaultProjectScope, projectId, scopeId: null, acceptedProjectOriginals: true };
 }
 
 export function scopeAllowsOriginal(scope: SyntheticScope | CustomerScope, digest: string): boolean {

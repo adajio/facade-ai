@@ -195,6 +195,25 @@ export class PostgresIntentJournal {
     });
   }
 
+  async ensureProjectBudgets(projectIds: readonly string[]) {
+    if (!projectIds.length) return;
+    await transaction(this.pool, async tx => {
+      if (!(await this.bound(tx, false)).scoped) throw new GatewayError('budget_project_unconfigured');
+      const { rows: missing } = await tx.query<{ project_id: string }>(
+        `SELECT project_id FROM unnest($1::uuid[]) AS projects(project_id)
+         WHERE NOT EXISTS (SELECT 1 FROM gateway_external_project_budgets b WHERE b.project_id=projects.project_id)`,
+        [projectIds],
+      );
+      if (!missing.length) return;
+      await tx.query('SET LOCAL synchronous_commit=on');
+      await tx.query(
+        `INSERT INTO gateway_external_project_budgets(project_id)
+         SELECT unnest($1::uuid[]) ON CONFLICT(project_id) DO NOTHING`,
+        [missing.map(({ project_id }) => project_id)],
+      );
+    });
+  }
+
   async prepare(attempt: Attempt): Promise<JournalEntry | string> {
     return transaction(this.pool, async tx => {
       const bound = await this.bound(tx);
