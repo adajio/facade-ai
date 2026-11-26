@@ -8,7 +8,6 @@ import { replaySavedSheets } from '../infra/local-terra/replay-sheets.mjs';
 
 const scope = { projectId:'p', receiptId:'r', preparationId:'m', catalogVersionId:'c', stage:'stage_1' };
 const skillKey = reassessmentKey(scope,'sheet_applicability_v1');
-const key = reassessmentKey(scope,'replay_sheet_applicability_v1');
 const inventory = [{versionId:'v',originalSha256:'a'.repeat(64)}];
 const item = {kind:'document',state:'available',versionId:'v',readerVersion:'reader.1'};
 const source = {versionId:'v',originalSha256:inventory[0].originalSha256,anchor:'sheet:1',quote:'Стена'};
@@ -30,14 +29,21 @@ const snapshot = {...scope,requestSha256:'b'.repeat(64),reviewContract:2,require
   sheetReading:{images:[{...source,id:'I1',title:'Вид стены',sha256:'d'.repeat(64),readerVersion:item.readerVersion,
     address:{unitId:'1'}}]}};
 
-async function fixture(t, {lineage=[original,parent], saved={}, mapItems=[item], existing}={}) {
+async function fixture(t, {lineage=[original,parent], saved={}, mapItems=[item], existing, version='v1', otherVersion}={}) {
+  const originalKey = reassessmentKey(scope,'sheet_applicability_'+version);
+  const replayKey = reassessmentKey(scope,'replay_sheet_applicability_'+version);
   const root = await mkdtemp(join(tmpdir(),'replay-sheets-'));
   t.after(()=>rm(root,{recursive:true,force:true}));
   const folder = join(root, 'addressed', scope.receiptId);
   await mkdir(folder,{recursive:true});
-  const base = join(folder,key);
-  await writeFile(join(folder,skillKey+'.json'),JSON.stringify({state:'published',snapshot,response,
+  const base = join(folder,replayKey);
+  await writeFile(join(folder,originalKey+'.json'),JSON.stringify({state:'published',snapshot,response,
     reviewId:original.id,parentId:parent.id,...saved}));
+  if (otherVersion) {
+    const otherKey = reassessmentKey(scope,'sheet_applicability_'+otherVersion);
+    await writeFile(join(folder,otherKey+'.json'),JSON.stringify({state:'published',snapshot,
+      response:{rows:[]},reviewId:'wrong-version',parentId:parent.id}));
+  }
   const recorded = [];
   let published;
   let reads = 0;
@@ -56,7 +62,7 @@ async function fixture(t, {lineage=[original,parent], saved={}, mapItems=[item],
     }},
   };
   return {
-    replay:()=>replaySavedSheets(run,scope,key,base),
+    replay:()=>replaySavedSheets(run,scope,replayKey,base),
     publication:()=>published,
     receipt:async()=>JSON.parse(await readFile(base+'.done','utf8')),
     reads:()=>reads, recorded,
@@ -123,4 +129,16 @@ test('retains later removals and a conflicting applicability decision', async t=
   const changed = await fixture(t,{lineage:[excluded,baseWithOldSources,parent]});
   assert.equal(await changed.replay(),'published');
   assert.deepEqual(changed.publication().rows,excluded.rows);
+});
+
+
+test('v2 replay reads only the response saved under the explicitly requested profile', async t=>{
+  const exact = {...original,revisionKey:reassessmentKey(scope,'sheet_applicability_v2')};
+  const f = await fixture(t,{version:'v2',otherVersion:'v1',lineage:[exact,parent]});
+  assert.equal(await f.replay(),'published');
+  assert.equal(f.publication().rows[0].finding,'Исправленный вывод');
+  assert.equal((await f.receipt()).modelCalls,0);
+  const wrongLineage = await fixture(t,{version:'v2',otherVersion:'v1'});
+  assert.equal(await wrongLineage.replay(),'sheet_lineage_unverified');
+  assert.equal(wrongLineage.publication(),undefined);
 });

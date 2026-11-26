@@ -598,7 +598,7 @@ async function main() {
       const selected=[...new Set(process.argv.slice(4))].sort();
       const partial=process.argv[2]==='--refresh-requirements';
       if (partial && (!selected.length || !scope.rows.every(row=>row.analysis) || selected.some(key=>!scope.requirements.some(item=>item.key===key)))) throw Error('unknown_target_or_unstructured_report');
-      console.log(await queueReassessment(stateDir,scope,partial?'requirements:'+selected.join(','):process.argv[2]==='--replay-reading-skills'?'replay_sheet_applicability_v1':process.argv[2]==='--replay-saved'?'replay_saved_v3':process.argv[2]==='--refresh-reading-skills'?'sheet_applicability_v2':'operator'));
+      console.log(await queueReassessment(stateDir,scope,partial?'requirements:'+selected.join(','):process.argv[2]==='--replay-reading-skills'?'replay_sheet_applicability_v2':process.argv[2]==='--replay-saved'?'replay_saved_v3':process.argv[2]==='--refresh-reading-skills'?'sheet_applicability_v2':'operator'));
     } finally { reader.close(); await db.end(); }
     return;
   }

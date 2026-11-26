@@ -64,6 +64,8 @@ function mentions(text, label) {
 const scopeLabels = scope => Object.values(scope);
 const clauses = quote => quote.split(/[;\n\r]+|[.!?](?=\s+\p{Lu})/u).map(phrases).filter(Boolean);
 const matchesScope = (clause, scope) => scopeLabels(scope).every(label => mentions(clause, label));
+const finishCode = /^(?:ral|ncs|рал)\s*\d{3,5}(?:[ \t]*[-–—][ \t]*[\p{L}][\p{L} -]{0,80})?[.!]?$/iu;
+
 const measuredValues = text => [...phrases(text).matchAll(
   /(?<![\p{L}\p{N}])(?:[+-]?\d+(?:[.,]\d+)?\s*(?:мм|см|мпа|кпа|кн|м|н|квт|вт|°[сc]|%)|(?:ral|ncs|рал)\s*\d{3,5})(?![\p{L}\p{N}])/giu,
 )].map(match=>match[0].replace(/\s+/gu,''));
@@ -79,8 +81,10 @@ function recordSpans(quote, scope) {
       if (!mentions(part,scope.element)) continue;
       let span=part;
       for (const next of parts.slice(index+1,index+4)) {
-        const continues = !mentions(next,scope.element) && factScopeFields.slice(1).some(field=>
+        const qualifier = factScopeFields.slice(1).some(field=>
           scope[field] && !mentions(span,scope[field]) && sameLabel(next,scope[field]));
+        const adjacentCode = finishCode.test(next) && measuredValues(span).length===0;
+        const continues = !mentions(next,scope.element) && (qualifier || adjacentCode);
         if (!continues) break;
         span += ' '+next;
         spans.push(span);

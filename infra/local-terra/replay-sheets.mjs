@@ -9,6 +9,7 @@ import { renderQuestions } from './review-analysis.mjs';
 import { loadReport } from './revise.mjs';
 
 const maxLineage = 128;
+const supportedProfiles = ['sheet_applicability_v1','sheet_applicability_v2'];
 const replayNote = 'Консервативно переопубликован сохранённый ответ по графическим участкам. Последующие адресные изменения сохранены.';
 const sourceKey = source => JSON.stringify([
   source.versionId, source.originalSha256, source.anchor, source.quote ?? null, source.limitation ?? null,
@@ -136,6 +137,8 @@ function preserveDescendants(corrected, trail) {
 }
 
 export async function replaySavedSheets(run,scope,key,base) {
+  const profile = supportedProfiles.find(name => reassessmentKey(scope,'replay_'+name)===key);
+  if (!profile) return 'sheet_replay_profile_unknown';
   const notePath = base+'.done';
   const prior = await read(notePath);
   if (prior?.state && prior.modelCalls===0) return prior.state;
@@ -158,7 +161,7 @@ export async function replaySavedSheets(run,scope,key,base) {
   };
   if (existing) return published(existing.id);
 
-  const originalKey = reassessmentKey(scope,'sheet_applicability_v1');
+  const originalKey = reassessmentKey(scope,profile);
   const saved = await read(join(dirname(base),originalKey+'.json'));
   const snapshot = saved?.snapshot;
   if (!saved || !['published','responded','rejected'].includes(saved.state) || !saved.parentId ||

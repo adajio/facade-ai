@@ -388,3 +388,61 @@ test('an old addressed question closes only with a verified update to the same s
       output.rows[0].analysis.properties.length);
   }
 });
+
+test('a color designator can continue the same physical record without being a scope field',()=>{
+  const area=element('защитная система',{variant:'с последующей окраской'});
+  const note=source('color','Защитная система с последующей окраской. RAL 7000 - серый.');
+  const stated=rawProperty(rawScope(area,area,note),[note],{finding:'Для системы установлен RAL 7000.'});
+  assert.equal(makeRow([stated],[note]).analysis.properties[0].status,'confirmed');
+  const separate={...note,quote:'Защитная система с последующей окраской; RAL 7000 - серый.'};
+  assert.equal(makeRow([{...stated,citations:[cite(separate)],scope:rawScope(area,area,separate)}],
+    [separate]).analysis.properties[0].status,'insufficient');
+});
+
+test('bounded reassessment retains checked plans and addressed context without repeating validation',async()=>{
+  const {reconcilePreliminaryReview} = await import('../infra/local-terra/review-continuity.mjs');
+  const line=source('plan','План этажа на отм. -1.500\nс проёмами и лестницей');
+  const earlierArea=element('План этажа',{zone:'отм. -1.500',purpose:'с проёмами и лестницей'});
+  const currentArea=element('План этажа на отм. -1.500',{purpose:'с проёмами и лестницей'});
+  const note=source('reveal','На листе приведено название узла проёма.');
+  const context=rawProperty({...rawScope(element('узел проёма'),element('узел проёма'),note),kind:'undetermined'},[note],{
+    key:'reveal',label:'Содержание узла проёма',status:'insufficient',letter:{kind:'omit',text:'Нужно открыть узел.'},
+  });
+  const previous={...makeRow([rawProperty(rawScope(earlierArea,earlierArea,line),[line]),context],[line,note]),status:'partial'};
+  const fresh={...makeRow([rawProperty(rawScope(currentArea,currentArea,line),[line])],[line]),status:'partial'};
+  const input={factScopeVersion:1,inventory:[line],rows:[fresh]};
+  const merged=reconcilePreliminaryReview(input,[previous]);
+  assert.equal(merged.rows[0].status,'partial');
+  assert.equal(merged.rows[0].analysis.properties[0].scope.target.zone,earlierArea.zone);
+  assert.equal(merged.rows[0].analysis.properties[1].scope.kind,'undetermined');
+  assert.match(merged.rows[0].analysis.properties[1].scope.reason,/^Контекст предыдущего разбора/);
+  assert.equal(merged.draftText,noOpenQuestions);
+  const gone={...input,rows:[{...makeRow([],[]),status:'unassessed'}]};
+  assert.equal(reconcilePreliminaryReview(gone,[previous]).rows[0].status,'partial');
+  const excluded={...fresh,status:'unassessed',analysis:{...fresh.analysis,
+    applicability:{kind:'excluded',reason:'Эти планы исключены из выдачи.',sources:[line]},properties:[]}};
+  assert.equal(reconcilePreliminaryReview({...input,rows:[excluded]},[previous]).rows[0].status,'unassessed');
+  assert.equal(reconcilePreliminaryReview({...input,rows:[excluded]},[previous]).rows[0].analysis.applicability.kind,'excluded');
+});
+
+test('an already answered dimension does not widen an earlier scoped question or affect another variant',async()=>{
+  const {reconcilePreliminaryReview} = await import('../infra/local-terra/review-continuity.mjs');
+  const prior=source('grounded-dimension','Плита ПАН-7 толщиной 12 мм для стены в световом дворе.');
+  const oldGap={key:'panel-zone',label:'Плита из паспорта: зона применения',status:'insufficient',
+    finding:'В явно названной стене не установлены оси применения плиты.',
+    letter:{kind:'ask',text:'Уточните оси стены в световом дворе для плиты ПАН-7 толщиной 12 мм.'}};
+  // The value in the old question describes the object. The old request is for axes.
+  const earlier=makeRow([rawProperty(undefined,[prior],{...oldGap,
+    letter:{...oldGap.letter,text:'Уточните оси стены в световом дворе для плиты ПАН-7, 12 мм.'}}),
+  rawProperty(undefined,[prior],{key:'panel-thickness',label:'Толщина плиты',finding:'Толщина 12 мм.'})],[prior],[],{});
+  for (const [variant,zone,expected] of [['ПАН-7',undefined,1],['ПАН-8',undefined,2],['ПАН-7','Фасад Б',2]]) {
+    const note=source('new-window',`Плита ${variant}${zone ? ', '+zone : ''}.`);
+    const area=element('плита',{variant,...(zone && {zone})});
+    const newer=makeRow([rawProperty(rawScope(area,area,note),[note],{...oldGap,
+      label:oldGap.label+' и толщина',letter:{kind:'ask',text:`Какова толщина и каковы зоны применения плиты ${variant}?`},
+    })],[note]);
+    const report=reconcilePreliminaryReview({factScopeVersion:1,inventory:[prior],rows:[newer]},[earlier]);
+    assert.equal(report.rows[0].analysis.properties.filter(property=>property.letter.kind==='ask').length,expected);
+    if (expected===1) assert.doesNotMatch(report.draftText,/Какова толщина/);
+  }
+});

@@ -22,7 +22,7 @@ export function reassessmentKey(scope,reason) {
 }
 
 export async function queueReassessment(stateDir,scope,reason) {
-  if (!(reason==='operator' || (reason==='sheet_applicability_v1' || reason==='sheet_applicability_v2') || reason==='replay_sheet_applicability_v1' || reason==='index_complete' || /^replay_saved_v[1-3]$/.test(reason) || /^requirements:[a-z0-9_.-]+(?:,[a-z0-9_.-]+)*$/.test(reason)) || !/^[a-zA-Z0-9_-]+$/.test(scope.receiptId) || !scope.preparationId) throw Error('invalid_reassessment_scope');
+  if (!(reason==='operator' || /^(?:replay_)?sheet_applicability_v[12]$/.test(reason) || reason==='index_complete' || /^replay_saved_v[1-3]$/.test(reason) || /^requirements:[a-z0-9_.-]+(?:,[a-z0-9_.-]+)*$/.test(reason)) || !/^[a-zA-Z0-9_-]+$/.test(scope.receiptId) || !scope.preparationId) throw Error('invalid_reassessment_scope');
   const key = reassessmentKey(scope,reason);
   const folder = join(stateDir,'addressed',scope.receiptId);
   await mkdir(folder,{recursive:true,mode:0o700});
@@ -159,7 +159,7 @@ export async function runReassessment(run,scope,reason) {
   const base=join(stateDir,'addressed',scope.receiptId,key);
   const ticket=await read(base+'.ticket');
   if (!ticket) return 'idle';
-  if (reason==='replay_sheet_applicability_v1') return replaySavedSheets(run,scope,key,base);
+  if (/^replay_sheet_applicability_v[12]$/.test(reason)) return replaySavedSheets(run,scope,key,base);
   if (/^replay_saved_v[1-3]$/.test(reason)) return replayAddressed(run,scope,key,base);
   const path=base+'.json';
   let saved=await read(path);

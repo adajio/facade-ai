@@ -22,6 +22,19 @@ function sameAddressedGap(older,newer) {
 }
 const substantive = new Set(['confirmed','conflicting','unanswered']);
 
+const literal = text => identity(text).replace(/\s+/gu,' ');
+function bySameLiteral(old,fresh) {
+  if (!fresh || fresh.scope?.kind!=='undetermined' || old.scope?.kind!=='applicable' ||
+      !['confirmed','insufficient'].includes(old.status) || old.letter.kind!=='omit') return false;
+  const earlier = [...old.sources,...factScopeSources(old)];
+  const newer = factScopeSources(fresh);
+  // A different division of one unchanged citation into designation fields does
+  // not supersede an established observation. A newly exposed clause can do so.
+  return newer.length>0 && newer.every(source=>exactSource(source) && earlier.some(prior=>
+    exactSource(prior) && sameFactSourcePlace(prior,source) && literal(prior.quote).includes(literal(source.quote))));
+}
+
+
 function preserveProperties(current, previous, inInventory, positiveOnly, scoped = false) {
   if (!current || !previous || current.applicability.kind === 'excluded') return current;
   const properties = [...current.properties], tensions = [...current.tensions];
@@ -35,7 +48,7 @@ function preserveProperties(current, previous, inInventory, positiveOnly, scoped
     ])].every(inInventory)) continue;
     const existing = properties.findIndex(property => sameProperty(property,old));
     const fresh = properties[existing];
-    if (scoped && fresh) {
+    if (scoped && fresh && !bySameLiteral(old,fresh)) {
       if (!sameFactScopeTarget(old,fresh)) continue;
       if (fresh.scope.kind !== 'applicable' && !canPreserveScopedProperty(old,fresh)) continue;
     }
@@ -86,6 +99,35 @@ function priorPositive(older) {
   };
 }
 
+const numericSubjects = [/толщин/iu,/ширин/iu,/высот/iu,/длин[аыуе]/iu,/диаметр/iu,/шаг[ауые]?(?![\p{L}\p{N}])/iu];
+function repeatsAnsweredDimension(old,fresh,previousProperties) {
+  if (old.letter.kind!=='ask' || fresh.letter.kind!=='ask' || old.key!==fresh.key
+      || !fresh.scope?.target.variant || fresh.scope.target.zone || !identity(fresh.label).startsWith(identity(old.label))) return false;
+  const identifiers = fresh.scope.target.variant.match(
+    /(?<![\p{L}\p{N}])(?:[\p{Lu}]{3,}(?:[-./][\p{Lu}\p{N}]+)*|[\p{L}]{1,8}[- ]?\d{1,8})(?![\p{L}\p{N}])/gu,
+  ) ?? [];
+  return numericSubjects.some(topic=>topic.test(fresh.letter.text) && !topic.test(old.letter.text)
+    && previousProperties.some(property=>property.status==='confirmed' && topic.test(property.label+' '+property.finding)
+      && property.sources.some(proof=>exactSource(proof) && /\d\s*(?:мм|см|м)(?![\p{L}\p{N}])/iu.test(proof.quote)
+        && old.sources.some(question=>sameFactSourcePlace(question,proof))
+        && (sourceDescribesFactScope(proof,{element:fresh.scope.target.variant}) ||
+          identifiers.length>0 && identifiers.every(id=>sourceDescribesFactScope(proof,{element:id}))))));
+}
+
+function carryContext(row,previous,inInventory) {
+  const properties = [...row.analysis.properties];
+  for (const old of previous.analysis?.properties ?? []) {
+    if (!old.scope || old.status!=='insufficient' || old.letter.kind!=='omit' ||
+        properties.some(property=>sameProperty(property,old)) || properties.length>=16) continue;
+    const sources = [...old.sources,...factScopeSources(old)];
+    if (!sources.length || !sources.every(inInventory)) continue;
+    const context = 'Контекст предыдущего разбора по тем же оригиналам. ';
+    const reason = old.scope.reason.startsWith(context) ? old.scope.reason : context+old.scope.reason.slice(0,360);
+    properties.push({...old,scope:{...old.scope,reason}});
+  }
+  return properties.length===row.analysis.properties.length ? row : {...row,analysis:{...row.analysis,properties}};
+}
+
 const carriedFinding = 'По тем же оригиналам сохранены адресные сведения предыдущего разбора. Основания приведены в сохранённом выводе.';
 
 function carryLegacy(row, previous, inInventory) {
@@ -112,7 +154,12 @@ function carryLegacy(row, previous, inInventory) {
       || !addressed.length || !addressed.every(source=>exactSource(source) && inInventory(source)) || contested(addressed)) continue;
     const existing = properties.findIndex(property=>sameProperty(property,old) || sameAddressedGap(property,old));
     const fresh = properties[existing];
-    if (fresh?.scope?.kind==='applicable') {
+    const addressedEarlier = fresh?.scope?.kind==='applicable' && repeatsAnsweredDimension(old,fresh,previousProperties);
+    if (addressedEarlier) {
+      properties[existing] = {...fresh,letter:{kind:'omit',
+        text:'В письме сохранён узкий вопрос по прежнему адресу. Привязку общего обозначения к этому адресу нужно сверить.'}};
+    }
+    if (fresh?.scope?.kind==='applicable' && !addressedEarlier) {
       if (old.letter.kind!=='ask' || addressed.some(source=>sourceDescribesFactScope(source,fresh.scope.target)
         || [...fresh.sources,...factScopeSources(fresh)].some(current=>sameFactSourcePlace(source,current)))) continue;
     }
@@ -161,15 +208,18 @@ function reconcileScopedRow(row, previous, inInventory, positiveOnly, requireFac
   const current = applyFactApplicability({...row,analysis:{...row.analysis,properties:candidates}},{requireFactScope});
   const analysis = preserveProperties(current.analysis,earlier,inInventory,positiveOnly,true);
   const carried = analysis.properties.filter(property => !current.analysis.properties.includes(property));
-  if (!carried.length) return carryLegacy(current,previous,inInventory);
+  if (!carried.length) return carryContext(carryLegacy(current,previous,inInventory),previous,inInventory);
   const sources = mergeSources(...carried.map(property => [
     ...property.sources,...factScopeSources(property),...(property.response?.sources ?? []),
   ])).slice(0,100);
   const finding = carried.map(property => property.finding).join('\n');
   const {retained,...base} = current;
-  const scoped = applyFactApplicability({...base,analysis,...(sources.length && {retained:{status:'partial',finding,sources}})},
+  const keptChecked = carried.some(property=>property.scope?.kind==='applicable' && property.sources.some(exactSource));
+  const previousAddressed = hasFinding(previous) && previous.sources.filter(addressedSource).every(inInventory);
+  const status = current.status==='unassessed' && keptChecked && previousAddressed ? previous.status : current.status;
+  const scoped = applyFactApplicability({...base,analysis,status,...(sources.length && {retained:{status:'partial',finding,sources}})},
     {requireFactScope});
-  return carryLegacy(scoped,previous,inInventory);
+  return carryContext(carryLegacy(scoped,previous,inInventory),previous,inInventory);
 }
 
 // The new result is based on a bounded selection. Keep material findings against the same
