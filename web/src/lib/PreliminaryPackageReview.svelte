@@ -1,0 +1,178 @@
+<script lang="ts">
+  import { originalUrl } from './copilot';
+  import { date } from './format';
+  import { describe, id, interrupted, type Api } from './http';
+  import { projectV1 } from './workspace';
+  import Notice from './Notice.svelte';
+
+  type Status = 'present' | 'partial' | 'not_found' | 'unassessed';
+  type Review = {
+    id: string; receiptId: string; catalogVersionId: string; model: string; createdAt: string; stage: string;
+    scopeNote: string; isCurrent: boolean; draftText: string;
+    rows: { key: string; title: string; status: Status; finding: string;
+      sources: { documentId: string; versionId: string; label: string; anchor: string }[] }[];
+  };
+  type ReadingProgress = { totalWindows: number; mappedVersions: number; acceptedVersions: number;
+    completed: number; covered: number; noMatch: number; refused: number; held: number; reading: number };
+  let { api, projectId, refreshKey, mode }: { api: Api; projectId: string; refreshKey: number; mode: 'review' | 'letter' } = $props();
+  let reviews = $state<Review[]>([]);
+  let selectedId = $state('');
+  let manuallySelected = $state(false);
+  let error = $state('');
+  let copied = $state('');
+  let progress = $state<ReadingProgress>();
+  let progressError = $state('');
+  let textArea = $state<HTMLTextAreaElement>();
+  const statusLabels: Record<Status, string> = {
+    present: 'Представлено', partial: 'Частично', not_found: 'Не найдено', unassessed: 'Не оценено',
+  };
+  let selected = $derived(reviews.find((item) => item.id === selectedId));
+  let counts = $derived(selected ? (Object.keys(statusLabels) as Status[]).map((status) => ({
+    status, count: selected!.rows.filter((row) => row.status === status).length,
+  })) : []);
+
+  $effect(() => {
+    const project = projectId;
+    void refreshKey;
+    const controller = new AbortController();
+    async function load() {
+      const items: Review[] = [];
+      let cursor: string | null = null;
+      do {
+        const path = projectV1(project) + '/preliminary-package-reviews' + (cursor ? '?after=' + encodeURIComponent(cursor) : '');
+        const page: { items: Review[]; nextCursor?: string | null } = await api.json(path, { signal: controller.signal });
+        items.push(...page.items);
+        if (page.nextCursor && page.nextCursor === cursor) throw new Error('Курсор истории не продвинулся');
+        cursor = page.nextCursor ?? null;
+      } while (cursor);
+      if (controller.signal.aborted) return;
+      reviews = items;
+      if (!manuallySelected || !items.some((item) => item.id === selectedId)) {
+        selectedId = (items.find((item) => item.isCurrent) ?? items[0])?.id ?? '';
+        manuallySelected = false;
+      }
+      error = '';
+    }
+    void load().catch((failure) => {
+      if (!controller.signal.aborted && !interrupted(failure)) {
+        reviews = [];
+        selectedId = '';
+        error = describe(failure);
+      }
+    });
+    return () => controller.abort();
+  });
+
+  $effect(() => {
+    const reviewId = mode === 'review' && selected?.isCurrent ? selected.id : undefined;
+    const project = projectId;
+    progress = undefined;
+    progressError = '';
+    if (!reviewId) return;
+    const controller = new AbortController();
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    async function loadProgress() {
+      let finished = false;
+      try {
+        const result = await api.json<ReadingProgress>(projectV1(project) + '/preliminary-package-reviews/' + id(reviewId!) + '/reading-progress', { signal: controller.signal });
+        if (controller.signal.aborted) return;
+        progress = result;
+        progressError = '';
+        finished = result.acceptedVersions > 0 && result.mappedVersions >= result.acceptedVersions &&
+          result.completed >= result.totalWindows && result.reading === 0 && result.held === 0;
+      } catch (failure) {
+        if (controller.signal.aborted || interrupted(failure)) return;
+        progressError = describe(failure);
+      }
+      if (!controller.signal.aborted && !finished) timer = setTimeout(loadProgress, 30_000);
+    }
+    void loadProgress();
+    return () => { controller.abort(); if (timer) clearTimeout(timer); };
+  });
+
+  function sourcePage(label: string, anchor: string) {
+    if (!/\.pdf$/iu.test(label)) return undefined;
+    const match = anchor.trim().match(/^(?:стр(?:аница)?\.?\s*)?([1-9]\d*)(?:\s*[-–—,].*)?$/iu);
+    return match ? Number(match[1]) : undefined;
+  }
+
+  async function copyDraft() {
+    if (!selected) return;
+    try {
+      await navigator.clipboard.writeText(selected.draftText);
+      copied = 'Текст скопирован.';
+    } catch {
+      textArea?.focus();
+      textArea?.select();
+      copied = 'Текст выделен. Скопируйте его обычной командой копирования.';
+    }
+  }
+</script>
+
+{#if error}
+  <section class="card"><h2>Предварительный разбор пакета</h2><Notice kind="error" message={'Не удалось загрузить предварительный разбор: ' + error} /></section>
+{:else if selected}
+  <section class="card preliminary-review" aria-label={mode === 'review' ? 'Предварительный разбор пакета' : 'Черновик письма по разбору Terra'}>
+    <h2>{mode === 'review' ? 'Предварительный разбор пакета' : 'Черновик письма по разбору Terra'}</h2>
+    <p class="notice">Выводы одного читателя. Ожидается проверка инженером.</p>
+    {#if reviews.length > 1}
+      <label>Поступление
+        <select bind:value={selectedId} onchange={() => { manuallySelected = true; copied = ''; }}>
+          {#each reviews as item, index (item.id)}
+            <option value={item.id} title={item.receiptId}>Разбор {index + 1} · {date(item.createdAt)} · {item.isCurrent ? 'актуальное' : 'историческое'}</option>
+          {/each}
+        </select>
+      </label>
+    {/if}
+    <p title={selected.receiptId}><strong>{selected.isCurrent ? 'Актуальный разбор' : 'Исторический разбор'}</strong> · {date(selected.createdAt)}</p>
+    <p class="meta" title={'Версия каталога: ' + selected.catalogVersionId}>{selected.stage} · модель {selected.model}</p>
+    {#if selected.scopeNote}<p>{selected.scopeNote}</p>{/if}
+    {#if mode === 'review' && selected.isCurrent}
+      {#if progressError}<p role="alert">Не удалось загрузить состояние постраничного чтения: {progressError}</p>{/if}
+      {#if progress && !progressError}
+        <p role="status" class="meta">Постраничное чтение Terra:
+          {#if progress.mappedVersions < progress.acceptedVersions || progress.acceptedVersions === 0}
+            строится карта файлов ({progress.mappedVersions} из {progress.acceptedVersions}).
+            {#if progress.totalWindows > 0} Завершено {progress.completed} из {progress.totalWindows} участков.{/if}
+          {:else if progress.totalWindows === 0}
+            в карте нет участков для чтения.
+          {:else}
+            завершено {progress.completed} из {progress.totalWindows} участков: с находками {progress.covered}, без совпадений {progress.noMatch}, с отказом {progress.refused}.
+          {/if}
+          {#if progress.held > 0} Ожидают разбора: {progress.held}.{/if}
+          Сейчас читается {progress.reading}.
+        </p>
+      {/if}
+    {/if}
+    {#if mode === 'review'}
+      <div class="actions" aria-label="Число позиций по состояниям">
+        {#each counts as item (item.status)}<span class="pill">{statusLabels[item.status]}: {item.count}</span>{/each}
+      </div>
+      <p class="meta">Всего позиций: {selected.rows.length}</p>
+      <div class="table-wrap"><table>
+        <thead><tr><th>Позиция</th><th>Состояние</th><th>Предварительный разбор и источники</th></tr></thead>
+        <tbody>
+          {#each selected.rows as row (row.key)}
+            <tr><td>{row.title}</td><td>{statusLabels[row.status]}</td><td>
+              <p>{row.finding}</p>
+              {#if row.sources.length}
+                <ul>{#each row.sources as source}
+                  <li><a href={originalUrl(source.documentId, source.versionId, sourcePage(source.label, source.anchor))} target="_blank" rel="noopener noreferrer">{source.label}</a> · {source.anchor}</li>
+                {/each}</ul>
+              {/if}
+            </td></tr>
+          {/each}
+        </tbody>
+      </table></div>
+    {:else}
+      <label>Текст предварительного черновика
+        <textarea bind:this={textArea} readonly rows="18" value={selected.draftText}></textarea>
+      </label>
+      <div class="actions"><button type="button" onclick={copyDraft}>Скопировать текст</button><span role="status">{copied}</span></div>
+    {/if}
+  </section>
+{/if}
+
+<style>
+  textarea { width: 100%; min-height: 18em; field-sizing: content; }
+</style>

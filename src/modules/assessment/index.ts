@@ -1,3 +1,5 @@
+import { readPreliminaryPackageReviews, readPreliminaryReadingProgress } from "./preliminary-package-review.js";
+export { publishPreliminaryPackageReview, type PreliminaryPackageReviewInput } from "./preliminary-package-review.js";
 import { randomUUID } from "node:crypto";
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import type { PoolClient } from "pg";
@@ -73,6 +75,28 @@ export async function register(app: FastifyInstance): Promise<void> {
 
 function registerRoutes(app: FastifyInstance, prefix: string) {
   const db = app.db;
+  app.get<{ Params: Project; Querystring: { after?: string } }>(`${prefix}/projects/:projectId/preliminary-package-reviews`, async (request) => {
+    const projectId = identifier(request.params.projectId);
+    const after = request.query.after === undefined ? undefined : identifier(request.query.after);
+    return transaction(db, async (tx) => {
+      const session = await readSession(tx, request);
+      await authorize(tx, session, { action: "project:read", projectId });
+      const result = await readPreliminaryPackageReviews(tx, projectId, after);
+      await touchSession(tx, session);
+      return result;
+    });
+  });
+  app.get<{ Params: Project & { id: string } }>(`${prefix}/projects/:projectId/preliminary-package-reviews/:id/reading-progress`, async (request) => {
+    const projectId = identifier(request.params.projectId);
+    const id = identifier(request.params.id);
+    return transaction(db, async (tx) => {
+      const session = await readSession(tx, request);
+      await authorize(tx, session, { action: "project:read", projectId });
+      const progress = await readPreliminaryReadingProgress(tx, projectId, id);
+      await touchSession(tx, session);
+      return progress;
+    });
+  });
   registerDocumentFacades(app, prefix, synchronizeFacadeAssessment);
   const facadePath = `${prefix}/projects/:projectId/facade-assessment`;
   registerFactReviews(app, prefix);

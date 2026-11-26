@@ -6,6 +6,7 @@
   import { sections, type Route, type Section } from '../lib/routes';
   import { isEngineer, projectApi, scopedUrl, type Citation, type EventPage, type Projection } from '../lib/workspace';
   import Notice from '../lib/Notice.svelte';
+  import PreliminaryPackageReview from '../lib/PreliminaryPackageReview.svelte';
   import EvidenceViewer from '../lib/EvidenceViewer.svelte';
   import DualEvidenceViewer from '../lib/DualEvidenceViewer.svelte';
   import NavRail from '../lib/NavRail.svelte';
@@ -42,6 +43,8 @@
   let pinnedSlice = $derived(route.params.get('slice') ?? undefined);
   let revision = $derived(route.params.get('revision') ?? undefined);
   let objectId = $derived(route.objectId);
+  let showPreliminary = $derived(project.intakeMode && !project.scopeId && !requestedScope &&
+    !masked && !revision && !objectId && !route.params.has('sent') && !route.params.has('response'));
   let evidenceId = $derived(route.params.get('evidence'));
   let observationId = $derived(route.params.get('observation') ?? undefined);
   let evidenceComponent = $derived(route.params.get('component'));
@@ -449,6 +452,9 @@
           {:else if section === 'receipts'}
             <Receipts {api} {context} {projection} {renew} open={openEvidence} />
           {:else if section === 'completeness'}
+            {#if showPreliminary}
+              {#key project.id}<PreliminaryPackageReview {api} projectId={project.id} {refreshKey} mode="review" />{/key}
+            {/if}
             {#if project.intakeMode && (!scopeId || route.params.has('context')) && !project.scopeId}
               <FacadeAssessment {api} {context} {renew} {triage} {chooseTriage}
                 refreshProject={() => refresh()} open={openEvidence} />
@@ -466,6 +472,9 @@
           {:else if section === 'copilot'}
             <Copilot {api} {context} {navigate} budget={copilotBudget} />
           {:else if section === 'letters'}
+            {#if showPreliminary}
+              {#key project.id}<PreliminaryPackageReview {api} projectId={project.id} {refreshKey} mode="letter" />{/key}
+            {/if}
             <Letters {api} {context} {renew} open={openEvidence} />
           {:else if section === 'settings' && !project.scopeId}
             <ProjectSettings {project} />

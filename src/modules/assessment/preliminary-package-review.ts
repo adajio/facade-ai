@@ -1,0 +1,136 @@
+import { createHash } from "node:crypto";
+import type { Pool, PoolClient } from "pg";
+import { transaction } from "../access/commands.js";
+import { publishProjectEvent } from "../supplements/events.js";
+import { inventoryOpen } from "../intake/receipts.js";
+import { lockIntakeProject } from "../intake/gate.js";
+import { canonicalJson } from "./domain.js";
+import { AssessmentError, invalidInput } from "./store.js";
+
+type Original = { versionId: string; originalSha256: string };
+type Status = "present" | "partial" | "not_found" | "unassessed";
+export type PreliminaryPackageReviewInput = {
+  projectId: string; receiptId: string; catalogVersionId: string; model: "gpt-6.1-terra";
+  inventory: Original[];
+  scopeNote: string;
+  rows: { key: string; status: Status; finding: string; sources: (Original & { anchor: string })[] }[];
+  draftText: string;
+};
+
+type InventoryRow = Original & { documentId: string; label: string };
+function text(value: unknown, max: number): value is string {
+  return typeof value === "string" && value.trim().length > 0 && value.length <= max;
+}
+
+/** Trusted producer only: validates the complete original-byte inventory before saving a model draft. */
+export async function publishPreliminaryPackageReview(db: Pool, input: PreliminaryPackageReviewInput) {
+  if (input.model !== "gpt-6.1-terra" || !text(input.scopeNote, 10000) || !text(input.draftText, 200000) ||
+      !Array.isArray(input.rows) || !Array.isArray(input.inventory)) invalidInput("Некорректный предварительный разбор.");
+  return transaction(db, async (tx) => {
+    await lockIntakeProject(tx, input.projectId);
+    const { rows: [project] } = await tx.query<{ catalog_version_id: string; project_stage: string; requirements: { key: string; part: string }[]; generation: string }>(
+      `SELECT p.catalog_version_id,p.project_stage,c.requirements,coalesce(g.generation,0) AS generation
+       FROM projects p JOIN catalog_versions c ON c.id=p.catalog_version_id AND c.organization_id=p.organization_id
+       LEFT JOIN intake_project_generations g ON g.project_id=p.id WHERE p.id=$1 FOR UPDATE OF p`, [input.projectId]);
+    if (!project || project.catalog_version_id !== input.catalogVersionId || !project.project_stage) invalidInput("Каталог или стадия проекта изменились.");
+    const receipt = await tx.query(`SELECT 1 FROM intake_receipts r WHERE r.project_id=$1 AND r.id=$2 AND NOT ${inventoryOpen} FOR SHARE OF r`, [input.projectId, input.receiptId]);
+    if (!receipt.rowCount) invalidInput("Поступление не запечатано или недоступно.");
+    const { rows: originals } = await tx.query<InventoryRow>(
+      `SELECT DISTINCT ON (v.id) v.id AS "versionId",v.document_id AS "documentId",o.sha256 AS "originalSha256",i.relative_path AS label
+       FROM intake_occurrences i JOIN intake_document_versions v ON v.id=i.version_id AND v.project_id=i.project_id
+       JOIN intake_originals o ON o.id=v.original_id AND o.project_id=v.project_id
+       WHERE i.project_id=$1 AND i.receipt_id=$2 AND i.state='accepted'
+       ORDER BY v.id,i.relative_path,i.id`, [input.projectId, input.receiptId]);
+    const supplied = [...input.inventory].sort((a,b) => a.versionId.localeCompare(b.versionId));
+    if (!originals.length || supplied.length !== originals.length || supplied.some((item,i) =>
+      item.versionId !== originals[i].versionId || item.originalSha256 !== originals[i].originalSha256)) invalidInput("Опись или хэши оригиналов не совпадают с поступлением.");
+    const requirements = project.requirements.filter((r) => r && text(r.key, 200) && text(r.part, 1000));
+    if (requirements.length !== project.requirements.length || new Set(requirements.map((r) => r.key)).size !== requirements.length ||
+      input.rows.length !== requirements.length || new Set(input.rows.map((r) => r.key)).size !== requirements.length) invalidInput("Состав позиций не совпадает с каталогом.");
+    const byKey = new Map(input.rows.map((row) => [row.key, row]));
+    const byVersion = new Map(originals.map((item) => [item.versionId, item]));
+    const rows = requirements.map((requirement) => {
+      const row = byKey.get(requirement.key);
+      if (!row || !["present", "partial", "not_found", "unassessed"].includes(row.status) || !text(row.finding, 20000) || !Array.isArray(row.sources) || row.sources.length > 100) invalidInput("Некорректная позиция разбора.");
+      if ((row.status === "present" || row.status === "partial") && row.sources.length === 0) invalidInput("Для найденной позиции требуется источник.");
+      const sources = row.sources.map((source) => {
+        const original = byVersion.get(source.versionId);
+        if (!original || original.originalSha256 !== source.originalSha256 || !text(source.anchor, 4000)) invalidInput("Источник не относится к исходным байтам поступления.");
+        return { documentId: original.documentId, versionId: original.versionId, label: original.label, anchor: source.anchor, originalSha256: original.originalSha256 };
+      });
+      return { key: requirement.key, title: requirement.part, status: row.status, finding: row.finding, sources };
+    });
+    const inventory = originals.map(({ versionId, originalSha256 }) => ({ versionId, originalSha256 }));
+    const payload = { projectId: input.projectId, receiptId: input.receiptId, catalogVersionId: input.catalogVersionId,
+      model: input.model, stage: project.project_stage, inventory, scopeNote: input.scopeNote, rows, draftText: input.draftText };
+    const hash = createHash("sha256").update(canonicalJson(payload)).digest("hex");
+    const { rows: [saved] } = await tx.query<{ id: string }>(
+      `INSERT INTO preliminary_package_reviews(project_id,receipt_id,catalog_version_id,model,stage,input_generation,inventory,scope_note,rows,draft_text,content_hash)
+       VALUES($1,$2,$3,$4,$5,$6,$7::jsonb,$8,$9::jsonb,$10,$11)
+       ON CONFLICT(project_id,content_hash) DO NOTHING RETURNING id`,
+      [input.projectId,input.receiptId,input.catalogVersionId,input.model,project.project_stage,project.generation,JSON.stringify(inventory),input.scopeNote,JSON.stringify(rows),input.draftText,hash]);
+    if (saved) {
+      await publishProjectEvent(tx, input.projectId, { type: "package-analysis.changed", payload: {} });
+      return { id: saved.id };
+    }
+    const existing = await tx.query<{ id: string }>("SELECT id FROM preliminary_package_reviews WHERE project_id=$1 AND content_hash=$2", [input.projectId, hash]);
+    return { id: existing.rows[0].id };
+  });
+}
+
+export async function readPreliminaryPackageReviews(tx: PoolClient, projectId: string, after?: string) {
+  const { rows } = await tx.query<{ id: string; receiptId: string; catalogVersionId: string; model: string; createdAt: Date; stage: string; scopeNote: string; rows: unknown; draftText: string; isCurrent: boolean }>(
+    `SELECT r.id,r.receipt_id AS "receiptId",r.catalog_version_id AS "catalogVersionId",r.model,r.created_at AS "createdAt",
+       r.stage,r.scope_note AS "scopeNote",r.rows,r.draft_text AS "draftText",
+       (r.catalog_version_id=p.catalog_version_id AND r.stage=p.project_stage AND r.input_generation=coalesce(g.generation,0)
+        AND NOT EXISTS (SELECT 1 FROM intake_receipts later JOIN intake_receipts origin ON origin.id=r.receipt_id
+          WHERE later.project_id=r.project_id AND later.number>origin.number)
+        AND NOT EXISTS (SELECT 1 FROM preliminary_package_reviews newer WHERE newer.project_id=r.project_id
+          AND newer.receipt_id=r.receipt_id AND newer.catalog_version_id=r.catalog_version_id
+          AND (newer.created_at,newer.id)>(r.created_at,r.id))) AS "isCurrent"
+     FROM preliminary_package_reviews r JOIN projects p ON p.id=r.project_id
+     LEFT JOIN intake_project_generations g ON g.project_id=p.id
+     WHERE r.project_id=$1 AND ($2::uuid IS NULL OR (r.created_at,r.id) <
+       (SELECT created_at,id FROM preliminary_package_reviews WHERE project_id=$1 AND id=$2))
+     ORDER BY r.created_at DESC,r.id DESC LIMIT 101`, [projectId, after ?? null]);
+  return { items: rows.slice(0,100), nextCursor: rows.length > 100 ? rows[99].id : null };
+}
+
+/** A read-only count of primary A reading for the report's own receipt and model. */
+export async function readPreliminaryReadingProgress(tx: PoolClient, projectId: string, id: string) {
+  const { rows: [progress] } = await tx.query<{
+    totalWindows: number; mappedVersions: number; acceptedVersions: number; completed: number;
+    covered: number; noMatch: number; refused: number; held: number; reading: number;
+  }>(`WITH target AS (
+       SELECT receipt_id,project_id,model FROM preliminary_package_reviews WHERE project_id=$1 AND id=$2
+     ), accepted AS (
+       SELECT DISTINCT o.version_id FROM target t JOIN intake_occurrences o
+         ON o.project_id=t.project_id AND o.receipt_id=t.receipt_id
+       WHERE o.state='accepted' AND o.version_id IS NOT NULL
+     ), maps AS (
+       SELECT m.version_id,m.fingerprint FROM accepted a JOIN harness_package_maps m ON m.version_id=a.version_id AND m.active
+       JOIN target t ON t.project_id=m.project_id
+     ), windows AS (
+       SELECT w.id FROM maps m JOIN harness_package_windows w ON w.version_id=m.version_id AND w.map_fingerprint=m.fingerprint
+       JOIN target t ON t.project_id=w.project_id
+     ), jobs AS (
+       SELECT w.id,j.state,j.result FROM windows w JOIN harness_package_branches b
+         ON b.window_id=w.id AND b.active AND b.branch='A'
+       JOIN target t ON b.settings->>'model'=t.model
+       JOIN gateway_jobs j ON j.id=b.job_id AND j.project_id=t.project_id AND j.purpose='primary_a'
+       JOIN gateway_generations g ON g.generation_id=j.generation_id AND g.current
+     )
+     SELECT (SELECT count(*)::int FROM windows) AS "totalWindows",
+       (SELECT count(DISTINCT version_id)::int FROM maps) AS "mappedVersions",
+       (SELECT count(*)::int FROM accepted) AS "acceptedVersions",
+       count(DISTINCT id) FILTER (WHERE state='done' AND result->>'kind' IN ('covered','reviewed_no_match','final_refusal'))::int AS completed,
+       count(DISTINCT id) FILTER (WHERE state='done' AND result->>'kind'='covered')::int AS covered,
+       count(DISTINCT id) FILTER (WHERE state='done' AND result->>'kind'='reviewed_no_match')::int AS "noMatch",
+       count(DISTINCT id) FILTER (WHERE state='done' AND result->>'kind'='final_refusal')::int AS refused,
+       count(DISTINCT id) FILTER (WHERE state='held')::int AS held,
+       count(DISTINCT id) FILTER (WHERE state='leased')::int AS reading
+     FROM jobs WHERE EXISTS (SELECT 1 FROM target)
+     HAVING EXISTS (SELECT 1 FROM target)`, [projectId,id]);
+  if (!progress) throw new AssessmentError(404, "preliminary_review_not_found", "Предварительный разбор недоступен.");
+  return progress;
+}
