@@ -542,6 +542,14 @@ test('ordinary intake publishes independent package evidence before questions an
   const beforePassive = calls.length;
   run();
   const first = await upload('first.pdf', pdf([primaryDrawing, register, notDelivered, common]));
+  // Mapping the first upload may finish while the operator is still adding files.
+  await until(() => app.db.query('SELECT 1 FROM harness_package_maps WHERE project_id=$1 AND version_id=$2 AND active',
+    [project.id,first.versionId]), result => result.rowCount > 0, 'unsealed file mapped');
+  assert.equal((await app.db.query("SELECT 1 FROM gateway_jobs WHERE project_id=$1 AND payload ? 'packageWindow'",
+    [project.id])).rowCount, 0);
+  assert.equal(calls.length,beforePassive);
+  await upload('second.pdf', pdf([opposingDrawing, opposingTitle]));
+  await command('POST', receiptUrl + '/seal', {});
   const passive = await until(analyze, ({ windows }) => windows.some(({ branches }) => branches.A.status === 'held'), 'passive hold');
   assert.equal(calls.length, beforePassive);
   assert.equal(passive.facts.length, 0);
@@ -602,8 +610,6 @@ test('ordinary intake publishes independent package evidence before questions an
   delete process.env.FACADE_HARNESS_REPLAY_ONLY;
   process.env.FACADE_HARNESS_PACKAGE_EFFECTS = 'enabled';
   run();
-  await upload('second.pdf', pdf([opposingDrawing, opposingTitle]));
-  await command('POST', receiptUrl + '/seal', {});
   const complete = await until(analyze, ({ coverage }) => coverage.completedWindows === 2 && coverage.subjectProof, 'completed package');
   assert.equal(complete.coverage.physicalProof.versionIds.length, 2);
   assert.equal(complete.coverage.subjectProof.facadeIds.length, 2);
