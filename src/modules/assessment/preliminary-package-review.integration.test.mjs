@@ -1,6 +1,9 @@
 import assert from 'node:assert/strict';
-import { randomUUID } from 'node:crypto';
-import { readdir, readFile } from 'node:fs/promises';
+import { createHash, randomUUID } from 'node:crypto';
+import { readdir, readFile, mkdtemp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { Readable } from 'node:stream';
 import { resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import test from 'node:test';
@@ -102,8 +105,11 @@ test('preliminary review publication and receipt-scoped reading progress', { ski
     const [zipVersion,docxVersion,xmlVersion,zipOcc,docxOcc,xmlOcc] = Array.from({length:6}, randomUUID);
     for (const id of [zipVersion,docxVersion,xmlVersion]) await db.query("INSERT INTO intake_document_versions(id,project_id,document_id,original_id,media_type) VALUES($1,$2,$3,$4,'application/octet-stream')", [id,project,document,original]);
     await db.query("INSERT INTO intake_occurrences(id,project_id,receipt_id,parent_occurrence_id,relative_path,declared_media_type,version_id,state) VALUES($1,$4,$5,NULL,'source.zip','application/zip',$6,'accepted'),($2,$4,$5,$1,'part.docx','application/zip',$7,'accepted'),($3,$4,$5,$2,'word/document.xml','application/xml',$8,'accepted')", [zipOcc,docxOcc,xmlOcc,project,receipt,zipVersion,docxVersion,xmlVersion]);
+    const markerVersion = randomUUID(), markerOccurrence = randomUUID();
+    await db.query("INSERT INTO intake_document_versions(id,project_id,document_id,original_id,media_type) VALUES($1,$2,$3,$4,'application/xml')", [markerVersion,project,document,original]);
+    await db.query("INSERT INTO intake_occurrences(id,project_id,receipt_id,parent_occurrence_id,relative_path,declared_media_type,version_id,state) VALUES($1,$2,$3,$4,'[Content_Types].xml','application/xml',$5,'accepted')", [markerOccurrence,project,receipt,docxOcc,markerVersion]);
     const nested = (await readTerraReading(db, project)).receipt;
-    assert.deepEqual([nested.rootFiles,nested.rootArchives,nested.directChildren,nested.deeperChildren], [1,1,1,1]);
+    assert.deepEqual([nested.rootFiles,nested.rootArchives,nested.directChildren,nested.deeperChildren,nested.officeParts], [1,1,1,2,2]);
     await db.query('DELETE FROM preliminary_package_reviews WHERE id=$1', [report.id]);
     delete process.env.FACADE_HARNESS_PROFILE;
     assert.equal((await readTerraReading(db, project)).enabled, true);
@@ -118,6 +124,33 @@ test('preliminary review publication and receipt-scoped reading progress', { ski
     await db.query(`INSERT INTO gateway_jobs(id,project_id,scope_id,generation_id,job_key,kind,purpose,subject_id,spec_hash,payload,priority,state)
       VALUES($1,$2,NULL,$3,'fixture-lead','fixture','review','fixture','fixture','{}',1,'held')`, [leadJob,project,generation]);
     assert.equal((await readTerraReading(db, project)).enabled, false);
+    // Real intake commands with an isolated in-memory object store and temporary staging.
+    const { declareOriginal, writePart, finalizeOriginal } = await import(pathToFileURL(resolve(
+      process.env.ASSESSMENT_BUILD_ROOT ?? 'dist', 'src/modules/intake/uploads.js')).href);
+    const { transaction } = await import(pathToFileURL(resolve(
+      process.env.ASSESSMENT_BUILD_ROOT ?? 'dist', 'src/modules/access/commands.js')).href);
+    const temp = await mkdtemp(join(tmpdir(), 'facade-word-intake-'));
+    const objects = new Map();
+    const storage = { stagingDir:temp, partSize:8*1024*1024, ttlSeconds:3600, diskGuardBytes:0, objects: {
+      async head(key) { const item=objects.get(key); return item && {size:item.bytes.length,sha256:item.sha256}; },
+      async put(key, identity, stream) { const chunks=[]; for await (const chunk of stream) chunks.push(chunk); objects.set(key,{bytes:Buffer.concat(chunks),sha256:identity.sha256}); },
+      async get(key) { return Readable.from([objects.get(key).bytes]); }, async remove(key) { objects.delete(key); }, close() {} } };
+    try {
+      const uploadReceipt = randomUUID();
+      await db.query("INSERT INTO intake_receipts(id,project_id,source,created_by) VALUES($1,$2,'upload',$3)",[uploadReceipt,project,user]);
+      for (const [name, file, expectedArchive] of [['real-word.doc','schedule.docx',false],['real-zip.doc','schedule.xlsx',true],['ole.doc','schedule.doc',false]]) {
+        const bytes = await readFile(new URL(`../formats/test/fixtures/${file}`, import.meta.url));
+        const digest = createHash('sha256').update(bytes).digest('hex');
+        const declaration = await transaction(db, tx => declareOriginal(tx, storage, {projectId:project,receiptId:uploadReceipt,relativePath:name,size:bytes.length,sha256:digest}));
+        const coords = {projectId:project,uploadId:declaration.uploadId};
+        await writePart(db,storage,{...coords,number:1,length:bytes.length,sha256:digest},Readable.from([bytes]));
+        const published = await finalizeOriginal(db,storage,coords);
+        const {rows:[result]} = await db.query('SELECT inventory_pending,EXISTS(SELECT 1 FROM import_jobs WHERE occurrence_id=$1) AS archive FROM intake_occurrences WHERE id=$1',[published.occurrenceId]);
+        assert.equal(result.inventory_pending,expectedArchive, name);
+        assert.equal(result.archive,expectedArchive, name);
+        if (name==='real-word.doc') assert.equal(published.mediaType,'application/vnd.openxmlformats-officedocument.wordprocessingml.document');
+      }
+    } finally { await rm(temp,{recursive:true,force:true}); }
   } finally {
     if (oldProfile === undefined) delete process.env.FACADE_HARNESS_PROFILE;
     else process.env.FACADE_HARNESS_PROFILE = oldProfile;

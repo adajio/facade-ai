@@ -35,6 +35,8 @@ export function safeRelativePath(value: string): string {
   return path;
 }
 
+export const confirmedWordPackageMime = "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
+
 export function archiveFormat(path: string, mediaType?: string | null): "zip" | "rar" | "7z" | null {
   // Office and OpenDocument files remain reader inputs despite their ZIP packaging.
   if (/\.(?:docx|docm|xlsx|xlsm|pptx|pptm|odt|ods|odp)$/i.test(path)) return null;

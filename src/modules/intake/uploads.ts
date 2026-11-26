@@ -5,6 +5,9 @@ import { setTimeout as delay } from "node:timers/promises";
 import type { Readable } from "node:stream";
 import type { Pool, PoolClient } from "pg";
 import { lockProjectScopes, transaction } from "../access/commands.js";
+import { parseWordPackage } from "../formats/office.js";
+import { inputLimit } from "../formats/model.js";
+import { confirmedWordPackageMime } from "../imports/policy.js";
 import { queueArchive } from "../imports/archive-queue.js";
 import { importScratchUnwrittenBytes } from "../imports/reserve.js";
 import {
@@ -323,6 +326,23 @@ async function detectMediaType(storage: IntakeStorage, uploadId: string, part?: 
   return "application/octet-stream";
 }
 
+/** Distinguish a Word OPC package from an actual ZIP with a misleading .doc name. */
+export async function classifyDocZip(path: string, mediaType: string, size: number, bytes: () => Readable): Promise<string> {
+  if (mediaType !== "application/zip" || !/\.doc$/i.test(path)) return mediaType;
+  if (size > inputLimit) return mediaType;
+  const chunks: Buffer[] = [];
+  for await (const chunk of bytes()) chunks.push(Buffer.from(chunk));
+  const input = Buffer.concat(chunks);
+  if (input.length !== size) throw new Error("Word package input length changed");
+  try {
+    await parseWordPackage(input, true);
+    return confirmedWordPackageMime;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).syscall) throw error;
+    return mediaType;
+  }
+}
+
 function objectKey(upload: UploadRow): string {
   return `originals/${upload.project_id}/${upload.id}`;
 }
@@ -395,7 +415,10 @@ export async function prepareOriginal(
       }
       await verifyOriginal(await storage.objects.get(key), identity);
     }
-    const mediaType = await detectMediaType(storage, upload.id, parts[0]);
+    const detected = await detectMediaType(storage, upload.id, parts[0]);
+    const { rows: [occurrence] } = await tx.query<{ relative_path: string }>(
+      "SELECT relative_path FROM intake_occurrences WHERE id=$1 AND project_id=$2", [upload.occurrence_id, upload.project_id]);
+    const mediaType = await classifyDocZip(occurrence.relative_path, detected, size, () => partsStream(storage, upload.id, parts));
     await tx.query(
       "UPDATE intake_uploads SET prepared_object_key = $2, prepared_media_type = $3 WHERE id = $1",
       [upload.id, key, mediaType],
@@ -482,9 +505,7 @@ export async function publishPreparedOriginal(tx: PoolClient, input: UploadConte
       WHERE id = $1 RETURNING relative_path`,
     [upload.occurrence_id, versionId],
   );
-  // Office documents also have a ZIP header; their container is handled by the Office reader.
-  const officePackage = prepared.mediaType === "application/zip" && /\.(docx|xlsx|pptx)$/i.test(occurrence.relative_path);
-  const inventoryPending = !officePackage && await queueArchive(tx, {
+  const inventoryPending = await queueArchive(tx, {
     projectId: upload.project_id, receiptId: upload.receipt_id, occurrenceId: upload.occurrence_id,
     versionId, relativePath: occurrence.relative_path, mediaType: prepared.mediaType,
   });

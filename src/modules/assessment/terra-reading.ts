@@ -26,21 +26,34 @@ export async function readTerraReading(tx: PoolClient, projectId: string) {
     FROM projects p WHERE p.id=$1`, [projectId, explicitProfile, model, route]);
   if (!mode?.enabled) return { enabled: false, receipt: null, report: null, progress: null, activity: [] };
   const { rows: [receipt] } = await tx.query<{ receiptId: string; receiptNumber: number; inventoryOpen: boolean;
-    acceptedVersions: number; rootFiles: number; rootArchives: number; directChildren: number; deeperChildren: number }>(
+    acceptedVersions: number; rootFiles: number; rootArchives: number; directChildren: number; deeperChildren: number; officeParts: number }>(
     `WITH latest AS (SELECT r.*, ${inventoryOpen} AS inventory_open FROM intake_receipts r
        WHERE r.project_id=$1 ORDER BY r.number DESC LIMIT 1), occurrences AS (
        SELECT o.*, parent.parent_occurrence_id AS grandparent,
-         CASE WHEN o.relative_path ~* '\\.(docx|docm|xlsx|xlsm|pptx|pptm|odt|ods|odp)$' THEN false
-           ELSE lower(btrim(split_part(o.declared_media_type,';',1))) IN ('application/zip','application/x-zip-compressed','application/vnd.rar','application/x-rar-compressed','application/x-7z-compressed')
+         CASE WHEN o.relative_path ~* '\\.doc$' AND EXISTS (SELECT 1 FROM reader_maps rm
+             WHERE rm.project_id=o.project_id AND rm.version_id=o.version_id AND rm.format='doc'
+               AND rm.reader_version LIKE 'formats-1.1.4:doc:%'
+               AND EXISTS (SELECT 1 FROM jsonb_array_elements(rm.units) unit
+                 WHERE unit#>>'{locator,coverage}' IN ('addressable','partial'))) THEN false
+           WHEN o.relative_path ~* '\\.(docx|docm|xlsx|xlsm|pptx|pptm|odt|ods|odp)$' THEN false
+           ELSE lower(btrim(split_part(coalesce(u.prepared_media_type,v.media_type,o.declared_media_type),';',1))) IN ('application/zip','application/x-zip-compressed','application/vnd.rar','application/x-rar-compressed','application/x-7z-compressed')
              OR o.relative_path ~* '\\.(zip|rar|7z)$' END AS archive
        FROM latest r JOIN intake_occurrences o ON o.receipt_id=r.id AND o.project_id=r.project_id AND o.state='accepted'
        LEFT JOIN intake_occurrences parent ON parent.id=o.parent_occurrence_id AND parent.receipt_id=o.receipt_id
+       LEFT JOIN intake_uploads u ON u.occurrence_id=o.id
+       LEFT JOIN intake_document_versions v ON v.id=o.version_id AND v.project_id=o.project_id
+     ), office_parents AS (
+       SELECT parent.id FROM occurrences parent JOIN occurrences child ON child.parent_occurrence_id=parent.id
+       WHERE parent.relative_path ~* '\\.(doc|docx|docm)$'
+       GROUP BY parent.id HAVING bool_or(child.relative_path ~* '(^|/)\\[Content_Types\\]\\.xml$')
+         AND bool_or(child.relative_path ~* '(^|/)word/document\\.xml$')
      ) SELECT r.id AS "receiptId",r.number::float8 AS "receiptNumber",r.inventory_open AS "inventoryOpen",
        count(DISTINCT o.version_id)::int AS "acceptedVersions",
        count(*) FILTER (WHERE o.id IS NOT NULL AND o.parent_occurrence_id IS NULL AND NOT o.archive)::int AS "rootFiles",
        count(*) FILTER (WHERE o.id IS NOT NULL AND o.parent_occurrence_id IS NULL AND o.archive)::int AS "rootArchives",
        count(*) FILTER (WHERE o.parent_occurrence_id IS NOT NULL AND o.grandparent IS NULL)::int AS "directChildren",
-       count(*) FILTER (WHERE o.grandparent IS NOT NULL)::int AS "deeperChildren"
+       count(*) FILTER (WHERE o.grandparent IS NOT NULL)::int AS "deeperChildren",
+       count(*) FILTER (WHERE o.parent_occurrence_id IN (SELECT id FROM office_parents))::int AS "officeParts"
      FROM latest r LEFT JOIN occurrences o ON true GROUP BY r.id,r.number,r.inventory_open`, [projectId]);
   if (!receipt) return { enabled: true, receipt: null, report: null, progress: null, activity: [] };
   const { rows: [report] } = await tx.query<{ id: string; createdAt: Date; summary: unknown; draftAvailable: boolean }>(

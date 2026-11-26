@@ -11,7 +11,7 @@ import { buildDwgIndex, dwgReaderProfile, openDwgIndex } from "./dwg-index.js";
 import type { DwgIndex } from "./dwg-index.js";
 import { FormatHold, originalOnly, parseText, readInput, readerVersion } from "./model.js";
 import type { Locator, Parsed, Row, Unit } from "./model.js";
-import { cellAddress, parseDocx, parseXlsx } from "./office.js";
+import { cellAddress, parseDocx, parseWordPackage, parseXlsx } from "./office.js";
 import { stampPhysicalInventory } from "./physical-inventory.js";
 import { parseDxf, parseIfc } from "./spatial.js";
 
@@ -149,7 +149,7 @@ function converted(derived: Parsed, converter: Converter, hash: string, kind: st
 function adapter(format: Format): ReaderAdapter {
   const legacy = isLegacy(format) ? format : undefined;
   const profile = native.has(format) || format === "image" ? "formats-1.1.3"
-    : format === "dwg" ? dwgReaderProfile : format === "doc" ? "formats-1.1.1" : readerVersion;
+    : format === "dwg" ? dwgReaderProfile : format === "doc" ? "formats-1.1.4" : readerVersion;
   const fonts = format === "dwg" ? dwgFontAssets() : undefined;
   let configured: ReturnType<typeof converterFor> | undefined;
   const resolve = () => legacy ? configured ??= converterFor(legacy).catch((error) => {
@@ -169,9 +169,15 @@ function adapter(format: Format): ReaderAdapter {
     if (format === "unknown") return originalOnly("format_original_only", "original_only");
     const converter = await resolve();
     try {
-      if (legacy && !converter) throw new FormatHold(`${legacy}_converter_unavailable`);
       if (converter?.format === "dwg") throw new Error("DWG must use its part index");
+      if (legacy && legacy !== "doc" && !converter) throw new FormatHold(`${legacy}_converter_unavailable`);
       const input = await readInput(path);
+      if (format === "doc" && input.subarray(0,2).toString("hex") === "504b") {
+        const parsed = await parseWordPackage(input, checkInventory);
+        return { ...parsed, ...(parsed.inventory && !("limitation" in parsed.inventory)
+          ? { originalSha256: createHash("sha256").update(input).digest("hex") } : {}) };
+      }
+      if (legacy && !converter) throw new FormatHold(`${legacy}_converter_unavailable`);
       if (!converter) {
         const parsed = await native.get(format)!(input, checkInventory);
         return {

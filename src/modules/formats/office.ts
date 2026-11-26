@@ -14,6 +14,26 @@ function wordText(node: Element): string {
   return result;
 }
 
+/** Validate the OPC envelope before treating a ZIP named .doc as native Word. */
+export async function parseWordPackage(input: Buffer, checkInventory = false): Promise<Parsed> {
+  const files = await unpackXml(input, (name) => name === '[Content_Types].xml' || name === '_rels/.rels' || name === 'word/document.xml', new Set());
+  const types = files.get('[Content_Types].xml');
+  const rootRelations = files.get('_rels/.rels');
+  const document = files.get('word/document.xml');
+  const main = children(types, 'Override').some((item) => attr(item, 'PartName') === '/word/document.xml' &&
+    ['application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml',
+      'application/vnd.ms-word.document.macroEnabled.main+xml'].includes(attr(item, 'ContentType') ?? ''));
+  const target = [...relationships(rootRelations, '').values()].some((item) => !item.external &&
+    item.type.endsWith('/officeDocument') && item.path === 'word/document.xml');
+  if (types?.name !== 'Types' || types.namespace !== 'http://schemas.openxmlformats.org/package/2006/content-types' ||
+      rootRelations?.name !== 'Relationships' || rootRelations.namespace !== 'http://schemas.openxmlformats.org/package/2006/relationships' ||
+      !main || !target || document?.name !== 'document' ||
+      !['http://schemas.openxmlformats.org/wordprocessingml/2006/main','http://purl.oclc.org/ooxml/wordprocessingml/main'].includes(document.namespace)) {
+    throw new FormatHold('docx_package_invalid');
+  }
+  return parseDocx(input, checkInventory);
+}
+
 export async function parseDocx(input: Buffer, checkInventory = false): Promise<Parsed> {
   const paths = new Set<string>();
   const files = await unpackXml(input, (name) =>
