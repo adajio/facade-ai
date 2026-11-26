@@ -163,3 +163,18 @@ test('narrow review keeps distinct unanswered properties and uses the newer word
   const result=mergeSelection({inventory:[src],rows:[row]},[previous]);
   assert.deepEqual(result.rows[0].analysis.properties.map(p=>p.key),['next','edge']);
 });
+
+test('sheet reassessment carries an exact previous question and skips changed source bytes',async()=>{
+  const {selectReassessment}=await import('../infra/local-terra/reassessment.mjs');
+  const raw={projectId:'p',receiptId:'r',catalogVersionId:'c',stage:'one',preparationId:'m',
+    inventory:[{versionId:'v',originalSha256:'original'}],lines:[]};
+  const source={versionId:'v',originalSha256:'original',anchor:JSON.stringify({unitId:'page-1'}),quote:'Обозначение М1'};
+  const property={key:'code',label:'Обозначение',status:'insufficient',letter:{kind:'ask',text:'Уточните вариант.'},
+    sources:[source,{...source,quote:'Чужая редакция',originalSha256:'changed'}]};
+  const report={...raw,rows:[{key:'catalog',analysis:{properties:[property]}}]};
+  const selection=selectReassessment(raw,report,{reason:'sheet_applicability_v2'});
+  assert.deepEqual(selection.priorLineIds,['L1']);
+  assert.deepEqual(selection.lines.map(line=>line.text),[source.quote]);
+  assert.deepEqual(selection.priorProperties[0].at(-1),['L1']);
+  assert.equal(selectReassessment(raw,{...report,receiptId:'other'},{reason:'sheet_applicability_v2'}),raw);
+});

@@ -5,11 +5,12 @@ const contextId = '20000000-0000-4000-8000-000000000002';
 const receiptId = '20000000-0000-4000-8000-000000000003';
 const documentId = '20000000-0000-4000-8000-000000000004';
 const versionId = '20000000-0000-4000-8000-000000000005';
+const pngSha = '9'.repeat(64);
 const statuses = ['present', 'partial', 'not_found', 'unassessed'] as const;
 const labels = ['Представлено', 'Частично', 'Не найдено', 'Не оценено'];
 const base = `/projects/${projectId}/completeness`;
 
-async function fixture(page: Page, editable: boolean, comparable = false, structured = false) {
+async function fixture(page: Page, editable: boolean, comparable = false, structured = false, sheetPreviews = false) {
   const project = { id: projectId, name: 'Синтетический комплект', version: 1, intakeMode: true, scopes: [],
     stage: 'Стадия 1', actions: editable ? ['project:read', 'project:engineer'] : ['project:read'] };
   const questions = Array.from({ length: 16 }, (_, index) => ({
@@ -32,11 +33,23 @@ async function fixture(page: Page, editable: boolean, comparable = false, struct
       questions: questions.map((question, index) => index || historical || !decision ? question : { ...question, version: 2, decision }),
     }],
   });
+  const previewSource = (title: string, state: string, observation: string, sha256 = pngSha) => ({
+    documentId, versionId, label: 'Синтетический.pdf',
+    anchor: JSON.stringify({address:{unitId:'4',locator:{page:4}},sheetPreview:{sha256,state,title,observation}}),
+  });
+  const previewSources = sheetPreviews ? [
+    previewSource('Легенда', 'observed', 'В легенде видна штриховка облицовки.'),
+    previewSource('Фасад', 'inconclusive', 'Подпись у оси требует сверки.'),
+    previewSource('Узел', 'unreadable', ''),
+    previewSource('Посторонний путь', 'observed', 'Посторонняя ссылка', '../../external.png'),
+    previewSource('Контроль CRLF', 'observed', 'Посторонняя ссылка', pngSha+'\n'),
+    {...previewSource('Подменённая редакция', 'observed', 'Посторонняя ссылка'),versionId:versionId+'/../'},
+  ] : [];
   const review = { id: 'review', receiptId, catalogVersionId: 'catalog', model: 'synthetic-terra',
     createdAt: '2026-11-26T00:00:00Z', stage: 'Стадия 1', scopeNote: '', isCurrent: true, draftText: 'Синтетический черновик',
     rows: questions.map((question, index) => ({ key: question.requirement.positionId, title: question.requirement.part,
       status: statuses[index % statuses.length], finding: `Синтетический вывод ${index + 1}`,
-      sources: index ? [] : [{ documentId, versionId, label: 'Синтетический.pdf', anchor: 'Стр. 3–4' }],
+      sources: index ? [] : [{ documentId, versionId, label: 'Синтетический.pdf', anchor: 'Стр. 3–4' }, ...previewSources],
     })),
   };
   const baseline = { ...review, rows: review.rows.map((row, index) => index ? row : { ...row, status: 'partial' }),
@@ -312,4 +325,30 @@ test('Свойства различают получение ответа, по�
   await expect(basis.getByRole('link',{name:'Синтетический.pdf'})).toHaveAttribute('href',
     `/api/documents/${documentId}/versions/${versionId}/content#page=5`);
   await expect(letter.getByLabel('Текст предварительного черновика')).not.toHaveValue(/КЖ|Толщина покрытия/);
+});
+
+
+test('Адресное основание открывает сохранённый PNG и показывает исход графической проверки',async ({page})=>{
+  await fixture(page,false,false,false,true);
+  const path = `/api/v1/documents/${documentId}/versions/${versionId}/sheet-previews/${pngSha}`;
+  const image = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+rIVsAAAAASUVORK5CYII=', 'base64');
+  await page.context().route(`**${path}`,route=>route.fulfill({status:200,contentType:'image/png',body:image}));
+  await page.goto(base);
+  const table = page.getByRole('region',{name:'Комплектность по требованиям'});
+  await table.getByRole('link',{name:'Посмотреть основания · Требование 1',exact:true}).click();
+  const sources = table.getByRole('list',{name:'Основания вывода'});
+  const link = sources.getByRole('link',{name:'Открыть фрагмент листа · Легенда',exact:true});
+  await expect(link).toHaveAttribute('href',path);
+  await expect(link).toHaveAttribute('rel','noopener noreferrer');
+  await expect(sources).toContainText('Наблюдение на фрагменте');
+  await expect(sources).toContainText('В легенде видна штриховка облицовки.');
+  await expect(sources).toContainText('Требуется уточнение');
+  await expect(sources).toContainText('Недостаточная читаемость');
+  await expect(sources.getByRole('link',{name:/^Открыть фрагмент листа/})).toHaveCount(3);
+  await expect(sources.getByRole('link',{name:'Синтетический.pdf',exact:true}).first()).toHaveAttribute('href',
+    `/api/documents/${documentId}/versions/${versionId}/content#page=3`);
+  const [popup] = await Promise.all([page.waitForEvent('popup'),link.click()]);
+  await popup.waitForURL(`**${path}`);
+  await expect(popup.locator('img')).toBeVisible();
+  await popup.close();
 });

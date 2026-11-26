@@ -5,6 +5,7 @@ import { dirname, join } from 'node:path';
 import { atomicWrite, claim, makeRequest, preparePromptSnapshot, parseModelResponse, readSnapshot } from './producer.mjs';
 import { reconcilePreliminaryReview } from './review-continuity.mjs';
 import { validatedPartial } from './partial-result.mjs';
+import { replaySavedSheets } from './replay-sheets.mjs';
 import { replayAddressed } from './replay-addressed.mjs';
 import { renderQuestions } from './review-analysis.mjs';
 import { loadReport } from './revise.mjs';
@@ -21,7 +22,7 @@ export function reassessmentKey(scope,reason) {
 }
 
 export async function queueReassessment(stateDir,scope,reason) {
-  if (!(reason==='operator' || reason==='index_complete' || /^replay_saved_v[1-3]$/.test(reason) || /^requirements:[a-z0-9_.-]+(?:,[a-z0-9_.-]+)*$/.test(reason)) || !/^[a-zA-Z0-9_-]+$/.test(scope.receiptId) || !scope.preparationId) throw Error('invalid_reassessment_scope');
+  if (!(reason==='operator' || (reason==='sheet_applicability_v1' || reason==='sheet_applicability_v2') || reason==='replay_sheet_applicability_v1' || reason==='index_complete' || /^replay_saved_v[1-3]$/.test(reason) || /^requirements:[a-z0-9_.-]+(?:,[a-z0-9_.-]+)*$/.test(reason)) || !/^[a-zA-Z0-9_-]+$/.test(scope.receiptId) || !scope.preparationId) throw Error('invalid_reassessment_scope');
   const key = reassessmentKey(scope,reason);
   const folder = join(stateDir,'addressed',scope.receiptId);
   await mkdir(folder,{recursive:true,mode:0o700});
@@ -68,8 +69,43 @@ export async function queuedReasons(stateDir,scope) {
   return reasons;
 }
 
+// A bounded review must be able to revisit what the engineer already sees. Reuse
+// exact, previously accepted quotations only for the same version and preparation.
+export function withPreviousEvidence(raw,report) {
+  if (raw.preparationId!==report.preparationId || raw.projectId!==report.projectId ||
+      raw.receiptId!==report.receiptId || raw.catalogVersionId!==report.catalogVersionId || raw.stage!==report.stage) return raw;
+  const hashes=new Map(raw.inventory.map(item=>[item.versionId,item.originalSha256]));
+  const lines=[...raw.lines], priorProperties=[], priorLineIds=[];
+  const byAddress=new Map();
+  const addressKey=line=>JSON.stringify([line.versionId,line.anchor]);
+  for (const line of lines) byAddress.set(addressKey(line),line);
+  let sequence=lines.reduce((maximum,line)=>Math.max(maximum,Number(/^L(\d+)$/u.exec(line.id)?.[1]) || 0),0);
+  const groups=report.rows.map(row=> (row.analysis?.properties ?? []).filter(prop=>prop.letter.kind==='ask' || prop.status==='confirmed')
+    .map(prop=>({row,prop})).sort((a,b)=>Number(b.prop.letter.kind==='ask')-Number(a.prop.letter.kind==='ask')));
+  for (let rank=0;rank<16 && priorProperties.length<40;rank++) for (const group of groups) {
+    const record=group[rank];
+    if (!record || priorProperties.length>=40) continue;
+    const {row,prop}=record, ids=[];
+    for (const src of prop.sources.slice(0,3)) {
+      if (src.limitation || !src.quote || src.quote.length>4000 || hashes.get(src.versionId)!==src.originalSha256) continue;
+      try { if (!JSON.parse(src.anchor)?.unitId) continue; } catch { continue; }
+      const key=addressKey(src);
+      let line=byAddress.get(key);
+      if (!line?.text.includes(src.quote)) {
+        line={id:'L'+(++sequence),versionId:src.versionId,originalSha256:src.originalSha256,anchor:src.anchor,text:src.quote};
+        byAddress.set(key,line); lines.push(line);
+      }
+      ids.push(line.id);
+      if (!priorLineIds.includes(line.id)) priorLineIds.push(line.id);
+    }
+    priorProperties.push([row.key,prop.key,prop.label,prop.status,prop.letter.kind,prop.letter.text,ids]);
+  }
+  return {...raw,lines,priorLineIds,priorProperties};
+}
+
 export function selectReassessment(raw,report,ticket) {
   if (ticket.reason==='operator') return raw;
+  if (['sheet_applicability_v1','sheet_applicability_v2'].includes(ticket.reason)) return withPreviousEvidence(raw,report);
   const active=new Set(report.rows.map(row=>row.key));
   let selected;
   const uncovered=new Set();
@@ -123,6 +159,7 @@ export async function runReassessment(run,scope,reason) {
   const base=join(stateDir,'addressed',scope.receiptId,key);
   const ticket=await read(base+'.ticket');
   if (!ticket) return 'idle';
+  if (reason==='replay_sheet_applicability_v1') return replaySavedSheets(run,scope,key,base);
   if (/^replay_saved_v[1-3]$/.test(reason)) return replayAddressed(run,scope,key,base);
   const path=base+'.json';
   let saved=await read(path);
@@ -152,7 +189,7 @@ export async function runReassessment(run,scope,reason) {
       await notify('published',scope,{reviewId:publication.id,selectedFacts:0});
       return 'published';
     }
-    const snapshot=preparePromptSnapshot({...selected,reviewContract:2});
+    const snapshot=preparePromptSnapshot({...(run.withSkills ? await run.withSkills(selected) : selected),reviewContract:2});
     const request=makeRequest(snapshot);
     snapshot.requestSha256=digest(request);
     const startedAt=Date.now();

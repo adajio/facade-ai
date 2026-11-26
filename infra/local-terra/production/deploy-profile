@@ -1,0 +1,20 @@
+require_terra_deployment() {
+  local host=${FACADE_TERRA_DEPLOY_HOST:-}
+  local hostname=${FACADE_TERRA_DEPLOY_HOSTNAME:-}
+  local app_dir=${FACADE_TERRA_DEPLOY_APP_DIR:-}
+  if [[ ! $host =~ ^[A-Za-z0-9][A-Za-z0-9.-]*$ ||
+        ! $hostname =~ ^[A-Za-z0-9][A-Za-z0-9-]*$ ||
+        ! $app_dir =~ ^(/[A-Za-z0-9_-][A-Za-z0-9_.-]*)+$ ]]; then
+    echo 'Set FACADE_TERRA_DEPLOY_HOST, FACADE_TERRA_DEPLOY_HOSTNAME and FACADE_TERRA_DEPLOY_APP_DIR from the private installation profile.' >&2
+    return 2
+  fi
+}
+
+require_terra_ssh_identity() {
+  local user=${FACADE_TERRA_DEPLOY_USER:-}
+  local key=${FACADE_TERRA_DEPLOY_KEY:-}
+  if [[ ! $user =~ ^[A-Za-z_][A-Za-z0-9_-]*$ || $key != /* || ! -f $key || ! -r $key ]]; then
+    echo 'Set FACADE_TERRA_DEPLOY_USER and FACADE_TERRA_DEPLOY_KEY from the private installation profile.' >&2
+    return 2
+  fi
+}

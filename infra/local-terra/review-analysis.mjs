@@ -1,3 +1,8 @@
+import {
+  applyAnalysisFactApplicability, factScopeFields, factScopeKinds, factScopeLabelLimit,
+  factScopeReasonLimit, factScopeSources, missingFactScope,
+} from './fact-applicability.mjs';
+
 export const applicabilityKinds = ['included', 'excluded', 'undetermined'];
 export const propertyStatuses = ['confirmed', 'unanswered', 'not_mentioned', 'insufficient', 'conflicting'];
 export const responseStates = ['received', 'not_received'];
@@ -12,13 +17,17 @@ export const record = (properties, optional = []) => ({type:'object',properties,
 const keySchema = {type:'string',pattern:'^[a-z][a-z0-9_-]{0,49}$'};
 export const citationSchema = arraySchema(record({id:textSchema(80),quote:textSchema(4000)}), 12);
 
-export function analysisFields(references) {
+export function analysisFields(references, {requireFactScope = false} = {}) {
+  const scopeSide = record(Object.fromEntries(factScopeFields.map(field => [field,textSchema(factScopeLabelLimit)])),
+    factScopeFields.slice(1));
+  const scope = record({kind:enumSchema(factScopeKinds),target:scopeSide,observed:scopeSide,
+    reason:textSchema(factScopeReasonLimit),...references},['observed']);
   const applicability = record({kind:enumSchema(applicabilityKinds),reason:textSchema(420),...references});
   const properties = arraySchema(record({
     key:keySchema,label:textSchema(120),status:enumSchema(propertyStatuses),finding:textSchema(550),
-    ...references,response:{anyOf:[record({state:enumSchema(responseStates),finding:textSchema(350),...references}),{type:'null'}]},
+    scope,...references,response:{anyOf:[record({state:enumSchema(responseStates),finding:textSchema(350),...references}),{type:'null'}]},
     letter:record({kind:enumSchema(['ask','omit']),text:textSchema(350)}),
-  },['response']), 16);
+  },requireFactScope ? ['response'] : ['response','scope']), 16);
   const tensions = arraySchema(record({
     key:keySchema,propertyKey:keySchema,status:enumSchema(tensionStatuses),finding:textSchema(550),
     sides:arraySchema(record({text:textSchema(350),...references}),4,2),
@@ -75,24 +84,43 @@ export function checkAnalysis(analysis, check) {
   return analysis;
 }
 
-export function readAnalysis(raw, resolve, check) {
+export function readAnalysis(raw, resolve, check, options) {
   check(raw?.applicability && list(raw.properties,16) && list(raw.tensions,12), 'invalid_review_analysis');
   const {kind,reason,citations} = raw.applicability;
-  return checkAnalysis({
+  const analysis = {
     applicability:{kind,reason,sources:resolve(citations)},
-    properties:raw.properties.map(property => readProperty(property, resolve, check)),
+    properties:raw.properties.map(property => readProperty(property, resolve, check, options)),
     tensions:raw.tensions.map(tension => readTension(tension, resolve, check)),
-  },check);
+  };
+  return checkAnalysis(applyAnalysisFactApplicability(analysis),check);
 }
 
-export function readProperty(property, resolve, check) {
+function readScopeSide(value, check) {
+  check(value && typeof value === 'object' && validText(value.element,factScopeLabelLimit)
+    && Object.keys(value).every(field => factScopeFields.includes(field) && validText(value[field],factScopeLabelLimit)),
+  'invalid_fact_scope_side');
+  return Object.fromEntries(factScopeFields.filter(field => value[field] !== undefined).map(field => [field,value[field].trim()]));
+}
+
+function readScope(raw, resolve, check) {
+  const {kind,target,observed,reason} = raw;
+  check(factScopeKinds.includes(kind) && validText(reason,factScopeReasonLimit), 'invalid_fact_scope');
+  return {kind,target:readScopeSide(target,check),...(observed && {observed:readScopeSide(observed,check)}),
+    reason,sources:resolve(raw.citations ?? raw.ids)};
+}
+
+export function readProperty(property, resolve, check, {requireFactScope = false} = {}) {
   check(property && typeof property === 'object', 'invalid_review_property');
   const {key,label,status,finding,letter,response} = property;
+  check(keyOk(key) && validText(label,120) && propertyStatuses.includes(status) && validText(finding,550),
+    'invalid_review_property');
+  check(['ask','omit'].includes(letter?.kind) && validText(letter.text,350),'invalid_review_letter');
   check(response == null || typeof response === 'object','invalid_review_response');
-  return {key,label,status,finding,sources:resolve(property.citations ?? property.ids),
+  const scope = property.scope ? readScope(property.scope,resolve,check) : requireFactScope ? missingFactScope(label) : undefined;
+  return {key,label,status,finding,sources:resolve(property.citations ?? property.ids),...(scope && {scope}),
     ...(response && {response:{
       state:response.state,finding:response.finding,sources:resolve(response.citations ?? response.ids),
-    }}), letter:{kind:letter?.kind,text:letter?.text}};
+    }}), letter:{kind:letter.kind,text:letter.text}};
 }
 
 export function readTension(tension, resolve, check) {
@@ -106,7 +134,7 @@ export function readTension(tension, resolve, check) {
 
 export function analysisSources(analysis) {
   return [ ...analysis.applicability.sources,
-    ...analysis.properties.flatMap(property => [...property.sources,...(property.response?.sources ?? [])]),
+    ...analysis.properties.flatMap(property => [...property.sources,...(property.response?.sources ?? []),...factScopeSources(property)]),
     ...analysis.tensions.flatMap(tension => [...tension.sides.flatMap(side => side.sources), ...tension.resolutionSources]) ];
 }
 
@@ -118,6 +146,6 @@ export function mergeSources(...groups) {
 
 export function renderQuestions(rows) {
   const questions = rows.flatMap(row => (row.analysis?.properties ?? []).flatMap(property =>
-    property.letter.kind === 'ask' ? [`${row.title ?? row.key} — ${property.label}. ${property.letter.text.trim()}`] : []));
+    property.letter.kind === 'ask' && (!property.scope || property.scope.kind === 'applicable') ? [`${row.title ?? row.key} — ${property.label}. ${property.letter.text.trim()}`] : []));
   return questions.join('\n\n') || noOpenQuestions;
 }

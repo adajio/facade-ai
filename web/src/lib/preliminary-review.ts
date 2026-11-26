@@ -6,10 +6,15 @@ export type PreliminarySource = {
   originalSha256?: string; quote?: string; limitation?: string;
 };
 export type PreliminaryPropertyStatus = 'confirmed' | 'unanswered' | 'not_mentioned' | 'insufficient' | 'conflicting';
+export type PreliminaryScopeSide = { element: string; zone?: string; purpose?: string; variant?: string };
+export type PreliminaryFactScope = {
+  kind: 'applicable' | 'unrelated' | 'undetermined'; target: PreliminaryScopeSide; observed?: PreliminaryScopeSide;
+  reason: string; sources: PreliminarySource[];
+};
 export type PreliminaryAnalysis = {
   applicability: { kind: 'included' | 'excluded' | 'undetermined'; reason: string; sources: PreliminarySource[] };
   properties: {
-    key: string; label: string; status: PreliminaryPropertyStatus; finding: string; sources: PreliminarySource[];
+    key: string; label: string; status: PreliminaryPropertyStatus; finding: string; sources: PreliminarySource[]; scope?: PreliminaryFactScope;
     letter: { kind: 'ask' | 'omit'; text: string };
     response?: { state: 'received' | 'not_received'; finding: string; sources: PreliminarySource[] };
   }[];
@@ -46,10 +51,11 @@ export function preliminaryQuestions(rows: PreliminaryRow[]) {
   const unique = (sources: PreliminarySource[]) => [...new Map(sources.map(source => [
     JSON.stringify([source.versionId,source.anchor,source.quote,source.limitation]), source,
   ])).values()];
-  return rows.flatMap(row => row.analysis?.properties.flatMap(property => property.letter.kind === 'ask' ? [{
+  return rows.flatMap(row => row.analysis?.properties.flatMap(property => property.letter.kind === 'ask' &&
+      (!property.scope || property.scope.kind === 'applicable') ? [{
     key: `${row.key}/${property.key}`, requirement: row.title, property: property.label, text: property.letter.text,
     sources: unique([
-      ...property.sources, ...(property.response?.sources ?? []),
+      ...property.sources, ...(property.response?.sources ?? []), ...(property.scope?.sources ?? []),
       ...(row.analysis?.tensions.filter(tension => tension.propertyKey === property.key)
         .flatMap(tension => tension.sides.flatMap(side => side.sources)) ?? []),
     ]),

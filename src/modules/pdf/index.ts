@@ -1,6 +1,7 @@
 import { findStoredDwgDerivative } from './dwg-derivative.js';
 export { verifyStoredDwgDerivative } from './dwg-derivative.js';
 import { openVerifiedDwgFile } from '../formats/dwg-durable.js';
+import { createHash } from 'node:crypto';
 import { join } from 'node:path';
 import { Readable } from 'node:stream';
 import type { FastifyInstance, FastifyRequest } from 'fastify';
@@ -52,8 +53,8 @@ export function createPdfService(db: Pool, deps: ReaderDependencies, additional:
   };
 }
 
-function artifactsIn(store: ObjectStore): ArtifactStore {
-  const key = (projectId: string, hash: string) => `reader-evidence/${projectId}/${hash}`;
+function artifactsIn(store: ObjectStore, prefix = 'reader-evidence'): ArtifactStore {
+  const key = (projectId: string, hash: string) => `${prefix}/${projectId}/${hash}`;
   return {
     async put(projectId, sha256, bytes) {
       const objectKey = key(projectId, sha256);
@@ -120,6 +121,24 @@ export function createRuntimePdfService(
   }, adapters);
   return {
     ...service, formatFor,
+    async storeSheetPreview(document: DocumentKey, bytes: Buffer, digest: string) {
+      if (digest.length !== 64 || !/^[a-f0-9]{64}$/u.test(digest) || !bytes.subarray(0,8).equals(Buffer.from('89504e470d0a1a0a','hex'))
+          || bytes.length > 4 * 1024 ** 2 || createHash('sha256').update(bytes).digest('hex') !== digest) {
+        throw new ReaderError('reader_artifact_mismatch','Нарушена целостность фрагмента листа',424);
+      }
+      const prefix = `sheet-previews/${document.projectId}/${document.documentId}`;
+      await artifactsIn(storage.objects,prefix).put(document.versionId,digest,bytes);
+    },
+    async readSheetPreview(document: DocumentKey, digest: string) {
+      if (digest.length !== 64 || !/^[a-f0-9]{64}$/u.test(digest)) throw unavailable();
+      const prefix = `sheet-previews/${document.projectId}/${document.documentId}`;
+      const meta = await storage.objects.head(`${prefix}/${document.versionId}/${digest}`);
+      if (!meta) throw unavailable();
+      if (meta.sha256 !== digest || meta.size < 8 || meta.size > 4 * 1024 ** 2) throw new ReaderError('reader_artifact_mismatch','Повреждён фрагмент листа',424);
+      const bytes = await artifactsIn(storage.objects,prefix).get(document.versionId,digest,meta.size);
+      if (bytes.length !== meta.size || createHash('sha256').update(bytes).digest('hex') !== digest) throw new ReaderError('reader_artifact_mismatch','Повреждён фрагмент листа',424);
+      return bytes;
+    },
     close: () => { if (!options.storage) storage.objects.close(); },
   };
 }
@@ -200,6 +219,12 @@ export async function register(
       return reply.send(file.createReadStream({start:0,autoClose:true}));
     });
   }
+  app.get<{Params: UnitsRoute['Params'] & { sha256: string }}>('/api/v1/documents/:documentId/versions/:versionId/sheet-previews/:sha256', async (request,reply) => {
+    const document = await authorizedDocument(request);
+    const bytes = await reader().readSheetPreview(document,request.params.sha256);
+    await authorize(app.db,await readSession(app.db,request),{action:'project:read',projectId:document.projectId});
+    return reply.header('X-Content-Type-Options','nosniff').header('ETag','"sha256-'+request.params.sha256+'"').type('image/png').send(bytes);
+  });
   const documentReader = '/api/v1/documents/:documentId/versions/:versionId/reader';
   app.get<UnitsRoute>(documentReader + '/units', async (request) => {
     const document = await authorizedDocument(request);

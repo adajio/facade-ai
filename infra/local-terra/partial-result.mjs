@@ -1,4 +1,7 @@
 import { includeLayerEvidence } from './layer-composition.mjs';
+import { publishSheetObservations } from './sheet-review.mjs';
+import { renderQuestions } from './review-analysis.mjs';
+import { applyFactApplicability } from './fact-applicability.mjs';
 import { validate } from './producer.mjs';
 
 // Validate each catalog row independently only after strict whole-result validation fails.
@@ -6,7 +9,11 @@ import { validate } from './producer.mjs';
 export function validatedPartial(snapshot,result) {
   const input=availableRows(snapshot,result);
   input.rows=includeLayerEvidence(snapshot,input);
-  return input;
+  if (snapshot.factScopeVersion===1) {
+    input.rows=input.rows.map(row=>applyFactApplicability(row,{requireFactScope:true}));
+    input.draftText=renderQuestions(input.rows);
+  }
+  return publishSheetObservations(snapshot,input,result);
 }
 
 function verifiedProperties(snapshot,requirement,row) {

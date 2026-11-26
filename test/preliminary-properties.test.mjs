@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import test from 'node:test';
 import { makeRequest, preparePromptSnapshot, reconcilePreliminaryReview, validate } from '../infra/local-terra/producer.mjs';
-import { applyRevision, prepareRevisionSnapshot } from '../infra/local-terra/revise.mjs';
+import { applyRevision, prepareRevisionSnapshot, revisionRequest } from '../infra/local-terra/revise.mjs';
 import { remainingRequestBytes } from '../infra/local-terra/request-budget.mjs';
 
 const catalog = JSON.parse(await readFile(new URL('../infra/catalogs/intake-stage-1.json', import.meta.url)));
@@ -77,13 +77,31 @@ test('exclusion, fabricated quotes and the two sides of a disagreement are check
   assert.throws(() => validate(scope,revised({analysis:{...original,properties:[{...material,letter:ask('Какой материал?')},size]}})),/question_without_open_evidence/);
 });
 
-test('revision resolves one question from a new address and preserves unrelated decisions', () => {
-  const published = validate(scope,result);
+const scoped = (element, references) => ({
+  kind:'applicable',target:{element},observed:{element},reason:'В основании прямо назван тот же элемент.',
+  ...references,
+});
+
+function revisionResolutionFixture(requireFactScope) {
+  const publishedScope = requireFactScope ? {...scope,factScopeVersion:1} : scope;
+  const initial = requireFactScope ? {rows:result.rows.map((row,index)=>({
+    ...row,analysis:{...row.analysis,properties:row.analysis.properties.map(property=>({
+      ...property,scope:index===0 ? scoped('панели',{citations:property.key==='size' ? citations(0,1) : citations(3)})
+        : index===1 ? scoped('цинкового покрытия',{citations:citations(2)})
+        : {kind:'undetermined',target:{element:property.label},reason:'Данных для адресной проверки нет.',citations:[]},
+    }))},
+  }))} : result;
+  const published = validate(publishedScope,initial);
   const report = {...published,stage:scope.stage,requirements:catalog.requirements,reportId:'prior'};
   const fact = {id:'new-resolution',versionId:'second',originalSha256,address:{unitId:'page-2',locator:{page:2}},
     lineId:'1',label:'second.pdf',quote:'Применять габарит панели 620 мм из редакции 2.'};
-  const {snapshot,request} = prepareRevisionSnapshot(report,[fact],1);
-  assert.equal(snapshot.wireVersion,3);
+  const {snapshot:prepared,request:preparedRequest} = prepareRevisionSnapshot(report,[fact],1);
+  assert.equal(prepared.wireVersion,3);
+  assert.equal(prepared.factScopeVersion,1);
+  // An answered attempt saved by the previous revision producer has no scope-version field.
+  const {factScopeVersion,...savedLegacy} = prepared;
+  const snapshot = requireFactScope ? prepared : savedLegacy;
+  const request = requireFactScope ? preparedRequest : revisionRequest(savedLegacy);
   const data = JSON.parse(request.messages[1].content);
   const [row] = data.rows;
   const [priorTension] = row.analysis.tensions;
@@ -92,18 +110,51 @@ test('revision resolves one question from a new address and preserves unrelated 
   const {citations:unused,...priorSize} = size;
   const update = {key:row.key,status:'partial',finding:'Редакция 2 разрешила расхождение по размеру.',ids:['O1'],
     analysis:{applicability:null,properties:[{...priorSize,status:'confirmed',finding:'620 мм в редакции 2.',
-      ids:['O1'],letter:omit('Рабочий размер установлен.')}],tensions:[{
+      ids:['O1'],letter:omit('Рабочий размер установлен.'),
+      ...(requireFactScope && {scope:scoped('панели',{ids:['O1',...priorTension.sides.flatMap(side=>side.ids)]})}),
+    }],tensions:[{
       key:tension.key,propertyKey:size.key,status:'resolved',finding:'Применяется редакция 2.',
       sides:[{...first,ids:priorTension.sides[0].ids},{...second,ids:priorTension.sides[1].ids}],resolutionIds:['O1'],
     }]}};
+  return {published,fact,snapshot,update};
+}
+
+function checkAddressedResolution({published,fact,snapshot,update}) {
   const output = applyRevision({...snapshot,key:'revision'},{changes:[update]});
   assert.equal(output.rows[0].analysis.tensions[0].resolutionSources[0].quote,fact.quote);
-  assert.equal(output.rows[0].analysis.properties[1].status,'confirmed');
-  assert.deepEqual(output.rows[0].analysis.properties[0],published.rows[0].analysis.properties[0]);
+  assert.equal(output.rows[0].analysis.properties.find(property=>property.key==='size')?.status,'confirmed');
+  assert.deepEqual(output.rows[0].analysis.properties.find(property=>property.key==='material'),
+    published.rows[0].analysis.properties.find(property=>property.key==='material'));
   assert.deepEqual(output.rows.slice(1),published.rows.slice(1));
   assert.doesNotMatch(output.draftText,/Какой размер применять/);
   assert.match(output.draftText,/Укажите толщину цинкового покрытия/);
   assert.throws(() => applyRevision(snapshot,{changes:[{...update,analysis:{...update.analysis,tensions:[]}}]}),/unlinked_review_tension/);
+}
+
+test('saved legacy revision resolves an addressed question and preserves unrelated decisions', () => {
+  checkAddressedResolution(revisionResolutionFixture(false));
+});
+
+test('new revision resolves an addressed question only with both sides and applicable new evidence', () => {
+  const fixture = revisionResolutionFixture(true);
+  checkAddressedResolution(fixture);
+  const {snapshot,published,update} = fixture;
+  const {scope:absent,...withoutScope} = update.analysis.properties[0];
+  const downgraded = applyRevision(snapshot,{changes:[{...update,status:'present',analysis:{...update.analysis,properties:[withoutScope]}}]});
+  // A malformed new update can be discarded or retained for internal review.
+  // Either outcome keeps the independently confirmed earlier dispute and its addresses.
+  const surviving = downgraded?.rows[0] ?? published.rows[0];
+  assert.equal(surviving.status,published.rows[0].status);
+  assert.equal(surviving.analysis.properties.find(property=>property.key==='size')?.status,'conflicting');
+  assert.equal(surviving.analysis.tensions[0].status,'open');
+  assert.equal(surviving.analysis.tensions[0].resolutionSources.length,0);
+  assert.match(downgraded?.draftText ?? published.draftText,/Какой размер применять/);
+  const originalSide = {...fixture.fact,versionId:'first',address:{unitId:'page-1',locator:{page:1}},quote:lines[0].text};
+  const reopened = applyRevision({...snapshot,facts:[originalSide]},
+    {changes:[{...update,analysis:{...update.analysis,properties:[withoutScope]}}]});
+  assert.equal(reopened.rows[0].analysis.properties.find(property=>property.key==='size')?.status,'insufficient');
+  assert.equal(reopened.rows[0].analysis.tensions.length,0);
+  assert.doesNotMatch(reopened.draftText,/Какой размер применять/);
 });
 
 test('a bounded full reassessment preserves confirmed and disputed properties against pinned originals', () => {

@@ -2,21 +2,58 @@ import { recordPrimaryActivity } from './activity.mjs';
 
 export const maxInputTokens = 65_536;
 export const maxRequestBytes = 60_000;
+export const maxWireBytes = 6 * 1024 ** 2;
+export const maxImageBytes = 4 * 1024 ** 2;
+export const maxImageCount = 4;
+const imageTokens = 2048;
+const pngDataPrefix = 'data:image/png;base64,';
+const base64 = /^[A-Za-z0-9+/]+={0,2}(?![\s\S])/u;
 // This signed, tool-disabled Codex profile adds fixed instructions, an output schema and framing.
 // Reserve their allowance separately from the variable, byte-level BPE input. The private Terra
 // tokenizer isn't exposed by the adapter. Its measured usage is reported independently after a turn.
 const profileOverheadTokens = 8_192;
 
 export function measureRequest(request) {
-  const adapterBytes = Buffer.byteLength(JSON.stringify(request));
-  const promptBytes = Buffer.byteLength(JSON.stringify({messages:request.messages,available_functions:request.tools}));
-  return {requestBytes:Math.max(adapterBytes,promptBytes),promptBytes,
-    estimatedInputTokens:promptBytes + profileOverheadTokens,maxInputTokens,maxRequestBytes};
+  const wireBytes = Buffer.byteLength(JSON.stringify(request));
+  let imageCount = 0, imageBytes = 0, invalidMedia = false;
+  const messages = request.messages?.map(message => {
+    if (!Array.isArray(message.content)) return message;
+    const content = message.content.map(part => {
+      if (part?.type === 'text') {
+        invalidMedia ||= typeof part.text !== 'string';
+        return part;
+      }
+      if (part?.type !== 'image_url') {
+        invalidMedia = true;
+        return part;
+      }
+      const url = part.image_url?.url;
+      const encoded = typeof url === 'string' && url.startsWith(pngDataPrefix) ? url.slice(pngDataPrefix.length) : '';
+      if (message.role !== 'user' || !encoded || encoded.length % 4 || !base64.test(encoded)) {
+        invalidMedia = true;
+      } else {
+        imageBytes += encoded.length * 3 / 4 - (encoded.endsWith('==') ? 2 : Number(encoded.endsWith('=')));
+      }
+      return {type:'attached_image',ordinal:++imageCount};
+    });
+    return {...message,content};
+  });
+  // The Python adapter replaces each data URL with its attachment ordinal before composing the prompt.
+  const adapterBytes = imageCount ? Buffer.byteLength(JSON.stringify({...request,messages})) : wireBytes;
+  const tools = imageCount && request.tools === undefined ? [] : request.tools;
+  const promptBytes = Buffer.byteLength(JSON.stringify({messages,available_functions:tools}));
+  return {requestBytes:Math.max(adapterBytes,promptBytes),promptBytes,wireBytes,imageBytes,imageCount,
+    estimatedInputTokens:promptBytes + profileOverheadTokens + imageCount * imageTokens,maxInputTokens,maxRequestBytes,
+    ...(invalidMedia && {invalidMedia})};
 }
 
-export function remainingRequestBytes({requestBytes,estimatedInputTokens,maxRequestBytes:limit=maxRequestBytes}) {
-  // More JSON inside the user message adds the same escaped UTF-8 bytes to stdin and the CLI prompt.
-  return Math.min(Math.min(limit,maxRequestBytes) - requestBytes, maxInputTokens - estimatedInputTokens);
+export function remainingRequestBytes({
+  requestBytes,estimatedInputTokens,maxRequestBytes:limit=maxRequestBytes,
+  wireBytes=requestBytes,imageBytes=0,imageCount=0,invalidMedia=false,
+}) {
+  if (invalidMedia || imageBytes > maxImageBytes || imageCount > maxImageCount) return -1;
+  // Extra text adds escaped UTF-8 bytes both to the wire representation and to the projected request.
+  return Math.min(Math.min(limit,maxRequestBytes)-requestBytes,maxInputTokens-estimatedInputTokens,maxWireBytes-wireBytes);
 }
 
 export function messageEntryBytes(value) {

@@ -1,0 +1,45 @@
+services:
+  worker:
+    environment:
+      FACADE_HARNESS_REPLAY_ONLY: "1"
+  preliminary:
+    image: ${FACADE_APP_IMAGE:?}
+    pull_policy: never
+    init: true
+    user: "10001:10001"
+    restart: unless-stopped
+    stop_grace_period: 5m
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    networks: [core]
+    mem_limit: 1536m
+    environment:
+      NODE_EXTRA_CA_CERTS: /run/facade/data-ca.crt
+      FACADE_DATA_DIR: /data/objects
+      TMPDIR: /data/tmp
+      FACADE_CONVERTER_SOCKET: /run/facade-converters/broker.sock
+      FACADE_SOURCE_ROOT: /app
+      FACADE_PRELIMINARY_BASE: /var/lib/facade-terra
+      FACADE_PRELIMINARY_PUBLISHER: /app/dist/src/modules/assessment/preliminary-package-review.js
+      FACADE_TERRA_PRODUCTION_ADMISSION: /run/facade-terra/config/admission.json
+      FACADE_TERRA_PRODUCTION_SOCKET: /run/facade-terra/transport/model.sock
+      FACADE_PRELIMINARY_SINCE: ${FACADE_PRELIMINARY_SINCE:-}
+      FACADE_GATEWAY_LIVE_MODE: ""
+    volumes:
+      - ./terra/releases/${FACADE_TERRA_RELEASE:?}/producer:/app/infra/local-terra:ro
+      - ./objects:/data/objects
+      - ./tmp:/data/tmp
+      - ./runtime.env:/run/facade/runtime.env:ro
+      - ./data-ca.crt:/run/facade/data-ca.crt:ro
+      - ./socket:/run/facade-converters:ro
+      - ./terra/state:/var/lib/facade-terra
+      - ./terra/config:/run/facade-terra/config:ro
+      - ./terra/transport:/run/facade-terra/transport:ro
+    entrypoint: ["node", "--env-file=/run/facade/runtime.env"]
+    command: ["infra/local-terra/producer.mjs"]
+    depends_on:
+      api:
+        condition: service_healthy
+      converter-broker:
+        condition: service_healthy

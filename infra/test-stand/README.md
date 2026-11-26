@@ -76,7 +76,7 @@ Chrome на macOS подхватывается автоматически. На 
 или подготовить Chromium командой `npm --prefix web exec -- playwright install chromium`.
 
 ```bash
-export FACADE_RELEASE_DIR='/Volumes/ADATA SE920/OrbStack/facade-release-rehearsal'
+export FACADE_RELEASE_DIR="$PWD/.local/release-rehearsal"
 mkdir -p "$FACADE_RELEASE_DIR"
 export FACADE_RELEASE_READER_IMAGE="$(infra/test-stand/stand build reader <согласованный-Git-ref>)"
 export FACADE_RELEASE_BROKER_IMAGE='<ID образа брокера кандидата>'

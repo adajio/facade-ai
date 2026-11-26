@@ -1,0 +1,59 @@
+#!/usr/bin/env bash
+set -euo pipefail
+if [[ $# != 1 && $# != 2 ]]; then
+  echo 'usage: stage <full-commit> [<pinned-ssh-wrapper>]' >&2
+  exit 2
+fi
+if [[ $# == 2 ]]; then
+  source "$(dirname "$0")/deploy-profile"
+  require_terra_deployment
+fi
+sha=$1
+[[ $sha =~ ^[0-9a-f]{40}$ ]]
+[[ $(git rev-parse --verify "$sha^{commit}") == "$sha" ]]
+root=$(mktemp -d)
+trap 'rm -rf "$root"' EXIT
+git archive "$sha" -- infra/local-terra | tar -xf - -C "$root"
+from="$root/infra/local-terra"
+mkdir -p "$root/release/producer/transport"
+cp "$from/"*.mjs "$root/release/producer/"
+cp "$from/transport/production.mjs" "$root/release/producer/transport/"
+cp "$from/production/"{compose.yaml,status.mjs} "$root/release/"
+printf '%s\n' "$sha" > "$root/release/revision"
+(
+  cd "$root/release"
+  find . -type f | LC_ALL=C sort | while IFS= read -r path; do shasum -a 256 "$path"; done > "$root/checksums"
+  mv "$root/checksums" SHA256SUMS
+)
+archive() {
+  COPYFILE_DISABLE=1 tar --no-xattrs -C "$root/release" -cf - .
+}
+if [[ $# == 1 ]]; then
+  archive
+  exit
+fi
+ssh=$2
+read -r -d '' remote <<'REMOTE' || true
+  set -euo pipefail
+  test "$(hostname -s)" = "$1"
+  root="$2/terra"
+  sha=$3
+  install -d -m 0755 "$root" "$root/releases"
+  install -d -o 10001 -g 10001 -m 0700 "$root/state"
+  install -d -o root -g 10001 -m 0750 "$root/config" "$root/transport"
+  staged=$(mktemp -d "$root/releases/.new-$sha.XXXXXX")
+  trap 'rm -rf "$staged"' EXIT
+  tar -xf - -C "$staged"
+  test "$(cat "$staged/revision")" = "$sha"
+  (cd "$staged" && sha256sum --quiet -c SHA256SUMS)
+  if test -e "$root/releases/$sha"; then
+    cmp -s "$staged/SHA256SUMS" "$root/releases/$sha/SHA256SUMS"
+    (cd "$root/releases/$sha" && sha256sum --quiet -c SHA256SUMS)
+  else
+    chmod 0755 "$staged"
+    mv -T "$staged" "$root/releases/$sha"
+  fi
+  printf '%s\n' "$sha"
+REMOTE
+printf -v command 'bash -c %q terra-stage %q %q %q' "$remote" "$FACADE_TERRA_DEPLOY_HOSTNAME" "$FACADE_TERRA_DEPLOY_APP_DIR" "$sha"
+archive | "$ssh" "$FACADE_TERRA_DEPLOY_HOST" "$command"

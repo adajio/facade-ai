@@ -5,10 +5,16 @@ export type ReviewSourceInput = Original & { anchor: string; quote?: string; lim
 export type ReviewSource = ReviewSourceInput & { documentId: string; label: string };
 export type ReviewStatus = "present" | "partial" | "not_found" | "unassessed";
 export type ReviewPropertyStatus = "confirmed" | "unanswered" | "not_mentioned" | "insufficient" | "conflicting";
+const scopeFields = ["element","zone","purpose","variant"] as const;
+export type ReviewScopeSide = { element: string; zone?: string; purpose?: string; variant?: string };
+export type ReviewFactScope<S = ReviewSource> = {
+  kind: "applicable" | "unrelated" | "undetermined"; target: ReviewScopeSide; observed?: ReviewScopeSide;
+  reason: string; sources: S[];
+};
 export type ReviewAnalysis<S = ReviewSource> = {
   applicability: { kind: "included" | "excluded" | "undetermined"; reason: string; sources: S[] };
   properties: {
-    key: string; label: string; status: ReviewPropertyStatus; finding: string; sources: S[];
+    key: string; label: string; status: ReviewPropertyStatus; finding: string; sources: S[]; scope?: ReviewFactScope<S>;
     letter: { kind: "ask" | "omit"; text: string };
     response?: { state: "received" | "not_received"; finding: string; sources: S[] };
   }[];
@@ -22,6 +28,13 @@ export type RetainedReviewFinding<S = ReviewSource> = { status: "present" | "par
 const key = (value: unknown) => typeof value === "string" && /^[a-z][a-z0-9_-]{0,49}$/.test(value);
 const text = (value: unknown, max: number) => typeof value === "string" && value.trim().length > 0 && value.length <= max;
 const grounded = (sources: ReviewSource[]) => sources.filter(source => source.quote && !source.limitation);
+function scopeSide(side: ReviewScopeSide) {
+  if (!side || typeof side !== "object" || !text(side.element,120) ||
+      !Object.entries(side).every(([field,value]) => scopeFields.some(name => name === field) && text(value,120)))
+    invalidInput("Некорректная область инженерного свойства.");
+  return side;
+}
+
 const place = (source: ReviewSource) => JSON.stringify([source.versionId,source.anchor]);
 
 export function enrichReviewAnalysis(analysis: ReviewAnalysis<ReviewSourceInput>, source: (item: ReviewSourceInput) => ReviewSource): ReviewAnalysis {
@@ -38,13 +51,13 @@ export function enrichReviewAnalysis(analysis: ReviewAnalysis<ReviewSourceInput>
   if (!Array.isArray(properties) || properties.length > 16 || !Array.isArray(tensions) || tensions.length > 12)
     invalidInput("Некорректный состав разбора свойства или противоречия.");
 
-  const propertyKeys = new Set<string>();
+  const propertyKeys = new Set<string>(), held = new Set<string>();
   const checkedProperties = properties.map(property => {
     if (!property || !key(property.key) || propertyKeys.has(property.key) || !text(property.label,120) ||
         !["confirmed", "unanswered", "not_mentioned", "insufficient", "conflicting"].includes(property.status) || !text(property.finding,550))
       invalidInput("Некорректное свойство требования.");
     propertyKeys.add(property.key);
-    const { letter, response } = property;
+    const { letter, response, scope } = property;
     let checkedResponse: ReviewAnalysis["properties"][number]["response"];
     if (response !== undefined) {
       if (!response || !["received","not_received"].includes(response.state) || !text(response.finding,350) ||
@@ -62,13 +75,29 @@ export function enrichReviewAnalysis(analysis: ReviewAnalysis<ReviewSourceInput>
     if (!letter || !["ask","omit"].includes(letter.kind) || !text(letter.text,350) ||
         letter.kind === "ask" && (applies.kind === "excluded" || property.status === "confirmed" || !supported && !checkedResponse && property.status !== "conflicting"))
       invalidInput("Вопрос без открытого свойства или адресного основания.");
+    let checkedScope: ReviewFactScope | undefined;
+    if (scope !== undefined) {
+      if (!scope || !["applicable","unrelated","undetermined"].includes(scope.kind) || !text(scope.reason,420))
+        invalidInput("Некорректная проверка области инженерного свойства.");
+      const context = sources(scope.sources);
+      const observed = scope.observed === undefined ? undefined : scopeSide(scope.observed);
+      if (scope.kind !== "undetermined" && (!observed || !grounded(context).length))
+        invalidInput("Для установленной области свойства нужен адресный источник.");
+      if (scope.kind !== "applicable") {
+        if (property.status !== "insufficient" || letter.kind !== "omit" || checkedResponse || evidence.length)
+          invalidInput("Для свойства с непроверенной областью оставьте результат на внутреннюю сверку.");
+        held.add(property.key);
+      }
+      checkedScope = {kind:scope.kind,target:scopeSide(scope.target),...(observed && {observed}),reason:scope.reason,sources:context};
+    }
     return {key:property.key,label:property.label,status:property.status,finding:property.finding,sources:evidence,
+      ...(checkedScope && {scope:checkedScope}),
       ...(checkedResponse && {response:checkedResponse}), letter:{kind:letter.kind,text:letter.text}};
   });
 
   const tensionKeys = new Set<string>(), openTensions = new Set<string>();
   const checkedTensions = tensions.map(tension => {
-    if (!tension || !key(tension.key) || tensionKeys.has(tension.key) || !propertyKeys.has(tension.propertyKey) ||
+    if (!tension || !key(tension.key) || tensionKeys.has(tension.key) || !propertyKeys.has(tension.propertyKey) || held.has(tension.propertyKey) ||
         !["open","resolved"].includes(tension.status) || !text(tension.finding,550) ||
         !Array.isArray(tension.sides) || tension.sides.length < 2 || tension.sides.length > 4)
       invalidInput("Некорректное противоречие.");
@@ -95,7 +124,7 @@ export function enrichReviewAnalysis(analysis: ReviewAnalysis<ReviewSourceInput>
 }
 
 export function renderPreliminaryQuestions(rows: { title: string; analysis?: ReviewAnalysis }[]) {
-  return rows.flatMap(row => (row.analysis?.properties ?? []).flatMap(property => property.letter.kind === "ask"
+  return rows.flatMap(row => (row.analysis?.properties ?? []).flatMap(property => property.letter.kind === "ask" && (!property.scope || property.scope.kind === "applicable")
     ? [`${row.title} — ${property.label}. ${property.letter.text.trim()}`] : [])).join("\n\n")
     || "По доступным основаниям адресных вопросов для письма не установлено.";
 }

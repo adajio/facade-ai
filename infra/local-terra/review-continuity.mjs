@@ -1,3 +1,5 @@
+import {applyFactApplicability, canPreserveScopedProperty, factScopeSources, hasFactScopeDifference, sameFactScopeTarget,
+  sameFactSourcePlace, sheetPreviewSources, sourceDescribesFactScope} from './fact-applicability.mjs';
 import {analysisSources, mergeSources, renderQuestions} from './review-analysis.mjs';
 
 const hasFinding = row => ['present','partial'].includes(row.status) && row.sources.some(source => source.quote);
@@ -20,19 +22,24 @@ function sameAddressedGap(older,newer) {
 }
 const substantive = new Set(['confirmed','conflicting','unanswered']);
 
-function preserveProperties(current, previous, inInventory, positiveOnly) {
+function preserveProperties(current, previous, inInventory, positiveOnly, scoped = false) {
   if (!current || !previous || current.applicability.kind === 'excluded') return current;
   const properties = [...current.properties], tensions = [...current.tensions];
   for (const old of previous.properties) {
+    if (scoped && old.scope?.kind !== 'applicable') continue;
     const missingOpenQuestion=old.letter.kind==='ask' && !properties.some(property=>sameProperty(property,old) || sameAddressedGap(old,property));
     if (!substantive.has(old.status) && !old.response && !missingOpenQuestion) continue;
     const priorTensions = previous.tensions.filter(tension => tension.propertyKey === old.key);
-    if (![...old.sources,...(old.response?.sources ?? []),...priorTensions.flatMap(tension => [
+    if (![...old.sources,...factScopeSources(old),...(old.response?.sources ?? []),...priorTensions.flatMap(tension => [
       ...tension.sides.flatMap(side => side.sources), ...tension.resolutionSources,
     ])].every(inInventory)) continue;
     const existing = properties.findIndex(property => sameProperty(property,old));
     const fresh = properties[existing];
-    if (positiveOnly && fresh) continue;
+    if (scoped && fresh) {
+      if (!sameFactScopeTarget(old,fresh)) continue;
+      if (fresh.scope.kind !== 'applicable' && !canPreserveScopedProperty(old,fresh)) continue;
+    }
+    if (positiveOnly && fresh && (!scoped || fresh.scope.kind === 'applicable')) continue;
     const freshTensions = tensions.filter(tension => tension.propertyKey === fresh?.key);
     const priorDisputed = old.status === 'conflicting';
     const explicitlyResolved = freshTensions.some(tension => tension.status === 'resolved');
@@ -49,12 +56,13 @@ function preserveProperties(current, previous, inInventory, positiveOnly) {
 }
 
 const absence = /(?:^|[^\p{L}])(?:отсутств\p{L}*|нет|не(?!\s+(?:менее|более|ниже|выше)(?:\s|$))|неизвест\p{L}*|без|not|no|missing|absent|without)(?:$|[^\p{L}])/iu;
-const affirmed = /(?:^|[^\p{L}])(?<!не )(?:найден|указан|приведен|представлен|обнаружен|подтвержден|предусмотрен|зафиксирован|обозначен|содерж|имеется|есть|требует)\p{L}*/iu;
-const exactSource = source => typeof source.anchor === 'string' && source.anchor.trim() &&
-  typeof source.quote === 'string' && source.quote.trim() && !source.limitation;
-const historicalFinding = entry => {
+const affirmed = /(?:^|[^\p{L}])(?<!не )(?:найден|указан|приведен|представлен|обнаружен|установлен|подтвержден|предусмотрен|зафиксирован|обозначен|содерж|имеется|есть|требует)\p{L}*/iu;
+const addressedSource = source => typeof source.anchor === 'string' && source.anchor.trim() &&
+  typeof source.quote === 'string' && source.quote.trim();
+const exactSource = source => addressedSource(source) && !source.limitation;
+const historicalFinding = (entry,{allowLimited=false} = {}) => {
   if (!entry || !['present','partial'].includes(entry.status) || !entry.finding?.trim() ||
-      !entry.sources?.length || !entry.sources.every(exactSource)) return;
+      !entry.sources?.some(exactSource) || !entry.sources.every(allowLimited ? addressedSource : exactSource)) return;
   const wording = identity(entry.finding).replace(/\s+/gu,' ');
   if (absence.test(wording) && !affirmed.test(wording)) return;
   // Keep the old wording and its qualifications together, only as recorded history.
@@ -78,6 +86,92 @@ function priorPositive(older) {
   };
 }
 
+const carriedFinding = 'По тем же оригиналам сохранены адресные сведения предыдущего разбора. Основания приведены в сохранённом выводе.';
+
+function carryLegacy(row, previous, inInventory) {
+  const former = previous.analysis?.properties ?? [];
+  const previousProperties = former.filter(property=>!property.scope);
+  if (!previousProperties.length && former.some(property=>property.scope)) return row;
+
+  const currentProperties = row.analysis.properties;
+  const mismatches = currentProperties.filter(property=>property.scope?.kind !== 'applicable'
+    && (property.scope?.kind === 'unrelated' || hasFactScopeDifference(property.scope)));
+  const contested = sources => sources.some(source=>mismatches.some(property=>
+    factScopeSources(property).some(other=>sameFactSourcePlace(source,other))));
+  const fromInventory = history => history?.sources.every(inInventory) && !contested(history.sources) ? history : undefined;
+  const visual = new Set(sheetPreviewSources(previous.sources));
+  const basis = fromInventory(historicalFinding({...previous,sources:previous.sources.filter(source=>!visual.has(source))},
+    {allowLimited:true}));
+  const previousArchive = fromInventory(historicalFinding(previous.retained,{allowLimited:true}));
+  const summary = previous.finding===carriedFinding && previousArchive ? previousArchive : basis ?? previousArchive;
+  const properties = [...currentProperties];
+  const carries = [];
+  for (const old of previousProperties) {
+    const addressed = [...old.sources,...(old.response?.sources ?? [])];
+    if ((!['confirmed','unanswered'].includes(old.status) && !(old.status==='insufficient' && old.letter.kind==='ask'))
+      || !addressed.length || !addressed.every(source=>exactSource(source) && inInventory(source)) || contested(addressed)) continue;
+    const existing = properties.findIndex(property=>sameProperty(property,old) || sameAddressedGap(property,old));
+    const fresh = properties[existing];
+    if (fresh?.scope?.kind==='applicable') {
+      if (old.letter.kind!=='ask' || addressed.some(source=>sourceDescribesFactScope(source,fresh.scope.target)
+        || [...fresh.sources,...factScopeSources(fresh)].some(current=>sameFactSourcePlace(source,current)))) continue;
+    }
+    const append = !fresh || fresh.scope?.kind==='applicable' || hasFactScopeDifference(fresh.scope)
+      || row.analysis.tensions.some(tension=>tension.propertyKey===fresh.key);
+    if (append && properties.length>=16) continue;
+    let key = append ? old.key : fresh.key;
+    if (append && properties.some(property=>property.key===key)) {
+      const prefix = 'prior_' + old.key.slice(0,40);
+      for (let n=1; ; n++) {
+        key=prefix+'_'+n;
+        if (!properties.some(property=>property.key===key)) break;
+      }
+    }
+    // A carried property keeps the previous decision and citations. Its separate
+    // historical finding cannot be used to assert a fresh scoped value.
+    const historicalProperty = {...old,key};
+    if (append) properties.push(historicalProperty);
+    else properties[existing]=historicalProperty;
+    carries.push(historicalProperty);
+  }
+  if (!summary && !carries.length) return row;
+  const retained = row.retained ?? summary ?? {status:'partial',finding:carries.map(property=>property.finding).join('\n'),
+    sources:mergeSources(...carries.map(property=>[...property.sources,...(property.response?.sources ?? [])])).slice(0,100)};
+  const restore = row.status==='unassessed' && basis;
+  const sources = restore ? mergeSources(sheetPreviewSources(row.sources),row.sources,basis.sources).slice(0,100) : row.sources;
+  return {...row,analysis:{...row.analysis,properties},retained,sources,
+    ...(restore && {status:'partial',finding:carriedFinding})};
+}
+
+function reconcileScopedRow(row, previous, inInventory, positiveOnly, requireFactScope) {
+  if (!previous || previous.status === 'not_found' || previous.analysis?.applicability.kind === 'excluded' ||
+      row.status === 'not_found' || row.analysis.applicability.kind === 'excluded')
+    return applyFactApplicability(row,{requireFactScope});
+  if (!previous.analysis) return carryLegacy(applyFactApplicability(row,{requireFactScope}),previous,inInventory);
+  // Current scoped findings and carried historical entries keep separate authority.
+  const earlier = applyFactApplicability(previous).analysis;
+  const known = new Map(earlier.properties.filter(property => property.scope?.kind === 'applicable' &&
+    [...property.sources,...factScopeSources(property)].every(inInventory)).map(property => [property.key,property]));
+  const candidates = row.analysis.properties.map(property => {
+    const prior = known.get(property.key);
+    return prior && property.scope && !sameFactScopeTarget(prior,property)
+      ? {...property,scope:{...property.scope,target:prior.scope.target}}
+      : property;
+  });
+  const current = applyFactApplicability({...row,analysis:{...row.analysis,properties:candidates}},{requireFactScope});
+  const analysis = preserveProperties(current.analysis,earlier,inInventory,positiveOnly,true);
+  const carried = analysis.properties.filter(property => !current.analysis.properties.includes(property));
+  if (!carried.length) return carryLegacy(current,previous,inInventory);
+  const sources = mergeSources(...carried.map(property => [
+    ...property.sources,...factScopeSources(property),...(property.response?.sources ?? []),
+  ])).slice(0,100);
+  const finding = carried.map(property => property.finding).join('\n');
+  const {retained,...base} = current;
+  const scoped = applyFactApplicability({...base,analysis,...(sources.length && {retained:{status:'partial',finding,sources}})},
+    {requireFactScope});
+  return carryLegacy(scoped,previous,inInventory);
+}
+
 // The new result is based on a bounded selection. Keep material findings against the same
 // originals when the selection cannot revisit them, separately displaying earlier row wording.
 export function reconcilePreliminaryReview(input, previousRows = [], admittedVersions) {
@@ -88,7 +182,11 @@ export function reconcilePreliminaryReview(input, previousRows = [], admittedVer
   const previousByKey = new Map(previousRows.map(row => [row.key,row]));
   const rows = input.rows.map(row => {
     const previous = previousByKey.get(row.key);
-    if (!row.analysis || !previous) return row;
+    if (!row.analysis) return row;
+    const requireFactScope = input.factScopeVersion === 1;
+    if (requireFactScope || row.analysis.properties.some(property => property.scope))
+      return reconcileScopedRow(row,previous,inInventory,Boolean(admittedVersions),requireFactScope);
+    if (!previous) return row;
     if (admittedVersions) {
       if (row.status === 'not_found' || row.analysis.applicability.kind === 'excluded' ||
           row.analysis.tensions.some(tension => tension.status === 'open')) return row;

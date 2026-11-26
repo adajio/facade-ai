@@ -1,9 +1,19 @@
 <script lang="ts">
-  import type { PreliminaryAnalysis, PreliminaryPropertyStatus, PreliminaryRow } from './preliminary-review';
+  import type { PreliminaryAnalysis, PreliminaryFactScope, PreliminaryPropertyStatus, PreliminaryRow, PreliminaryScopeSide } from './preliminary-review';
   import PreliminarySources from './PreliminarySources.svelte';
 
   let { analysis, retained }: { analysis?: PreliminaryAnalysis; retained?: PreliminaryRow['retained'] } = $props();
   const applicability = { included: 'Применимо', excluded: 'Исключено', undetermined: 'Применимость не установлена' };
+  const factScope: Record<PreliminaryFactScope['kind'], string> = {
+    applicable: 'Область свидетельства подтверждена',
+    unrelated: 'Свидетельство относится к другой области',
+    undetermined: 'Область свидетельства требует сверки',
+  };
+  const scopeFields = { element: 'Элемент', zone: 'Зона', purpose: 'Назначение', variant: 'Исполнение' } as const;
+  function scopeLabel(side: PreliminaryScopeSide) {
+    return (Object.keys(scopeFields) as (keyof PreliminaryScopeSide)[])
+      .flatMap(key => side[key] ? [scopeFields[key] + ' — ' + side[key]] : []).join(' · ');
+  }
   const propertyStatus: Record<PreliminaryPropertyStatus, string> = {
     confirmed: 'Подтверждённый вариант',
     unanswered: 'Запрос зафиксирован, ответ в доступных источниках не найден',
@@ -33,6 +43,22 @@
       <section class="property" aria-label={property.label}>
         <h4>{property.label}</h4>
         <p><strong>{statusLabel(property)}</strong> · {property.finding}</p>
+        {#if property.scope}
+          <div class="scope">
+            <p><strong>{factScope[property.scope.kind]}</strong> · {property.scope.reason}</p>
+            <dl>
+              <dt>Область вопроса</dt>
+              <dd>{scopeLabel(property.scope.target)}</dd>
+              {#if property.scope.observed}
+                <dt>Область источника</dt>
+                <dd>{scopeLabel(property.scope.observed)}</dd>
+              {/if}
+            </dl>
+            {#if property.scope.sources.length}
+              <PreliminarySources sources={property.scope.sources} label={'Адреса проверки области по свойству «' + property.label + '»'} />
+            {/if}
+          </div>
+        {/if}
         {#if property.response}
           <p><strong>Сведения об ответе</strong> · {property.response.finding}</p>
           <PreliminarySources sources={property.response.sources} label={'Основания статуса ответа по свойству «' + property.label + '»'} />
@@ -76,6 +102,10 @@
   .analysis p { margin: .35rem 0; }
   .property { margin-block: .65rem; padding-block-start: .55rem; border-block-start: 1px solid var(--line); }
   .property h4 { margin: 0; }
+  .scope { margin-block: .45rem; padding-inline-start: .7rem; border-inline-start: 2px solid var(--line); }
+  .scope dl { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: .25rem .6rem; margin: .35rem 0; }
+  .scope dt { font-weight: 600; }
+  .scope dd { margin: 0; }
   .tension { margin-block: .45rem; padding-inline-start: .7rem; border-inline-start: 2px solid var(--line); }
   .tension-side { margin-block: .5rem; }
 </style>

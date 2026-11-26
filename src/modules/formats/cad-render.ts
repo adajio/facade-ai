@@ -13,6 +13,7 @@ function invalid(): never {
 
 export function renderCad(
   unit: Unit, address: ReaderAddress, handle?: string, load?: (digest: string) => CadDefinition, fonts = dwgFontAssets(), textFont?: string,
+  maxSide = 1600,
 ) {
   if (unit.limitations.includes("cad_mask_context_limit")) {
     throw new ReaderError("cad_mask_context_limit", "В области слишком много пересекающихся масок DWG", 424);
@@ -53,8 +54,8 @@ export function renderCad(
       crop = { x, y: top, width: right - x, height: Math.min(entire.height, end) - top };
     }
   }
-  const width = Math.ceil(Math.min(1600, Math.max(1, 1600 * crop.width / Math.max(crop.width, crop.height))));
-  const height = Math.ceil(Math.min(1600, Math.max(1, 1600 * crop.height / Math.max(crop.width, crop.height))));
+  const width = Math.ceil(Math.min(maxSide, Math.max(1, maxSide * crop.width / Math.max(crop.width, crop.height))));
+  const height = Math.ceil(Math.min(maxSide, Math.max(1, maxSide * crop.height / Math.max(crop.width, crop.height))));
   const scale = Math.min(width / crop.width, height / crop.height);
   const originX = crop.x * scale - (width - crop.width * scale) / 2;
   const originY = crop.y * scale - (height - crop.height * scale) / 2;

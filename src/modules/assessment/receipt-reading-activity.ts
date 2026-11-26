@@ -4,7 +4,7 @@ type ProgressEvent = { stage: string; status: string; reason: string | null; at:
 type ReadingBoundary = { projectId: string; receiptId: string; preparationId: string | null; reviewId: string | null; cutoff: string | null };
 
 const primaryMetrics = [
-  'requestBytes', 'promptBytes', 'estimatedInputTokens', 'maxInputTokens', 'maxRequestBytes',
+  'requestBytes', 'promptBytes', 'wireBytes', 'imageBytes', 'imageCount', 'estimatedInputTokens', 'maxInputTokens', 'maxRequestBytes',
   'inputTokens', 'outputTokens', 'totalFiles', 'selectedFiles', 'coveredFiles',
   'totalLines', 'selectedLines', 'remainingLines', 'elapsedMs', 'providerElapsedMs', 'timeToFirstUsefulMs',
 ] as const;
