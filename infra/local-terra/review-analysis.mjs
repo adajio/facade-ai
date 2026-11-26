@@ -1,6 +1,6 @@
 import {
   applyAnalysisFactApplicability, factScopeFields, factScopeKinds, factScopeLabelLimit,
-  factScopeReasonLimit, factScopeSources, literalFactBasis, missingFactScope,
+  factScopeReasonLimit, factScopeSources, isLiteralFactSource, literalFactBasis, missingFactScope,
 } from './fact-applicability.mjs';
 
 export const applicabilityKinds = ['included', 'excluded', 'undetermined'];
@@ -41,11 +41,15 @@ const keyOk = value => typeof value === 'string' && /^[a-z][a-z0-9_-]{0,49}$/.te
 const list = (value, max, min=0) => Array.isArray(value) && value.length >= min && value.length <= max;
 const sourcePlace = source => JSON.stringify([source.versionId,source.anchor]);
 const located = sources => sources.filter(source => validText(source.quote,4000) && !source.limitation);
+const independent = sources => located(sources).filter(source=>!isLiteralFactSource(source));
 
 export function checkAnalysis(analysis, check) {
   const {applicability,properties,tensions} = analysis ?? {};
   check(applicabilityKinds.includes(applicability?.kind) && validText(applicability.reason,420), 'invalid_review_applicability');
-  check(applicability.kind !== 'excluded' || located(applicability.sources).length > 0, 'exclusion_without_evidence');
+  check(applicability.kind !== 'excluded' || independent(applicability.sources).length > 0
+    && !applicability.sources.some(isLiteralFactSource), 'exclusion_without_evidence');
+  check(applicability.kind !== 'included' || !applicability.sources.some(isLiteralFactSource),
+    'inclusion_without_independent_evidence');
   check(list(properties,16) && list(tensions,12), 'invalid_review_analysis');
   const byProperty = new Map(), tensionKeys = new Set(), open = new Set();
   for (const property of properties) {
@@ -54,7 +58,8 @@ export function checkAnalysis(analysis, check) {
     const supported = located(property.sources).length > 0;
     const response = property.response;
     if (response) {
-      check(responseStates.includes(response.state) && validText(response.finding,350) && located(response.sources).length > 0,
+      check(responseStates.includes(response.state) && validText(response.finding,350) && independent(response.sources).length > 0
+        && !response.sources.some(isLiteralFactSource),
         'response_without_evidence');
       check(response.state !== 'received' || property.status !== 'unanswered','received_response_marked_unanswered');
       check(response.state !== 'not_received' || property.status !== 'not_mentioned','unreceived_response_marked_unmentioned');
@@ -70,11 +75,11 @@ export function checkAnalysis(analysis, check) {
       && tensionStatuses.includes(tension.status) && validText(tension.finding,550) && list(tension.sides,4,2), 'invalid_review_tension');
     const distinct = new Set();
     for (const side of tension.sides) {
-      const places = located(side.sources).map(sourcePlace);
-      check(validText(side.text,350) && places.length > 0 && places.every(place => !distinct.has(place)), 'tension_without_distinct_sides');
+      const places = independent(side.sources).map(sourcePlace);
+      check(validText(side.text,350) && places.length > 0 && !side.sources.some(isLiteralFactSource) && places.every(place => !distinct.has(place)), 'tension_without_distinct_sides');
       for (const place of places) distinct.add(place);
     }
-    check(tension.status !== 'resolved' || located(tension.resolutionSources).length > 0, 'tension_without_resolution');
+    check(tension.status !== 'resolved' || independent(tension.resolutionSources).length > 0 && !tension.resolutionSources.some(isLiteralFactSource), 'tension_without_resolution');
     check(tension.status !== 'open' || tension.resolutionSources.length === 0, 'open_tension_with_resolution');
     if (tension.status === 'open') open.add(tension.propertyKey);
     tensionKeys.add(tension.key);

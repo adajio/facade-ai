@@ -1,5 +1,5 @@
 import { readSheetEvidence } from './sheet-reading.mjs';
-import { readDrawingEvidence } from './drawing-reading.mjs';
+import { drawingTextVersion, readDrawingEvidence } from './drawing-reading.mjs';
 import { drawingAttachments } from './drawing-attachments.mjs';
 
 export async function attachReadingSkills(db,reader,sourceRoot,snapshot) {
@@ -30,7 +30,7 @@ export async function attachReadingSkills(db,reader,sourceRoot,snapshot) {
   const scopeNote=snapshot.scopeNote+
     (reading.limitations.length?' Ограничения чтения листов: '+[...new Set(reading.limitations.map(item=>item.reason))].join(', ')+'.':'');
   const attachments=drawing.drawings.length ? await drawingAttachments(drawing.drawings,images) : undefined;
-  return {...snapshot,scopeNote,factScopeVersion:1,lines:[...snapshot.lines,...reading.lines,...drawing.lines],
+  return {...snapshot,scopeNote,factScopeVersion:1,...(drawing.drawings.length && {drawingTextVersion}),lines:[...snapshot.lines,...reading.lines,...drawing.lines],
     sheetReading:{images,candidates,drawings:drawing.drawings,limitations:reading.limitations,...(attachments && {attachments})}};
 }
 

@@ -7,6 +7,27 @@ import { deriveDrawingAlternatives } from '../infra/local-terra/drawing-alternat
 import { queueReassessment, reassessmentKey, runReassessment } from '../infra/local-terra/reassessment.mjs';
 
 const scope={projectId:'p',receiptId:'r',catalogVersionId:'c',stage:'stage_1',preparationId:'m'};
+test('the drawing text revision is reserved once and only for a historical hint-only drawing snapshot',async t=>{
+  const {hadUncitableDrawingText}=await import('../infra/local-terra/drawing-batches.mjs');
+  const {queuedReasons}=await import('../infra/local-terra/reassessment.mjs');
+  const legacy={sheetReading:{drawings:[{}]},promptData:{drawingPhrases:[['P1',1,'unit','Панель М1']]}};
+  assert.equal(hadUncitableDrawingText(legacy),true);
+  assert.equal(hadUncitableDrawingText({...legacy,drawingTextVersion:2}),false);
+  assert.equal(hadUncitableDrawingText({...legacy,promptData:{drawingPhrases:[]}}),false);
+  assert.equal(hadUncitableDrawingText(null),false);
+  const directory=await mkdtemp(join(tmpdir(),'drawing-text-coverage-'));
+  t.after(()=>rm(directory,{recursive:true,force:true}));
+  await Promise.all([queueReassessment(directory,scope,'drawing_text_coverage'),queueReassessment(directory,scope,'drawing_text_coverage')]);
+  assert.deepEqual(await queuedReasons(directory,scope),['drawing_text_coverage']);
+});
+
+test('only reconstructed labels joined to the delivered line and its own pinned source count as new text', async()=>{
+  const {addressedDrawingIds}=await import('../infra/local-terra/drawing-batches.mjs');
+  const line=id=>({id,anchor:JSON.stringify({lineId:id,evidenceMode:'literal',drawingText:{version:2,origin:'dwg_native_geometry'}})});
+  const src={drawingTextVersion:2,promptData:{lines:[['P1'],['P2'],['P4']]},lines:[line('P1'),{id:'P2',anchor:'{}'},line('P3'),{...line('P1'),id:'P4'}]};
+  assert.deepEqual([...addressedDrawingIds(src)],['P1']);
+});
+
 test('only an unambiguous prepared sibling PDF is a readable companion',()=>{
   const item=(id,label,state,format)=>({label,state,format,kind:'document',occurrenceId:id,documentId:id,versionId:id,
     originalSha256:'a'.repeat(64),windowIds:state==='available'?['one']:[]});

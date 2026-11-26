@@ -83,20 +83,24 @@ export function preliminarySourcePlace(source: PreliminarySource): ParsedPlace {
       const at = address?.locator ?? {};
       const page = Number(at.page);
       const validPage = Number.isSafeInteger(page) && page > 0;
+      const drawing = typeof at.space === 'string' && typeof at.derivativeSha256 === 'string';
+      const drawingText = drawing && anchor.drawingText?.origin === 'dwg_native_geometry';
       const parts = [
+        drawingText && 'Надпись на чертеже',
         validPage && `Стр. ${page}`,
         (at.sheet ?? at.sheetName) && `Лист ${at.sheet ?? at.sheetName}`,
         at.cell && `Ячейка ${at.cell}`, at.range && `Диапазон ${at.range}`,
         at.row && `Строка ${at.row}`, at.paragraph && `Абзац ${at.paragraph}`, at.table && `Таблица ${at.table}`,
-        at.layout && `Лист чертежа ${at.layout}`, at.layer && `Слой ${at.layer}`,
+        (at.layout || drawing) && (at.space === 'Model' && !at.layout ? 'Пространство модели' : `Лист чертежа ${at.layout ?? at.space}`), at.layer && `Слой ${at.layer}`,
       ].filter(Boolean);
       const unitId = address?.unitId ?? anchor?.unitId;
-      if (!parts.length && typeof unitId === 'string') parts.push(unitId);
-      if (typeof anchor?.lineId === 'string' && anchor.lineId.length <= 40) parts.push(`Строка ${anchor.lineId}`);
+      if (drawingText && (at.part !== undefined || unitId)) parts.push(at.part !== undefined ? `Участок ${at.part}` : `Участок ${unitId}`);
+      else if (!parts.length && typeof unitId === 'string') parts.push(unitId);
+      if (!drawingText && typeof anchor?.lineId === 'string' && anchor.lineId.length <= 40) parts.push(`Строка ${anchor.lineId}`);
       if (address?.box) {
         const { x, y, width, height } = address.box;
         const coordinates = [x, y, width, height];
-        if (coordinates.every(Number.isFinite)) parts.push(`Область ${coordinates.map((value) => Math.round(value * 100) / 100).join(', ')} пт`);
+        if (coordinates.every(Number.isFinite)) parts.push(`Область ${coordinates.map((value) => Math.round(value * 100) / 100).join(', ')}${drawing ? ' ед. чертежа' : ' пт'}`);
       }
       if (parts.length) return {label:parts.join(' · '), page:validPage ? page : undefined};
     } catch { /* Plain-text addresses from previous reviews remain readable. */ }

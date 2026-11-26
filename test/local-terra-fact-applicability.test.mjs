@@ -549,3 +549,108 @@ test('a saved native quotation from a held visual reading can only confirm a lit
   assert.match(verified.finding,/Панель П2 из стали/u);
   assert.doesNotMatch(verified.finding,/всём фасаде/u);
 });
+
+const reconstructed = (id,quote) => source(JSON.stringify({unitId:'model',lineId:id,evidenceMode:'literal',
+  address:{unitId:'model',box:{x:20,y:30,width:120,height:12},locator:{handles:['E2','E3']}}}),quote);
+const pendingBinding=(scope,sources)=>rawProperty(scope,sources,{key:'binding',status:'insufficient',
+  finding:'Панель назначена всем зонам.',
+  letter:{kind:'ask',text:'Назовите толщину назначенной всем фасадам панели.'}});
+
+test('primary CAD evidence can establish only the inscription and a neutral binding question',async()=>{
+  const {validate}=await import('../infra/local-terra/producer.mjs');
+  const p=reconstructed('p-a','Панель П2, фасад А. Не применяется покрытие.');
+  const footer=source('native-footer','Лист 1.');
+  const subject=element('Панель П2');
+  const scope=rawScope(subject,subject,p);
+  const literal=rawProperty({...scope,basis:'literal'},[p],{key:'inscription',label:'Все фасады из П2'});
+  const forced=rawProperty(scope,[p],{key:'assignment',finding:'П2 назначена фасаду А.'});
+  const unscoped=rawProperty(undefined,[p],{key:'legacy'});
+  const binding=pendingBinding(scope,[p]);
+  const markedAsUnanswered={...binding,key:'claimed_absence',status:'unanswered'};
+  const snapshot={reviewContract:2,factScopeVersion:1,requirements:[{key:'panel',part:'Панель'}],
+    lines:[p,footer].map(line=>({...line,id:line.anchor,text:line.quote})),scopeNote:'Синтетический чертёж.',inventory:[p]};
+  const publish=(analysis)=>validate(snapshot,{rows:[{key:'panel',status:'present',finding:'Панель фасада.',
+    citations:[cite(p)],analysis}]});
+  const primary=publish(rawAnalysis([literal,forced,unscoped,binding,markedAsUnanswered]));
+  assert.equal(primary.rows[0].status,'partial');
+  const accepted=primary.rows[0].analysis.properties;
+  assert.deepEqual(accepted.map(property=>[property.key,property.status]),[
+    ['inscription','confirmed'],['assignment','insufficient'],['legacy','insufficient'],['binding','insufficient'],
+    ['claimed_absence','insufficient'],
+  ]);
+  assert.equal(accepted[0].label,subject.element);
+  assert.ok(accepted[0].finding.includes(p.quote));
+  assert.match(primary.draftText,/к какому элементу и участку относится запись «Панель П2»/u);
+  assert.doesNotMatch(primary.draftText,/толщину|назначенной/u);
+  assert.throws(()=>publish({...rawAnalysis([]),applicability:{kind:'excluded',reason:'Прочитано исключение.',citations:[cite(p)]}}),
+    /exclusion_without_evidence/);
+  assert.throws(()=>publish({...rawAnalysis([]),applicability:{kind:'included',reason:'Прочитано назначение.',citations:[cite(p)]}}),
+    /inclusion_without_independent_evidence/);
+  for (const kind of ['included','excluded']) {
+    assert.throws(()=>publish({...rawAnalysis([]),applicability:{kind,reason:'Панель П2 не применяется.',
+      citations:[cite(p),cite(footer)]}}),/clusion_without/u);
+  }
+  const missing=publish({...rawAnalysis([]),applicability:{kind:'excluded',reason:'Панель П2 не применяется.',
+    citations:[cite(footer)]}});
+  assert.equal(missing.rows[0].status,'unassessed');
+  assert.equal(missing.rows[0].analysis.applicability.kind,'undetermined');
+  assert.doesNotMatch(missing.rows[0].finding,/Панель П2 не применяется/u);
+});
+
+test('reconstructed CAD evidence cannot bridge scopes or act as a contradiction side',()=>{
+  const target=element('Панель П2',{zone:'фасад А'});
+  const observed=element('Панель П2',{zone:'фасад Б'});
+  const measured=source('native','Панель П2 фасад Б — 100 мм.');
+  const relation=reconstructed('p-link','Панель П2 фасада Б применяется на фасаде А.');
+  const independent=source('other','Панель П2 фасада Б применяется на фасаде А.');
+  const footer=source('footer','Лист 1.');
+  const property=(...witnesses)=>rawProperty(rawScope(target,observed,measured,...witnesses),[measured],{finding:'Указано 100 мм.'});
+  const mixed=[measured,relation,footer];
+  assert.equal(makeRow([property(relation,footer)],mixed).analysis.properties[0].scope.kind,'undetermined');
+  assert.equal(makeRow([property(independent)],[measured,independent]).analysis.properties[0].status,'confirmed');
+  assert.equal(makeRow([pendingBinding(rawScope(target,observed,measured,relation),[measured])],
+    [measured,relation]).analysis.properties[0].letter.kind,'omit');
+
+  const conflicting=reconstructed('p-dim','Панель П2 фасад Б — 120 мм.');
+  const tension={key:'conflict',propertyKey:'subject',status:'open',finding:'Две разные толщины.',
+    sides:[{text:'100 мм',citations:[cite(measured)]},{text:'120 мм',citations:[cite(conflicting)]}],resolutionCitations:[]};
+  const proposal=rawProperty(rawScope(observed,observed,measured,conflicting),[measured],{
+    status:'conflicting',letter:{kind:'ask',text:'Какую толщину применять?'},
+  });
+  const output=makeRow([proposal],[measured,conflicting],[tension]);
+  assert.equal(output.analysis.properties[0].status,'insufficient');
+  assert.equal(output.analysis.tensions.length,0);
+  assert.doesNotMatch(renderQuestions([output]),/Какую толщину/u);
+});
+
+test('an R alias cannot reuse a reconstructed label as an independent assignment witness',async()=>{
+  const {applyRevision,prepareRevisionSnapshot}=await import('../infra/local-terra/revise.mjs');
+  const target=element('Панель П2',{zone:'фасад А'});
+  const observed=element('Панель П2',{zone:'фасад Б'});
+  const relation=reconstructed('p-a','Панель П2 фасада Б применяется на фасаде А.');
+  const printed=element('Панель П2');
+  const prior=makeRow([rawProperty({...rawScope(printed,printed,relation),basis:'literal'},[relation],{key:'inscription'})],
+    [relation]);
+  const fact={id:'direct',versionId:'synthetic',originalSha256:'a'.repeat(64),label:'План.pdf',grounding:'text',
+    address:{unitId:'model',locator:{page:1}},lineId:'line-1',quote:'Панель П2 фасад Б — 100 мм.'};
+  const independent={...fact,id:'connection',lineId:'line-2',quote:relation.quote};
+  const prepare=candidates=>prepareRevisionSnapshot({rows:[prior],inventory:[relation],requirements:[{key:prior.key,part:'Панель'}],
+    scopeNote:'Закреплённая первичная цитата.'},candidates,candidates.length);
+  const run=(prepared,witness)=>{
+    const user=JSON.parse(prepared.request.messages[1].content);
+    const sourceId=user.facts.find(item=>item.quote===fact.quote).id;
+    const aliases=user.rows[0].priorSources;
+    const priorId=aliases.find(item=>item.quote===relation.quote).id;
+    const witnessId=witness ? user.facts.find(item=>item.quote===independent.quote).id : priorId;
+    const property={key:'assignment',label:'Толщина панели',status:'confirmed',finding:'Применяется 100 мм.',ids:[sourceId],
+      scope:{kind:'applicable',target,observed,reason:'Привязка подтверждена.',ids:[sourceId,witnessId]},
+      letter:{kind:'omit',text:'Толщина установлена.'}};
+    return applyRevision(prepared.snapshot,{changes:[{key:prior.key,status:'partial',finding:'Толщина установлена.',
+      ids:[sourceId],analysis:{applicability:null,properties:[property],tensions:[]}}]}).rows[0];
+  };
+  const held=run(prepare([fact]),false);
+  assert.equal(held.analysis.properties.find(item=>item.key==='assignment').status,'insufficient');
+  assert.equal(held.analysis.properties.find(item=>item.key==='inscription').status,'confirmed');
+  const justified=run(prepare([fact,independent]),true);
+  assert.equal(justified.analysis.properties.find(item=>item.key==='assignment').status,'confirmed');
+});

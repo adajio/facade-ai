@@ -9,7 +9,7 @@ import { replaySavedSheets } from './replay-sheets.mjs';
 import { replayAddressed } from './replay-addressed.mjs';
 import { renderQuestions } from './review-analysis.mjs';
 import { loadReport } from './revise.mjs';
-import { isDrawingBatch, preserveUnrevisitedRows, selectDrawingBatch } from './drawing-batches.mjs';
+import { addressedDrawingIds, isDrawingBatch, preserveUnrevisitedRows, selectDrawingBatch } from './drawing-batches.mjs';
 import { duration, emitActivity, modelFailure, remainingRequestBytes, responseUsage } from './request-budget.mjs';
 
 const digest = value => createHash('sha256').update(JSON.stringify(value)).digest('hex');
@@ -23,7 +23,7 @@ export function reassessmentKey(scope,reason) {
 }
 
 export async function queueReassessment(stateDir,scope,reason) {
-  if (!(isDrawingBatch(reason) || reason==='operator' || /^(?:replay_)?sheet_applicability_v[12]$/.test(reason) || reason==='index_complete' || /^replay_saved_v[1-3]$/.test(reason) || /^requirements:[a-z0-9_.-]+(?:,[a-z0-9_.-]+)*$/.test(reason)) || !/^[a-zA-Z0-9_-]+$/.test(scope.receiptId) || !scope.preparationId) throw Error('invalid_reassessment_scope');
+  if (!(isDrawingBatch(reason) || reason==='drawing_text_coverage' || reason==='operator' || /^(?:replay_)?sheet_applicability_v[12]$/.test(reason) || reason==='index_complete' || /^replay_saved_v[1-3]$/.test(reason) || /^requirements:[a-z0-9_.-]+(?:,[a-z0-9_.-]+)*$/.test(reason)) || !/^[a-zA-Z0-9_-]+$/.test(scope.receiptId) || !scope.preparationId) throw Error('invalid_reassessment_scope');
   const key = reassessmentKey(scope,reason);
   const folder = join(stateDir,'addressed',scope.receiptId);
   await mkdir(folder,{recursive:true,mode:0o700});
@@ -116,7 +116,7 @@ export function withPreviousEvidence(raw,report) {
 
 export function selectReassessment(raw,report,ticket) {
   if (isDrawingBatch(ticket.reason)) return selectDrawingBatch(raw,ticket.reason);
-  if (ticket.reason==='operator') return withPreviousEvidence(raw,report);
+  if (ticket.reason==='operator' || ticket.reason==='drawing_text_coverage') return withPreviousEvidence(raw,report);
   if (['sheet_applicability_v1','sheet_applicability_v2'].includes(ticket.reason)) return withPreviousEvidence(raw,report);
   const active=new Set(report.rows.map(row=>row.key));
   let selected;
@@ -165,6 +165,22 @@ async function indexComplete(db,scope) {
   return row.complete;
 }
 
+// Paid drawing batches may already have delivered these exact locations for this preparation.
+async function hasNewDrawingText(folder,snapshot,ids) {
+  const remaining=new Set(ids);
+  for (const name of await readdir(folder)) {
+    if (!name.endsWith('.json')) continue;
+    const prior=await read(join(folder,name));
+    const input=prior?.snapshot;
+    if (!input || !(['published','responded','superseded'].includes(prior.state) || prior.state==='rejected' && prior.response) ||
+        input.preparationId!==snapshot.preparationId || input.stage!==snapshot.stage ||
+        input.catalogVersionId!==snapshot.catalogVersionId) continue;
+    for (const id of addressedDrawingIds(input)) remaining.delete(id);
+    if (!remaining.size) return false;
+  }
+  return remaining.size>0;
+}
+
 export async function runReassessment(run,scope,reason) {
   const {db,stateDir,modelCall,publish,admitClaim,recordActivity}=run;
   const key=reassessmentKey(scope,reason);
@@ -194,6 +210,12 @@ export async function runReassessment(run,scope,reason) {
     if (reason==='index_complete' && !await indexComplete(db,scope)) return 'waiting';
     const report=await loadReport(db,scope.receiptId);
     if (!report || report.preparationId!==scope.preparationId || report.catalogVersionId!==scope.catalogVersionId || report.stage!==scope.stage) return 'waiting';
+    const drawingText=reason==='drawing_text_coverage';
+    const skip=async reason=>{
+      await atomicWrite(base+'.done',{reason});
+      return 'no_new_evidence';
+    };
+    if (drawingText && !report.rows.some(row=>row.status==='unassessed' && row.analysis?.applicability.kind!=='excluded')) return skip('already_assessed');
     const raw=await readSnapshot(db,scope.receiptId);
     if (!raw || raw.preparationId!==report.preparationId || raw.stage!==report.stage || raw.catalogVersionId!==report.catalogVersionId ||
         JSON.stringify(raw.inventory)!==JSON.stringify(report.inventory) || reason==='index_complete' && raw.indexCoverage.pendingVersions) return 'waiting';
@@ -204,7 +226,24 @@ export async function runReassessment(run,scope,reason) {
       await notify('published',scope,{reviewId:publication.id,selectedFacts:0});
       return 'published';
     }
-    const snapshot=preparePromptSnapshot({...(run.withSkills ? await run.withSkills(selected) : selected),reviewContract:2,factScopeVersion:1});
+    const material={...(run.withSkills ? await run.withSkills(selected) : selected),reviewContract:2,factScopeVersion:1};
+    let snapshot=preparePromptSnapshot(material);
+    if (drawingText) {
+      let addresses=addressedDrawingIds(snapshot);
+      const drawings=material.sheetReading?.drawings ?? [];
+      if (!addresses.size && drawings.some(d=>d.phrases.some(p=>p.literalId))) {
+        // The previous overview already carried images. Give new text the full allowance
+        // before concluding this immutable input contains no readable reconstruction.
+        snapshot=preparePromptSnapshot({...material,sheetReading:{...material.sheetReading,images:[],attachments:[]}});
+        addresses=addressedDrawingIds(snapshot);
+      }
+      if (!addresses.size || !await hasNewDrawingText(dirname(base),snapshot,addresses)) {
+        const transient=new Set(['dwg_reading_timeout','dwg_native_unavailable','dwg_pinned_map_unavailable',
+          'dwg_index_source_lookup_unavailable','reader_resource_wait']);
+        if (drawings.some(d=>d.limitations.some(l=>transient.has(l.reason)))) return 'waiting';
+        return skip(addresses.size ? 'drawing_text_already_delivered' : 'no_addressable_drawing_text');
+      }
+    }
     const request=makeRequest(snapshot);
     if (drawingBatch) snapshot.drawingBatchVersions=selected.files.map(file=>file.versionId);
     snapshot.requestSha256=digest(request);
@@ -258,9 +297,11 @@ export async function runReassessment(run,scope,reason) {
     }
   }
   let updated=mergeSelection(input,current.rows);
-  if (drawingBatch) {
+  if (drawingBatch || reason==='drawing_text_coverage') {
     updated=preserveUnrevisitedRows(updated,current.rows,input.rows);
     updated.draftText=renderQuestions(updated.rows);
+  }
+  if (drawingBatch) {
     updated.scopeNote=(current.scopeNote ?? '').slice(0,9000)+
       ` Дополнительная партия DWG — файлов с источниками: ${snapshot.budget.evidenceFiles} из ${snapshot.files.length}, с графикой: ${snapshot.budget.visualFiles}.`;
   }

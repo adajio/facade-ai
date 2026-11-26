@@ -9,7 +9,7 @@ import { drawingBatchReasons } from '../infra/local-terra/drawing-batches.mjs';
 import { queueReassessment, queuedReasons, runReassessment } from '../infra/local-terra/reassessment.mjs';
 
 import { groupDrawingPhrases } from '../infra/local-terra/drawing-reading.mjs';
-import { preparePromptSnapshot, makeRequest } from '../infra/local-terra/producer.mjs';
+import { preparePromptSnapshot, makeRequest, validate } from '../infra/local-terra/producer.mjs';
 import { ModelTransportError, remainingRequestBytes } from '../infra/local-terra/request-budget.mjs';
 import { attachReadingSkills } from '../infra/local-terra/sheet-review.mjs';
 import { terraRequestKind } from '../infra/local-terra/transport/production.mjs';
@@ -43,7 +43,7 @@ test('CAD glyph groups keep coordinate order and exact underlying literals',()=>
   ]);
 });
 
-function syntheticDrawings() {
+function syntheticDrawings({missingIndex=false,mismatch=false}={}) {
   const files=Array.from({length:11},(_,index)=>({versionId:uuid(20+index),documentId:uuid(40+index),
     originalSha256:sha(`synthetic-dwg-${index}`),format:'dwg',path:`drawing-${index}.dwg`}));
   const source={projectId:uuid(1),receiptId:uuid(2),preparationId:uuid(3),catalogVersionId:uuid(4),stage:'Стадия 1',
@@ -51,11 +51,14 @@ function syntheticDrawings() {
     requirements:[{key:'facades',part:'Фасады'}],indexCursor:files.map(file=>({versionId:file.versionId,readerVersion:'dwg-fixture-v1',
       contract:3,processedUnits:3}))};
   const frame={width:240,height:170};
-  const unit=(id,space)=>({id,label:id,...frame,locator:{coverage:'partial',space,candidateCount:2,entityCount:125}});
+  const unit=(id,space)=>({id,label:id,...frame,locator:{coverage:'partial',space,candidateCount:5,entityCount:125,
+    derivativeSha256:sha('derivative'),partSha256:sha(id),converterIdentity:'sha256:'+sha('converter'),derivativeFormat:'dxf'}});
   const maps=files.map(file=>({...file,readerVersion:'dwg-fixture-v1',mapFingerprint:sha(file.versionId),
     units:[unit('PL1','Paper'),unit('M1','Model')]}));
   const byVersion=new Map(maps.map(map=>[map.versionId,map]));
-  const text=new Map([['B1','Условные обозначения'],['B2','Лист 1']]);
+  const text=new Map([['B1','Условные обозначения'],['B2','Лист 1'],['B3','Плитка'],['B4','под'],['B5','кирпич']]);
+  const geometry=[{x:176,y:-9,width:100,height:10},{x:176,y:39,width:36,height:10},
+    {x:176,y:83,width:33,height:10},{x:212,y:83,width:16.5,height:10},{x:231,y:83,width:33,height:10}];
   const db={async query(sql,params){
     if (sql.startsWith('SELECT DISTINCT')) {
       assert.deepEqual(params.slice(0,3),[source.projectId,source.receiptId,source.preparationId]);
@@ -63,8 +66,8 @@ function syntheticDrawings() {
       return {rows:maps.filter(map=>params[3].includes(map.versionId))};
     }
     assert.match(sql,/JOIN project_memory_lines/u);
-    return {rows:JSON.parse(params[3]).map(target=>({...target,blockId:'block:'+target.unitId,blockOrdinal:0,ordinal:0,
-      readerVersion:'dwg-fixture-v1',text:text.get(target.lineId),
+    return {rows:missingIndex ? [] : JSON.parse(params[3]).map(target=>({...target,blockId:'block:'+target.unitId,blockOrdinal:0,ordinal:0,
+      readerVersion:'dwg-fixture-v1',text:mismatch && target.lineId==='B5' ? 'гранит' : text.get(target.lineId),
       address:{unitId:target.unitId,locator:{derivativeHandle:target.lineId}}}))};
   }};
   const blank=png(false), graphic=png(true);
@@ -75,9 +78,10 @@ function syntheticDrawings() {
     assert.equal(pin.documentId,map.documentId);
     assert.equal(input.readerVersion,map.readerVersion);
     const {address,representation}=input;
-    if (representation==='native') return {address,drawingFrame:{x:100,y:-40,...frame},lines:[...text].map(([id,value],i)=>({
-      id,text:value,locator:{derivativeHandle:id},drawingBounds:{x:176,y:-9+i*48,width:100,height:10},details:{layer:'titles'},
-    }))};
+    if (representation==='native') return {address:{...address,locator:map.units.find(unit=>unit.id===address.unitId).locator},
+      drawingFrame:{x:100,y:-40,...frame},lines:[...text].map(([id,value],i)=>({
+        id,text:value,locator:{derivativeHandle:id},drawingBounds:geometry[i],details:{layer:'titles'},
+      }))};
     const box=address.locator ? {x:8,y:8,width:210,height:140} : address.box ?? {x:0,y:0,...frame};
     const bytes=pin.versionId===files[3].versionId && address.unitId==='PL1' ? blank : graphic;
     return {address:{...address,box},mediaType:'image/png',bytes,transform:{...frame,pixelOriginX:0,pixelOriginY:0,pixelsPerPoint:1},limitations:[]};
@@ -104,7 +108,11 @@ test('ordinary primary request retains all eleven DWG overviews, their addressab
   assert.equal(prompt.sheetImages.filter(image=>image[1]==='drawing_sheet').length,10);
   assert.equal(prompt.sheetImages.filter(image=>image[1]==='drawing_model').length,1);
   assert.equal(prompt.sheetImages.filter(image=>image[1]==='title_block').length,11);
-  assert.equal(new Set(prompt.drawingPhrases.map(row=>row[1])).size,11);
+  const inscriptions=prompt.lines.filter(row=>row[0].startsWith('P'));
+  assert.equal(new Set(inscriptions.map(row=>row[1])).size,11);
+  assert.ok(inscriptions.some(row=>row[3]==='Плитка под кирпич'));
+  assert.ok(inscriptions.some(row=>row[3]==='Условные обозначения'));
+  assert.equal(prepared.drawingTextVersion,2);
   const parts=request.messages[1].content.slice(1);
   assert.ok(parts.length<prompt.sheetImages.length);
   assert.ok(prompt.sheetImages.some(panel=>panel[1]==='legend' && images.get(panel[0]).box.width<frame.width));
@@ -186,4 +194,44 @@ test('overflow resumes through independently journaled DWG batches and keeps the
   assert.equal(await runReassessment(run,source,tickets[0]),'published');
   assert.equal(orders.length,tickets.length);
   assert.match(report.scopeNote,/Дополнительная партия DWG/u);
+});
+
+test('a reconstructed material annotation is citable before indexing and cannot assign a zone',async()=>{
+  const {source,db,reader}=syntheticDrawings({missingIndex:true});
+  const evidence=await attachReadingSkills(db,reader,'unused',source);
+  const snapshot=preparePromptSnapshot({...evidence,reviewContract:2});
+  const line=snapshot.lines.find(line=>line.text==='Плитка под кирпич');
+  assert.match(line.id,/^P[a-f0-9]{24}$/u);
+  assert.equal(line.indexChecked,false);
+  const anchor=JSON.parse(line.anchor);
+  assert.equal(anchor.evidenceMode,'literal');
+  assert.equal(anchor.address.locator.derivativeSha256,sha('derivative'));
+  assert.equal(anchor.address.locator.partSha256,sha(anchor.unitId));
+  assert.equal(anchor.address.box.x,76);
+  assert.deepEqual(anchor.drawingText.parts,[['B3','B3'],['B4','B4'],['B5','B5']]);
+  const citations=[{id:line.id,quote:line.text}];
+  const side={element:'Плитка под кирпич'};
+  const property={key:'material_label',label:'Подпись материала',status:'confirmed',finding:'Зафиксирована подпись материала.',
+    citations,letter:{kind:'omit',text:'Сохранена подпись.'},scope:{kind:'applicable',target:side,observed:side,
+      basis:'literal',reason:'Подпись прочитана.',citations}};
+  const result={rows:[{key:'facades',status:'present',finding:'Подпись материала найдена.',citations,
+    analysis:{applicability:{kind:'included',reason:'Материал указан.',citations:[]},properties:[property],tensions:[]}}]};
+  const [row]=validate(snapshot,result).rows;
+  assert.equal(row.status,'partial');
+  assert.equal(row.analysis.properties[0].scope.basis,'literal');
+  assert.equal(row.sources[0].quote,'Плитка под кирпич');
+  assert.equal(row.sources[0].anchor,line.anchor);
+  property.scope.basis=undefined;
+  property.scope.target={...side,zone:'весь фасад'};
+  assert.equal(validate(snapshot,result).rows[0].status,'unassessed');
+  citations[0].quote='Панель под кирпич';
+  assert.throws(()=>validate(snapshot,result),/invalid_citation/u);
+});
+
+test('an indexed and native glyph mismatch withholds the reconstructed line',async()=>{
+  const {source,db,reader}=syntheticDrawings({mismatch:true});
+  const evidence=await attachReadingSkills(db,reader,'unused',source);
+  const snapshot=preparePromptSnapshot({...evidence,reviewContract:2});
+  assert.ok(snapshot.lines.some(line=>line.text==='Условные обозначения'));
+  assert.ok(snapshot.lines.every(line=>line.text!=='Плитка под кирпич'));
 });

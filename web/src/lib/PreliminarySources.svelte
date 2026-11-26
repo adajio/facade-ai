@@ -12,6 +12,17 @@
     ['unreadable', 'Недостаточная читаемость'],
   ]);
 
+  function drawingUnit(source: PreliminarySource) {
+    if (!validId(source.documentId) || !validId(source.versionId)) return;
+    try {
+      const anchor = JSON.parse(source.anchor);
+      if (anchor.drawingText?.origin !== 'dwg_native_geometry' || anchor.evidenceMode !== 'literal' ||
+          typeof anchor.readerVersion !== 'string' || typeof anchor.unitId !== 'string') return;
+      const query = new URLSearchParams({readerVersion:anchor.readerVersion, representation:'render'});
+      return `/api/v1/documents/${source.documentId}/versions/${source.versionId}/reader/units/${encodeURIComponent(anchor.unitId)}?${query}`;
+    } catch { return; }
+  }
+
   function sheetPreview(source: PreliminarySource) {
     if (!validId(source.documentId) || !validId(source.versionId)) return;
     try {
@@ -33,9 +44,11 @@
 <ul aria-label={label}>
   {#each sources as source}
     {@const preview = sheetPreview(source)}
+    {@const unit = drawingUnit(source)}
     <li>
       <a href={preliminarySourceUrl(source)} target="_blank" rel="noopener noreferrer">{source.label}</a>
       · {preliminarySourcePlace(source).label}
+      {#if unit}<p class="meta"><a href={unit} target="_blank" rel="noopener noreferrer">Открыть участок чертежа</a></p>{/if}
       {#if source.quote?.trim()}<blockquote>{source.quote}</blockquote>{/if}
       {#if preview}
         <p class="meta">

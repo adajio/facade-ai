@@ -7,6 +7,10 @@ const sharp=createRequire(new URL('../../src/modules/formats/package.json',impor
 const stamp = /^(?:лист(?:ов)?|стадия|изм\.?|разработал|проверил|н\.?\s*контр\.?|гип|проектировал|\S{2,}[-.]\s*(?:ар|кж|км|нвф))(?=$|[^\p{L}])/iu;
 const legend = /^(?:условные обозначения|легенда|экспликация|ведомость|спецификация|примечания|общие указания)/iu;
 const meaningful = /фасад|разрез|сечени|план|отметк|уз(?:ел|лы)|стык|размер|толщин|креплен|направляющ|кронштейн|анк[её]р|облицов|состав|утепл|мембран|противопожар|бетон|арматур|профил|алюмини|кирпич|панел|материал|цвет|\bRAL\b/iu;
+const material = /(?:фасадн\p{L}* панел|плитк|кирпич|алюмини|утепл|изоляци|керам|минерал|штукатур|бетон|арматур|блок[аиоув]?\b|облицов|стекл|профил|анк[её]р|кронштейн|мембран)/iu;
+const digest = /^[a-f0-9]{64}$/u;
+const maxPhraseParts = 72;
+export const drawingTextVersion = 2;
 const permissions = /^([a-z][a-z0-9_]{0,80})$/u;
 const sha = data => createHash('sha256').update(data).digest('hex');
 const stableId = (prefix, parts) => prefix+sha(JSON.stringify(parts)).slice(0,24);
@@ -22,8 +26,21 @@ const ascii = part => part.replace(/\\[fFhHwWqQcCaAtT][^;]*;/gu,'')
   .replace(/[{}]/gu,'').replace(/\s+/gu,' ');
 const fold = value => value.normalize('NFKC').toLowerCase().replaceAll('ё','е').trim();
 const clean = value => value.replace(/\s+/gu,' ').trim();
+const reference = /^(?:все|см\.|смотри|эскиз|необходимо)|согласова|спецификаци|см\.\s*раздел/iu;
+function phraseType(text) {
+  if (legend.test(text) || sheetHeading(text)) return 'heading';
+  if (stamp.test(text)) return 'stamp';
+  if (material.test(text) && !reference.test(text)) return 'material';
+  if (/\bRAL\b/iu.test(text)) return 'color';
+  return 'note';
+}
+
+const materialRank = text => (phraseType(text)==='material' ? 20 : 0)
+  + (/(?:мм|кирпич|изоляци|керам|панел|стекл|профил|облицов)/iu.test(text) ? 7 : 0)
+  - (reference.test(text) ? 9 : 0);
 const textRank = text => (legend.test(text) ? 18 : 0)+(stamp.test(text) ? 9 : 0)
-  +(sheetHeading(text) ? 12 : 0)+(meaningful.test(text) ? 8 : 0)+Math.min(6,text.length/12);
+  +(sheetHeading(text) ? 12 : 0)+(meaningful.test(text) ? 8 : 0)+Math.min(6,text.length/12)+materialRank(text);
+const sourceHandle = locator => locator?.derivativeHandle ?? locator?.handle;
 const unitRank = (a,b) => Number(b.locator?.candidateCount ?? 0)-Number(a.locator?.candidateCount ?? 0)
   || Number(b.locator?.entityCount ?? 0)-Number(a.locator?.entityCount ?? 0);
 
@@ -31,12 +48,15 @@ export function groupDrawingPhrases(lines) {
   const parts = [];
   for (const line of lines) {
     const box = line.drawingBounds;
-    const handle = line.locator?.derivativeHandle ?? line.locator?.handle;
+    const handle = sourceHandle(line.locator);
     if (!handle || typeof line.text!=='string' || line.text.length>1120 || !box || ![box.x,box.y,box.width,box.height].every(Number.isFinite) || box.width<=0 || box.height<=0) continue;
     const display = ascii(line.text);
     if (!display.trim() || /\\[a-z0-9]+;/iu.test(display)) continue;
-    const advance = Math.min(box.width,box.height * .69 * Math.max(1,[...display].length));
-    parts.push({line,handle,box,display,advance,layer:line.details?.layer ?? null});
+    const widthRatio = box.width/box.height;
+    const characters = [...display.trim()].length;
+    const hiddenExtent = widthRatio > characters*1.4;
+    const advance = Math.min(box.width,box.height*(hiddenExtent ? .58 : .69)*Math.max(1,characters));
+    parts.push({line,handle,box,display,advance,characters,layer:line.details?.layer ?? null});
   }
   parts.sort((a,b)=>a.box.y-b.box.y||a.box.x-b.box.x);
   const rows = [];
@@ -60,11 +80,11 @@ export function groupDrawingPhrases(lines) {
     let group=[], display='';
     function flush() {
       const text=clean(display);
-      if (text.length>=5 && /[а-яa-z]{2}/iu.test(text) && textRank(text)>=4) {
+      if (text.length>=5 && text.length<=480 && /[а-яёa-z]{2}/iu.test(text) && textRank(text)>=4) {
         const x=group[0].box.x, y=Math.min(...group.map(part=>part.box.y));
         const right=Math.max(...group.map(part=>part.box.x+part.advance));
         const bottom=Math.max(...group.map(part=>part.box.y+part.box.height));
-        phrases.push({display:text.slice(0,240),box:{x,y,width:right-x,height:bottom-y},parts:group,score:textRank(text)});
+        phrases.push({display:text,type:phraseType(text),box:{x,y,width:right-x,height:bottom-y},parts:group,score:textRank(text)});
       }
       group=[];
       display='';
@@ -73,8 +93,9 @@ export function groupDrawingPhrases(lines) {
       const previous=group.at(-1), height=Math.min(part.box.height,previous?.box.height ?? part.box.height);
       const gap=previous ? part.box.x-previous.box.x-previous.advance : 0;
       if (previous?.display===part.display && Math.abs(part.box.x-previous.box.x)<height*.16) continue;
-      if (previous && (gap>height*1.04 || gap< -height*.32 || group.length>=90)) flush();
-      if (group.length && gap>height*.36) display+=' ';
+      if (previous && (gap>height*1.04 || gap< -height*.32 || group.length>=maxPhraseParts)) flush();
+      const wordSpacing = part.characters>1 || previous?.characters>1 ? .24 : .36;
+      if (group.length && gap>height*wordSpacing) display+=' ';
       group.push(part);
       display+=part.display;
     }
@@ -159,11 +180,17 @@ function cropBox(unit) {
   return {x:width*.53,y:height*.68,width:width*.47,height:height*.32};
 }
 
-function phraseCrop(phrase,kind) {
-  const {frame,box,unit}=phrase;
+function withinFrame({frame,box,unit}) {
   if (!frame || frame.width!==unit.width || frame.height!==unit.height || ![frame.x,frame.y].every(Number.isFinite)) return;
-  const left=box.x-frame.x, top=box.y-frame.y;
-  if (left<0 || top<0 || left+box.width>frame.width || top+box.height>frame.height) return;
+  const x=box.x-frame.x, y=box.y-frame.y;
+  if (x<0 || y<0 || x+box.width>frame.width || y+box.height>frame.height) return;
+  return {x,y,width:box.width,height:box.height};
+}
+
+function phraseCrop(phrase,kind) {
+  const inside=withinFrame(phrase);
+  if (!inside) return;
+  const {frame,box}=phrase, {x:left,y:top}=inside;
   const margin=Math.max(box.width*.30,box.height*6);
   const x=Math.max(0,left-margin), y=Math.max(0,top-box.height*4);
   const right=Math.min(frame.width,left+box.width+margin*(kind==='legend' ? 2.2 : 1));
@@ -213,7 +240,7 @@ async function readDrawing(reader,snapshot,map,deadline) {
   if (!overviewUnit) note('dwg_overview_unavailable');
 
   const opened=[];
-  const nativeUnits=[...new Set([overviewUnit,paper[0],model[0],model[1]].filter(Boolean))].slice(0,3);
+  const nativeUnits=[...new Set([overviewUnit,paper[0],...model.slice(0,8)].filter(unit=>unit&&unit.locator?.candidateCount>0))];
   for (const unit of nativeUnits) {
     if (!withinTime()) break;
     try {
@@ -221,18 +248,40 @@ async function readDrawing(reader,snapshot,map,deadline) {
       if (address?.unitId!==unit.id || !Array.isArray(lines)) throw Error('dwg_native_address_mismatch');
       coverage.nativeUnits.push(unit.id);
       for (const limitation of limitations ?? []) if (limitation) note(limitation,unit.id);
-      opened.push(...groupDrawingPhrases(lines).slice(0,5).map(phrase=>({...phrase,unit,frame:drawingFrame})));
+      const pin=address.locator;
+      const exactPin=pin?.derivativeFormat==='dxf' && digest.test(pin.derivativeSha256 ?? '') && digest.test(pin.partSha256 ?? '')
+        && ['derivativeSha256','partSha256','converterIdentity'].every(key=>pin[key]===unit.locator?.[key]);
+      const groups=groupDrawingPhrases(lines);
+      for (const type of ['material','heading','stamp','color','note']) {
+        const candidates=groups.filter(group=>group.type===type)
+          .map(phrase=>({...phrase,unit,frame:drawingFrame,pin:exactPin ? pin : undefined}));
+        opened.push(...candidates.slice(0,type==='material' ? 12 : 5));
+      }
     } catch(error) { note(reason(error,'dwg_native_unavailable'),unit.id); }
   }
   if (!opened.length) note('dwg_no_spatial_text');
-  const candidates=opened.sort((a,b)=>b.score-a.score || Number(b.unit===overviewUnit)-Number(a.unit===overviewUnit));
-  for (const phrase of candidates.slice(0,6)) {
-    coverage.phrases.push({id:stableId('P',[versionId,originalSha256,readerVersion,phrase.unit.id,phrase.parts.map(part=>part.line.id)]),
-      unitId:phrase.unit.id,display:phrase.display,box:phrase.box,kind:detailKind(phrase),parts:phrase.parts.map(part=>part.line)});
+  const candidates=opened.map(phrase=>({...phrase,relativeBox:withinFrame(phrase)}));
+  candidates.sort((a,b)=>Number(Boolean(b.pin&&b.relativeBox))-Number(Boolean(a.pin&&a.relativeBox))
+    || b.score-a.score || Number(b.unit===overviewUnit)-Number(a.unit===overviewUnit));
+  const seen=new Set();
+  const limits={material:8,heading:4,stamp:1,color:3,note:2};
+  for (const phrase of candidates) {
+    const key=fold(phrase.display);
+    if (seen.has(key) || limits[phrase.type]<=0) continue;
+    seen.add(key);
+    limits[phrase.type]--;
+
+    const parts=phrase.parts.map(part=>part.line);
+    const id=stableId('P',[drawingTextVersion,versionId,originalSha256,readerVersion,phrase.unit.id,
+      phrase.pin?.derivativeSha256,phrase.pin?.partSha256,parts.map(part=>part.id),phrase.display]);
+    coverage.phrases.push({id,unitId:phrase.unit.id,display:phrase.display,box:phrase.box,relativeBox:phrase.relativeBox,
+      kind:detailKind(phrase),type:phrase.type,pin:phrase.pin,parts});
   }
 
   const detail = new Set();
-  for (const phrase of candidates.slice(0,8)) {
+  const graphics=opened.filter(phrase=>phrase.type!=='material' || detailKind(phrase)!=='detail')
+    .sort((a,b)=>Number(b.type==='heading')-Number(a.type==='heading') || b.score-a.score);
+  for (const phrase of graphics.slice(0,8)) {
     const kind=detailKind(phrase);
     if (detail.size>=2 || !withinTime()) break;
     if (detail.has(kind)) continue;
@@ -301,10 +350,12 @@ export async function readDrawingEvidence(db,reader,snapshot) {
     const source=files.find(file=>file.versionId===drawing.versionId);
     drawing.phrases=drawing.phrases.flatMap(({parts,...phrase})=>{
       const rows=parts.map(part=>indexed.get(key(drawing.versionId,phrase.unitId,part.id)));
-      if (!rows.every((row,i)=>row?.text===parts[i].text && row.address?.unitId===phrase.unitId
-        && row.readerVersion===drawing.readerVersion)) return [];
+      if (rows.some((row,i)=>row && (row.text!==parts[i].text || row.address?.unitId!==phrase.unitId
+        || sourceHandle(row.address?.locator)!==sourceHandle(parts[i].locator) || row.readerVersion!==drawing.readerVersion))) return [];
+      const literal=addressedDrawingLine(drawing,source,phrase,parts,rows);
+      if (literal) result.lines.push(literal);
       const lineIds=[], indexedParts=[];
-      for (const row of rows) {
+      for (const row of rows.filter(Boolean)) {
         const lineKey=key(row.versionId,row.unitId,row.lineId);
         const {unitId,lineId,address,readerVersion,blockId,blockOrdinal,ordinal,versionId,text}=row;
         const id=stableId('D',[source.originalSha256,versionId,readerVersion,unitId,lineId]);
@@ -317,9 +368,29 @@ export async function readDrawingEvidence(db,reader,snapshot) {
         }
         lineIds.push(existing.get(lineKey).id);
       }
-      return [{...phrase,lineIds:[...new Set(lineIds)],indexedParts}];
+      if (!literal && !lineIds.length) return [];
+      return [{...phrase,lineIds:[...new Set(lineIds)],indexedParts,
+        ...(literal && {literalId:literal.id,sourceParts:parts.map(({id,text,drawingBounds,locator})=>({id,text,drawingBounds,locator}))})}];
     });
     if (!drawing.phrases.length && drawing.nativeUnits.length) drawing.limitations.push({reason:'dwg_spatial_text_unavailable_in_index'});
   }
   return result;
+}
+
+function addressedDrawingLine(drawing,file,phrase,parts,rows) {
+  const {pin,relativeBox,unitId}=phrase;
+  if (!pin || !relativeBox || !parts.length || parts.length>maxPhraseParts) return;
+  const coordinates=[relativeBox.x,relativeBox.y,relativeBox.width,relativeBox.height];
+  if (!coordinates.every(Number.isFinite) || relativeBox.width<=0 || relativeBox.height<=0) return;
+  const locator=Object.fromEntries(['space','view','part','derivativeSha256','derivativeFormat','partSha256','converterIdentity']
+    .filter(key=>pin[key]!==undefined).map(key=>[key,pin[key]]));
+  const glyphs=parts.map(part=>[part.id,sourceHandle(part.locator)]);
+  if (!glyphs.every(([id,handle])=>typeof id==='string' && typeof handle==='string') || new Set(glyphs.map(([id])=>id)).size!==glyphs.length) return;
+  const drawingText={version:drawingTextVersion,origin:'dwg_native_geometry',type:phrase.type,mapFingerprint:drawing.mapFingerprint,
+    parts:glyphs,sourceDigest:sha(JSON.stringify(parts.map(({id,text,drawingBounds})=>[id,text,drawingBounds])))};
+  const anchor=JSON.stringify({unitId,lineId:phrase.id,readerVersion:drawing.readerVersion,evidenceMode:'literal',
+    address:{unitId,box:relativeBox,locator},drawingText});
+  if (anchor.length>4000) return;
+  return {id:phrase.id,versionId:drawing.versionId,originalSha256:file.originalSha256,text:phrase.display,anchor,drawingType:phrase.type,
+    indexChecked:rows.every(Boolean)};
 }

@@ -8,7 +8,7 @@ import { canonicalJson } from "./domain.js";
 import { AssessmentError, invalidInput } from "./store.js";
 
 import { preliminaryChanges, type ReviewRow } from "./preliminary-changes.js";
-import { enrichReviewAnalysis, renderPreliminaryQuestions, type Original, type RetainedReviewFinding, type ReviewAnalysis,
+import { enrichReviewAnalysis, literalSource, renderPreliminaryQuestions, type Original, type RetainedReviewFinding, type ReviewAnalysis,
   type ReviewSourceInput, type ReviewStatus } from "./preliminary-analysis.js";
 export type PreliminaryPackageReviewInput = {
   projectId: string; receiptId: string; catalogVersionId: string; model: "gpt-6.1-terra";
@@ -80,6 +80,11 @@ export async function publishPreliminaryPackageReview(db: Pool, input: Prelimina
       };
       const sources = row.sources.map(enrichSource);
       const analysis = row.analysis === undefined ? undefined : enrichReviewAnalysis(row.analysis,enrichSource);
+      const onlyLiteral = sources.some(literalSource) &&
+        !sources.some(source => source.quote && !source.limitation && !literalSource(source));
+      if (onlyLiteral && (!analysis || analysis.applicability.kind === "excluded" ||
+          row.status === "present" || row.status === "not_found"))
+        invalidInput("Дословная запись не устанавливает выполнение или исключение требования.");
       let retained: RetainedReviewFinding | undefined;
       if (row.retained !== undefined) {
         const earlier = row.retained;

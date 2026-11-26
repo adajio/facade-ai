@@ -4,6 +4,27 @@ const uuid='[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}';
 const batchReason=new RegExp(`^drawing_batch:(${uuid})(?:,(${uuid}))?$`, 'u');
 export const isDrawingBatch = reason => batchReason.test(reason);
 
+// Older drawing snapshots kept reconstructed captions only as hints. Their source
+// components can now supply addressable text for an otherwise undecided report.
+export function hadUncitableDrawingText(snapshot) {
+  return Boolean(snapshot?.sheetReading?.drawings?.length && !snapshot.drawingTextVersion
+    && snapshot.promptData?.drawingPhrases?.length);
+}
+
+export function addressedDrawingIds(snapshot) {
+  const ids=new Set();
+  if (snapshot?.drawingTextVersion!==2) return ids;
+  const sent=new Set((snapshot.promptData?.lines ?? []).map(([id])=>id));
+  for (const line of snapshot.lines ?? []) {
+    if (!sent.has(line.id)) continue;
+    let anchor;
+    try { anchor=JSON.parse(line.anchor); } catch { continue; }
+    if (anchor?.drawingText?.version===2 && anchor.drawingText.origin==='dwg_native_geometry'
+        && anchor.evidenceMode==='literal' && anchor.lineId===line.id) ids.add(line.id);
+  }
+  return ids;
+}
+
 export function drawingBatchReasons(snapshot) {
   const sheet=snapshot?.sheetReading;
   const sent=new Set((sheet?.images ?? []).map(image=>image.id));

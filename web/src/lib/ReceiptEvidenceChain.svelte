@@ -20,7 +20,7 @@
     preparationId: string | null; cutoff: string | null;
     latest: { stage: string; status: string; reason: string | null; at: string } | null;
     request: { status: string; requestBytes?: number; selectedFiles?: number; totalFiles?: number;
-      evidenceFiles?: number; visualFiles?: number; coveredFiles?: number; selectedLines?: number; totalLines?: number; remainingLines?: number;
+      evidenceFiles?: number; visualFiles?: number; reconstructedLines?: number; coveredFiles?: number; selectedLines?: number; totalLines?: number; remainingLines?: number;
       inputTokens?: number; estimatedInputTokens?: number } | null;
     items: FileReading[]; nextCursor: string | null;
   };
@@ -178,6 +178,7 @@
         {#if request.selectedFiles !== undefined && request.totalFiles !== undefined} Файлов в описи запроса {count(request.selectedFiles)} из {count(request.totalFiles)}.{/if}
         {#if request.evidenceFiles !== undefined} Файлов с текстом или изображением {count(request.evidenceFiles)} из {count(request.totalFiles ?? request.evidenceFiles)}.{/if}
         {#if request.visualFiles !== undefined} Файлов с изображениями {count(request.visualFiles)}.{/if}
+        {#if request.reconstructedLines} Адресных надписей на чертежах {count(request.reconstructedLines)}.{/if}
         {#if request.coveredFiles !== undefined} Файлов с текстом {count(request.coveredFiles)}.{/if}
         {#if request.selectedLines !== undefined && request.totalLines !== undefined} Индексных строк {count(request.selectedLines)} из {count(request.totalLines)}.{/if}
         {#if request.remainingLines !== undefined && request.remainingLines > 0} За пределами запроса {count(request.remainingLines)} строк.{/if}
