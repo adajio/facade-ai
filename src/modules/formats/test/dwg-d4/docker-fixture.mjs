@@ -5,9 +5,11 @@ import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 
 const [resource, command, ...args] = process.argv.slice(2);
+const odaLauncher = "--entrypoint=/usr/local/bin/facade-oda-convert";
 const image = process.env.FACADE_DWG_IMAGE;
 const id = "7".repeat(64);
 const state = process.env.FACADE_DWG_TEST_STATE;
+const failures = { d: 73, o: 137, u: 69, r: 74 };
 
 process.on("uncaughtExceptionMonitor", (error) => appendFileSync(state + ".errors", error.stack + "\n"));
 
@@ -35,9 +37,12 @@ function derivative(file, size) {
 }
 
 switch (`${resource} ${command}`) {
-  case "image inspect":
-    assert.deepEqual(args, ["--format", "{{.Id}}", image]);
-    console.log(image);
+  case "run --rm":
+    assert.deepEqual(args.slice(-2), [image, "oda-probe"]);
+    assert.ok(args.includes("--platform=linux/amd64"));
+    assert.ok(args.includes(odaLauncher));
+    console.log(process.env.FACADE_ODA_BINARY_SHA256);
+    console.log(process.env.FACADE_ODA_TEST_RUNTIME_HASH);
     break;
   case "container ls":
     assert.ok(args.at(-1).startsWith("label=io.facade.converter-broker="));
@@ -46,7 +51,11 @@ switch (`${resource} ${command}`) {
     assert.deepEqual(args.slice(-2), [image, "dwg"]);
     assert.ok(args.includes("--network=none"));
     assert.ok(args.includes("--memory=1536m"));
-    const input = args.map(arg => /^type=bind,src=(.+),dst=\/original\.dwg,readonly$/u.exec(arg)?.[1]).find(Boolean);
+    assert.ok(args.includes("--platform=linux/amd64"));
+    assert.ok(args.includes(odaLauncher));
+    assert.ok(args.includes(`type=bind,src=${process.env.FACADE_ODA_ROOT},dst=/oda,readonly`));
+    assert.ok(args.includes(`type=bind,src=${process.env.FACADE_ODA_RUNTIME},dst=/deps,readonly`));
+    const input = args.map(arg => /^type=bind,src=(.+),dst=\/input\/original\.dwg,readonly$/u.exec(arg)?.[1]).find(Boolean);
     const out = args.map(arg => /^type=bind,src=(.+),dst=\/out$/u.exec(arg)?.[1]).find(Boolean);
     assert.ok(input && out);
     assert.equal(statSync(out).mode & 0o777, 0o733);
@@ -74,11 +83,11 @@ switch (`${resource} ${command}`) {
     assert.deepEqual(args, ["--attach", id]);
     const { out, mode, outputSize } = JSON.parse(readFileSync(state));
     if (mode === "s") await delay(20_000);
-    if (mode === "d") process.exit(73);
-    if (mode === "o") process.exit(137);
+    if (mode in failures) process.exit(failures[mode]);
     if (mode === "m") break;
     const file = join(out, "derivative");
     if (mode === "t") writeFileSync(file, "0\nSECTION\n2\nENTITIES\n");
+    else if (mode === "j") writeFileSync(file, '{"OBJECTS":[]}');
     else derivative(file, outputSize);
     chmodSync(file, 0o444);
     break;
@@ -86,7 +95,7 @@ switch (`${resource} ${command}`) {
   case "container inspect": {
     assert.deepEqual(args, ["--format", "{{json .State}}", id]);
     const { mode } = JSON.parse(readFileSync(state));
-    console.log(JSON.stringify({ Status: "exited", ExitCode: mode === "d" ? 73 : mode === "o" ? 137 : 0, OOMKilled: mode === "o", Error: "" }));
+    console.log(JSON.stringify({ Status: "exited", ExitCode: failures[mode] ?? 0, OOMKilled: mode === "o", Error: "" }));
     break;
   }
   case "container rm":

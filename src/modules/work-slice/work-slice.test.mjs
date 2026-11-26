@@ -19,6 +19,41 @@ test('work-slice counts distinguish checked requirements from grounds admitted t
   assert.deepEqual([d8.total, d8.checked, d8.review, d8.letter, d8.ready], [2,0,1,1,0]);
 });
 
+test('the work slice exposes local findings, an open remainder and independent letter grounds together', async () => {
+  const { countRequirements } = await compiled('src/modules/work-slice/store.js');
+  const row = (outcome, state, letterEligible = false, readable = false) => ({
+    outcome, letterEligible, semanticRemainder: { state },
+    machine: { outcome, citations: [], ...(readable && { delivery: 'received', readability: 'readable' }) },
+  });
+  const output = countRequirements([
+    row('covered', 'complete'), row('covered', 'open'),
+    row('confirmed_conflict', 'open', true), row('needs_review', 'open', false, true),
+    ...Array.from({ length: 12 }, () => row('needs_review', 'open')),
+  ]);
+  assert.deepEqual(output.evidence, { proven: 2, partial: 2, remainder: 15 });
+  assert.deepEqual([output.total, output.checked, output.review, output.letter, output.ready], [16, 2, 14, 1, 1]);
+});
+
+test('an engineering decision is kept alongside residual evidence and technical stops do not create engineering work', async () => {
+  const { countRequirements } = await compiled('src/modules/work-slice/store.js');
+  const technical = {
+    outcome: 'needs_review',
+    machine: { outcome: 'needs_review', citations: [] },
+    semanticRemainder: { state: 'open', items: [{ reason: 'material_not_mapped' }, { reason: 'reading_pending' }] },
+  };
+  assert.equal(countRequirements([technical]).actionable, 0);
+  const addressed = { ...technical, semanticRemainder: { state: 'open', items: [{ reason: 'semantic_check_missing' }] } };
+  assert.equal(countRequirements([addressed]).actionable, 1);
+  const local = { outcome: 'covered', machine: { outcome: 'covered' }, semanticRemainder: { state: 'open' } };
+  const reviewed = countRequirements([{ ...local, decision: { action: 'confirm', outcome: 'covered' } }, technical]);
+  assert.deepEqual([reviewed.checked, reviewed.ready, reviewed.review], [1, 1, 1]);
+  assert.deepEqual(reviewed.evidence, { proven: 0, partial: 1, remainder: 2 });
+  assert.equal(countRequirements([{ ...local, decision: { action: 'revoke', outcome: 'covered' } }]).ready, 0);
+  const limited = countRequirements([{ ...local, semanticRemainder: { state: 'complete' },
+    machine: { outcome: 'covered', limitations: ['structural_remainder_open'] } }]);
+  assert.deepEqual(limited.evidence, { proven: 0, partial: 1, remainder: 1 });
+});
+
 test('the authorized work slice freezes totals, receipt pages and sealed inventory coordinates', { skip: !databaseUrl }, async (t) => {
   const url = new URL(databaseUrl);
   assert.equal(url.hostname, '127.0.0.1');

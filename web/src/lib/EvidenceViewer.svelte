@@ -1,7 +1,7 @@
 <script lang="ts">
   import { tick } from 'svelte';
   import { denied, describe, id, interrupted, type Api, type RecordData } from './http';
-  import { V1, type Citation } from './workspace';
+  import { approvalEvidence, V1, type Citation } from './workspace';
   import Notice from './Notice.svelte';
   import CadEvidence from './CadEvidence.svelte';
   import { cadAddress } from './cad';
@@ -20,11 +20,13 @@
     mediaType?: string;
     inputImage?: { transform: Transform };
   };
+  type EvidenceLine = { id?: string; text: string; box?: Box; locator?: Record<string, string | number> };
   type Observation = Citation & { scope?: string; box?: Box; limitation?: string; address?: Evidence['address'] };
 
-  let { api, projectId, refs, index, componentIndex, select, selectComponent, close, verify, embedded = false, slotLabel }: {
+  let { api, projectId, refs, index, componentIndex, select, selectComponent, openLine, close, verify, embedded = false, slotLabel }: {
     api: Api; projectId: string; refs: Citation[]; index: number; select: (i: number) => void; close: () => void; verify: () => void;
     componentIndex?: number; selectComponent: (index?: number) => void;
+    openLine?: (ref: Citation, trigger: HTMLElement) => void;
     embedded?: boolean; slotLabel?: string;
   } = $props();
 
@@ -46,7 +48,13 @@
   let root: HTMLElement;
   let closeButton = $state<HTMLButtonElement>();
   let evidence = $state<Evidence>();
-  let rows = $state<{ text: string; box?: Box }[]>([]);
+  let rows = $state<EvidenceLine[]>([]);
+  let approval = $derived(approvalEvidence(parent));
+  let addressedLine = $derived.by(() => {
+    if (!citation?.lineId) return;
+    const sameId = rows.filter(({ id }) => id === citation.lineId);
+    return sameId.length === 1 ? sameId[0] : undefined;
+  });
   let image = $state('');
   let transform = $state<Transform>();
   let error = $state('');
@@ -58,7 +66,7 @@
   const headingId = $props.id();
   let viewport = $state<HTMLDivElement>();
   let selectedAddress = $derived(citation?.address as Evidence['address'] | undefined);
-  let locator = $derived({ ...evidence?.address.locator, ...selectedAddress?.locator, ...observation?.address?.locator });
+  let locator = $derived({ ...evidence?.address.locator, ...selectedAddress?.locator, ...observation?.address?.locator, ...addressedLine?.locator });
   let cad = $derived.by(() => {
     const address = evidence?.address;
     if (!address?.unitId) return;
@@ -69,7 +77,8 @@
     });
   });
   let box = $derived.by(() => {
-    const placed = observation?.box ?? observation?.address?.box ?? selectedAddress?.box ?? evidence?.address?.box;
+    const placed = citation?.lineId ? addressedLine?.box ?? selectedAddress?.box :
+      observation?.box ?? observation?.address?.box ?? selectedAddress?.box ?? evidence?.address?.box;
     return placed && [placed.x, placed.y, placed.width, placed.height].every(Number.isFinite) &&
       placed.width > 0 && placed.height > 0 ? placed : undefined;
   });
@@ -133,7 +142,7 @@
               response.headers.get('Content-Type')?.startsWith('application/pdf') ? '#page=' + page : '');
           }
         }).catch(() => { /* Full-source access is independent of the addressed fragment. */ });
-        if (cached) return;
+        if (cached && !ref.lineId) return;
         const response = await api.response(path + '/content', { signal });
         if (/^image\/(png|jpeg|webp)(?:;|$)/u.test(response.headers.get('Content-Type') ?? '')) {
           const body = await response.blob();
@@ -145,7 +154,7 @@
           const result = await response.json() as RecordData;
           signal.throwIfAborted();
           rows = Array.isArray(result) ? result : Array.isArray(result.lines) ? result.lines : [];
-          if (meta.inputImage) {
+          if (meta.inputImage && !cached) {
             const raster = await api.response(path + '/ocr-input', { signal }).then((res) => res.blob());
             signal.throwIfAborted();
             if (generation !== pageCache.generation) return;
@@ -252,15 +261,23 @@
       {/each}
     </div>
   {/if}
+  {#if approval && openLine}
+    <div class="actions">
+      <button type="button" onclick={(event) => openLine?.(approval!, event.currentTarget)}>Открыть строку подписи</button>
+    </div>
+  {/if}
   {#if pending}<p role="status">Открываем сохранённый адрес…</p>{/if}
   <Notice kind="error" message={error} />
-  {#if evidence}
+  {#if evidence && citation.lineId && !addressedLine}
+    {#if !pending}<p class="meta">Закреплённая строка недоступна в этом фрагменте.</p>{/if}
+  {:else if evidence}
     {#snippet sourceDetails(meta: Evidence)}
     <dl class="details">
       {#if meta.source.name || meta.source.relativePath}<dt>Файл</dt><dd>{meta.source.name ?? meta.source.relativePath}</dd>{/if}
       {#if citation.documentRevision?.label}<dt>Редакция документа</dt><dd>{citation.documentRevision.label}</dd>{/if}
       <dt>Версия оригинала</dt><dd class="numeric">{meta.source.versionId}</dd>
       <dt>Ветвь</dt><dd>{observation?.branch ?? meta.branch ?? '—'}</dd>
+      {#if citation.lineId && !locator.line}<dt>Строка оригинала</dt><dd>{citation.lineId}</dd>{/if}
       {#if observation?.scope}<dt>Область</dt><dd>{observation.scope}</dd>{/if}
       {#if locator.page || meta.address.page}
         <dt>Физическая страница</dt><dd>{locator.page ?? meta.address.page}</dd>
@@ -271,7 +288,8 @@
         <dt>{({sheet: 'Лист', range: 'Ячейки', cell: 'Ячейка', line: 'Строка', row: 'Строка таблицы', column: 'Столбец', paragraph: 'Абзац', section: 'Раздел', handle: 'Объект', layout: 'Вид'} as Record<string, string>)[key] ?? key}</dt><dd>{value}</dd>
       {/each}
     </dl>
-    {#if observation?.quote || citation.quote}<blockquote>{observation?.quote ?? citation.quote}</blockquote>{/if}
+    {#if addressedLine}<blockquote>{addressedLine.text}</blockquote>
+    {:else if observation?.quote || citation.quote}<blockquote>{observation?.quote ?? citation.quote}</blockquote>{/if}
     {#if (observation?.value ?? citation.value) != null}
       <p class="numeric">{observation?.value ?? citation.value} {observation?.unit ?? citation.unit ?? ''}
         {#if (observation?.normalizedValue ?? citation.normalizedValue) != null}
@@ -319,9 +337,9 @@
         </div>
       </div>
     {:else if rows.length}
-        <details open={embedded}>
+        <details open={embedded || Boolean(citation.lineId)}>
         <summary>Текст представления</summary>
-        <ul class="plain-list">{#each rows as row}<li>{row.text}</li>{/each}</ul>
+        <ul class="plain-list">{#each rows as row}<li>{#if row === addressedLine}<mark>{row.text}</mark>{:else}{row.text}{/if}</li>{/each}</ul>
       </details>
     {:else if !pending}
       <p class="meta">Доступность изображения для этого адреса ограничена.</p>

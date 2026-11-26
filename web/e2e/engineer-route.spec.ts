@@ -102,6 +102,7 @@ test('От первого комплекта до заключения по ор
   await page.locator('[data-triage-row]').filter({ hasText: 'Раздел АР' }).first().click();
   await expect(page.getByRole('heading', { name: 'Раздел АР', exact: true })).toBeFocused();
   await expect(page.getByText('Критерий достаточности', { exact: true })).toBeVisible();
+  await page.getByText('Форматы по каталогу', { exact: true }).click();
   await expect(page.getByText(/Допустимая замена:.*dxf/i)).toBeVisible();
   await expect(page.getByText(/Формат по каталогу · DWG · Допустимая замена: DXF/)).toBeVisible();
   await page.screenshot({ path: info.outputPath('requirement.png') });

@@ -10,7 +10,7 @@ x-runtime: &runtime
     HOST: "0.0.0.0"
     PORT: "3000"
     FACADE_DATA_DIR: /data/objects
-    FACADE_PUBLIC_ORIGIN: https://127.0.0.1:18443
+    FACADE_PUBLIC_ORIGIN: ${FACADE_STAND_ORIGIN-https://127.0.0.1:18443}
     FACADE_GATEWAY_LIVE_MODE: ""
     TMPDIR: /data/tmp
   volumes:

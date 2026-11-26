@@ -18,7 +18,7 @@ export type ModelPurpose = Exclude<Purpose, 'local'>;
 export type GenerationRef<S extends string | null = string> = { projectId: string; scopeId: S; generationId: string };
 export type QueueTarget = GenerationRef<string | null>;
 export type Obligation = { id: string; branch: 'A' | 'B'; place: string };
-export type PrimaryResult = { state: 'completed' | 'final_refusal'; evidenceRef: string };
+export type PrimaryResult = { state: 'completed' | 'final_refusal' | 'partial'; evidenceRef: string };
 export type Lease = { jobId: string; workerId: string; epoch: number };
 
 export type EnqueueInput = QueueTarget & {

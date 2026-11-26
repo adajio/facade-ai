@@ -1,7 +1,7 @@
 import { exactDeliveryStatement } from "../../domain/delivery-statement.js";
 import type { PackageFact } from "../harness/package-analysis.js";
 import { verifiedNativeLineCrops } from "../pdf/native-line.js";
-import type { Evidence, ReaderLine } from "../pdf/types.js";
+import { pdfPageFormat, type Evidence, type ReaderLine } from "../pdf/types.js";
 import { canonicalJson, type Citation } from "./domain.js";
 
 export type DeliveryEvidence = Pick<Evidence, "source" | "address" | "representation" | "readerVersion" | "runId" |
@@ -19,12 +19,12 @@ export function fullDeliveryLine(fact: DeliveryFact, format: string, evidence: R
   const claim = observation.deliveryStatement;
   if (!issuedLine || !claim || observation.grounding !== "text" || issuedLine.id !== observation.lineId ||
       !observation.quote || !issuedLine.text.includes(observation.quote)) return;
-  if (!/^(?:application\/|\.)?pdf$/iu.test(format) && evidence.get(observation.evidenceId)?.format !== "pdf") return { line: issuedLine };
+  if (!/^(?:application\/|\.)?pdf$/iu.test(format) && !pdfPageFormat(evidence.get(observation.evidenceId)?.format ?? "")) return { line: issuedLine };
 
   const { source, address, evidenceId, readerVersion, runId, branch, receiptId } = observation;
   const native = (id: string) => {
     const stored = evidence.get(id);
-    return stored?.format === "pdf" && stored.representation === "native" && stored.mediaType === "application/json" &&
+    return stored && pdfPageFormat(stored.format) && stored.representation === "native" && stored.mediaType === "application/json" &&
       !stored.limitations?.length && stored.readerVersion === readerVersion && stored.runId === runId && stored.branch === branch &&
       stored.receiptId === receiptId && canonicalJson(stored.source) === canonicalJson(source) &&
       stored.address.unitId === address.unitId && stored.address.locator?.page === address.locator?.page &&

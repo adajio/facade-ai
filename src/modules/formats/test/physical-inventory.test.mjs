@@ -6,6 +6,7 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { test } from "node:test";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import sharp from "sharp";
 
 const dist = process.env.FACADE_STEP11_DIST ?? resolve("dist");
 const load = (path) => import(pathToFileURL(join(dist, "src/modules", path)));
@@ -23,7 +24,7 @@ async function inspect(path) {
     projectId: randomUUID(), documentId: randomUUID(), versionId: randomUUID(),
     sha256: createHash("sha256").update(await readFile(path)).digest("hex"),
   };
-  return { source, receiptId: randomUUID(), format, readerVersion: await adapter.version(), units: await adapter.inspect(path) };
+  return { source, receiptId: randomUUID(), format, readerVersion: await adapter.version(), units: await adapter.inspect(path, source) };
 }
 
 function persisted(map) {
@@ -133,8 +134,11 @@ test("unmapped graphics and nested structure preserve explicit format limitation
   assert.deepEqual(verifyPhysicalInventory(await inspect(fixture("structure.ifc"))), { limitation: "ifc_geometry_not_rendered" });
 
   const raster = join(directory, "elevation.png");
-  await writeFile(raster, Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAACklEQVR4nGMAAQAABQABDQottAAAAABJRU5ErkJggg==", "base64"));
-  assert.deepEqual(verifyPhysicalInventory(await inspect(raster)), { limitation: "image_reader_unsupported" });
+  await sharp({ create: { width: 2, height: 2, channels: 3, background: 'white' } }).png().toFile(raster);
+  assert.match(verifyPhysicalInventory(await inspect(raster)).basisId, /^inventory-v1:/);
+  const broken = join(directory, "broken.png");
+  await writeFile(broken, Buffer.from('89504e470d0a1a0a', 'hex'));
+  await assert.rejects(inspect(broken), { code: 'raster_invalid_or_unreadable' });
   assert.deepEqual(verifyPhysicalInventory(await inspect(fixture("presence-only.rvt"))), { limitation: "rvt_original_only" });
 });
 

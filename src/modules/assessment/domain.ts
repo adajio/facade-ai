@@ -1,4 +1,4 @@
-import type { DeliveryStatement, ReaderObservationComponent } from "../pdf/types.js";
+import type { DeliveryStatement, ReaderAddress, ReaderObservationComponent } from "../pdf/types.js";
 import type { CatalogComparisonRule, CatalogEvidenceRule, ValueRole } from "../access/input.js";
 
 export type Outcome =
@@ -61,6 +61,7 @@ export type Citation = {
   deliveryUncertainty?: "contradictory_original" | "original_statement_unverified";
   documentRevision?: DocumentRevision;
   verifiedRevision?: string;
+  documentApproval?: { evidenceId: string; lineId: string; address: ReaderAddress; quote: string };
   stageConfirmation?: { stage: string; evidenceId?: string; originalBasis?: import("../intake/accepted-originals.js").OriginalBasis };
   valueRoleBasis?: { kind: ValueRole; quote: string; evidenceId: string; address: Record<string, unknown> };
   components?: ReaderObservationComponent[];
@@ -116,6 +117,7 @@ export type Review = {
   requireVerifiedPairs?: boolean;
   supplementReceiptIds?: string[];
   packageCoverageIds?: string[];
+  approvalCandidate?: true;
   clarification?: ClarificationBasis;
 };
 
@@ -236,12 +238,18 @@ export function canonicalJson(value: unknown): string {
 }
 
 export function requirementSubjectKey(value: string): string {
-  return value.normalize("NFKC").toLocaleLowerCase("ru").replace(/\s+/g, " ").trim();
+  return value.normalize("NFKC").toLocaleLowerCase("ru").replace(/[‐‑]/gu, "-").replace(/ё/gu, "е").replace(/\s+/g, " ").trim();
 }
 
 export function matchesRequirementSubject(requirement: Requirement, item: string): boolean {
   const key = requirementSubjectKey(item);
   return [requirement.subject, requirement.part, ...requirement.aliases ?? []].some((name) => key === requirementSubjectKey(name));
+}
+
+export function requiresDocumentApproval(requirement: Requirement) {
+  const explicit = /(?<!\p{L})(?:подписанн\p{L}*|утвержденн\p{L}*|signed|approved)(?!\p{L})/u;
+  const check = /(?:наличие|проверить|проверка|требуется)\s+(?:(?:действующей|электронной)\s+)?(?:подпись|подписи|утверждение|утверждения)(?!\p{L})/u;
+  return explicit.test(requirementSubjectKey(requirement.part)) || check.test(requirementSubjectKey(requirement.completeness ?? ""));
 }
 
 export function isInventoryRole(sourceRole: string): boolean {
@@ -276,8 +284,8 @@ export function evaluate(
     outcome: "needs_review",
     citations: scoped.map(({ citation }) => citation),
     receiptIds,
-    delivery: received.length ? "received" : supplied.length ? "received_in_other_format" : "not_demonstrated",
-    readability: values.length ? "readable" : received.length ? "unreadable" : "unknown",
+    delivery: review?.approvalCandidate || received.length ? "received" : supplied.length ? "received_in_other_format" : "not_demonstrated",
+    readability: review?.approvalCandidate || values.length ? "readable" : received.length ? "unreadable" : "unknown",
     limitations: [],
   };
   if (requirement.applicability !== "applicable") {
@@ -300,20 +308,25 @@ export function evaluate(
       return { ...base, limitations: [...new Set([...review.remaining, pairRevalidationRequired])] };
     }
   }
-  if (!review || !review.completenessChecked || review.remaining.length ||
-      findings.some((finding) => finding.applicability === "unknown" ||
-        (finding.applicability === "active" && finding.sourceRole === "unknown"))) {
+  if (!review || !review.completenessChecked || review.remaining.length) {
     const limitations = review?.remaining.length ? review.remaining : ["review_incomplete"];
     return { ...base, limitations };
   }
 
+  const unresolvedFinding = findings.some((finding) => finding.applicability === "unknown" ||
+    (finding.applicability === "active" && finding.sourceRole === "unknown"));
   if (review.packageCoverageIds?.length) {
     const ids = new Set(review.packageCoverageIds);
     const citations = received.filter(({ citation }) => ids.has(citation.observationId)).map(({ citation }) => citation);
     if (new Set(citations.map(({ observationId }) => observationId)).size === ids.size) {
-      return { ...base, outcome: "covered", readability: "readable", citations };
+      return { ...base, outcome: "covered", readability: "readable", citations,
+        limitations: unresolvedFinding ? ["review_incomplete"] : [] };
     }
     return { ...base, limitations: ["required_evidence_incomplete"] };
+  }
+
+  if (unresolvedFinding) {
+    return { ...base, limitations: ["review_incomplete"] };
   }
 
   let conflict: [Citation, Citation] | null = null;

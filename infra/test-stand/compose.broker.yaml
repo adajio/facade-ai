@@ -10,12 +10,12 @@ services:
     mem_limit: 256m
     restart: unless-stopped
     environment:
-      FACADE_CONVERTER_SOCKET: /run/facade-ai-stand-converters/broker.sock
+      FACADE_CONVERTER_SOCKET: /run/facade-ai-stand-converters/${FACADE_STAND_SOCKET_NAME:-broker.sock}
       FACADE_CONVERTER_SCRATCH: ${FACADE_STAND_BROKER_SCRATCH:?}
       FACADE_ARCHIVE_IMAGE: ${FACADE_ARCHIVE_IMAGE:-}
       FACADE_OFFICE_IMAGE: ${FACADE_OFFICE_IMAGE:-}
       FACADE_DWG_IMAGE: ${FACADE_DWG_IMAGE:-}
-      FACADE_DWG_ENGINE: ${FACADE_DWG_ENGINE:-oda}
+      FACADE_DWG_ENGINE: ${FACADE_DWG_ENGINE:-}
       FACADE_ODA_ROOT: ${FACADE_ODA_ROOT:-}
       FACADE_ODA_RUNTIME: ${FACADE_ODA_RUNTIME:-}
       FACADE_ODA_BINARY_SHA256: ${FACADE_ODA_BINARY_SHA256:-}
@@ -39,7 +39,7 @@ services:
       retries: 20
 volumes:
   converter-socket:
-    name: facade-ai-test-server_converter-socket
+    name: ${FACADE_STAND_SOCKET_VOLUME:-facade-ai-test-server_converter-socket}
   converter-scratch:
-    name: facade-ai-test-server_converter-scratch
+    name: ${FACADE_STAND_SCRATCH_VOLUME:-facade-ai-test-server_converter-scratch}
     external: true

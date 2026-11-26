@@ -159,3 +159,97 @@ test('Каталог сохраняет применимость по типу �
   expect(changed).not.toHaveProperty('facadeKinds');
   expect(changed.evidenceRule.allOf[0].anyOf[0]).not.toHaveProperty('valueRole');
 });
+
+test('Подписи A и B открываются по своим строкам и восстанавливаются после обновления', async ({ page }) => {
+  const projectId = '30000000-0000-4000-8000-000000000001';
+  const project = { id: projectId, name: 'Подписанный документ', version: 1, intakeMode: true, scopes: [],
+    actions: ['project:read'] };
+  const area = 'area-signed';
+  const boundary = { complete: true, reason: null, basisIds: [] };
+  const position = { cursor: '1', projectionVersion: '1', sliceId: '1' };
+  const sources = ['A', 'B'].map((branch, index) => {
+    const evidenceId = 'evidence-' + branch;
+    const number = 17 + index;
+    return { evidenceId, observationId: 'title-' + branch, documentId: 'source', versionId: 'version', sha256: 'fixture',
+      branch, quote: 'Титульная строка', address: { unitId: 'page:1', locator: { page: 1, line: 2 } },
+      documentApproval: { evidenceId, lineId: 'signature-' + branch,
+        quote: index ? 'Подписано: Петрова А. В.' : 'Подписано: Иванова А. В.',
+        address: { unitId: 'page:1', locator: { page: 1, line: number, range: 'A' + number + ':D' + number } } },
+    };
+  });
+  let allow = true;
+  const observations: string[] = [];
+  const errors: string[] = [];
+  page.on('pageerror', ({ message }) => errors.push(message));
+  await page.route('**/api/**', async (route) => {
+    const { pathname } = new URL(route.request().url());
+    if (pathname === '/api/me') return route.fulfill({ json: { user: { id: projectId, login: 'viewer' }, projects: [project] } });
+    if (pathname === '/api/projects/' + projectId) return route.fulfill({ json: project });
+    if (pathname.endsWith('/snapshot')) return route.fulfill({ json: position });
+    if (pathname.endsWith('/events')) return route.fulfill({ json: { events: [], cursor: '1', head: position, hasMore: false } });
+    if (pathname.endsWith('/facade-assessment')) return route.fulfill({ json: {
+      projectId, version: 1, stage: 'Стадия 1', outcome: 'sufficient', activeWindows: 1, completedWindows: 1, limitations: [],
+      coverage: { inventory: boundary, map: boundary, reading: boundary, subject: boundary },
+      contexts: [{ assessmentContextId: area, name: 'Весь комплект', version: 1, kind: 'common', outcome: 'sufficient',
+        counts: {}, questionHolds: [], questions: [{ id: 'signed', version: 1, outcome: 'covered',
+          requirement: { subject: 'Подписанный документ', part: 'Подписанный документ', formats: ['pdf'] },
+          machine: { outcome: 'covered', citations: sources, receiptIds: [], limitations: [] },
+        }] }],
+    } });
+    if (pathname.endsWith('/applicability')) return route.fulfill({ json: { replacements: [] } });
+    if (pathname.includes('/observations/')) {
+      observations.push(pathname);
+      const source = sources.find(({ observationId }) => pathname.endsWith('/' + observationId));
+      return route.fulfill({ json: source });
+    }
+    if (pathname.includes('/evidence/')) {
+      if (!allow) return route.fulfill({ status: 403, json: { code: 'forbidden' } });
+      const source = sources.find(({ evidenceId }) => pathname.includes('/' + evidenceId))!;
+      const approval = source.documentApproval;
+      if (pathname.endsWith('/content')) return route.fulfill({ json: { lines: [
+        { id: source.observationId, text: source.quote, locator: source.address.locator },
+        { id: approval.lineId, text: approval.quote, locator: approval.address.locator },
+      ] } });
+      return route.fulfill({ json: {
+        id: source.evidenceId, branch: source.branch, source: { projectId, documentId: source.documentId,
+          versionId: source.versionId, sha256: source.sha256 }, address: source.address, mediaType: 'application/json',
+      } });
+    }
+    return route.fulfill({ status: 404, json: { code: 'not_found' } });
+  });
+
+  const viewer = page.getByRole('region', { name: 'Оригинал и основание', exact: true });
+  const opened = () => new URL(page.url()).searchParams;
+  await page.goto('/projects/' + projectId + '/completeness/signed?context=' + area);
+  await page.getByRole('button', { name: 'Основание A', exact: true }).click();
+  await expect(viewer.locator('blockquote')).toHaveText('Титульная строка');
+  expect(opened().get('observation')).toBe('title-A');
+  await expect.poll(() => observations.length).toBe(1);
+  observations.length = 0;
+  await viewer.getByRole('button', { name: 'Открыть строку подписи', exact: true }).click();
+  await expect(viewer.locator('blockquote')).toHaveText(sources[0].documentApproval.quote);
+  await expect(viewer.getByText('A17:D17', { exact: true })).toBeVisible();
+  await expect(viewer.locator('mark')).toHaveText(sources[0].documentApproval.quote);
+  expect(opened().get('evidence')).toBe('evidence-A');
+  expect(opened().get('line')).toBe('signature-A');
+  expect(opened().has('observation')).toBe(false);
+
+  await page.reload();
+  await expect(viewer.locator('blockquote')).toHaveText(sources[0].documentApproval.quote);
+  await expect(viewer.getByText('A17:D17', { exact: true })).toBeVisible();
+  await viewer.getByRole('button', { name: 'Закрыть просмотр оригинала' }).click();
+
+  await page.getByRole('button', { name: 'Подпись · ветвь B', exact: true }).click();
+  await expect(viewer.locator('blockquote')).toHaveText(sources[1].documentApproval.quote);
+  await expect(viewer.getByText('A18:D18', { exact: true })).toBeVisible();
+  expect(opened().get('evidence')).toBe('evidence-B');
+  expect(opened().get('line')).toBe('signature-B');
+  expect(opened().has('observation')).toBe(false);
+  expect(observations).toEqual([]);
+
+  allow = false;
+  await page.reload();
+  await expect(viewer.getByRole('alert')).toHaveText('Ресурс недоступен.');
+  await expect(viewer.locator('blockquote')).toHaveCount(0);
+  expect(errors).toEqual([]);
+});

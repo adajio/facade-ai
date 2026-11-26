@@ -5,8 +5,7 @@ here="$(cd -- "$(dirname -- "$0")" && pwd)"
 format="${1:-}"
 case "$format" in
   doc|xls) image="${FACADE_OFFICE_IMAGE:?Set FACADE_OFFICE_IMAGE}" ;;
-  dwg) image="${FACADE_DWG_IMAGE:?Set FACADE_DWG_IMAGE}" ;;
-  *) printf 'Usage: %s doc|xls|dwg [original]\n' "$0" >&2; exit 2 ;;
+  *) printf 'Usage: %s doc|xls [original]\n' "$0" >&2; exit 2 ;;
 esac
 original="${2:-$here/fixtures/schedule.$format}"
 [[ -f "$original" ]] || exit 2
@@ -18,8 +17,7 @@ docker run --rm --pull=never --name "$container" --network=none --read-only --ca
   --security-opt=no-new-privileges=true --user=65534:65534 --pids-limit=64 --memory=512m \
   --memory-swap=512m --cpus=1 --tmpfs=/tmp:rw,noexec,nosuid,nodev,size=96m,mode=1777 --log-driver=none \
   --mount "type=bind,source=$original,target=/original.$format,readonly" --entrypoint /bin/sh "$image_id" -ec '
-    if [ "$1" = dwg ]; then tool=version-dwg; else tool=version-office; fi
-    /usr/local/bin/facade-convert "$tool"
+    /usr/local/bin/facade-convert version-office
     uname -m
     printf "image=%s\n" "$2"
     payload="$(wc -c < "/original.$1")"

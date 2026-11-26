@@ -1,9 +1,10 @@
 import type { PoolClient } from "pg";
 import { contradictoryDeliveryLine, exactDeliveryStatement } from "../../domain/delivery-statement.js";
 import { readPackageAnalysis, type PackageAnalysis, type PackageFact } from "../harness/package-analysis.js";
+import { hasPrintedRevision, hasInactiveRevision } from "../harness/pair-evidence.js";
 import { blockedComparisonReads } from "../harness/package-walk.js";
 import { deliveredLines } from "../questions/attribute-aliases.js";
-import { hasAddressedSubject } from "../questions/subject-evidence.js";
+import { hasAddressedCategoricalSubject, hasAddressedSubject } from "../questions/subject-evidence.js";
 import { canonicalJson, isInventoryRole, normalizeFactValue, requirementSubjectKey } from "./domain.js";
 import type { Evidence, ReaderAddress, ReaderLine } from "../pdf/types.js";
 import { comparisonRows, readCanonicalComparisonRows, type IssuedComparisonEvidence } from "./facade-comparison-rows.js";
@@ -37,12 +38,46 @@ export type FacadeReplacement = {
   replacements: ReplacementReference[];
 };
 
+function unlabelledHeading(line: string | undefined, quote: string) {
+  if (!line?.includes(quote)) return;
+  const fields = line.trim().split(/[|;·\n]/u);
+  const headers = fields.flatMap((field) => {
+    const title = /^(?:title|heading|заголовок|наименование)\s*:\s*(.+)$/iu.exec(field.trim())?.[1]?.trim();
+    return title ? [title] : [];
+  });
+  const heading = headers.length === 1 ? headers[0] : !headers.length && fields.length === 1 ? fields[0] : undefined;
+  if (heading && quote.includes(heading) && !exactDeliveryStatement(line, heading, "not_delivered") &&
+    !contradictoryDeliveryLine(line, heading)) return heading;
+}
+
+function addressedApproval(lines: ReaderLine[], anchor: ReaderLine, observation: PackageFact["observation"], revision: string) {
+  const inactive = /(?:не\s+(?:подписан|утвержд[её]н)|подпись\s+(?:отсутствует|аннулирована|отозвана)|черновик|\b(?:draft|unsigned|unapproved)\b)/iu;
+  const revisionMarker = /^(?:revision|rev\.?|редакция|ревизия|ред\.?)(?=\s|[:№=])/iu;
+  const marker = /^(?:подписано|подписал[а]?|утвержд[её]но|утвердил[а]?|signed by|approved by)(?:\s*:\s*|\s+)(.+)$/iu;
+  const fullName = /^\p{Lu}\p{Ll}{1,}(?:[-‐‑]\p{Lu}\p{Ll}{1,})?\s+(?:\p{Lu}\.\s*\p{Lu}\.|(?:\p{Lu}\p{Ll}{1,}\s+)?\p{Lu}\p{Ll}{1,}\.?)$/u;
+  const fields = lines.flatMap((line) => line.text.split(/[|;·\n]/u).map((text) => ({ line, text: text.trim() })));
+  if (fields.some(({ text }) => inactive.test(text) || revisionMarker.test(text) && !hasPrintedRevision(text, revision))) return;
+  const approvals = fields.filter(({ text }) => marker.test(text));
+  if (approvals.length !== 1) return;
+  const [{ text: quote, line }] = approvals;
+  const signer = marker.exec(quote)![1];
+  const unnamed = /(?<!\p{L})(?:фамилия|отчество|должность|директор|инженер|ответственное лицо|full name|first name|last name|signatory|director|engineer)(?!\p{L})/iu;
+  if (!fullName.test(signer) || unnamed.test(signer)) return;
+  const { address, evidenceId } = observation;
+  const lineId = line.id;
+  if (line === anchor) return { evidenceId, lineId, address, quote };
+  if (!lineId || lines.filter(({ id }) => id === lineId).length !== 1 || !line.box && !Object.keys(line.locator ?? {}).length) return;
+  return { evidenceId, lineId, address: { unitId: address.unitId, ...(line.box ? { box: line.box } : {}),
+    ...(line.locator ? { locator: line.locator } : {}) }, quote };
+}
+
 export function convertFact(fact: PackageFact, accepted: Map<string, AcceptedVersion>, formats: Map<string, string>,
   stages: Map<string, ConfirmedStage>, evidence: Map<string, DeliveryEvidence>, original: ReaderLine[] | undefined,
   provenFacade: boolean, links?: ReadonlyMap<string, DocumentFacadeLink>): FacadeFact | null {
   const { source, quote, value, unit, evidenceId, receiptId, runId, lineId, address, components, deliveryStatement } = fact.observation;
   const acceptedOriginal = accepted.get(source.versionId);
-  const format = formats.get(fact.windowId);
+  const storedFormat = formats.get(fact.windowId);
+  const format = storedFormat === 'sig' && address.locator?.signatureKind === 'embedded_pdf' ? 'pdf' : storedFormat;
   if (!acceptedOriginal || acceptedOriginal.sha256 !== source.sha256 || acceptedOriginal.documentId !== source.documentId || !format) return null;
   const { state, candidates, actorId } = fact.binding;
   const anchored = Boolean(fact.binding.quote || actorId);
@@ -56,16 +91,26 @@ export function convertFact(fact: PackageFact, accepted: Map<string, AcceptedVer
     matchingDocumentFacadeLink(links, format === 'pdf' && !address.locator?.page && /^[1-9]\d*$/.test(address.unitId) ?
       { ...address, locator: { page: Number(address.unitId) } } : address) : undefined;
   const attribute = fact.attribute?.trim() || deliveryStatement?.item || null;
-  const subjectVerified = attribute && !deliveryStatement && value != null && quote && lineId &&
-    hasAddressedSubject({ subject: attribute, property: attribute }, fact.observation,
-      original?.length ? original : [{ id: lineId, text: quote, box: address.box, locator: address.locator }]);
+  const addressedLines = original ?? (lineId && quote ? [{ id: lineId, text: quote, box: address.box, locator: address.locator }] : []);
+  const subjectVerified = attribute && !deliveryStatement && value != null &&
+    (hasAddressedSubject({ subject: attribute, property: attribute }, fact.observation, addressedLines) ||
+      hasAddressedCategoricalSubject(attribute, fact.observation, addressedLines));
   const literal = attribute?.normalize("NFKC").trim().replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
+  const addressedLine = addressedLines.filter(({ id }) => id === lineId);
+  const heading = !attribute && value == null && !deliveryStatement && quote && fact.observation.grounding === "text" &&
+    addressedLine.length === 1 ? unlabelledHeading(addressedLine[0].text, quote) : undefined;
   const anchoredPresence = literal && !deliveryStatement && value == null && quote &&
-    fact.observation.grounding === "text" && !exactDeliveryStatement(quote, attribute!, "not_delivered") &&
+    fact.observation.grounding === "text" && addressedLine.length === 1 && addressedLine[0].text.includes(quote) &&
+    !exactDeliveryStatement(addressedLine[0].text, attribute!, "not_delivered") &&
     new RegExp(`(?<![\\p{L}\\p{N}])${literal}(?![\\p{L}\\p{N}])`, "iu").test(quote.normalize("NFKC"));
-  const evidenceBound = Boolean(quote) && fact.observation.grounding !== "limited" && !fact.observation.limitation &&
-    Boolean(fact.basis.role) && Boolean(fact.basis.revision) && Boolean(deliveryStatement || subjectVerified || anchoredPresence);
-  const active = evidenceBound && fact.sourceRole !== "unknown" && fact.revisionStatus === "current";
+  const currentLine = !addressedLine.some((line) => hasInactiveRevision(line.text));
+  const metadataGrounded = currentLine && Boolean(quote) && fact.observation.grounding !== "limited" && !fact.observation.limitation &&
+    !fact.observation.alternatives?.length &&
+    Boolean(fact.basis.role) && Boolean(fact.basis.revision) && fact.sourceRole !== "unknown" && fact.revisionStatus === "current";
+  const active = metadataGrounded && Boolean(deliveryStatement || subjectVerified || anchoredPresence);
+  const documentApproval = metadataGrounded && (anchoredPresence || heading) && original && quote && fact.revision &&
+    addressedLine.length === 1 && addressedLine[0].text.includes(quote)
+    ? addressedApproval(original, addressedLine[0], fact.observation, fact.revision) : undefined;
   function contextAddress(evidenceId: string) {
     const item = evidence.get(evidenceId);
     return item?.source.versionId === source.versionId && item.source.sha256 === source.sha256 ? item.address : undefined;
@@ -112,6 +157,9 @@ export function convertFact(fact: PackageFact, accepted: Map<string, AcceptedVer
     membership: link ? { kind: 'facades', facadeIds: [link.facadeId] } : membership,
     ...(link ? { documentFacadeLink: { version: link.version, basis: link.basis, facadeId: link.facadeId } } : {}),
     property: attribute,
+    ...(heading ? { legacyPresence: { subject: heading, verified: Boolean(original) && metadataGrounded } } : {}),
+    ...(anchoredPresence || heading && original ? { addressedPresence: true } : {}),
+    ...(documentApproval ? { documentApproval } : {}),
     materials: fact.materials.map(({ label }) => label),
     variant: fact.variant,
     addressedValue: Boolean(subjectVerified),
@@ -172,13 +220,14 @@ export function facadeObservation(fact: PackageFact, originalLine?: string) {
 }
 
 export type FacadeObservation = ReturnType<typeof facadeObservation>;
-export type ComparisonRead = { branch: PackageFact["branch"]; state: "route_required" | "ready" | "leased" | "held" | "done" };
+export type ComparisonRead = { branch: PackageFact["branch"]; state: "route_required" | "ready" | "leased" | "held" | "done" | "partial" };
 
 async function comparisonReads(tx: PoolClient, projectId: string, windows: PackageAnalysis["windows"], facts: PackageFact[],
   targetIds: string[]) {
   const { rows } = await tx.query<ComparisonRead & { windowId: string; lineId: string; property: string }>(
     `SELECT f.window_id AS "windowId",f.branch,
-      CASE WHEN j.state='leased' AND j.lease_until<=clock_timestamp() THEN 'ready' ELSE j.state END AS state,
+      CASE WHEN j.state='leased' AND j.lease_until<=clock_timestamp() THEN 'ready'
+        WHEN j.state='done' AND j.result->>'kind'='partial' THEN 'partial' ELSE j.state END AS state,
       j.payload#>>'{packageWindow,followup,comparison,lineId}' AS "lineId",
       j.payload#>>'{packageWindow,followup,comparison,property}' AS property
      FROM harness_package_followups f JOIN gateway_jobs j ON j.id=f.job_id
@@ -308,11 +357,8 @@ export async function readFacadeInput(tx: PoolClient, projectId: string) {
     `SELECT id,payload FROM reader_evidence WHERE project_id=$1 AND id=ANY($2::uuid[])`, [projectId, evidenceIds],
   )).rows : [];
   const evidenceById = new Map(evidenceRows.map(({ id, payload }) => [id, payload]));
-  const statementIds = activeFacts.filter(({ observation }) =>
-    observation.deliveryStatement || observation.components?.length || typeInLine(observation.quote ?? "")).map(({ id }) => id);
-  const statementSet = new Set(statementIds);
-  const rowIds = activeFacts.filter(({ id, windowId, observation, attribute }) => statementSet.has(id) ||
-    (["pdf", "xlsx"].includes(formats.get(windowId) ?? "") && (attribute || observation.value))).map(({ id }) => id);
+  const rowIds = activeFacts.filter(({ observation }) => observation.grounding === "text" &&
+    observation.lineId && observation.quote).map(({ id }) => id);
   const { rows: statements } = rowIds.length ? await tx.query<IssuedComparisonEvidence>(
     `SELECT o.evidence_id AS "evidenceId", o.run_id AS "runId", issued.content
        FROM (SELECT DISTINCT evidence_id,run_id FROM reader_observations
@@ -323,10 +369,11 @@ export async function readFacadeInput(tx: PoolClient, projectId: string) {
          ORDER BY sequence LIMIT 1
        ) issued ON true`, [projectId, rowIds],
   ) : { rows: [] };
-  const statementsByEvidence = new Map(statements.map((event) => [event.evidenceId, event]));
+  const statementsByEvidence = new Map(statements.map(({ evidenceId, runId, content }) =>
+    [evidenceId, { runId, lines: deliveredLines(content) }]));
   const originalLines = new Map(activeFacts.flatMap(({ id, observation }) => {
-    const statement = statementSet.has(id) && statementsByEvidence.get(observation.evidenceId);
-    return statement && statement.runId === observation.runId ? [[id, deliveredLines(statement.content)] as const] : [];
+    const statement = statementsByEvidence.get(observation.evidenceId);
+    return statement && statement.runId === observation.runId ? [[id, statement.lines] as const] : [];
   }));
   const discovery = facadeDiscovery(activeFacts, analysis.facadeProfiles, analysis.facadeMentions);
   const observations = activeFacts.map((fact) => facadeObservation(

@@ -4,9 +4,10 @@
   "private": true,
   "type": "module",
   "dependencies": {
+    "@resvg/resvg-js": "2.6.2",
     "saxes": "6.0.0",
-    "yauzl": "3.4.0",
-    "@resvg/resvg-js": "2.6.2"
+    "sharp": "0.35.5",
+    "yauzl": "3.4.0"
   },
   "devDependencies": {
     "@types/yauzl": "3.4.0"

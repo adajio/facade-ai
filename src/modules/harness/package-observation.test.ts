@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
-import { randomUUID } from 'node:crypto';
+import { readFileSync } from 'node:fs';
+import { createHash, randomUUID } from 'node:crypto';
 import { test } from 'node:test';
 import type { Pool, PoolClient } from 'pg';
 import { groundComponents } from '../pdf/components.js';
@@ -8,6 +9,8 @@ import type { Evidence, Observation, ReaderComponentInput, ReaderLine } from '..
 import { verifiedNativeLineCrops, type NativeLineCrop } from '../pdf/native-line.js';
 import { packageCommonGrounded, packageNonDeliveryGrounded, publishPackageObservation, verifiedNativeInventoryRole } from './package-observation.js';
 import type { ObservationInput, ReaderContext } from './contracts.js';
+import { request } from './openrouter.js';
+import { packageDetails } from './package-observation.js';
 import type { PackageFact } from './package-analysis.js';
 
 const item = 'Теплотехнический расчёт';
@@ -68,6 +71,72 @@ function addressedFixture(quote: string) {
   } } as unknown as PoolClient;
   return { observation, evidence, context, issued, facts, tx };
 }
+
+test('all active Stage 1 evidence roles can be requested and stored with a printed title', async () => {
+  const catalog = JSON.parse(readFileSync('infra/catalogs/intake-stage-1.json', 'utf8'));
+  const roles = new Set<string>(catalog.requirements.flatMap((r: {sourceRoles: string[]}) => r.sourceRoles));
+  const titles: Record<string, string> = {
+    drawing: 'Чертёж фасада', schedule: 'Ведомость материалов', specification: 'Спецификация панелей',
+    inventory: 'Опись', calculation: 'Расчёт усилия', model: 'Модель корпуса',
+    brief: 'ТЗ на проектирование НВФ', certificate: 'Техническое свидетельство на облицовку',
+    test_report: 'Акт испытаний анкеров на вырыв', design: 'Проектное решение по энергоэффективности',
+  };
+  for (const value of roles) {
+    const title = titles[value];
+    assert.ok(title, value);
+    const f = addressedFixture('Вид документа: ' + title + ' | Стадия П');
+    const metadata = packageDetails.safeParse({ role: { value, quote: title } });
+    assert.ok(metadata.success, 'reader contract: ' + value);
+    await publishPackageObservation(f.tx, f.context, { evidence: f.evidence, package: metadata.data }, f.observation);
+    assert.equal(f.facts[0][5], value);
+  }
+  for (const [value, title, quote] of [
+    ['certificate', 'Опись | Техническое свидетельство на облицовку', 'Техническое свидетельство'],
+    ['certificate', 'Комплект | Сертификат соответствия', 'Сертификат'],
+    ['test_report', 'Протокол испытаний не предоставлен', 'Протокол испытаний'],
+    ['brief', 'См. задание на проектирование', 'задание на проектирование'],
+    ['test_report', 'Протокол совещания по испытаниям', 'Протокол'],
+    ['design', 'Проектное решение по энергоэффективности', 'энергоэффективности'],
+  ]) {
+    const f = addressedFixture(title);
+    const metadata = packageDetails.parse({ role: { value, quote } });
+    await publishPackageObservation(f.tx, f.context, { evidence: f.evidence, package: metadata }, f.observation);
+    assert.equal(f.facts[0][5], 'unknown', title);
+  }
+});
+
+test('new package jobs expose catalog roles on both save tools and old jobs retain the original request identity', () => {
+  const { context } = addressedFixture('Опись');
+  const { job } = context.task;
+  assert.ok(job.mode === 'primary' && job.settings && job.packageWindow);
+  const primary = { ...job, settings: job.settings, observationProtocol: 2 as const, packageWindow: job.packageWindow };
+  // Baseline wire digests from b1eccbc, including the optional header tool schema.
+  for (const [wire, original, withHeader] of [
+    ['package-observation-v2','da2412054ca3c5e103d3f1fbf4268a924362ad140fd085233d9e68853ba686a9','15b08f14bd9978e17967cb6da86f9b1378f51d77fb9cbdca4ad64477b1d40980'],
+    ['current','ff0a003da1a55c3e1e4a15dfa95e9a184ae94f02dd3cf86d09ee7439e88505d3','bbfdb8ea004a6f51d03d925a0d1a00944edfaa6d7bb814c53678e82db43815c3'],
+  ] as const) {
+    const historical = request(primary, [], wire).tools;
+    assert.equal(createHash('sha256').update(JSON.stringify(historical)).digest('hex'), original);
+    const oldScan = request({ ...primary, packageWindow: { ...primary.packageWindow, profileInspection:{lineIds:[]} } }, [], wire);
+    assert.equal(createHash('sha256').update(JSON.stringify(oldScan.tools)).digest('hex'), withHeader);
+    const current = request({ ...primary, packageWindow: { ...primary.packageWindow, packageReadingVersion: 2 } }, [], wire);
+    for (const name of ['save_observation', 'save_compound_observation']) {
+      const tool = current.tools.find(t => t.function.name === name);
+      assert.ok(tool);
+      assert.match(JSON.stringify(tool.function.parameters), /"test_report"/u, name);
+    }
+  }
+});
+
+test('a narrowed revision quote cannot hide the draft status of its own source line', async () => {
+  const line = 'Техническое задание НВФ (черновик) | Revision R1 current | Для здания в целом';
+  const f = addressedFixture(line);
+  const receipt = await publishPackageObservation(f.tx, f.context, { evidence: f.evidence, package: {
+    revision: {value:'R1',quote:'Revision R1 current',status:'current'},
+  } }, { ...f.observation, quote:'Revision R1 current' });
+  assert.equal(f.facts[0][8], 'unknown');
+  assert.ok(receipt?.rejected.some(field => field.field === 'revisionStatus'));
+});
 
 test('a schedule observation gives field-specific recovery without promoting its title or stage to value purpose', async () => {
   const quote = 'Schedule | Facade: FX-00AB-Q | Revision: M3 current | Guide offset: 51 mm';

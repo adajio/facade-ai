@@ -2,15 +2,16 @@ import type { Pool, PoolClient } from 'pg';
 import { allowsCatalogPair } from '../access/catalog-comparison.js';
 import { getCatalog, getProject, matchesDefaultProfile } from '../access/project-state.js';
 import type { CatalogRequirement } from '../access/input.js';
-import type { Branch, PackageBlock, PackageSemanticCheck, Place } from './contracts.js';
+import type { Branch, PackageBlock, PackageSemanticCheck, Place, ResearchOutcome } from './contracts.js';
 import type { Observation } from '../pdf/types.js';
 import { compareCitationValues, type VerifiedPairEvidence } from '../assessment/domain.js';
 import { printedPairVariant } from './pair-evidence.js';
 import { currentFacadeScopes } from './package-walk.js';
 import { buildFacadeProfiles, facadeDiscoveryVersion, type FacadeMention, type FacadeProfile } from './facade-discovery.js';
 
-export const packageRoles = ['drawing', 'detail', 'schedule', 'specification', 'calculation', 'inventory',
+export const originalPackageRoles = ['drawing', 'detail', 'schedule', 'specification', 'calculation', 'inventory',
   'correspondence', 'model', 'other', 'unknown'] as const;
+export const packageRoles = [...originalPackageRoles, 'brief', 'certificate', 'test_report', 'design'] as const;
 export type PackageSourceRole = typeof packageRoles[number];
 
 export interface PackageBinding {
@@ -70,13 +71,17 @@ export interface PackageWindow {
   readerVersion: string | null;
   format: string;
   structure?: PackageWalkState;
-  branches: Record<Branch, {
-    status: 'pending' | 'queued' | 'reading' | 'held' | 'covered' | 'reviewed_no_match' | 'refused';
-    reason: string | null;
-    jobId: string | null;
-    nextAction: string | null;
-  }>;
+  branches: Record<Branch, PackageBranchReading>;
 }
+
+type PartialReading = Extract<ResearchOutcome, { kind: 'partial' }>;
+type PackageBranchReading = {
+  reason: string | null;
+  jobId: string | null;
+  nextAction: string | null;
+} & ({
+  status: 'pending' | 'queued' | 'reading' | 'held' | 'covered' | 'reviewed_no_match' | 'refused';
+} | ({ status: 'partial' } & Pick<PartialReading, 'evidenceIds' | 'observationIds' | 'limitationIds'>));
 
 export interface PackageComparison {
   aFactId: string;
@@ -127,7 +132,7 @@ type WindowRow = Omit<PackageWindow, 'branches'> & {
   walk: boolean;
   state: 'ready' | 'leased' | 'held' | 'done' | null;
   jobId: string | null;
-  outcome: { kind?: string; reason?: string } | null;
+  outcome: PartialReading | { kind: 'covered' | 'reviewed_no_match' | 'final_refusal'; reason?: string } | null;
   reason: string | null;
   nextAction: string | null;
   blocker: string | null;
@@ -149,6 +154,10 @@ function branchState(row: WindowRow): PackageWindow['branches'][Branch] {
     : row.blockerState === 'unknown' || row.blockerState === 'sending' ? 'prior_effect_unsettled' : 'prior_effect_reserved', jobId: null,
     nextAction: `Сверить исходную работу ${blocker}.` };
   if (state === 'done') {
+    if (outcome?.kind === 'partial') {
+      const { reason, evidenceIds, observationIds, limitationIds } = outcome;
+      return { status: 'partial', reason, jobId, nextAction, evidenceIds, observationIds, limitationIds };
+    }
     const status = outcome?.kind === 'covered' ? 'covered' :
       outcome?.kind === 'reviewed_no_match' ? 'reviewed_no_match' : 'refused';
     return { status, reason: outcome?.reason ?? null, jobId, nextAction };
@@ -417,7 +426,8 @@ export async function readPackageAnalysis(db: Pool | PoolClient, projectId: stri
        closed.id AS "completedFollowupId",scan.blocks AS "profileBlocks"
      FROM harness_package_branches b LEFT JOIN harness_package_structures s ON s.window_id=b.window_id
      LEFT JOIN LATERAL (
-       SELECT j.id,j.state,j.reason FROM harness_package_followups f JOIN gateway_jobs j ON j.id=f.job_id
+       SELECT j.id,CASE WHEN j.state='done' AND j.result->>'kind'='partial' THEN 'partial' ELSE j.state END AS state,
+         coalesce(j.reason,j.result->>'reason') AS reason FROM harness_package_followups f JOIN gateway_jobs j ON j.id=f.job_id
        WHERE f.root_job_id=b.job_id ORDER BY j.created_at DESC,j.id LIMIT 1
      ) child ON true
      LEFT JOIN LATERAL (
@@ -496,7 +506,7 @@ export async function readPackageAnalysis(db: Pool | PoolClient, projectId: stri
   const completedWindows = windows.filter(({ branches,structure }) => (['A','B'] as const).every((key)=>{
     const {status,reason}=branches[key];
     return status==='covered'||status==='reviewed_no_match'||
-      (status==='held'&&reason==='turn_limit_final'&&Boolean(structure?.branches[key].completedFollowupId));
+      ((status==='partial'||status==='held'&&reason==='turn_limit_final')&&Boolean(structure?.branches[key].completedFollowupId));
   })).length;
   const structurallyReviewedWindows=windows.filter(({structure})=>structure?.branches.A.complete&&structure.branches.B.complete).length;
   const versionIds = versions.rows.map(({ id }) => id);

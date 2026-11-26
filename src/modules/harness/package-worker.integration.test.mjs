@@ -438,6 +438,7 @@ test('ordinary intake publishes independent package evidence before questions an
     const bytes=pdf([...Array.from({length:72},(_,row)=>'Record '+(row+1)),'Material Graphite | project facade ID: K-88'],
       {size:4,leading:6,top:475,height:500});
     walkOriginal=sha(bytes);
+    const callsBeforePassive = calls.length;
     run();
     try {
       await upload('walk.pdf',bytes,target);
@@ -448,7 +449,7 @@ test('ordinary intake publishes independent package evidence before questions an
       const { rows: protocols }=await app.db.query(`SELECT payload#>>'{packageWindow,walkProtocol}' AS protocol
         FROM gateway_jobs WHERE id=ANY($1::uuid[])`,[roots]);
       assert.deepEqual(protocols.map(({protocol})=>protocol),['1','1']);
-      assert.equal(calls.length,0);
+      assert.equal(calls.length,callsBeforePassive);
       driver.abort();
       await worker;
       process.env.FACADE_HARNESS_PACKAGE_WALK='0';
@@ -541,6 +542,14 @@ test('ordinary intake publishes independent package evidence before questions an
   const beforePassive = calls.length;
   run();
   const first = await upload('first.pdf', pdf([primaryDrawing, register, notDelivered, common]));
+  // Mapping the first upload may finish while the operator is still adding files.
+  await until(() => app.db.query('SELECT 1 FROM harness_package_maps WHERE project_id=$1 AND version_id=$2 AND active',
+    [project.id,first.versionId]), result => result.rowCount > 0, 'unsealed file mapped');
+  assert.equal((await app.db.query("SELECT 1 FROM gateway_jobs WHERE project_id=$1 AND payload ? 'packageWindow'",
+    [project.id])).rowCount, 0);
+  assert.equal(calls.length,beforePassive);
+  await upload('second.pdf', pdf([opposingDrawing, opposingTitle]));
+  await command('POST', receiptUrl + '/seal', {});
   const passive = await until(analyze, ({ windows }) => windows.some(({ branches }) => branches.A.status === 'held'), 'passive hold');
   assert.equal(calls.length, beforePassive);
   assert.equal(passive.facts.length, 0);
@@ -601,8 +610,6 @@ test('ordinary intake publishes independent package evidence before questions an
   delete process.env.FACADE_HARNESS_REPLAY_ONLY;
   process.env.FACADE_HARNESS_PACKAGE_EFFECTS = 'enabled';
   run();
-  await upload('second.pdf', pdf([opposingDrawing, opposingTitle]));
-  await command('POST', receiptUrl + '/seal', {});
   const complete = await until(analyze, ({ coverage }) => coverage.completedWindows === 2 && coverage.subjectProof, 'completed package');
   assert.equal(complete.coverage.physicalProof.versionIds.length, 2);
   assert.equal(complete.coverage.subjectProof.facadeIds.length, 2);
@@ -732,14 +739,20 @@ test('ordinary intake publishes independent package evidence before questions an
       WHERE project_id=$1 ORDER BY state`, [existing.id])).rows;
     assert.deepEqual(before.map(({ state }) => state), ['paid', 'unknown']);
     const readerVersion = complete.windows[0].readerVersion;
+    async function fixtureMap(source, version) {
+      const count = source.projectId === existing.id ? 2625 : 3;
+      const units = Array.from({ length: count }, (_, index) => ({
+        id: String(index + 1), width: 600, height: 400, locator: { page: index + 1 },
+      }));
+      await app.db.query(`INSERT INTO reader_maps(project_id,document_id,version_id,reader_version,receipt_id,original_sha256,format,units)
+        SELECT project_id,document_id,version_id,$2,receipt_id,$3,'pdf',$4::jsonb FROM intake_reader_jobs
+        WHERE version_id=$1 ON CONFLICT(version_id,reader_version) DO NOTHING`,
+        [source.versionId,version,source.sha256,JSON.stringify(units)]);
+      return { format: 'pdf', source, readerVersion: version, units };
+    }
     const map = {
       formatFor: () => 'pdf', readerVersion: async () => readerVersion,
-      async map(source) {
-        const count = source.projectId === existing.id ? 2625 : 3;
-        return { format: 'pdf', source, readerVersion, units: Array.from({ length: count }, (_, index) => ({
-          id: String(index + 1), width: 600, height: 400, locator: { page: index + 1 },
-        })) };
-      },
+      async map(source) { return fixtureMap(source, readerVersion); },
     };
     await activatePackageProjects(app.db, gateway, [existing.id]);
     const target = (await app.db.query('SELECT generation_id FROM harness_package_projects WHERE project_id=$1', [existing.id])).rows[0];
@@ -750,7 +763,7 @@ test('ordinary intake publishes independent package evidence before questions an
     assert.equal(await preparePackageMap(app.db, gateway, map, [existing.id]), false);
 
     const profile = managedProfile();
-    for (let index = 0; index < 12; index++) if (!await dispatchPackagePair(app.db, gateway, profile)) break;
+    for (let index = 0; index < 12; index++) if (!await dispatchPackagePair(app.db, gateway, profile, undefined, map)) break;
     const large = await readPackageAnalysis(app.db, existing.id);
     const competing = await readPackageAnalysis(app.db, small.id);
     assert.equal(large.windows.length, 2625);
@@ -771,7 +784,7 @@ test('ordinary intake publishes independent package evidence before questions an
       WHERE project_id=$1 ORDER BY state`, [existing.id])).rows, before);
     const nextReaderVersion = readerVersion + ';fixture-profile=v2';
     const switched = { ...map, readerVersion: async () => nextReaderVersion,
-      async map(source) { return { ...await map.map(source), readerVersion: nextReaderVersion }; } };
+      async map(source) { return fixtureMap(source, nextReaderVersion); } };
     // The same source and frames are read under a new derived-map contract.
     const { rows: [{ mappedOriginals }] }=await app.db.query(`SELECT count(*)::int AS "mappedOriginals"
       FROM harness_package_maps WHERE active`);
@@ -779,7 +792,7 @@ test('ordinary intake publishes independent package evidence before questions an
       assert.equal(await preparePackageMap(app.db, gateway, switched, [existing.id]), true);
     }
     assert.equal(await preparePackageMap(app.db, gateway, switched, [existing.id]), false);
-    for (let index = 0; index < 12; index++) if (!await dispatchPackagePair(app.db, gateway, profile)) break;
+    for (let index = 0; index < 12; index++) if (!await dispatchPackagePair(app.db, gateway, profile, undefined, switched)) break;
     const changed = await readPackageAnalysis(app.db, existing.id);
     assert.notEqual(changed.windows[0].id, large.windows[0].id);
     assert.deepEqual(changed.windows[0].place, large.windows[0].place);

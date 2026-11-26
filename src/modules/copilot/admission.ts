@@ -48,7 +48,7 @@ export async function verifyCopilotInputs(
             AND EXISTS (SELECT 1 FROM intake_occurrences c WHERE c.project_id=$1 AND c.version_id=v.id AND c.state='accepted')
             AND (
               (r.proof->>'kind'='memory' AND EXISTS (
-                SELECT 1 FROM project_memory_blocks b WHERE b.project_id=$1 AND b.version_id=v.id AND b.id=r.proof->>'blockId'
+                SELECT 1 FROM project_memory_blocks_all b WHERE b.project_id=$1 AND b.version_id=v.id AND b.id=r.proof->>'blockId'
               )) OR (r.proof->>'kind'='evidence' AND EXISTS (
                 SELECT 1 FROM reader_evidence e JOIN reader_maps m USING(project_id,version_id,reader_version)
                 WHERE e.project_id=$1 AND e.version_id=v.id AND m.original_sha256=o.sha256

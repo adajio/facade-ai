@@ -51,6 +51,7 @@ function primaryResult(task: ScheduledResearchTask, outcome: ResearchOutcome): P
   if (task.job.mode !== 'primary') return undefined;
   if (outcome.kind === 'covered') return { state: 'completed', evidenceRef: outcome.observationIds[0] };
   if (outcome.kind === 'reviewed_no_match') return { state: 'completed', evidenceRef: outcome.evidenceIds[0] };
+  if (outcome.kind === 'partial') return { state: 'partial', evidenceRef: outcome.limitationIds[0] };
   if (outcome.kind === 'final_refusal') return {
     state: 'final_refusal', evidenceRef: outcome.evidenceIds[0] ?? `harness:${task.jobId}:refusal`,
   };
@@ -253,7 +254,7 @@ export async function executeResearch(
           await lockIntakeProject(tx, task.projectId);
           if (!await gateway.finish(lease, state.outcome, primaryResult(task, state.outcome), tx)) return;
           await services.publishOutcome(tx, task, state.outcome);
-          if (comparison) await notify(tx);
+          if (comparison || task.scopeId === null && state.outcome.kind === 'partial') await notify(tx);
         });
         break;
       case 'suspended':

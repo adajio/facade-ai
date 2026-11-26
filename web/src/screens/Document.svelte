@@ -27,10 +27,12 @@
   const commands = new Commands(() => api);
   let units = $state<ReaderMap['units']>([]);
   let cadMap = $state<{ versionId: string; readerVersion: string }>();
+  let previewMap = $state<{ versionId: string; readerVersion: string; format: 'image' | 'sig' }>();
   let work = $state<Work>();
   let readerError = $state('');
   let workError = $state('');
   let originalError = $state('');
+  let derivativeState = $state<{ url: string; available: boolean; error?: string }>();
   let ready = $state(false);
   let heading: HTMLHeadingElement;
   let viewer = $state<HTMLHeadingElement>();
@@ -47,7 +49,13 @@
   const mapReady = $derived(work?.mapReady);
   const path = $derived('/api/documents/' + id(documentId) + '/versions/' + id(versionId));
   const original = $derived(path + '/content');
+  const derivativeUrl = $derived(!context.masked && cadVersion
+    ? V1 + path.slice(4) + '/dwg-derivative?readerVersion=' + encodeURIComponent(cadVersion) : undefined);
+  const derivative = $derived(derivativeState?.url === derivativeUrl ? derivativeState : undefined);
   const isPdf = $derived(occurrence.mediaType === 'application/pdf');
+  const alternatePreview = $derived(previewMap?.versionId === versionId ? previewMap : undefined);
+  const paged = $derived(isPdf || Boolean(alternatePreview));
+  const viewerTitle = $derived(isPdf ? 'Оригинал PDF' : alternatePreview?.format === 'sig' ? 'PDF внутри контейнера подписи' : 'Оригинал изображения');
   const pages = $derived(units.flatMap(({ locator }) => typeof locator?.page === 'number' ? [locator.page] : []));
   const selectedPage = $derived.by(() => {
     const raw = context.params.get('page');
@@ -56,8 +64,8 @@
   const page = $derived(selectedPage !== undefined && (!pages.length || pages.includes(selectedPage))
     ? selectedPage : pages[0] ?? 1);
   const pdfUrl = $derived(original + '#page=' + page);
-  const previewKey = $derived(ready && isPdf && !fullPdf && !context.masked && originalHash &&
-    selectedPage !== undefined && pages.includes(page) ? [context.project.id, versionId, originalHash, page].join('/') : undefined);
+  const previewKey = $derived(ready && paged && !fullPdf && !context.masked && originalHash &&
+    selectedPage !== undefined && pages.includes(page) ? [context.project.id, versionId, originalHash, alternatePreview?.readerVersion, page].join('/') : undefined);
 
   $effect(() => {
     const key = previewKey;
@@ -136,19 +144,47 @@
           expected.sha256 && value.source.sha256 !== expected.sha256) {
         units = [];
         cadMap = undefined;
+        previewMap = undefined;
         readerError = 'Карта относится к другой версии оригинала.';
         return;
       }
       units = value.units;
       cadMap = value.format === 'dwg' ? { versionId: expected.versionId, readerVersion: value.readerVersion } : undefined;
+      const renderable = value.format === 'image' && value.units.some(({ locator }) => locator?.rasterFormat) ||
+        value.format === 'sig' && value.units.some(({ locator }) => locator?.signatureKind === 'embedded_pdf');
+      previewMap = renderable && (value.format === 'image' || value.format === 'sig')
+        ? { versionId: expected.versionId, readerVersion: value.readerVersion, format: value.format } : undefined;
     }).catch((error) => {
       if (controller.signal.aborted || interrupted(error)) return;
       units = [];
       cadMap = undefined;
+      previewMap = undefined;
       readerError = error instanceof ApiError && error.code === 'reader_map_unavailable'
         ? 'Карта физических единиц ещё недоступна.' : describe(error);
     });
     return () => controller.abort();
+  });
+
+  $effect(() => {
+    const url = derivativeUrl;
+    derivativeState = undefined;
+    if (!url) return;
+    const controller = new AbortController();
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const checkDerivative = async () => {
+      try {
+        await api.response(url, { method: 'HEAD', signal: controller.signal });
+        if (!controller.signal.aborted) derivativeState = { url, available: true };
+      } catch (error) {
+        if (controller.signal.aborted || interrupted(error)) return;
+        derivativeState = {
+          url, available: false, error: error instanceof ApiError && error.status === 404 ? undefined : describe(error),
+        };
+        timer = setTimeout(checkDerivative, 30_000);
+      }
+    };
+    void checkDerivative();
+    return () => { controller.abort(); if (timer) clearTimeout(timer); };
   });
 
   $effect(() => {
@@ -209,49 +245,57 @@
     <h2 id="document-heading" bind:this={heading} tabindex="-1">{occurrence.relativePath}</h2>
     {#if ready}
       <div class="actions">
-        {#if isPdf}
+        {#if paged}
           <button id="document-open-original" class="primary" type="button"
-            onclick={() => setPage(pages.includes(page) || !pages.length ? page : pages[0], true)}>Открыть оригинал</button>
-          {#if context.canEdit && context.scopeId}
+            onclick={() => setPage(pages.includes(page) || !pages.length ? page : pages[0], true)}>{alternatePreview?.format === 'sig' ? 'Открыть вложенный PDF' : 'Открыть оригинал'}</button>
+          {#if isPdf && context.canEdit && context.scopeId}
             <a class="button" href={scopedUrl(context.project.id, 'fragments', {
               scope: context.scopeId, document: documentId, version: versionId, page,
             })}>Подготовить фрагмент</a>
           {/if}
         {/if}
         <a class="button" href={original} download={occurrence.relativePath.split('/').at(-1)}>Скачать оригинал</a>
+        {#if derivative?.available}
+          <a class="button" href={derivative.url}>Скачать машиночитаемую версию DWG</a>
+        {/if}
       </div>
     {/if}
   </div>
   <Notice kind="error" message={originalError} />
+  {#if derivative?.error}<Notice kind="error" message={'Машиночитаемая версия DWG · ' + derivative.error} />{/if}
   {#if !ready && !originalError && !workError}<p role="status">Проверяем доступ к оригиналу…</p>{/if}
-  {#if selectedPage !== undefined && ready && isPdf && !context.masked}
+  {#if selectedPage !== undefined && ready && paged && !context.masked}
     <section class="original" aria-labelledby="document-viewer">
       <div class="card-header">
-        <h3 id="document-viewer" tabindex="-1" bind:this={viewer}>Оригинал PDF</h3>
+        <h3 id="document-viewer" tabindex="-1" bind:this={viewer}>{viewerTitle}</h3>
         <button type="button" onclick={closeOriginal}>Закрыть просмотр</button>
       </div>
       <div class="actions">
         <button type="button" disabled={page === 1} onclick={() => setPage(page - 1)}>Предыдущая страница</button>
         <span aria-live="polite">Страница {page}{pages.length ? ' из ' + pages.length : ''}</span>
         <button type="button" disabled={!pages.length || page >= pages.at(-1)!} onclick={() => setPage(page + 1)}>Следующая страница</button>
-        <a href={pdfUrl} target="_blank" rel="noopener">Открыть PDF в новой вкладке</a>
-        {#if previewKey || fullPdf}
-          <button type="button" class="quiet" onclick={() => fullPdf = !fullPdf}>
-            {fullPdf ? 'Быстрый просмотр страницы' : 'Полный просмотр PDF'}
-          </button>
+        {#if isPdf}
+          <a href={pdfUrl} target="_blank" rel="noopener">Открыть PDF в новой вкладке</a>
+          {#if previewKey || fullPdf}
+            <button type="button" class="quiet" onclick={() => fullPdf = !fullPdf}>
+              {fullPdf ? 'Быстрый просмотр страницы' : 'Полный просмотр PDF'}
+            </button>
+          {/if}
         {/if}
       </div>
       {#if previewKey && preview?.key !== previewKey}
         <p role="status">Готовим страницу {page}…</p>
       {:else if previewKey && preview?.url}
-        <img class="page-preview" alt={'Оригинал PDF, страница ' + page} src={preview.url} />
-      {:else}
+        <img class="page-preview" alt={viewerTitle + ', страница ' + page} src={preview.url} />
+      {:else if isPdf}
         {#if previewKey && preview?.key === previewKey && !preview.url}
           <p>Сейчас открыт полный PDF. <button type="button" class="quiet" onclick={() => { preview = undefined; previewAttempt++; }}>Повторить быстрый просмотр страницы</button></p>
         {/if}
         {#key pdfUrl}
           <iframe title={'Оригинал PDF, страница ' + page} src={pdfUrl}></iframe>
         {/key}
+      {:else}
+        <p>Предпросмотр страницы недоступен. <button type="button" class="quiet" onclick={() => { preview = undefined; previewAttempt++; }}>Повторить предпросмотр</button></p>
       {/if}
     </section>
   {/if}
@@ -263,7 +307,7 @@
     <dt>Фактический тип</dt><dd>{occurrence.mediaType ?? '—'}</dd>
   </dl>
   </details>
-  <h3>{isPdf ? 'Страницы документа' : 'Листы и части документа'}</h3>
+  <h3>{paged ? 'Страницы документа' : 'Листы и части документа'}</h3>
   <Notice message={readerError} />
   {#if cadVersion && ready && !context.masked && units.some(unit => unit.locator?.partSha256)}
     <CadDocument {api} {units} readerVersion={cadVersion} endpoint={V1 + path.slice(4) + '/reader/units'}
@@ -273,7 +317,7 @@
       {#each units as unit (unit.id)}
         {@const number = unit.locator?.page}
         <li>
-          {#if isPdf && typeof number === 'number' && ready}
+          {#if paged && typeof number === 'number' && ready}
             <button type="button" onclick={() => setPage(number, true)}>{unit.label ?? 'Страница ' + number}</button>
           {:else}
             {unit.label ?? unit.id}

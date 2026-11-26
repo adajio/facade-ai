@@ -13,9 +13,9 @@ const fixtures = fileURLToPath(new URL("./fixtures/", import.meta.url));
 const expected = JSON.parse(await readFile(new URL("./gold/expected.json", import.meta.url), "utf8"));
 const adapters = new Map(createFormatAdapters().map((adapter) => [adapter.format, adapter]));
 
-async function read(name, { select, locator, box, representation = "native", adapter } = {}) {
+async function read(name, { select, locator, box, representation = "native", adapter, inputPath } = {}) {
   adapter ??= adapters.get(resolveFormat(name));
-  const path = join(fixtures, name);
+  const path = inputPath ?? join(fixtures, name);
   const units = await adapter.inspect(path);
   const unit = select ? units.find(select) : units[0];
   assert.ok(unit, `missing physical unit: ${name} ${JSON.stringify(units)}`);
@@ -179,12 +179,16 @@ test("Linux LibreOffice produces versioned derivatives and marks conversion prec
   assert.equal((await read("unreadable.xls")).json.limitations[0], "xls_signature_invalid");
 });
 
-test("Linux LibreDWG reads model schedule and marks converted handle", {
+test("Linux ODA reads a synthetic DWG and marks the derived handle", {
   skip: !process.env.FACADE_CONVERTER_SOCKET || process.env.FACADE_STEP11_DWG !== "1",
 }, async () => {
-  const survey = await read("schedule.dwg");
+  const inputPath = process.env.FACADE_STEP11_ODA_FIXTURE;
+  assert.ok(inputPath, "Set FACADE_STEP11_ODA_FIXTURE to the synthetic D4 control DWG");
+  const survey = await read("control.dwg", {inputPath, select: unit => unit.locator.space === "Model"});
   assert.ok(survey.json.limitations.includes("cad_converted_handle_unverified"));
-  const target = survey.json.lines.find((line) => line.text === expected.dxf.text);
+  assert.equal(survey.unit.locator.derivativeFormat, "dxf");
+  const target = survey.json.lines.find((line) => line.text === "D4 POSITIVE | gap 37 mm");
+  assert.ok(target);
   assert.match(target.locator.derivativeHandle, /^[0-9A-F]+$/);
   assert.equal(target.locator.handle, undefined);
   assert.equal((await read("unreadable.dwg")).json.limitations[0], "dwg_signature_invalid");
@@ -201,24 +205,6 @@ test("Linux legacy DOC recovery preserves separate cells from a flattened import
   assert.deepEqual(json.lines.map(({ text, locator }) => [locator.column, text]), [
     [1, "AX-725"], [2, "63"], [3, "mm"],
   ]);
-});
-
-test("Linux DWG recovery exposes decoder text when the DXF export is incomplete", {
-  skip: process.env.FACADE_STEP11_RECOVERY !== "1" || process.env.FACADE_STEP11_DWG !== "1"
-    || !process.env.FACADE_CONVERTER_SOCKET,
-}, async () => {
-  const { unit, json } = await read("dwg-recovery.dwg");
-  assert.equal(unit.locator.space, "Model");
-  assert.equal(unit.locator.derivative, "dwg-json");
-  assert.ok(json.limitations.includes("cad_dwg_json_recovery"));
-  const line = json.lines.find((row) => row.text === "Rib L2 | 13.25 mm");
-  assert.ok(line);
-  assert.ok(json.lines.some((row) => row.text === "Rib L7 | 28.5 mm"));
-  const address = line.locator;
-  const reopened = await read("dwg-recovery.dwg", { locator: address });
-  assert.equal(reopened.json.lines[0].text, line.text);
-  const rendered = await read("dwg-recovery.dwg", { locator: address, representation: "render" });
-  assert.equal(rendered.output.mediaType, "image/png");
 });
 
 test("mixed, rotated and unreadable PDF distinguish native layer, raster and OCR", async () => {

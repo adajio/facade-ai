@@ -131,20 +131,19 @@ async function converterInfo(signal?: AbortSignal): Promise<Record<string, unkno
 }
 
 export async function converterImage(operation: Operation, signal?: AbortSignal): Promise<string | undefined> {
+  if (operation === "dwg") return (await dwgProfile(signal))?.id;
   const id = (await converterInfo(signal))?.[operation];
   if (typeof id === "string" && imageId.test(id)) return id;
 }
 
 export async function dwgProfile(signal?: AbortSignal): Promise<{ id: string; identity: string; timeout: number; reserve: number } | undefined> {
   const info = await converterInfo(signal);
-  const id = info?.dwg;
-  const timeout = info?.dwgClientTimeoutMs;
-  const reserve = info?.dwgReserveBytes;
-  const identity = info?.dwgIdentity ?? (info?.dwgEngine === "oda" ? undefined : id);
+  if (info?.dwgEngine !== "oda" || info.dwgError !== undefined) return;
+  const { dwg: id, dwgIdentity: identity, dwgClientTimeoutMs: timeout, dwgReserveBytes: reserve } = info;
   if (typeof id === "string" && imageId.test(id) && typeof timeout === "number"
       && Number.isInteger(timeout) && timeout > 0 && timeout <= 7_260_000
       && typeof reserve === "number" && Number.isSafeInteger(reserve) && reserve > 0
-      && typeof identity === "string" && imageId.test(identity)) {
+      && typeof identity === "string" && imageId.test(identity) && identity !== id) {
     return { id, identity, timeout, reserve };
   }
 }
@@ -191,12 +190,12 @@ export async function convertDwg(
   source: Readable,
   output: Writable,
   options: {
-    size: number; image: string; identity?: string; timeout: number; signal?: AbortSignal;
+    size: number; image: string; identity: string; timeout: number; signal?: AbortSignal;
     checkSpace?: (size: number) => Promise<void>;
   },
 ): Promise<{ size: number; sha256: string }> {
-  if (!imageId.test(options.image) || !Number.isSafeInteger(options.size)
-      || options.size < 6 || options.size > receiptLimit) {
+  if (!imageId.test(options.image) || !imageId.test(options.identity) || options.identity === options.image
+      || !Number.isSafeInteger(options.size) || options.size < 6 || options.size > receiptLimit) {
     source.destroy();
     output.destroy();
     throw new ConverterPortError("invalid_request");
@@ -209,7 +208,7 @@ export async function convertDwg(
     source, sourceSize: options.size, signal: options.signal, timeout: options.timeout,
     headers: {
       "content-length": String(options.size), "x-converter-image": options.image,
-      ...(options.identity ? { "x-converter-profile": options.identity } : {}),
+      "x-converter-profile": options.identity,
     },
     async prepare(headers) {
       const length = headers["x-converter-bytes"];

@@ -51,7 +51,7 @@
 
 - Образ брокера — `sha256:846f8548ece00d0007afb71103a2ed04f39f23bda905f84707ed078d8304a705`.
 - Образ DWG — `sha256:7f19cb0a60a0b633a8e96df51aebef54e3d3e5b48106271910e6c2414534a9f2`.
-- SHA-256 ARM64-пакета LibreDWG — `9564f3befabc1baca44747ce79f8caadbca774412846fccfa77e1e74d48f902f`.
+- SHA-256 архивного ARM64-пакета — `9564f3befabc1baca44747ce79f8caadbca774412846fccfa77e1e74d48f902f`.
   В сборку по рецепту шага 11 понадобилось явно передать `--build-arg TARGETARCH=arm64`.
 - Протокол — `databases/test_full_release_4dafd70b365a/deployed-dwg/`. Модельная квалификация чтения DWG ведётся в проверке шага 11.
 
@@ -250,7 +250,7 @@ HTTP 206 для того же Range. Снятие копии, восстанов
 
 Образ Office из исходного рецепта `sha256:9f42791d2656657fbe1eaeb21012d34cf1e15df510e4890fdefd2e1799b526d4`
 включает LibreOffice 7.4.7.2. Образ DWG `sha256:561a1a324440a155a295fd1aa7cab1719fdb9ebaf00b7261f591b22e8843b557`
-включает `dwg2dxf` и `dwgread` 0.13.4. Стадия DWG побайтно совпадает с `421632b`. На предыдущем образе reader
+включает архивные утилиты экспорта DXF и JSON версии 0.13.4. Стадия DWG побайтно совпадает с `421632b`. На предыдущем образе reader
 со штатным брокером прошли 7 проверок DOC, DWG и DXF. У запущенного worker обычный DWG открыл Model и Paper, а исходный
 DWG с незавершённым DXF дал частичную карту Model, пять доступных строк и ограничение `cad_dwg_json_recovery`.
 [Проверки адаптеров](</Volumes/ADATA SE920/OrbStack/facade-ai-test-server/step15/shared-release.jOLzH58g/adapter-cad-broker.log>) · [Обычный DWG](</Volumes/ADATA SE920/OrbStack/facade-ai-test-server/step15/shared-release.jOLzH58g/deployed-dwg-normal.json>) · [DWG с восстановлением](</Volumes/ADATA SE920/OrbStack/facade-ai-test-server/step15/shared-release.jOLzH58g/deployed-dwg-fallback.json>)

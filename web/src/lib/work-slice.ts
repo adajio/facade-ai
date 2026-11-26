@@ -1,4 +1,5 @@
 import { id } from './http';
+import type { EvidenceFilter } from './triage';
 import { projectApi, scopedUrl, type Position } from './workspace';
 
 export type WorkReceiptFilter = 'all' | 'open' | 'processing';
@@ -12,6 +13,7 @@ export type AreaCounts = {
   outcome: string; covered: number; total: number; checked?: number; review?: number; ready?: number;
   previousConclusion?: { assessmentVersion: number; reason: string };
   letter?: number; contextId?: string; concluded?: boolean; conflicts?: number; actionable?: number;
+  evidence?: Record<EvidenceFilter, number>;
 };
 export type WorkArea = AreaCounts & { contextId: string; name: string; kind: string };
 

@@ -2,9 +2,12 @@ import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import { mkdtemp, open, readdir, rename, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
+import { pathToFileURL } from "node:url";
 import { test } from "node:test";
-import { buildDwgIndex, openDwgIndex } from "../../../../../dist/src/modules/formats/dwg-index.js";
+const buildRoot = process.env.FACADE_STEP11_DIST ?? resolve('dist');
+const load = (name) => import(pathToFileURL(join(buildRoot, 'src/modules/formats', name)).href);
+const { buildDwgIndex, openDwgIndex } = await load('dwg-index.js');
 
 function drawing(count) {
   const lines = ["0", "SECTION", "2", "ENTITIES"];
@@ -75,12 +78,12 @@ test("DWG parts preserve unique coverage, duplicate-handle ordinals and immutabl
   }
 });
 
-test("DWG batch uses one conversion when the persistent index is unavailable", async () => {
+test("DWG does not silently accept a temporary index when persistent storage is unavailable", async () => {
   const root = await mkdtemp(join(tmpdir(), "dwg-parts-batch-"));
   const { createHash } = await import("node:crypto");
   const { once } = await import("node:events");
   const { createServer } = await import("node:http");
-  const { createFormatAdapters } = await import("../../../../../dist/src/modules/formats/index.js");
+  const { createFormatAdapters } = await load('index.js');
   const dataDir = process.env.FACADE_DATA_DIR;
   const oldSocket = process.env.FACADE_CONVERTER_SOCKET;
   const socket = join(root, "b.sock");
@@ -94,7 +97,7 @@ test("DWG batch uses one conversion when the persistent index is unavailable", a
   let payload = Buffer.from(drawing(520));
   let calls = 0;
   const server = createServer((_req, res) => res.end(JSON.stringify({
-    dwgEngine: "libredwg", dwg: image, dwgIdentity: image, dwgClientTimeoutMs: 4000, dwgReserveBytes: 1,
+    dwgEngine: "oda", dwg: image, dwgIdentity: "sha256:" + "c".repeat(64), dwgClientTimeoutMs: 4000, dwgReserveBytes: 1,
   })));
   server.on("checkContinue", (req, res) => {
     calls++;
@@ -114,17 +117,8 @@ test("DWG batch uses one conversion when the persistent index is unavailable", a
     await once(server, "listening");
     const adapter = createFormatAdapters().find(candidate => candidate.format === "dwg");
     const source = { projectId: randomUUID(), documentId: randomUUID(), versionId: randomUUID(), sha256: "b".repeat(64) };
-    const mapped = await adapter.inspect(original, source);
-    assert.equal(mapped.length, 3);
+    await assert.rejects(adapter.inspect(original, source));
     assert.equal(calls, 1);
-    assert.equal(await adapter.readCachedNativeUnits(source, mapped), undefined);
-    const ids = [];
-    for await (const read of adapter.readNativeUnits(original, mapped, source)) ids.push(read.address.unitId);
-    assert.deepEqual(ids, mapped.map(unit => unit.id));
-    assert.equal(calls, 2);
-    payload = Buffer.from(drawing(521));
-    await assert.rejects(adapter.read(original, { representation: "native", address: { unitId: mapped[0].id } },
-      mapped[0], undefined, source), { code: "dwg_index_identity_changed" });
   } finally {
     server.closeAllConnections();
     await new Promise(resolve => server.close(resolve));
@@ -176,7 +170,7 @@ test("layout names come from AcDbLayout and preserve empty sheets", async () => 
 });
 
 test("DWG draws shared nested blocks and clips layout viewports without changing entity addresses", async () => {
-  const { renderCad } = await import("../../../../../dist/src/modules/formats/cad-render.js");
+  const { renderCad } = await load('cad-render.js');
   const root = await mkdtemp(join(tmpdir(), "dwg-geometry-"));
   const path = join(root, "source");
   const line = (handle, layer, x, y, x2, y2) => [
@@ -237,7 +231,7 @@ test("DWG draws shared nested blocks and clips layout viewports without changing
 
 test("DWG draws proxy shell topology, hatch holes and ordered wipeout occlusion", async () => {
   const { inflateSync } = await import("node:zlib");
-  const { cadFrame, renderCad } = await import("../../../../../dist/src/modules/formats/cad-render.js");
+  const { cadFrame, renderCad } = await load('cad-render.js');
   const root = await mkdtemp(join(tmpdir(), "dwg-special-"));
   const path = join(root, "source");
   const line = (handle, y) => [0, "LINE", 5, handle, 10, 0, 20, y, 11, 20, 21, y];
@@ -327,7 +321,7 @@ test("DWG draws proxy shell topology, hatch holes and ordered wipeout occlusion"
 
 test("DWG composites later direct and nested masks across parts without moving addresses or the frame", async () => {
   const { inflateSync } = await import("node:zlib");
-  const { cadFrame, renderCad } = await import("../../../../../dist/src/modules/formats/cad-render.js");
+  const { cadFrame, renderCad } = await load('cad-render.js');
   const root = await mkdtemp(join(tmpdir(), "dwg-cross-mask-"));
   const path = join(root, "source");
   const line = (handle, y) => [0, "LINE", 5, handle, 10, 0, 20, y, 11, 20, 21, y];
@@ -394,8 +388,8 @@ test("DWG composites later direct and nested masks across parts without moving a
 
 test("DWG pins SHX strokes, reports missing glyphs and ignores font paths outside the configured assets", async () => {
   const { symlink, mkdir } = await import("node:fs/promises");
-  const { dwgFontAssets } = await import("../../../../../dist/src/modules/formats/cad-font-assets.js");
-  const { renderCad } = await import("../../../../../dist/src/modules/formats/cad-render.js");
+  const { dwgFontAssets } = await load('cad-font-assets.js');
+  const { renderCad } = await load('cad-render.js');
   const root = await mkdtemp(join(tmpdir(), "dwg-font-"));
   const fontDir = join(root, "fonts");
   const input = join(root, "source");
@@ -463,7 +457,7 @@ test("DWG pins SHX strokes, reports missing glyphs and ignores font paths outsid
 
 test("DWG renders the full viewport with over 4000 short glyph runs in paint order", async () => {
   const { inflateSync } = await import("node:zlib");
-  const { cadFrame, renderCad } = await import("../../../../../dist/src/modules/formats/cad-render.js");
+  const { cadFrame, renderCad } = await load('cad-render.js');
   const clip = { left: 0, right: 1600, top: 0, bottom: 800 };
   const digest = "a".repeat(64);
   const viewport = { kind: "VIEWPORT", handle: "1", layer: "0", x: 800, y: -400, bounds: clip, clip,
@@ -505,7 +499,7 @@ test("DWG renders the full viewport with over 4000 short glyph runs in paint ord
 });
 
 test("DWG retains a UTF-8 glyph markup limit for large text", async () => {
-  const { rasterCad } = await import("../../../../../dist/src/modules/formats/cad-raster.js");
+  const { rasterCad } = await load('cad-raster.js');
   const label = { kind: "TEXT", layer: "0", x: 1, y: -10, height: 4, text: "Ж".repeat(1024) };
   assert.throws(() => rasterCad(Array(1100).fill(label), 100, 100, 1, 0, 0, () => ({ shapes: [] })),
     { code: "cad_block_render_limit" });

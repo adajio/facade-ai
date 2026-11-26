@@ -1,10 +1,16 @@
+x-converter-client: &converter-client
+  environment:
+    FACADE_CONVERTER_SOCKET: /run/facade-ai-stand-converters/${FACADE_STAND_SOCKET_NAME:-broker.sock}
+  volumes:
+    - converter-socket:/run/facade-ai-stand-converters:ro
+
 services:
+  api:
+    <<: *converter-client
   worker:
-    environment:
-      FACADE_CONVERTER_SOCKET: /run/facade-ai-stand-converters/broker.sock
-    volumes:
-      - converter-socket:/run/facade-ai-stand-converters:ro
+    <<: *converter-client
+
 volumes:
   converter-socket:
-    name: facade-ai-test-server_converter-socket
+    name: ${FACADE_STAND_SOCKET_VOLUME:-facade-ai-test-server_converter-socket}
     external: true

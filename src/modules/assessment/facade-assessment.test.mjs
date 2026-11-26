@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
+import { readFileSync } from "node:fs";
 import { test } from "node:test";
 import Fastify from "fastify";
 import pg from "pg";
@@ -8,6 +9,166 @@ import pg from "pg";
 const built = (path) => import(new URL(`../../../dist/src/modules/${path}.js`, import.meta.url));
 const sha = (value) => createHash("sha256").update(value).digest("hex");
 const recipient = "Customer";
+
+test("published readings resolve applicable catalog rows with addressed values and keep open neighbors visible", async (t) => {
+  const { convertFact } = await built("assessment/facade-input");
+  const { facadeReview, requirementsFor, unambiguousCatalogSubjects } = await built("assessment/facade-model");
+  const { evaluate } = await built("assessment/domain");
+  const { facadeVerdict } = await built("assessment/facade-semantic");
+  const catalog = JSON.parse(readFileSync(new URL("../../../infra/catalogs/intake-stage-1.json", import.meta.url)));
+  const context = { id: "common", kind: "common", facadeId: null, name: "Общий уровень" };
+  const stage = "Стадия 1";
+  const requirements = requirementsFor(catalog.requirements, context, stage);
+  assert.equal(requirements.length, 16);
+  const boundary = { complete: false, reason: "open", basisIds: [] };
+  const coverage = { inventory: boundary, map: boundary, reading: boundary, subject: boundary };
+  function reading(branch, { subject, text = subject, value, unit, format = "pdf", role = "drawing", name = format,
+    line = 1, original, revision = "R1", revisionStatus = "current", versionId = name, variant = null, box } = {}) {
+    const source = { projectId: "project", versionId, documentId: name, sha256: sha(name) };
+    const address = { unitId: "1", locator: { line }, ...(box ? { box } : {}) };
+    const lineId = "line-" + line;
+    const id = [name, line, branch].join("-");
+    const fact = {
+      id, windowId: versionId, branch, attribute: subject, sourceRole: role, designStage: null,
+      revision, revisionStatus, variant, basis: { role: "Document role", revision: revision + " current" },
+      binding: { state: "common", candidates: [], quote: "Common material", version: 1, actorId: null }, materials: [],
+      evidenceHref: "/sources/" + id, observation: { id, branch, source, address, lineId, quote: text, value, unit,
+        evidenceId: id, readerVersion: "reader", receiptId: "intake", runId: "run-" + branch, grounding: "text" },
+    };
+    return convertFact(fact, new Map([[versionId, { id: versionId, label: name, documentId: name, sha256: source.sha256 }]]),
+      new Map([[versionId, format]]), new Map(), new Map(),
+      original === null ? undefined : original ?? [{ id: lineId, text, locator: address.locator }], true);
+  }
+  const both = (fixture) => ["A", "B"].map((branch) => reading(branch, fixture));
+  function assess(key, facts, rows = requirements, reviewCoverage = coverage) {
+    const requirement = rows.find(({ positionId }) => positionId === key);
+    const review = facadeReview({ context, stage, questionId: key, requirement, facts, pairs: [], coverage: reviewCoverage,
+      versionIds: ["intake"], supplementReceiptIds: [], legacyPresenceSubjects: unambiguousCatalogSubjects(rows) });
+    return evaluate(requirement, review);
+  }
+  const facades = { subject: "Чертежи фасадов", format: "dxf" };
+  await t.test("equivalent format and an unfinished neighboring place", () => {
+    const local = assess("doc.facades", both(facades));
+    assert.equal(local.outcome, "covered");
+    assert.equal(local.citations.length, 2);
+    assert.equal(assess("doc.facades", both({ ...facades, format: "pdf" })).outcome, "needs_review");
+    assert.equal(facadeVerdict(coverage, [], [{ machine: local, semanticRemainder: { state: "open" } }]), "mixed");
+    const unfinished = reading("A", { ...facades, line: 2, text: "Неразобранный соседний лист" });
+    const mixed = assess("doc.facades", [...both(facades), unfinished]);
+    assert.equal(mixed.outcome, "covered");
+    const complete = Object.fromEntries(Object.keys(coverage).map((axis) => [axis, { complete: true }]));
+    assert.equal(facadeVerdict(complete, [], [{ machine: mixed, semanticRemainder: { state: "complete" } }]), "mixed");
+  });
+  await t.test("different source occurrences or printed revisions do not corroborate one place", () => {
+    assert.equal(assess("doc.facades", [reading("A", facades), reading("B", { ...facades, versionId: "different-occurrence" })])
+      .outcome, "needs_review");
+    assert.equal(assess("doc.facades", [reading("A", facades), reading("B", { ...facades, revision: "R2" })])
+      .outcome, "needs_review");
+  });
+  await t.test("legacy facts can prove literal presence only using their own journal line and an unambiguous catalog subject", () => {
+    const storedAsCurrent = { ...facades, original: [{id:"line-1", text:facades.subject + " (черновик) | Revision R1 current"}] };
+    assert.equal(assess("doc.facades", both(storedAsCurrent)).outcome, "needs_review");
+    const bare = { ...facades, subject: null, text: "Чертежи фасадов" };
+    const titled = { ...bare, text: "Заголовок: Чертежи фасадов | Drawing" };
+    assert.equal(assess("doc.facades", both(bare)).outcome, "covered");
+    assert.equal(assess("doc.facades", both(titled)).outcome, "covered");
+    const missingJournal = assess("doc.facades", both({ ...bare, original: null }));
+    assert.equal(missingJournal.outcome, "needs_review");
+    assert.equal(missingJournal.citations.length, 2);
+    assert.equal(assess("doc.facades", both({ ...bare, original: [{ id: "line-1", text: "Чертежи фасадов не переданы" }] }))
+      .outcome, "needs_review");
+    assert.equal(assess("doc.facades", both({ ...bare, text: "Опись | Чертежи фасадов", role: "inventory" })).outcome, "needs_review");
+    const other = { ...requirements.find(({ positionId }) => positionId === "doc.facades"), positionId: "other" };
+    assert.equal(assess("doc.facades", both(bare), [...requirements, other]).outcome, "needs_review");
+  });
+  await t.test("a required signed or approved original needs an addressed act and named signer in both readings", () => {
+    const key = "doc.facade_brief";
+    const brief = { subject: "Техническое задание НВФ", role: "brief" };
+    const full = Object.fromEntries(Object.keys(coverage).map((axis) => [axis, { complete: true }]));
+    for (const marker of ["", " | Подпись: __________", " | Подписанное техническое задание", " | Не подписано",
+      " | Подписано: ______", " | Подписано: Фамилия Имя Отчество", " | Подписано: Главный Инженер", " | Будет подписано: Иванов И.И.",
+      " | Подписано: Иванов И.И. | Подпись аннулирована"]) {
+      const incomplete = assess(key, both({ ...brief, text: brief.subject + marker }), requirements, full);
+      assert.equal(incomplete.outcome, "needs_review", marker);
+      assert.equal(incomplete.readability, "readable");
+      assert.equal(incomplete.citations.length, 2);
+    }
+    const signed = { ...brief, text: brief.subject + " | Подписано: Иванов И.И." };
+    assert.equal(assess(key, both(signed)).outcome, "covered");
+    assert.equal(assess(key, both({ ...brief, text: brief.subject + " | Утверждено: Иванов Иван Иванович" })).outcome, "covered");
+    assert.equal(assess(key, [reading("A", signed), reading("B", brief)]).outcome, "needs_review");
+    assert.equal(assess(key, [reading("A", signed), reading("B", { ...signed, text: brief.subject + " | Подписано: Петров П.П." })])
+      .outcome, "needs_review");
+    assert.equal(assess(key, both({ ...signed, original: null })).outcome, "needs_review");
+    assert.equal(assess(key, both({
+      ...brief, original: [{ id: "line-1", text: brief.subject }, { id: "neighbor", text: "Подписано: Иванов И.И." }],
+    })).outcome, "needs_review");
+    const onSeparateLine = { ...brief, original: [
+      { id: "line-1", text: brief.subject },
+      { id: "signature", text: "Подписано: Иванов И.И.", locator: { line: 2 } },
+    ] };
+    const proven = assess(key, both(onSeparateLine));
+    assert.equal(proven.outcome, "covered");
+    assert.deepEqual(proven.citations.map(({ documentApproval }) => [documentApproval.address.locator.line, documentApproval.quote]),
+      [[2, "Подписано: Иванов И.И."], [2, "Подписано: Иванов И.И."]]);
+    const otherRevision = { ...onSeparateLine, original: [onSeparateLine.original[0],
+      { ...onSeparateLine.original[1], text: "Подписано: Иванов И.И. | Редакция R2" }] };
+    assert.equal(assess(key, both(otherRevision)).outcome, "needs_review");
+    const draft = both({ ...brief, text: brief.subject + " (черновик)", revisionStatus: "unknown" });
+    assert.equal(assess(key, draft).readability, "readable");
+    const old = requirements.find(({ positionId }) => positionId === key);
+    const review = facadeReview({ context, stage, questionId: key, requirement: old, facts: draft, pairs: [], coverage: full,
+      versionIds: ["intake"], supplementReceiptIds: [], semanticBasisIds: ["A", "B"],
+      clarification: { inventories: [{ receiptId: "receipt", number: "1", revision: "1" }], places: [], alternatives: [], semanticBasisIds: ["A", "B"] } });
+    assert.equal(review.clarification, undefined);
+    assert.equal(review.inventory, undefined);
+    const legacyRows = [{ ...old, part: brief.subject, subject: brief.subject, completeness: "Проверить назначение задания." }];
+    assert.equal(assess(key, both(brief), legacyRows).outcome, "covered");
+  });
+  await t.test("all categorical and numeric cladding parameters have their own addressed fields", () => {
+    const material = { subject: "Материал облицовки", text: "Материал облицовки: керамогранит", value: "керамогранит", line: 1 };
+    const thickness = { subject: "Толщина облицовки", text: "Толщина облицовки 12 мм", value: "12", unit: "мм", line: 2 };
+    const zone = { subject: "Зона применения облицовки", text: "Зона применения облицовки — цоколь", value: "цоколь", line: 3 };
+    const attachment = { subject: "Способ крепления облицовки", text: "Способ крепления облицовки = кляммеры", value: "кляммеры", line: 4 };
+    const withoutMaterial = [thickness, zone, attachment].flatMap(both);
+    assert.equal(assess("data.cladding", withoutMaterial).outcome, "needs_review");
+    const covered = assess("data.cladding", [...both(material), ...withoutMaterial]);
+    assert.equal(covered.outcome, "covered");
+    assert.equal(covered.citations.length, 8);
+    assert.equal(assess("data.cladding", [...both({ ...material, text: "Материал облицовки: неизвестен | Отделка пола: керамогранит" }),
+      ...withoutMaterial]).outcome, "needs_review");
+    assert.equal(assess("data.cladding", [...both({ ...material, text: "Материал облицовки упоминается в описании керамогранита" }),
+      ...withoutMaterial]).outcome, "needs_review");
+    assert.equal(assess("data.cladding", [...both({ ...material,
+      text: "Материал облицовки: керамогранит или фиброцемент" }), ...withoutMaterial]).outcome, "needs_review");
+    const parameters = [material, thickness, zone, attachment];
+    const variant = (name, parameters) =>
+      parameters.flatMap((fixture) => both({ ...fixture, name: "drawing-" + name, variant: name }));
+    const assembly = variant("A1", parameters);
+    assert.equal(assess("data.cladding", assembly).outcome, "covered");
+    assert.equal(assess("data.cladding", [...variant("A1", parameters.slice(0, 2)), ...variant("B2", parameters.slice(2))])
+      .outcome, "needs_review");
+    assert.equal(assess("data.cladding", [...assembly, ...variant("B2", [material])]).outcome, "needs_review");
+    assert.equal(assess("data.cladding", [...assembly, ...variant("B2", parameters)]).outcome, "covered");
+  });
+});
+
+test("assessment applies an alias only to an unambiguous catalog position", async () => {
+  const { requirementsFor } = await built("assessment/facade-model");
+  const { matchesRequirementSubject } = await built("assessment/domain");
+  const context = { id: "common", kind: "common", facadeId: null, name: "Общий уровень" };
+  const row = { level: "common", applicability: "stage:P", formats: ["pdf"], equivalents: [], sourceRoles: ["drawing"],
+    completenessCriterion: "Addressed", addressee: "Customer" };
+  const [a, b] = requirementsFor([
+    { ...row, key: "a", part: "Узлы крепления", aliases: ["Сборочный лист", "Схема X‐3"] },
+    { ...row, key: "b", part: "Сборочные единицы", aliases: ["Сборочный лист", "Узлы крепления"] },
+  ], context, "P");
+  assert.equal(matchesRequirementSubject(a, "Сборочный лист"), false);
+  assert.equal(matchesRequirementSubject(b, "Сборочный лист"), false);
+  assert.equal(matchesRequirementSubject(b, "Узлы крепления"), false);
+  assert.equal(matchesRequirementSubject(a, "Узлы крепления"), true);
+  assert.equal(matchesRequirementSubject(a, "схема X‑3"), true);
+});
 
 function pdf(line) {
   const stream = `BT /F1 8 Tf 20 120 Td (${line}) Tj ET`;
@@ -364,7 +525,8 @@ test("ordinary intake publishes a local conflict, then keeps sent history after 
     drawing("width.pdf", "Width", "100", "R3"),
     drawing("south.pdf", "Thickness", "200", "R4", "F2"),
     { filename: "common.pdf", attribute: "Clearance", value: "17", revision: "R5", common: true,
-      quote: "Drawing Clearance 17 mm | Stage P | Revision R5 current | Applies to all facades" },
+      quote: "Clearance 17 mm | Clearance | Drawing | Stage P | Revision R5 current | Applies to all facades",
+      savedQuote: "17 mm | Clearance | Drawing | Stage P | Revision R5 current | Applies to all facades" },
     { ...drawing("later.pdf", "Other", "300", "R8", "F2"), deferred: true },
     { filename: "facade-type.pdf", attribute: "Facade type", facade: "F1", revision: "R10",
       quote: "Drawing | Facade type: panel | Stage P | Revision R10 current | Scope: F1 | Project facade id: F1" },
@@ -421,7 +583,10 @@ test("ordinary intake publishes a local conflict, then keeps sent history after 
   assert.equal(early.coverage.subject.complete, false);
   assert.equal(early.coverage.reading.complete, false);
   assert.equal(early.contexts.find(({ kind }) => kind === "common").questions[0].semanticRemainder.state, "open");
-  assert.equal(early.contexts.find(({ kind }) => kind === "common").counts.covered, 1);
+  const common = early.contexts.find(({ kind }) => kind === "common");
+  assert.equal(common.counts.covered, 1, "Re-use the original numeric row from the legacy reader journal");
+  assert.deepEqual(common.questions[0].machine.citations.map(({ branch, value }) => [branch, value]).sort(),
+    [["A", "17"], ["B", "17"]]);
   const untypedFacade = early.contexts.find(({ name }) => name === "F2");
   assert.equal(untypedFacade.facadeType.state, "unconfirmed");
   assert.equal(untypedFacade.counts.covered, 1);

@@ -102,10 +102,10 @@ function collectLines(words: Word[]): ReaderLine[] {
 }
 
 function wordRows(tsv: Buffer, source: 'native' | 'ocr', viewport: Box, transform?: ImageTransform,
-  containedWords = false): ReaderLine[] {
+  containedWords = false, stage = `pdf_${source}`): ReaderLine[] {
   const rows = tsv.toString('utf8').replaceAll('\r\n', '\n').split('\n');
   if (!rows.shift()?.startsWith('level\tpage_num\t')) {
-    throw new ReaderError(`pdf_${source}_invalid`, 'Инструмент вернул неизвестный формат координат', 422);
+    throw new ReaderError(`${stage}_invalid`, 'Инструмент вернул неизвестный формат координат', 422);
   }
   const words: Word[] = [];
   let segment = 0;
@@ -171,6 +171,28 @@ function textOutput(address: ReaderAddress, lines: ReaderLine[], empty: string):
   };
 }
 
+export async function tesseractVersion(stage: string) {
+  return command('tesseract', ['--version'], stage, 5000)
+    .then((output) => /^tesseract (\S+)/.exec(output.toString('utf8'))?.[1] ?? 'unknown', () => 'unavailable');
+}
+
+export async function tesseractLanguages(stage: string) {
+  return new Set((await command('tesseract', ['--list-langs'], stage, 5000)).toString('utf8').trim().split('\n').slice(1));
+}
+
+export async function recognizeImage(image: { bytes: Buffer; transform: ImageTransform }, box: Box, languages: string,
+  stage: 'pdf_ocr' | 'raster_ocr') {
+  const temp = await mkdtemp(join(tmpdir(), 'facade-reader-ocr-'));
+  try {
+    const input = join(temp, 'fragment.png');
+    await writeFile(input, image.bytes, { mode: 0o600 });
+    const tsv = await command('tesseract', [input, 'stdout', '-l', languages, '--psm', '11', 'tsv'], stage);
+    return wordRows(tsv, 'ocr', box, image.transform, false, stage);
+  } finally {
+    await rm(temp, { recursive: true, force: true });
+  }
+}
+
 export function createPdfAdapter(options: { ocrLanguages?: string; profile?: string } = {}): ReaderAdapter {
   const languages = options.ocrLanguages ?? 'rus+eng';
   if (!/^[a-zA-Z0-9_]+(?:\+[a-zA-Z0-9_]+)*$/.test(languages)) throw new Error('Invalid OCR languages');
@@ -182,9 +204,7 @@ export function createPdfAdapter(options: { ocrLanguages?: string; profile?: str
         .then(async (identification) => {
           const poppler = /pdfinfo version (\S+)/.exec(identification.toString('utf8'))?.[1];
           if (!poppler) throw new ReaderError('pdf_inventory_version_failed', 'Версия Poppler недоступна', 503);
-          const ocr = await command('tesseract', ['--version'], 'pdf_ocr_version', 5000)
-            .then((output) => /^tesseract (\S+)/.exec(output.toString('utf8'))?.[1] ?? 'unknown',
-              () => 'unavailable');
+          const ocr = await tesseractVersion('pdf_ocr_version');
           return `pdf-v1;poppler=${poppler};ocr=${ocr}:${languages};profile=${options.profile ?? 'local'}`;
         })
         .catch((error: unknown) => { version = undefined; throw error; });
@@ -216,18 +236,10 @@ export function createPdfAdapter(options: { ocrLanguages?: string; profile?: str
       }
       const image = await render(path, page, viewport, box, dpi);
       if (request.representation === 'render') return { address, ...image, mediaType: 'image/png' };
-      const temp = await mkdtemp(join(tmpdir(), 'facade-pdf-ocr-'));
-      try {
-        const input = join(temp, 'fragment.png');
-        await writeFile(input, image.bytes, { mode: 0o600 });
-        const tsv = await command('tesseract', [input, 'stdout', '-l', languages, '--psm', '11', 'tsv'], 'pdf_ocr');
-        return {
-          ...textOutput(address, wordRows(tsv, 'ocr', box, image.transform), 'pdf_ocr_empty'),
-          inputImage: image,
-        };
-      } finally {
-        await rm(temp, { recursive: true, force: true });
-      }
+      return {
+        ...textOutput(address, await recognizeImage(image, box, languages, 'pdf_ocr'), 'pdf_ocr_empty'),
+        inputImage: image,
+      };
     },
   };
 }

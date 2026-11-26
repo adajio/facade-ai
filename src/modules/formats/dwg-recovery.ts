@@ -97,7 +97,6 @@ export async function* recoveryObjects(source: AsyncIterable<string>): AsyncGene
 
   try {
     await expect("{");
-    let createdBy: unknown;
     let objects = false;
     let item = await next();
     while (item !== "}") {
@@ -117,8 +116,7 @@ export async function* recoveryObjects(source: AsyncIterable<string>): AsyncGene
           }
         }
       } else {
-        const entry = await value(await next(), 1);
-        if (name === "created_by") createdBy = entry;
+        await value(await next(), 1);
       }
       item = await next();
       if (item === "}") break;
@@ -126,7 +124,7 @@ export async function* recoveryObjects(source: AsyncIterable<string>): AsyncGene
       item = await next();
       if (item === "}") invalid();
     }
-    if (!objects || typeof createdBy !== "string" || !createdBy.startsWith("LibreDWG ") || await next() !== undefined) {
+    if (!objects || await next() !== undefined) {
       invalid();
     }
   } finally {

@@ -1,0 +1,82 @@
+#!/bin/bash
+set -euo pipefail
+mode=$1
+root=$2
+source=$3
+node=$4
+relay_run="/tmp/facade-terra-$(id -u)"
+mac_socket="$relay_run/model.sock"
+
+umask 077
+install -d -m 0700 "$relay_run"
+if [[ $mode == bridge ]]; then
+  if [[ -S $mac_socket && ! -L $mac_socket ]]; then
+    "$node" - "$mac_socket" <<'JS'
+const socket = process.argv[2];
+const client = require('node:net').createConnection(socket);
+client.setTimeout(2000,()=>client.destroy(new Error('socket_state_unknown')));
+client.on('connect',()=>{client.destroy();process.exitCode=3;});
+client.on('error',error=>{
+  if (error.code !== 'ECONNREFUSED') {process.exitCode=3;return;}
+  require('node:fs').unlinkSync(socket);
+});
+JS
+  fi
+  export FACADE_TERRA_MAC_SOCKET="$mac_socket"
+  export FACADE_TERRA_MAC_PAUSE="$root/controls/paused"
+  export FACADE_TERRA_MAC_LIMIT="$root/controls/limit.json"
+  export FACADE_TERRA_MAC_LEDGER="$root/ledger"
+  export FACADE_TERRA_MAC_ADAPTER="$source/infra/local-terra/model/call.py"
+  exec "$node" "$source/infra/local-terra/transport/mac-bridge.mjs"
+fi
+[[ $mode == tunnel ]]
+source "$(dirname "$0")/deploy-profile"
+require_terra_deployment
+require_terra_ssh_identity
+vps_socket="$FACADE_TERRA_DEPLOY_APP_DIR/terra/transport/model.sock"
+target="$FACADE_TERRA_DEPLOY_USER@$FACADE_TERRA_DEPLOY_HOST"
+remote=(/usr/bin/ssh -F /dev/null -T -o BatchMode=yes -o StrictHostKeyChecking=yes
+  -o UpdateHostKeys=no -o ControlMaster=no -o IdentitiesOnly=yes -o ForwardAgent=no
+  -o IPQoS=none -o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=3
+  -o GlobalKnownHostsFile=/dev/null -o UserKnownHostsFile="$root/ssh/known_hosts"
+  -i "$FACADE_TERRA_DEPLOY_KEY")
+prepare_remote() {
+  "${remote[@]}" "$target" "bash -s -- '$FACADE_TERRA_DEPLOY_HOSTNAME' '$vps_socket'" <<'REMOTE'
+set -euo pipefail
+test "$(hostname -s)" = "$1"
+socket=$2
+test -d "$(dirname "$socket")"
+if test -e "$socket" || test -L "$socket"; then
+  test -S "$socket" && ! test -L "$socket"
+  listeners=$(ss -xlnH)
+  if awk -v path="$socket" '$5==path {seen=1} END {exit !seen}' <<< "$listeners"; then exit 75; fi
+  rm -- "$socket"
+fi
+REMOTE
+}
+heartbeat() {
+  while printf 'terra-relay\n'; do sleep 10; done
+}
+read -r -d '' attach <<'REMOTE' || true
+set -euo pipefail
+test "$(hostname -s)" = "$1"
+socket=$2
+for i in 1 2 3 4 5; do
+  if test -S "$socket"; then break; fi
+  sleep 1
+done
+test -S "$socket" && ! test -L "$socket"
+chown 10001:10001 "$socket"
+chmod 0600 "$socket"
+while IFS= read -r -t 35 pulse; do
+  test "$pulse" = terra-relay
+done
+REMOTE
+printf -v remote_attach 'bash -c %q terra-attach %q %q' "$attach" "$FACADE_TERRA_DEPLOY_HOSTNAME" "$vps_socket"
+while true; do
+  if [[ -S $mac_socket ]] && prepare_remote; then
+    heartbeat | "${remote[@]}" -o ExitOnForwardFailure=yes -R "$vps_socket:$mac_socket" \
+      "$target" "$remote_attach" || true
+  fi
+  sleep 5
+done

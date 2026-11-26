@@ -1,0 +1,83 @@
+#!/bin/bash
+set -euo pipefail
+if [[ $# != 2 || ! $1 =~ ^[a-f0-9]{40}$ ]]; then
+  echo 'usage: install-mac <full-commit> <pinned-ssh-known-hosts-file>' >&2
+  exit 2
+fi
+sha=$1
+pin=$2
+id=$(id -u)
+root="$HOME/.local/share/facade-terra/production"
+source="$root/releases/$sha"
+relay_run="/tmp/facade-terra-$id"
+agents="$HOME/Library/LaunchAgents"
+source "$(dirname "$0")/deploy-profile"
+require_terra_deployment
+require_terra_ssh_identity
+export FACADE_TERRA_DEPLOY_HOST FACADE_TERRA_DEPLOY_HOSTNAME FACADE_TERRA_DEPLOY_APP_DIR
+export FACADE_TERRA_DEPLOY_USER FACADE_TERRA_DEPLOY_KEY
+node=$(command -v node)
+test "$(uname -s)" = Darwin
+test -x "$HOME/.local/bin/codex"
+ssh-keygen -F "$FACADE_TERRA_DEPLOY_HOST" -f "$pin" >/dev/null
+umask 077
+install -d -m 0700 "$root/releases" "$root/ssh" "$root/ledger" "$root/logs" "$root/controls" "$relay_run"
+pause="$root/controls/paused"
+installer_pause="$root/controls/install-paused"
+if [[ -S "$relay_run/model.sock" ]]; then
+  if [[ ! -e $pause ]]; then
+    : > "$pause"
+    : > "$installer_pause"
+  fi
+  state=$(/usr/bin/curl -fsS --max-time 2 --unix-socket "$relay_run/model.sock" http://local/health)
+  if [[ $state != '{"ready":false,"busy":false}' ]]; then
+    echo 'mac-terra relay paused; retry installation after its active turn has finished' >&2
+    exit 3
+  fi
+fi
+mkdir -p "$agents"
+if [[ ! -d "$source" ]]; then
+  prepared=$(mktemp -d "$root/releases/.release-$sha.XXXXXX")
+  trap 'rm -rf "$prepared"' EXIT
+  git archive "$sha" -- infra/local-terra | tar -xf - -C "$prepared"
+  adapter="$prepared/infra/local-terra/model"
+  install -d -m 0700 "$adapter/tmp" "$adapter/empty" "$adapter/../logs"
+  test -x "$prepared/infra/local-terra/production/mac-relay"
+  mv "$prepared" "$source"
+fi
+if [[ "$pin" != "$root/ssh/known_hosts" ]]; then
+  install -m 0600 "$pin" "$root/ssh/known_hosts.next"
+  mv "$root/ssh/known_hosts.next" "$root/ssh/known_hosts"
+fi
+bridge=dev.ftbd.facade-terra-bridge
+tunnel=dev.ftbd.facade-terra-tunnel
+for service in "$bridge" "$tunnel"; do
+  launchctl bootout "gui/$id/$service" 2>/dev/null || true
+done
+for service in "$bridge" "$tunnel"; do
+  role="${service##*-}"
+  plist="$agents/$service.plist"
+  /usr/bin/python3 - "$plist" "$service" "$role" "$root" "$source" "$node" <<'PY'
+import os, pathlib, plistlib, sys
+path, label, role, root, source, node = sys.argv[1:]
+target = pathlib.Path(path)
+pending = target.with_suffix('.next')
+env = {k:os.environ[k] for k in ('CODEX_HOME', 'SSL_CERT_FILE') if k in os.environ}
+if role == 'tunnel':
+    for key in ('HOST', 'HOSTNAME', 'APP_DIR', 'USER', 'KEY'):
+        name = 'FACADE_TERRA_DEPLOY_' + key
+        env[name] = os.environ[name]
+with pending.open('wb') as stream:
+    plistlib.dump(dict(Label=label,EnvironmentVariables=env,
+        ProgramArguments=[str(pathlib.Path(source)/'infra/local-terra/production/mac-relay'),role,root,source,node],
+        RunAtLoad=True, KeepAlive=True, ThrottleInterval=5,
+        StandardOutPath=str(pathlib.Path(root)/'logs'/(role+'.out')),
+        StandardErrorPath=str(pathlib.Path(root)/'logs'/(role+'.err'))), stream)
+os.replace(pending,target)
+PY
+  plutil -lint "$plist"
+  launchctl bootstrap "gui/$id" "$plist"
+done
+if [[ -e $installer_pause ]]; then rm -f "$pause" "$installer_pause"; fi
+launchctl print "gui/$id/$bridge" | awk '/state =/{print; exit}'
+launchctl print "gui/$id/$tunnel" | awk '/state =/{print; exit}'

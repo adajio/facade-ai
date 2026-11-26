@@ -1,9 +1,10 @@
 <script lang="ts">
-  import { type Citation, type EvidenceActions, type OpenEvidence } from './workspace';
+  import { approvalEvidence, type Citation, type EvidenceActions, type OpenEvidence } from './workspace';
   let { citations = [], open, compare = false, actions }: {
     citations?: Citation[]; open: OpenEvidence; compare?: boolean; actions?: EvidenceActions;
   } = $props();
   let chosen = $state<string[]>([]);
+  let approvals = $derived(citations.flatMap((citation) => approvalEvidence(citation) ?? []));
   // Independent readings may cite the same place. Keep both visible in the list
   // while offering a comparison between distinct places in the originals.
   let places = $derived.by(() => {
@@ -37,6 +38,11 @@
       <button type="button" onclick={(event) => open(citations, index, event.currentTarget)}>
         {citation.sourceLabel ?? (citation.branch ? 'Основание ' + citation.branch : 'Основание ' + (index + 1))}
         {#if citation.value != null} · {citation.value} {citation.unit ?? ''}{/if}
+      </button>
+    {/each}
+    {#each approvals as approval, index (`${approval.evidenceId}:${approval.lineId}:${index}`)}
+      <button type="button" onclick={(event) => open(approvals, index, event.currentTarget)}>
+        Подпись · {approval.branch ? 'ветвь ' + approval.branch : 'источник ' + (index + 1)}
       </button>
     {/each}
   </div>

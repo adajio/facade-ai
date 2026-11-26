@@ -12,10 +12,13 @@ import { test } from "node:test";
 import { fileURLToPath } from "node:url";
 
 import { createFormatAdapters } from "../../../../../dist/src/modules/formats/index.js";
-import { convertDwg, dwgProfile } from "../../../converter-port/index.ts";
+import { convertDwg, converterImage, dwgProfile } from "../../../converter-port/index.ts";
 
 const limit = 16 * 1024 ** 2;
 const image = `sha256:${"6".repeat(64)}`;
+const odaBinary = "8".repeat(64);
+const odaRuntime = "9".repeat(64);
+const otherIdentity = `sha256:${"0".repeat(64)}`;
 
 function fixture(inputBytes, outputBytes, mode = ".") {
   const bytes = Buffer.alloc(inputBytes);
@@ -39,8 +42,9 @@ test("DWG adapter streams both legs above the old limit and broker releases abor
   await mkdir(scratch, { mode: 0o700 });
   await mkdir(join(scratch, "job-ABC123"));
   const broker = spawn(process.execPath, [fileURLToPath(new URL("../../../../../infra/converters/broker.mjs", import.meta.url))], {
-    env: { PATH: bin + delimiter + process.env.PATH, FACADE_DWG_IMAGE: image, FACADE_DWG_ENGINE: "libredwg",
-      FACADE_DWG_TEST_STATE: state, FACADE_CONVERTER_SOCKET: socket, FACADE_CONVERTER_SCRATCH: root },
+    env: { PATH: bin + delimiter + process.env.PATH, FACADE_DWG_IMAGE: image, FACADE_ODA_ROOT: join(root, "distribution"),
+      FACADE_ODA_RUNTIME: join(root, "runtime"), FACADE_ODA_BINARY_SHA256: odaBinary,
+      FACADE_ODA_TEST_RUNTIME_HASH: odaRuntime, FACADE_DWG_TEST_STATE: state, FACADE_CONVERTER_SOCKET: socket, FACADE_CONVERTER_SCRATCH: root },
     stdio: ["ignore", "pipe", "pipe"],
   });
   const exited = once(broker, "close");
@@ -69,8 +73,11 @@ test("DWG adapter streams both legs above the old limit and broker releases abor
   const profile = await dwgProfile();
   assert.equal(profile.id, image);
   assert.ok(profile.timeout > 420_000);
+  assert.equal(profile.identity, `sha256:${createHash("sha256")
+    .update(JSON.stringify(["oda", "27.10.0.151591", image, odaBinary, odaRuntime, "ACAD2013", "DXF", 0, 0]))
+    .digest("hex")}`);
   const convert = (data, options = {}, sink = new Writable({ write(_chunk, _encoding, done) { done(); } })) =>
-    convertDwg(Readable.from([data]), sink, { size: data.length, image, timeout: profile.timeout, ...options });
+    convertDwg(Readable.from([data]), sink, { size: data.length, image, identity: profile.identity, timeout: profile.timeout, ...options });
 
   const source = join(root, "size.dwg");
   await writeFile(source, fixture(limit + 1, limit + 1));
@@ -88,6 +95,11 @@ test("DWG adapter streams both legs above the old limit and broker releases abor
   const small = fixture(11, 256);
   await assert.rejects(convert(fixture(11, 0, "m")), { code: "output_missing" });
   await assert.rejects(convert(fixture(11, 0, "t")), { code: "failed" });
+  await assert.rejects(convert(fixture(11, 0, "j")), { code: "failed" });
+  await assert.rejects(convert(fixture(11, 0, "u")), { code: "oda_unavailable" });
+  await assert.rejects(convert(fixture(11, 0, "r")), { code: "oda_rejected" });
+  await assert.rejects(convert(small, { identity: otherIdentity }), { code: "unavailable" });
+  await assert.rejects(convert(small, { identity: undefined }), { code: "invalid_request" });
   await assert.rejects(convert(fixture(11, 0, "d")), { code: "scratch_unavailable" });
   await assert.rejects(convert(fixture(11, 0, "o")), { code: "memory_limit" });
   await assert.rejects(convert(small, { size: 12 }), { code: "invalid_request" });
@@ -110,7 +122,7 @@ test("DWG adapter streams both legs above the old limit and broker releases abor
   assert.deepEqual(launches.slice(0, 2).map(({ size, outputSize }) => [size, outputSize]), [
     [limit + 1, limit + 1], [limit + 1, limit + 1],
   ]);
-  assert.equal(launches.length, 10);
+  assert.equal(launches.length, 13);
 });
 
 async function retry(run) {
@@ -133,6 +145,7 @@ test("DWG output requires the result trailer and matching size and digest", asyn
   const sha256 = createHash("sha256").update(bytes).digest("hex");
   let mode;
   server.on("checkContinue", (input, output) => {
+    assert.equal(input.headers["x-converter-profile"], otherIdentity);
     output.writeContinue();
     input.on("end", () => {
       output.writeHead(200, {
@@ -154,7 +167,7 @@ test("DWG output requires the result trailer and matching size and digest", asyn
     await once(server, "listening");
     process.env.FACADE_CONVERTER_SOCKET = socket;
     const convert = () => convertDwg(Readable.from([Buffer.from("AC1015")]),
-      new Writable({ write(_chunk, _encoding, done) { done(); } }), { size: 6, image, timeout: 4000 });
+      new Writable({ write(_chunk, _encoding, done) { done(); } }), { size: 6, image, identity: otherIdentity, timeout: 4000 });
     mode = "no-trailer";
     await assert.rejects(convert(), { code: "unavailable" });
     mode = "bad-hash";
@@ -170,4 +183,38 @@ test("DWG output requires the result trailer and matching size and digest", asyn
     await new Promise(resolve => server.close(resolve));
     await rm(root, { recursive: true, force: true });
   }
+});
+
+
+test("DWG client accepts an explicit ODA profile with a separate runtime identity", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "dwg-info-"));
+  const socket = join(root, "b.sock");
+  const old = process.env.FACADE_CONVERTER_SOCKET;
+  const base = { dwg: image, dwgClientTimeoutMs: 4000, dwgReserveBytes: 1, doc: image };
+  let fields;
+  const server = createServer((_input, output) => output.end(JSON.stringify({ ...base, ...fields })));
+  server.listen(socket);
+  await once(server, "listening");
+  process.env.FACADE_CONVERTER_SOCKET = socket;
+  t.after(async () => {
+    if (old === undefined) delete process.env.FACADE_CONVERTER_SOCKET;
+    else process.env.FACADE_CONVERTER_SOCKET = old;
+    server.closeAllConnections();
+    await new Promise(resolve => server.close(resolve));
+    await rm(root, { recursive: true, force: true });
+  });
+  for (fields of [
+    { dwgIdentity: otherIdentity },
+    { dwgEngine: "legacy-engine", dwgIdentity: otherIdentity },
+    { dwgEngine: "oda" },
+    { dwgEngine: "oda", dwgIdentity: image },
+    { dwgEngine: "oda", dwgIdentity: otherIdentity, dwgError: "oda_unavailable" },
+  ]) {
+    assert.equal(await dwgProfile(), undefined);
+    assert.equal(await converterImage("dwg"), undefined);
+    assert.equal(await converterImage("doc"), image);
+  }
+  fields = { dwgEngine: "oda", dwgIdentity: otherIdentity };
+  assert.deepEqual(await dwgProfile(), { id: image, identity: otherIdentity, timeout: 4000, reserve: 1 });
+  assert.equal(await converterImage("dwg"), image);
 });

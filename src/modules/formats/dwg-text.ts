@@ -33,18 +33,35 @@ export async function* derivativeText(file: FileHandle): AsyncGenerator<string> 
   if (decoder) yield decode(decoder);
 }
 
+export function dxfLineEnding(text: string) {
+  return text.match(/\r\n|[\r\n]/u)?.[0];
+}
+
+const maxDxfLine = 1024 ** 2;
 export async function* derivativeLines(source: AsyncIterable<string>): AsyncGenerator<string> {
   let pending = "";
-  let splitCrlf = false;
+  let ending: string | undefined;
   for await (const chunk of source) {
     if (!chunk) continue;
-    const text: string = pending + (splitCrlf && chunk[0] === "\n" ? chunk.slice(1) : chunk);
-    splitCrlf = text.endsWith("\r");
-    const lines = text.split(/\r\n|[\r\n]/u);
+    pending += chunk;
+    if (!ending) {
+      // The first separator establishes framing. A CR at the end of a chunk may belong to CRLF.
+      ending = dxfLineEnding(pending);
+      if (ending === "\r" && pending.indexOf("\r") === pending.length - 1) ending = undefined;
+      if (!ending) {
+        if (pending.length > maxDxfLine) throw new FormatHold("dxf_line_limit");
+        continue;
+      }
+    }
+    const lines = pending.split(ending);
     pending = lines.pop()!;
-    if (pending.length > 1024 ** 2) throw new FormatHold("dxf_line_limit");
-    yield* lines;
+    for (const line of lines) {
+      if (line.length > maxDxfLine) throw new FormatHold("dxf_line_limit");
+      yield line;
+    }
+    if (pending.length > maxDxfLine) throw new FormatHold("dxf_line_limit");
   }
+  if (!ending && pending.endsWith("\r")) pending = pending.slice(0, -1);
   if (pending) yield pending;
 }
 
@@ -66,5 +83,76 @@ export function dxfValue(line: string): string {
     return text;
   } catch {
     throw new FormatHold("text_encoding_unconfirmed");
+  }
+}
+
+// R2004 and earlier carry this code page in the text DXF header. Later
+// versions are UTF-8 and cannot use the legacy declaration to reinterpret bytes.
+const legacyDxfVersions = new Set(["AC1006", "AC1009", "AC1012", "AC1014", "AC1015", "AC1018"]);
+export async function declaresLegacyDxfCodePage(file: FileHandle): Promise<boolean> {
+  const prefix = Buffer.alloc(64 * 1024);
+  const { bytesRead } = await file.read(prefix, 0, prefix.length, 0);
+  const header = prefix.toString("latin1", 0, bytesRead);
+  if (dxfLineEnding(header) !== "\r\n") return false;
+  const lines = header.split("\r\n");
+  let inHeader = false;
+  let version: string | undefined;
+  let codePage: string | undefined;
+  for (let i = 0; i + 1 < lines.length; i += 2) {
+    const code = lines[i].trim();
+    const value = lines[i + 1].trim();
+    if (!inHeader) {
+      if (code === "999") continue;
+      if (code !== "0" || value !== "SECTION" || lines[i + 2]?.trim() !== "2" || lines[i + 3]?.trim() !== "HEADER") return false;
+      inHeader = true;
+      i += 2;
+    } else if (code === "0") {
+      return value === "ENDSEC" && legacyDxfVersions.has(version ?? "") && codePage === "ANSI_1251";
+    } else if (code === "9" && (value === "$ACADVER" || value === "$DWGCODEPAGE")) {
+      const valueCode = lines[i + 2]?.trim();
+      const declaration = lines[i + 3]?.trim();
+      if (value === "$ACADVER" && version === undefined && valueCode === "1") version = declaration;
+      else if (value === "$DWGCODEPAGE" && codePage === undefined && valueCode === "3") codePage = declaration;
+      else return false;
+      i += 2;
+    }
+  }
+  return false;
+}
+
+const cp1251 = new TextDecoder("windows-1251", { fatal: true, ignoreBOM: true });
+export function legacyDxfValue(line: string): string {
+  if (/^[ -~\t]*$/u.test(line)) return line;
+  const text = cp1251.decode(Buffer.from(line, "latin1"));
+  if (/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F-\x9F]/u.test(text) || text.includes("\uFFFD")) {
+    throw new FormatHold("text_encoding_unconfirmed");
+  }
+  return text;
+}
+
+/** The physical framing has already been verified as CRLF. Opaque XRECORD
+ * values are outside the geometry/projection reader and may carry bare LF. */
+export async function* isolateLegacyOpaqueValues(lines: AsyncIterable<string>, issues: Set<string>): AsyncGenerator<string> {
+  let code: string | undefined;
+  let record = "";
+  let section = "";
+  for await (const line of lines) {
+    if (code === undefined) {
+      code = line.trim();
+      yield line;
+      continue;
+    }
+    if (code === "0") {
+      record = line.trim();
+      if (record === "ENDSEC") section = "";
+    } else if (code === "2" && record === "SECTION") {
+      section = line.trim();
+    }
+    if (section === "OBJECTS" && record === "XRECORD" && (code === "1" || code === "3")
+        && line.includes("\n") && !line.includes("\r")) {
+      issues.add("cad_dxf_opaque_metadata_ignored");
+      yield "";
+    } else yield line;
+    code = undefined;
   }
 }

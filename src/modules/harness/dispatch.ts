@@ -2,11 +2,12 @@ import { randomUUID } from 'node:crypto';
 import type { Pool, PoolClient } from 'pg';
 import { getLockedGate, getQuestions, synchronize } from '../assessment/store.js';
 import { verifyPhysicalInventory } from '../formats/physical-inventory.js';
+import { thumbnailCacheUnits } from '../formats/windows-thumbnail-cache.js';
 import type { WorkQueue } from '../gateway/queue.js';
 import { hash, transaction, type Obligation } from '../gateway/types.js';
 import { lockIntakeProject } from '../intake/gate.js';
 import type { PageMap, ReaderUnit } from '../pdf/types.js';
-import { ReaderError } from '../pdf/types.js';
+import { pdfPageFormat, ReaderError } from '../pdf/types.js';
 import type { Place, PrimaryJob, Source, TargetQuestion } from './contracts.js';
 import type { ResearchTask } from './contracts.js';
 import { occurrenceScope, occurrenceScopeJoin } from './occurrence-scope.js';
@@ -34,18 +35,23 @@ export const originalJoins = `JOIN intake_originals o ON o.id=j.original_id
 function unitPlaces(unit: ReaderUnit, format: string): Unit[] {
   const page = typeof unit.locator?.page === 'number' ? unit.locator.page : undefined;
   const { width, height } = unit;
-  if (format !== 'pdf' || !width || !height || Math.max(width, height) <= 720) {
+  const raster = format === 'image';
+  if ((!raster && !pdfPageFormat(format)) || !width || !height || Math.max(width, height) <= (raster ? 1800 : 720)) {
     return [{ id: unit.id, ...(page ? { page } : {}) }];
   }
   // Overlap keeps labels which straddle two geometric windows visible in both.
-  const xCount = Math.ceil(width / 640);
-  const yCount = Math.ceil(height / 640);
+  const span = raster ? 1800 : 640;
+  const overlap = raster ? 48 : 18;
+  const xCount = Math.ceil(width / span);
+  const yCount = Math.ceil(height / span);
   return Array.from({ length: yCount }, (_, row) =>
     Array.from({ length: xCount }, (_, column) => {
-      const x = Math.max(0, width * column / xCount - 18);
-      const y = Math.max(0, height * row / yCount - 18);
-      const right = Math.min(width, width * (column + 1) / xCount + 18);
-      const bottom = Math.min(height, height * (row + 1) / yCount + 18);
+      const startX = width * column / xCount, startY = height * row / yCount;
+      const endX = width * (column + 1) / xCount, endY = height * (row + 1) / yCount;
+      const x = Math.max(0, (raster ? Math.floor(startX) : startX) - overlap);
+      const y = Math.max(0, (raster ? Math.floor(startY) : startY) - overlap);
+      const right = Math.min(width, (raster ? Math.ceil(endX) : endX) + overlap);
+      const bottom = Math.min(height, (raster ? Math.ceil(endY) : endY) + overlap);
       return { id: unit.id, ...(page ? { page } : {}), box: { x, y, width: right - x, height: bottom - y } };
     })).flat();
 }
@@ -54,13 +60,13 @@ export async function buildMap(job: IntakeJob, map: (source: Source) => Promise<
   const { projectId, documentId, versionId, sha256 } = job;
   try {
     const result = await map({ projectId, documentId, versionId, sha256 });
-    const units = result.units.flatMap((unit) => unitPlaces(unit, result.format));
-    const physical = result.format !== 'pdf' ? verifyPhysicalInventory(result)
-      : result.units.length > 0 && result.units.every((unit, index) =>
-        unit.locator?.page === index + 1 && unit.width && unit.height)
+    const technical = thumbnailCacheUnits(result.format, result.units);
+    const units = technical ? [] : result.units.flatMap((unit) => unitPlaces(unit, result.format));
+    const physical = pdfPageFormat(result.format) && result.units.length > 0 && result.units.every((unit, index) =>
+      unit.locator?.page === index + 1 && unit.width && unit.height)
         ? { basisId: 'inventory-v1:' + hash([result.source.versionId, result.source.sha256, result.readerVersion, result.units.map(({ id, width, height, locator }) => [id, width!, height!, locator!])]) }
-        : { limitation: 'pdf_physical_inventory_unavailable' };
-    return { units: units.length ? units : [{ id: 'original', refusal: 'reader_no_physical_units' }],
+        : result.format === 'pdf' ? { limitation: 'pdf_physical_inventory_unavailable' } : verifyPhysicalInventory(result);
+    return { units: technical || units.length ? units : [{ id: 'original', refusal: 'reader_no_physical_units' }],
       format: result.format, readerVersion: result.readerVersion, physical };
   } catch (error) {
     if (!(error instanceof ReaderError) || ![415, 422].includes(error.statusCode)) throw error;

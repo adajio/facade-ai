@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import type { PoolClient } from "pg";
 import type { PackageAnalysis, PackageFact } from "../harness/package-analysis.js";
 import { verifiedNativeLineCrops } from "../pdf/native-line.js";
-import { contains, validBox, type Evidence, type NativePresentation, type ReaderAddress, type ReaderLine } from "../pdf/types.js";
+import { contains, pdfPageFormat, validBox, type Evidence, type NativePresentation, type ReaderAddress, type ReaderLine } from "../pdf/types.js";
 import { blockId, memoryVersion } from "../project-memory/contracts.js";
 import { canonicalJson, requirementSubjectKey } from "./domain.js";
 
@@ -70,7 +70,7 @@ export async function readCanonicalComparisonRows(tx: PoolClient, projectId: str
   }>();
   for (const { observation: o } of facts) {
     const stored = evidence.get(o.evidenceId);
-    if (stored?.format !== "pdf" || stored.representation !== "native" || o.grounding !== "text" ||
+    if (!stored || !pdfPageFormat(stored.format) || stored.representation !== "native" || o.grounding !== "text" ||
         !o.lineId || !o.value || o.limitation) continue;
     const { unitId } = o.address;
     const block = blockId(o.source, o.readerVersion, unitId);
@@ -89,7 +89,7 @@ export async function readCanonicalComparisonRows(tx: PoolClient, projectId: str
        JOIN reader_maps r ON r.project_id=b.project_id AND r.version_id=b.version_id AND r.reader_version=v.reader_version
        JOIN project_memory_lines l ON l.block_id=b.id
        WHERE v.reader_version=t.reader_version AND r.document_id=t.document_id
-         AND r.original_sha256=t.original_sha256 AND r.format='pdf'
+         AND r.original_sha256=t.original_sha256 AND r.format IN ('pdf','sig')
          AND b.ordinal<v.next_ordinal AND r.units->b.ordinal->>'id'=t.unit_id
          AND b.artifact_sha256 IS NOT NULL AND NOT ('native'=ANY(b.remaining)) AND NOT (b.address ? 'box')`,
     [projectId, JSON.stringify([...targets.values()]), memoryVersion],
@@ -106,7 +106,7 @@ function nativeWitness(fact: PackageFact, evidence: Evidence, lines: ReaderLine[
   const [line, duplicate] = lines.filter(({ id }) => id === o.lineId);
   if (!line || duplicate || !line.text.includes(o.quote)) return;
   let place;
-  if (evidence.format === "pdf") {
+  if (pdfPageFormat(evidence.format)) {
     const box = line.box;
     const frame = evidence.address.box;
     place = locatorKey(o.address.locator, pageKeys);
@@ -126,7 +126,7 @@ function nativeWitness(fact: PackageFact, evidence: Evidence, lines: ReaderLine[
 }
 
 function issuedLines(evidence: Evidence, content: string | null): ReaderLine[] {
-  if (!["pdf", "xlsx"].includes(evidence.format) || evidence.representation !== "native" ||
+  if ((!pdfPageFormat(evidence.format) && evidence.format !== "xlsx") || evidence.representation !== "native" ||
       evidence.mediaType !== "application/json" || evidence.limitations?.length || typeof content !== "string" ||
       Buffer.byteLength(content) !== evidence.size || createHash("sha256").update(content).digest("hex") !== evidence.sha256) return [];
   try {
@@ -330,7 +330,7 @@ export function comparisonRows(facts: PackageFact[], formats: ReadonlyMap<string
       if (!matching.length) continue;
       // Prefer the anchor's own scope when it has a validated row; other witnesses remain within its branch.
       const { witness, role, scopeKey, property, measured } = matching.find(({ witness }) => witness === anchor) ?? matching[0];
-      const physicalPlace = anchor.evidence.format === "pdf" ?
+      const physicalPlace = pdfPageFormat(anchor.evidence.format) ?
         ["pdf", ...locatorKey(address.locator, pageKeys), line.id] :
         ["xlsx", address.locator?.sheetId, address.locator?.cell];
       const drawingView = role === "drawing" && canonical?.completePage ?
@@ -338,7 +338,7 @@ export function comparisonRows(facts: PackageFact[], formats: ReadonlyMap<string
       result.set(fact.id, { key: canonicalJson([source, physicalPlace]), property, role, scopeKey, binding: witness.fact.binding,
         value: { ...anchor.citation, quote: measured }, context: witness.citation,
         ...(drawingView ? { drawingView } : {}),
-        ...(canonical && anchor.evidence.format === "pdf" ? { canonical: {
+        ...(canonical && pdfPageFormat(anchor.evidence.format) ? { canonical: {
           blockId: canonical.blockId, artifactSha256: canonical.artifactSha256, lineId: canonical.lineId,
         } } : {}),
         composed: !fact.attribute || witness !== anchor || fact.sourceRole !== role });

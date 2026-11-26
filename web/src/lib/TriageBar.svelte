@@ -1,11 +1,13 @@
 <script lang="ts">
-  import { triageOptions, type Triage } from './triage';
-  let { value, counts, checked, choose, letterUrl }: {
-    value: Triage; counts: Record<'review' | 'letter' | 'done', number>; checked: number; choose: (value: Triage) => void; letterUrl: string;
+  import { evidenceFilters, triageOptions, type EvidenceFilter, type Triage } from './triage';
+  let { value, counts, checked, evidence, choose, letterUrl }: {
+    value: Triage; counts: Record<'review' | 'letter' | 'done', number>; checked: number; evidence?: Record<EvidenceFilter, number>; choose: (value: Triage) => void; letterUrl: string;
   } = $props();
-  const labels = { all: 'Все требования', checked: 'Проверено', review: 'Требуют проверки', letter: 'Для письма', done: 'Готово' };
-  let totals = $derived({ ...counts, all: counts.review + counts.letter + counts.done, checked });
-  const options: Triage[] = ['all', 'checked', ...triageOptions];
+  const labels = { all: 'Все требования', checked: 'Проверено', review: 'Требуют проверки', letter: 'Для письма', done: 'Готово', ...evidenceFilters };
+  let totals = $derived({ ...counts, all: counts.review + counts.letter + counts.done, checked, ...evidence });
+  const options = $derived<Triage[]>(evidence
+    ? ['all', 'checked', 'proven', 'partial', 'remainder', ...triageOptions]
+    : ['all', 'checked', ...triageOptions]);
   const name = $props.id();
 </script>
 

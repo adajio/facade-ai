@@ -10,6 +10,12 @@ const variant = /(?<![\p{L}\p{N}_-])(?:variant|execution|исполнени[ея
 const revision = /(?<![\p{L}\p{N}_-])(?:revision|rev\.?|редакция|ревизия|ред\.?)(?:\s*[:№=]\s*|\s+)([\p{L}\p{N}]+(?:[-_.][\p{L}\p{N}]+)*)(?![\p{L}\p{N}_-])/giu;
 const scope = /(?:^|[|·;])\s*(?:scope|zone|area|область|участок|зона)\s*[:№=]\s*([^|·;]+)/giu;
 const ineffective = /(?<![\p{L}\p{N}])(?:superseded|withdrawn|obsolete|archived|draft|not[ -]+current|не\s+действует|недействующая|замен[её]н[а-яё]*|отмен[её]н[а-яё]*|архивн[а-яё]*|черновик)(?![\p{L}\p{N}])/iu;
+const inactivePackageMark = /(?:\b(?:superseded|obsolete|withdrawn|draft|not[ -]+current)\b|замен[её]н\p{L}*|архивн\p{L}*|не\s+действующ\p{L}*|недействующ\p{L}*|неактуальн\p{L}*|отмен[её]н\p{L}*|черновик)/iu;
+
+export function hasInactiveRevision(line: string) {
+  return ineffective.test(line) || inactivePackageMark.test(line);
+}
+
 const currentPrefix = /(?<![\p{L}\p{N}])(?:current|effective|действующая|актуальная)\s*$/iu;
 const currentSuffix = /^(?:\s|[:=,(-])+(?:(?:is|является)\s+)?(?:current|effective|действующая|актуальная)(?![\p{L}\p{N}])/iu;
 const code = /^(?:[\p{L}]{1,3}|(?=[\p{L}\p{N}_.-]*\d)[\p{L}\p{N}_.-]{1,24})$/u;

@@ -32,8 +32,8 @@ test('held package jobs retain their effects while independent windows and suppl
     return attempt.purpose === 'primary_b' ? { receipt: { state: 'unknown', code: 'mock_lost_reply' } }
       : { receipt: { state: 'paid', costUsdNanos: 0, providerId: attempt.id, evidenceRef: 'synthetic:paid' }, output: {} };
   } };
-  const gateway = new Gateway(db, journal, transport, undefined, packageModelAdmission(true, [], true));
-  const passive = new Gateway(db, journal, transport, undefined, packageModelAdmission(true, [], false));
+  const gateway = new Gateway(db, journal, transport, undefined, packageModelAdmission(true, [], true, () => reader));
+  const passive = new Gateway(db, journal, transport, undefined, packageModelAdmission(true, [], false, () => reader));
   const profile = Object.fromEntries(['A','B'].map((branch) => [branch, {
     routeId: `fixture-${branch}`, model: `fixture/${branch}`, dataClass: 'synthetic', maxTokens: 256, maxTurns: 4, maxKnownRejections: 1,
   }]));
@@ -65,27 +65,120 @@ test('held package jobs retain their effects while independent windows and suppl
     counts.set(id, pages);
     return id;
   }
-  const reader = { formatFor: () => 'pdf', readerVersion: () => 'fixture', async map(source) {
-    return { format: 'pdf', source, readerVersion: 'fixture', units: Array.from({ length: counts.get(source.versionId) }, (_, index) => ({
+  let readerVersion = 'fixture';
+  let waitReader; let readerEntered;
+  const reader = { formatFor: () => 'pdf', readerVersion: async () => {
+    if (waitReader) { readerEntered?.(); await waitReader; }
+    return readerVersion;
+  }, async map(source) {
+    const units = Array.from({ length: counts.get(source.versionId) }, (_, index) => ({
       id: String(index + 1), width: 640, height: 270, locator: { page: index + 1 },
-    })) };
+    }));
+    await db.query(`INSERT INTO reader_maps(project_id,document_id,version_id,reader_version,receipt_id,original_sha256,format,units)
+      SELECT project_id,document_id,version_id,'fixture',receipt_id,$2,'pdf',$3::jsonb FROM intake_reader_jobs
+      WHERE version_id=$1 ON CONFLICT(version_id,reader_version) DO NOTHING`,[source.versionId,source.sha256,JSON.stringify(units)]);
+    return { format: 'pdf', source, readerVersion: 'fixture', units };
   } };
-  const step = () => dispatchPackagePair(db, gateway, profile);
+  const step = () => dispatchPackagePair(db, gateway, profile, undefined, reader);
   const first = await project('first');
   const original = await accept(first, 'first.pdf', 6);
+  const { rows: [{ receipt_id: firstReceipt }] } = await db.query('SELECT receipt_id FROM intake_reader_jobs WHERE version_id=$1',[original]);
+  await db.query('UPDATE intake_receipts SET sealed_at=NULL WHERE id=$1',[firstReceipt]);
   assert.equal(await preparePackageMap(db, gateway, reader, []), true);
+  // A physical-inventory limitation is not a total refusal when usable units exist.
+  await db.query("UPDATE harness_package_maps SET refusal='physical_inventory_unverified' WHERE version_id=$1 AND active",[original]);
+  const previousProfile = process.env.FACADE_HARNESS_PROFILE;
+  process.env.FACADE_HARNESS_PROFILE = JSON.stringify({A:{routeId:'codex-subscription-terra',model:'gpt-6.1-terra',dataClass:'synthetic',maxTokens:100,maxTurns:1,maxKnownRejections:0}});
+  try {
+    const { readTerraReading } = await import(built('src/modules/assessment/terra-reading.js'));
+    assert.equal((await readTerraReading(db,first)).progress.totalWindows,0);
+  } finally {
+    if (previousProfile === undefined) delete process.env.FACADE_HARNESS_PROFILE; else process.env.FACADE_HARNESS_PROFILE = previousProfile;
+  }
   while (await step()) {}
+  assert.equal((await db.query("SELECT count(*)::int AS n FROM gateway_jobs WHERE kind='harness_research'")).rows[0].n,0);
+  await db.query('UPDATE intake_receipts SET sealed_at=clock_timestamp() WHERE id=$1',[firstReceipt]);
+  const { packagePreparationSweep } = await import(built('src/modules/harness/package-preparation.js'));
+  await db.query("UPDATE harness_package_maps SET refusal='format_unavailable' WHERE version_id=$1 AND active",[original]);
+  await packagePreparationSweep(db,reader)();
+  while (await step()) {}
+  assert.equal((await db.query("SELECT count(*)::int AS n FROM gateway_jobs WHERE kind='harness_research'")).rows[0].n,0);
+  await db.query("UPDATE harness_package_maps SET refusal='physical_inventory_unverified' WHERE version_id=$1 AND active",[original]);
+  await packagePreparationSweep(db,reader)();
+  let releaseReader;
+  waitReader = new Promise(resolve => { releaseReader = resolve; });
+  const entered = new Promise(resolve => { readerEntered = resolve; });
+  const delayedStep = step();
+  await entered;
+  const lockProbe = await db.connect();
+  try {
+    await lockProbe.query('BEGIN');
+    assert.equal((await lockProbe.query("SELECT pg_try_advisory_xact_lock(hashtextextended('facade/package-dispatch',0)) AS ok")).rows[0].ok,true);
+    await lockProbe.query('ROLLBACK');
+  } finally { lockProbe.release(); }
+  waitReader = undefined; releaseReader(); readerEntered = undefined;
+  assert.equal(await delayedStep,true);
+  while (await step()) {}
+  assert.ok((await db.query("SELECT payload#>>'{packageWindow,preparationId}' AS pin FROM gateway_jobs WHERE kind='harness_research' LIMIT 1")).rows[0]?.pin);
+
   const claim = () => gateway.claim({ workerId: 'fixture', kinds: ['harness_research'], leaseMs: 20_000 });
   const call = (job) => ({ lease: job.lease, routeId: job.payload.settings.routeId, dataClass: 'synthetic',
     effectKey: 'fixture-turn', request: { fixture: true }, inputRefs: [] });
+  const probe = await claim();
+  assert.ok(probe);
+  readerVersion = 'fixture-v2';
+  const stale = await gateway.call(call(probe));
+  assert.equal(stale.status, 'held');
+  assert.equal(stale.code, 'preparation_changed');
+  assert.equal(sends.length, 0);
+  // Waiting after an earlier preparation shows assigned legacy work, not all mapped windows.
+  const { rows: [legacyBranch] } = await db.query(`SELECT b.window_id,b.profile_hash,b.settings FROM harness_package_branches b
+    JOIN harness_package_windows w ON w.id=b.window_id WHERE w.project_id=$1 AND b.branch='A' AND b.active LIMIT 1`,[first]);
+  const priorProfile = process.env.FACADE_HARNESS_PROFILE;
+  process.env.FACADE_HARNESS_PROFILE = JSON.stringify({A:{routeId:'codex-subscription-terra',model:'gpt-6.1-terra',dataClass:'synthetic',maxTokens:100,maxTurns:1,maxKnownRejections:0}});
+  try {
+    await db.query(`UPDATE harness_package_branches SET settings=$3 WHERE window_id=$1 AND branch='A' AND profile_hash=$2`,
+      [legacyBranch.window_id,legacyBranch.profile_hash,JSON.stringify({model:'gpt-6.1-terra',routeId:'codex-subscription-terra'})]);
+    const { readTerraReading } = await import(built('src/modules/assessment/terra-reading.js'));
+    const overview = await readTerraReading(db,first);
+    assert.equal(overview.progress.totalWindows,1);
+    assert.equal(overview.progress.unassigned,0);
+    const { rows: [duplicate] } = await db.query(`WITH r AS (INSERT INTO intake_receipts(project_id,source,created_by,sealed_at)
+      VALUES($1,'upload',$2,now()) RETURNING id), o AS (INSERT INTO intake_occurrences(project_id,receipt_id,relative_path,declared_media_type,version_id,state)
+      SELECT $1,r.id,'duplicate.pdf','application/pdf',$3,'accepted' FROM r RETURNING id,receipt_id)
+      SELECT id,receipt_id FROM o`,[first,user,original]);
+    try { assert.equal((await readTerraReading(db,first)).progress.totalWindows,0); }
+    finally {
+      await db.query('DELETE FROM intake_occurrences WHERE id=$1',[duplicate.id]);
+      await db.query('DELETE FROM intake_receipts WHERE id=$1',[duplicate.receipt_id]);
+    }
+  } finally {
+    await db.query(`UPDATE harness_package_branches SET settings=$3 WHERE window_id=$1 AND branch='A' AND profile_hash=$2`,
+      [legacyBranch.window_id,legacyBranch.profile_hash,JSON.stringify(legacyBranch.settings)]);
+    if (priorProfile === undefined) delete process.env.FACADE_HARNESS_PROFILE; else process.env.FACADE_HARNESS_PROFILE = priorProfile;
+  }
+  readerVersion = 'fixture';
   const held = [];
   for (let i = 0; i < 8; i++) {
-    const job = await claim();
+    const job = i === 0 ? probe : await claim();
     assert.ok(job);
     const hasEffect = job.payload.place.unitId === '1';
     const model = hasEffect ? await gateway.call(call(job)) : null;
     if (hasEffect) assert.equal(model.status, job.purpose === 'primary_b' ? 'held' : 'paid');
-    if (model?.status === 'held') assert.equal((await gateway.call(call(job))).code, 'unknown_charge');
+    if (model?.status === 'paid') {
+      readerVersion = 'fixture-v2';
+      assert.equal((await gateway.call(call(job))).replay, true);
+      // A replaced map must not hide the already-paid journal result or resend it.
+      const {rows:[activeMap]} = await db.query('UPDATE harness_package_maps SET active=false WHERE version_id=$1 AND active RETURNING fingerprint',[original]);
+      try { assert.equal((await gateway.call(call(job))).replay, true); }
+      finally { await db.query('UPDATE harness_package_maps SET active=true WHERE version_id=$1 AND fingerprint=$2',[original,activeMap.fingerprint]); }
+      readerVersion = 'fixture';
+    }
+    if (model?.status === 'held') {
+      readerVersion = 'fixture-v2';
+      assert.equal((await gateway.call(call(job))).code, 'unknown_charge');
+      readerVersion = 'fixture';
+    }
     assert.equal(await gateway.suspend(job.lease, { reason: model?.status === 'held' ? 'unknown_charge' : 'repeated_rejected_action',
       nextAction: 'fixture' }), true);
     held.push(job);

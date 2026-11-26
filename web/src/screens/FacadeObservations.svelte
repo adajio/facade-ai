@@ -3,7 +3,7 @@
   import { Commands } from '../lib/commands';
   import { observationLabels, type Binding, type FacadeAssessment, type FacadeObservation, type FactEquivalentsPage } from '../lib/facade-assessment';
   import { date, label } from '../lib/format';
-  import { describe, id, interrupted, query, type Api } from '../lib/http';
+  import { denied, describe, id, interrupted, query, type Api } from '../lib/http';
   import { supportAddress } from '../lib/inquiry-supports';
   import { projectV1, scopedUrl, type Citation, type OpenEvidence, type WorkspaceProps } from '../lib/workspace';
   import FactReviewControl from '../lib/FactReviewControl.svelte';
@@ -31,7 +31,9 @@
   let busy = $state(false);
   let heading = $state<HTMLHeadingElement>();
   let focused = '';
+  let focusedSelection = '';
   let paramsKey = '';
+  let loadedObservationSelection = '';
   $effect(() => {
     const current = context.params.toString();
     if (paramsKey === current) return;
@@ -47,27 +49,32 @@
     const version = summary.version;
     const path = projectV1(context.project.id) + '/facade-assessment/' + id(version) + '/observations';
     const stop = new AbortController();
-    problem = '';
+    const selectionKey = JSON.stringify([context.project.id, binding, facadeId, after, selection, facts]);
+    if (loadedObservationSelection !== selectionKey) { observations = undefined; problem = ''; }
     void api.json<ObservationPage>(query(path, { binding, facadeId, after, observationId: selection, grouped: facts ? '1' : undefined }), {
       signal: stop.signal,
     }).then((result) => {
       if (stop.signal.aborted) return;
       if (result.version === version) {
         observations = result;
-        if (selection && result.items.some(({ id }) => id === selection)) {
+        loadedObservationSelection = selectionKey;
+        problem = '';
+        if (!selection) focusedSelection = '';
+        else if (selection !== focusedSelection && result.items.some(({ id }) => id === selection)) {
+          focusedSelection = selection;
           void tick().then(() => document.getElementById('finding-' + selection)?.focus());
         }
       } else problem = 'Получены сведения другой ревизии оценки.';
     }).catch((failure) => {
       if (stop.signal.aborted || interrupted(failure)) return;
-      observations = undefined;
+      if (denied(failure) || loadedObservationSelection !== selectionKey) observations = undefined;
       problem = describe(failure);
     });
     return () => stop.abort();
   });
 
   $effect(() => {
-    const location = JSON.stringify([facts, binding, facadeId, after, selection]);
+    const location = JSON.stringify([facts, context.params.toString(), facadeId]);
     if (!facts || !heading || location === focused) return;
     if (!selection) heading.focus();
     focused = location;
@@ -186,7 +193,7 @@
           {#if editable && item.revisionStatus !== 'superseded'}
             <FactReviewControl {item} canMerge={mergeAvailable(item)} contextId={context.params.get('context')}
               {loadEquivalents} otherVariants={variants(item)} version={observations.version}
-              busy={busy || observations.version !== summary.version} submit={save} />
+              busy={busy || Boolean(problem) || observations.version !== summary.version} submit={save} />
           {/if}
         </li>
       {/each}
