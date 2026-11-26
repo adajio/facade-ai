@@ -6,6 +6,7 @@
   import { chooseWorkArea, currentOperation, requirementsUrl, workReceiptFilters, workSliceApi, type WorkReceiptFilter, type WorkSlice } from '../lib/work-slice';
   import Notice from '../lib/Notice.svelte';
   import WorkProgress from '../lib/WorkProgress.svelte';
+  import TerraReadingProgress, { type TerraReading } from '../lib/TerraReadingProgress.svelte';
 
   let { api, context, projection, open, renew }: {
     api: Api; context: WorkspaceProps; projection?: Projection; open: OpenEvidence; renew: () => void;
@@ -16,6 +17,9 @@
   let accessDenied = $state(false);
   let scopedAssessment = $state<Assessment>();
   let refreshSlice = $state<() => void>();
+  let terra = $state<TerraReading>();
+  let terraError = $state('');
+  let terraUpdated = $state<number>();
 
   $effect(() => {
     const projectId = context.project.id;
@@ -26,6 +30,11 @@
     let timer: ReturnType<typeof setTimeout>;
     let loading = false;
     let refreshPending = false;
+    workSlice = undefined;
+    scopedAssessment = undefined;
+    terra = undefined;
+    terraError = '';
+    terraUpdated = undefined;
 
     async function load() {
       if (loading) {
@@ -41,7 +50,18 @@
           scopedAssessment = await api.json<Assessment>(
             query(projectV1(projectId) + '/assessments/current', { scopeId: accessScope }), request);
         } else {
-          workSlice = await api.json<WorkSlice>(query(workSliceApi(projectId), { scopeId }), request);
+          const slicePromise = api.json<WorkSlice>(query(workSliceApi(projectId), { scopeId }), request);
+          const terraPromise = facadeMode ? api.json<TerraReading>(projectV1(projectId) + '/terra-reading', request) : undefined;
+          if (terraPromise) {
+            const [sliceResult, terraResult] = await Promise.allSettled([slicePromise, terraPromise]);
+            if (sliceResult.status === 'rejected') throw sliceResult.reason;
+            workSlice = sliceResult.value;
+            if (terraResult.status === 'fulfilled') { terra = terraResult.value; terraError = ''; terraUpdated = Date.now(); }
+            else {
+              if (denied(terraResult.reason)) terra = undefined;
+              terraError = describe(terraResult.reason);
+            }
+          } else workSlice = await slicePromise;
         }
         error = '';
         accessDenied = false;
@@ -51,6 +71,7 @@
         if (accessDenied) {
           workSlice = undefined;
           scopedAssessment = undefined;
+          terra = undefined;
         }
         error = deadline.aborted ? 'Ответ сервера задерживается. Можно повторить загрузку сводки.' : describe(problem);
       } finally {
@@ -59,15 +80,18 @@
           if (refreshPending) {
             refreshPending = false;
             void load();
-          } else if (workSlice && document.visibilityState === 'visible') {
+          } else if (document.visibilityState === 'visible') {
             // Confirmed upload parts can move ahead of the project event stream.
-            timer = setTimeout(load, 15_000);
+            timer = setTimeout(load, facadeMode && (terra?.enabled || terraError || error) ? 8_000 : 15_000);
           }
         }
       }
     }
     refreshSlice = () => { void load(); };
-    return () => { cancel.abort(); clearTimeout(timer); };
+    void load();
+    const onVisible = () => { if (document.visibilityState === 'visible') void load(); };
+    document.addEventListener('visibilitychange', onVisible);
+    return () => { cancel.abort(); clearTimeout(timer); document.removeEventListener('visibilitychange', onVisible); };
   });
 
   $effect(() => {
@@ -87,7 +111,11 @@
 
 </script>
 
-{#if workSlice}
+{#if workSlice && facadeMode && terra?.enabled}
+  <TerraReadingProgress data={terra} slice={workSlice} updatedAt={terraUpdated} error={terraError} canEdit={context.canEdit} />
+{:else if workSlice && facadeMode && !terra && terraError}
+  <section class="card"><h2>Состояние разбора</h2><Notice kind="error" message={'Не удалось загрузить состояние чтения: ' + terraError} /><button onclick={refreshSlice}>Повторить</button></section>
+{:else if workSlice}
   {@const selected = chooseWorkArea(workSlice, context.params.get('context'))}
   {@const assessment = selected.assessment}
   {@const areas = workSlice.assessment?.contexts}

@@ -3,6 +3,7 @@
   import { Commands } from '../lib/commands';
   import { tick } from 'svelte';
   import TriageBar from '../lib/TriageBar.svelte';
+  import { preliminarySourceUrl, preliminaryStatusLabels, type PreliminaryReview } from '../lib/preliminary-review';
   import { evidenceCounts, hasRemainder, localFinding, matchesSelection, requirementChecked, requirementTitle, triageCounts, type Triage } from '../lib/triage';
   import { conflictMessage, conflictVersion } from '../lib/conflict';
   import { date, label } from '../lib/format';
@@ -28,6 +29,10 @@
   let summary = $state<FacadeAssessment>();
   let problem = $state('');
   let assessmentRetry = $state(0);
+  let preliminary = $state<PreliminaryReview>();
+  let preliminaryError = $state('');
+  let preliminaryProject = $state('');
+  let factsSyncError = $state('');
   let reading = $state(false);
   let staleView = $state(false);
   let loadedSelection: string | undefined;
@@ -123,6 +128,80 @@
   });
 
   $effect(() => {
+    const projectId = context.project.id;
+    if (mode !== 'facts' || overview || historicalVersion) {
+      factsSyncError = '';
+      return;
+    }
+    const controller = new AbortController();
+    let timer: ReturnType<typeof setTimeout>;
+    async function refreshFactsVersion() {
+      try {
+        const fresh = await api.json<FacadeAssessment>(projectV1(projectId) + '/facade-assessment', { signal: controller.signal });
+        if (controller.signal.aborted) return;
+        if (fresh.projectId !== projectId) throw new Error('Сводка относится к другому проекту.');
+        if (fresh.version !== summary?.version) summary = fresh;
+        factsSyncError = '';
+      } catch (failure) {
+        if (controller.signal.aborted || interrupted(failure)) return;
+        if (denied(failure)) { summary = undefined; loadedSelection = undefined; problem = describe(failure); }
+        factsSyncError = describe(failure);
+      }
+      if (!controller.signal.aborted) timer = setTimeout(refreshFactsVersion, 30_000);
+    }
+    timer = setTimeout(refreshFactsVersion, 30_000);
+    return () => { controller.abort(); clearTimeout(timer); };
+  });
+
+  $effect(() => {
+    const projectId = context.project.id;
+    void context.refreshKey;
+    if (overview || mode !== 'matrix' || historicalVersion) {
+      preliminary = undefined;
+      preliminaryError = '';
+      return;
+    }
+    const controller = new AbortController();
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    async function loadPreliminary() {
+      try {
+        let after: string | null = null;
+        let found: PreliminaryReview | undefined;
+        do {
+          const path = projectV1(projectId) + '/preliminary-package-reviews' + (after ? '?after=' + encodeURIComponent(after) : '');
+          const page: { items: PreliminaryReview[]; nextCursor?: string | null } = await api.json(path, { signal: controller.signal });
+          found = page.items.find((item) => item.isCurrent);
+          if (page.nextCursor && page.nextCursor === after) throw new Error('Курсор истории не продвинулся');
+          after = page.nextCursor ?? null;
+        } while (!found && after);
+        if (controller.signal.aborted) return;
+        preliminary = found;
+        preliminaryProject = projectId;
+        preliminaryError = '';
+      } catch (error) {
+        if (controller.signal.aborted || interrupted(error)) return;
+        preliminary = undefined;
+        preliminaryError = describe(error);
+      }
+      if (!controller.signal.aborted) timer = setTimeout(loadPreliminary, 30_000);
+    }
+    void loadPreliminary();
+    return () => { controller.abort(); if (timer) clearTimeout(timer); };
+  });
+
+  const showTerra = $derived(!historicalVersion && preliminaryProject === context.project.id && !!preliminary && preliminary.catalogVersionId === summary?.catalogVersionId);
+
+  function preliminaryFor(question: AssessmentQuestion) {
+    if (!showTerra || !preliminary) return undefined;
+    return preliminary.rows.find((row) => row.key === question.requirement.positionId);
+  }
+
+  function contentReason(value: string, question: AssessmentQuestion) {
+    if (value === 'semantic_check_missing' && preliminaryFor(question)) return 'Независимая проверка содержания по этому требованию ещё не завершена';
+    return reason(value);
+  }
+
+  $effect(() => {
     void requestFocus;
     startWork = '';
     conclusionReason = '';
@@ -183,6 +262,7 @@
   }
 
   function reason(value: string) {
+    if (value === 'semantic_check_missing' && !historicalVersion && preliminaryProject === context.project.id && preliminary && preliminary.catalogVersionId === summary?.catalogVersionId) return 'Независимая проверка содержания ещё не завершена';
     return assessmentReasons[value] ?? label(value);
   }
 
@@ -264,6 +344,7 @@
   <Notice message="Эта область недоступна в выбранной версии." />
   <a href={scopedUrl(context.project.id, mode === 'matrix' ? 'completeness' : mode, { revision: historicalVersion })}>Выбрать доступную область</a>
 {:else if summary && mode === 'facts'}
+  {#if factsSyncError}<Notice kind="error" message={'Не удалось обновить сведения · ' + factsSyncError} />{/if}
   <section class="card">
     <div class="card-header">
       <h2>{view?.name ?? 'Сведения по комплекту'}</h2>
@@ -529,25 +610,37 @@
       {/if}
     </details>
 
-    {#if chooseTriage}
-      <TriageBar value={current} {counts} {evidence} checked={view.questions.filter(requirementChecked).length} choose={chooseTriage}
-        letterUrl={scopedUrl(context.project.id, 'letters', { context: view.assessmentContextId, scope: context.scopeId })} />
-    {/if}
+    {#if preliminaryError}<Notice kind="error" message={'Предварительный разбор Terra · ' + preliminaryError} />{/if}
+    {#if preliminary && preliminaryProject === context.project.id && preliminary.catalogVersionId !== summary.catalogVersionId}<p class="notice">Предварительный разбор относится к другой версии каталога и не сопоставлен с этими требованиями.</p>{/if}
+    {#if showTerra && view.kind !== 'common'}<p class="notice">Terra оценила поступление целиком. Сверьте, какие источники относятся к выбранной области.</p>{/if}
+    {#snippet filters()}
+      {#if chooseTriage}
+        <TriageBar value={current} {counts} {evidence} checked={view.questions.filter(requirementChecked).length} choose={chooseTriage}
+          letterUrl={scopedUrl(context.project.id, 'letters', { context: view.assessmentContextId, scope: context.scopeId })} />
+      {/if}
+    {/snippet}
+    {#if showTerra && chooseTriage}
+      <details class="card" open={current !== 'all'}><summary>Фильтры по состоянию инженерной проверки</summary>{@render filters()}</details>
+    {:else}{@render filters()}{/if}
     <section class="card table-card">
       <div class="card-header"><h2>{mode === 'questions' ? 'Требования для внутренней сверки' : 'Требования'} · {view.kind === 'common' ? 'Весь комплект' : view.name}</h2></div>
       {#if questions.length}
         <div class="table-wrap"><table>
-          <thead><tr><th>Требование</th><th>Машинный вывод</th><th>Проверка содержания</th><th>Решение инженера</th></tr></thead>
+          <thead><tr><th>Требование</th>{#if showTerra}<th>Что нашла Terra</th>{:else}<th>Формальный машинный вывод</th><th>Независимая проверка содержания</th>{/if}<th>Решение инженера</th></tr></thead>
           <tbody>
             {#each questions as question (question.id)}
               <tr>
                 <td><a id={'requirement-' + question.id} data-triage-row href={url(view, question, context.filter)} aria-current={active?.id === question.id ? 'true' : undefined}>{requirementTitle(question.requirement)}</a></td>
+                {#if showTerra}
+                <td>{#if preliminaryFor(question)}<span class="pill">{preliminaryStatusLabels[preliminaryFor(question)!.status]}</span><br /><span class="meta">{preliminaryFor(question)!.finding}</span>{:else}Нет текущего разбора по позиции{/if}</td>
+                {:else}
                 <td>{machineResult(question)}</td>
                 <td>{question.semanticRemainder
                   ? question.semanticRemainder.verifiedWindows + ' из ' + question.semanticRemainder.totalWindows +
                     (question.semanticRemainder.state === 'open' ? ' · есть остаток' :
                       question.machine.outcome === 'covered' && question.machine.limitations?.length ? ' · есть ограничения' : '')
-                  : 'Данные отсутствуют в этой ревизии'}</td>
+                  : 'Нет данных независимой проверки в этой ревизии'}</td>
+                {/if}
                 <td>{label(question.decision?.action === 'request_clarification' ? 'clarification' : question.decision?.outcome,
                   'Ожидает решения')}</td>
               </tr>
@@ -570,7 +663,22 @@
         {/if}
         {#if active.requirement.completeness}<p><strong>Критерий достаточности</strong> · {active.requirement.completeness}</p>{/if}
         <p>Формат по каталогу · {(active.requirement.requiredFormats ?? active.requirement.formats?.filter((format) => !active.requirement.equivalentFormats?.includes(format)))?.join(', ').toUpperCase() || 'Не указан'}{active.requirement.equivalentFormats?.length ? ' · Допустимая замена: ' + active.requirement.equivalentFormats.join(', ').toUpperCase() : ''}</p>
-        <p>Машинный вывод · {machineResult(active)}</p>
+        {#if preliminaryFor(active)}
+          {@const initial = preliminaryFor(active)!}
+          <h3>Предварительный разбор Terra по поступлению</h3>
+          <p><strong>{preliminaryStatusLabels[initial.status]}</strong> · {initial.finding}</p>
+          <p class="meta">Поступление от {date(preliminary!.createdAt)}. Сверьте вывод по указанным источникам.</p>
+          {#if initial.sources.length}
+            <ul>{#each initial.sources as source}
+              <li><a href={preliminarySourceUrl(source)} target="_blank" rel="noopener noreferrer">{source.label}</a> · {source.anchor}</li>
+            {/each}</ul>
+          {:else}<p>Адресные источники в предварительном разборе не указаны.</p>{/if}
+          {#if context.canEdit && !historicalVersion && !view.questionHolds.some(({ questionId }) => questionId === active?.id)}
+            <p>После сверки запишите решение по требованию. Если данных недостаточно, укажите, что нужно уточнить.</p>
+            <button type="button" onclick={() => decisionInput?.focus()}>Перейти к решению по требованию</button>
+          {/if}
+        {/if}
+        <p>Формальный машинный вывод · {machineResult(active)}</p>
         {#if active.machine.outcome === 'covered' && active.semanticRemainder?.state === 'open'}
           <p>По открытым источникам есть адресные опоры. Для вывода по всему требованию проверьте оставшиеся места и допустимые замены.</p>
         {/if}
@@ -590,13 +698,14 @@
         {/each}
         {#if active.semanticRemainder}
           {@const remainder = active.semanticRemainder}
-          <h3>Проверка содержания</h3>
+          <h3>Независимая проверка содержания</h3>
+          {#if preliminaryFor(active)}<p>Эти числа относятся к независимым проверкам окон A/B. Первичный разбор Terra сюда не входит.</p>{/if}
           <p>{remainder.verifiedWindows} из {remainder.totalWindows} окон · {remainder.state === 'open' ? 'Есть остаток' : 'Проверка окон завершена'}</p>
           {#if remainder.alternativesVerified !== undefined}
             <p>Альтернативы · {remainder.alternativesVerified ? 'Проверены' : 'Требуют сверки'}</p>
           {/if}
           {#if remainder.reasons.length}
-            <ul class="plain-list">{#each remainder.reasons as item}<li>{reason(item)}</li>{/each}</ul>
+            <ul class="plain-list">{#each remainder.reasons as item}<li>{contentReason(item, active)}</li>{/each}</ul>
           {/if}
           {#if remainder.items.length}
             <ul class="plain-list">
@@ -617,7 +726,7 @@
           {/if}
           {#if remainder.omittedItems}<p>Ещё адресов с остатком · {remainder.omittedItems}</p>{/if}
         {/if}
-        {#if active.machine.limitations?.length}<p class="meta">{active.machine.limitations.map(reason).join(' · ')}</p>{/if}
+        {#if active.machine.limitations?.length}<p class="meta">{active.machine.limitations.map((item) => contentReason(item, active!)).join(' · ')}</p>{/if}
         {#each view.questionHolds.find(({ questionId }) => questionId === active?.id)?.receiptIds ?? [] as receiptId (receiptId)}
           <p><a href={receiptLink(receiptId)}>Открыть досылку для пересмотра основания</a></p>
         {/each}

@@ -31,6 +31,7 @@
   let busy = $state(false);
   let heading = $state<HTMLHeadingElement>();
   let focused = '';
+  let focusedSelection = '';
   let paramsKey = '';
   $effect(() => {
     const current = context.params.toString();
@@ -54,7 +55,9 @@
       if (stop.signal.aborted) return;
       if (result.version === version) {
         observations = result;
-        if (selection && result.items.some(({ id }) => id === selection)) {
+        if (!selection) focusedSelection = '';
+        else if (selection !== focusedSelection && result.items.some(({ id }) => id === selection)) {
+          focusedSelection = selection;
           void tick().then(() => document.getElementById('finding-' + selection)?.focus());
         }
       } else problem = 'Получены сведения другой ревизии оценки.';

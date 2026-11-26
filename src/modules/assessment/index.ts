@@ -1,3 +1,4 @@
+import { readTerraReading } from "./terra-reading.js";
 import { readPreliminaryPackageReviews, readPreliminaryReadingProgress } from "./preliminary-package-review.js";
 export { publishPreliminaryPackageReview, type PreliminaryPackageReviewInput } from "./preliminary-package-review.js";
 import { randomUUID } from "node:crypto";
@@ -95,6 +96,16 @@ function registerRoutes(app: FastifyInstance, prefix: string) {
       const progress = await readPreliminaryReadingProgress(tx, projectId, id);
       await touchSession(tx, session);
       return progress;
+    });
+  });
+  app.get<{ Params: Project }>(`${prefix}/projects/:projectId/terra-reading`, async (request) => {
+    const projectId = identifier(request.params.projectId);
+    return transaction(db, async (tx) => {
+      const session = await readSession(tx, request);
+      await authorize(tx, session, { action: "project:read", projectId });
+      const result = await readTerraReading(tx, projectId);
+      await touchSession(tx, session);
+      return result;
     });
   });
   registerDocumentFacades(app, prefix, synchronizeFacadeAssessment);

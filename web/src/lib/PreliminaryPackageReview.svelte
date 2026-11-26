@@ -1,21 +1,14 @@
 <script lang="ts">
-  import { originalUrl } from './copilot';
+  import { preliminarySourceUrl, preliminaryStatusLabels, type PreliminaryReview, type PreliminaryStatus } from './preliminary-review';
   import { date } from './format';
   import { describe, id, interrupted, type Api } from './http';
   import { projectV1 } from './workspace';
   import Notice from './Notice.svelte';
 
-  type Status = 'present' | 'partial' | 'not_found' | 'unassessed';
-  type Review = {
-    id: string; receiptId: string; catalogVersionId: string; model: string; createdAt: string; stage: string;
-    scopeNote: string; isCurrent: boolean; draftText: string;
-    rows: { key: string; title: string; status: Status; finding: string;
-      sources: { documentId: string; versionId: string; label: string; anchor: string }[] }[];
-  };
   type ReadingProgress = { totalWindows: number; mappedVersions: number; acceptedVersions: number;
     completed: number; covered: number; noMatch: number; refused: number; held: number; reading: number };
   let { api, projectId, refreshKey, mode }: { api: Api; projectId: string; refreshKey: number; mode: 'review' | 'letter' } = $props();
-  let reviews = $state<Review[]>([]);
+  let reviews = $state<PreliminaryReview[]>([]);
   let selectedId = $state('');
   let manuallySelected = $state(false);
   let error = $state('');
@@ -23,11 +16,8 @@
   let progress = $state<ReadingProgress>();
   let progressError = $state('');
   let textArea = $state<HTMLTextAreaElement>();
-  const statusLabels: Record<Status, string> = {
-    present: 'Представлено', partial: 'Частично', not_found: 'Не найдено', unassessed: 'Не оценено',
-  };
   let selected = $derived(reviews.find((item) => item.id === selectedId));
-  let counts = $derived(selected ? (Object.keys(statusLabels) as Status[]).map((status) => ({
+  let counts = $derived(selected ? (Object.keys(preliminaryStatusLabels) as PreliminaryStatus[]).map((status) => ({
     status, count: selected!.rows.filter((row) => row.status === status).length,
   })) : []);
 
@@ -36,11 +26,11 @@
     void refreshKey;
     const controller = new AbortController();
     async function load() {
-      const items: Review[] = [];
+      const items: PreliminaryReview[] = [];
       let cursor: string | null = null;
       do {
         const path = projectV1(project) + '/preliminary-package-reviews' + (cursor ? '?after=' + encodeURIComponent(cursor) : '');
-        const page: { items: Review[]; nextCursor?: string | null } = await api.json(path, { signal: controller.signal });
+        const page: { items: PreliminaryReview[]; nextCursor?: string | null } = await api.json(path, { signal: controller.signal });
         items.push(...page.items);
         if (page.nextCursor && page.nextCursor === cursor) throw new Error('Курсор истории не продвинулся');
         cursor = page.nextCursor ?? null;
@@ -89,12 +79,6 @@
     void loadProgress();
     return () => { controller.abort(); if (timer) clearTimeout(timer); };
   });
-
-  function sourcePage(label: string, anchor: string) {
-    if (!/\.pdf$/iu.test(label)) return undefined;
-    const match = anchor.trim().match(/^(?:стр(?:аница)?\.?\s*)?([1-9]\d*)(?:\s*[-–—,].*)?$/iu);
-    return match ? Number(match[1]) : undefined;
-  }
 
   async function copyDraft() {
     if (!selected) return;
@@ -146,24 +130,25 @@
     {/if}
     {#if mode === 'review'}
       <div class="actions" aria-label="Число позиций по состояниям">
-        {#each counts as item (item.status)}<span class="pill">{statusLabels[item.status]}: {item.count}</span>{/each}
+        {#each counts as item (item.status)}<span class="pill">{preliminaryStatusLabels[item.status]}: {item.count}</span>{/each}
       </div>
       <p class="meta">Всего позиций: {selected.rows.length}</p>
+      <details><summary>Все строки разбора Terra и источники</summary>
       <div class="table-wrap"><table>
         <thead><tr><th>Позиция</th><th>Состояние</th><th>Предварительный разбор и источники</th></tr></thead>
         <tbody>
           {#each selected.rows as row (row.key)}
-            <tr><td>{row.title}</td><td>{statusLabels[row.status]}</td><td>
+            <tr><td>{row.title}</td><td>{preliminaryStatusLabels[row.status]}</td><td>
               <p>{row.finding}</p>
               {#if row.sources.length}
                 <ul>{#each row.sources as source}
-                  <li><a href={originalUrl(source.documentId, source.versionId, sourcePage(source.label, source.anchor))} target="_blank" rel="noopener noreferrer">{source.label}</a> · {source.anchor}</li>
+                  <li><a href={preliminarySourceUrl(source)} target="_blank" rel="noopener noreferrer">{source.label}</a> · {source.anchor}</li>
                 {/each}</ul>
               {/if}
             </td></tr>
           {/each}
         </tbody>
-      </table></div>
+      </table></div></details>
     {:else}
       <label>Текст предварительного черновика
         <textarea bind:this={textArea} readonly rows="18" value={selected.draftText}></textarea>
