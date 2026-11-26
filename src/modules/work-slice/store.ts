@@ -182,17 +182,33 @@ async function capture(tx: PoolClient, projectId: string, scopeId?: string) {
     open: rows.filter((row) => includes(row, 'open')).length,
     processing: rows.filter((row) => includes(row, 'processing')).length,
   };
-  const { rows: [files] } = await tx.query<{ accepted: number; prepared: number }>(
-    `SELECT count(DISTINCT o.version_id)::int AS accepted,
-            count(DISTINCT o.version_id) FILTER (WHERE EXISTS (
-              SELECT 1 FROM jsonb_array_elements(m.units) u
-              WHERE u->>'id' IS DISTINCT FROM 'original'
-                AND coalesce(u#>>'{locator,coverage}','addressable') NOT IN ('held','original_only')
-            ))::int AS prepared
-       FROM intake_occurrences o
-       LEFT JOIN LATERAL (SELECT units FROM reader_maps
-         WHERE version_id=o.version_id AND project_id=o.project_id ORDER BY created_at DESC,reader_version DESC LIMIT 1) m ON true
-       WHERE o.project_id=$1 AND o.state='accepted'`, [projectId],
+  const { rows: [files] } = await tx.query<{
+    accepted: number; documents: number; archives: number; technical: number; prepared: number
+  }>(`WITH classified AS (
+      SELECT item->>'occurrenceId' AS occurrence_id,item->>'kind' AS kind,item->>'state' AS state
+      FROM intake_package_preparation_current c
+      JOIN intake_package_preparations p ON p.project_id=c.project_id AND p.id=c.manifest_id
+      CROSS JOIN LATERAL jsonb_array_elements(p.manifest->'items') item WHERE c.project_id=$1
+    ), occurrences AS (
+      SELECT o.version_id,coalesce(c.kind,CASE WHEN j.id IS NOT NULL THEN 'archive' ELSE 'document' END) AS kind,
+        c.state
+      FROM intake_occurrences o LEFT JOIN classified c ON c.occurrence_id=o.id::text
+      LEFT JOIN import_jobs j ON j.occurrence_id=o.id AND j.depth IS NOT NULL
+      WHERE o.project_id=$1 AND o.state='accepted' AND o.version_id IS NOT NULL
+    ), versions AS (
+      SELECT version_id,bool_or(kind='document') AS document,bool_or(kind='archive') AS archive,
+        bool_or(state='available') AS available,bool_or(kind='document' AND state IS NULL) AS pending
+      FROM occurrences GROUP BY version_id
+    ) SELECT count(*)::int AS accepted,count(*) FILTER (WHERE document)::int AS documents,
+      count(*) FILTER (WHERE NOT document AND archive)::int AS archives,
+      count(*) FILTER (WHERE NOT document AND NOT archive)::int AS technical,
+      count(*) FILTER (WHERE document AND (available OR (pending AND EXISTS (
+        SELECT 1 FROM jsonb_array_elements(m.units) u WHERE u->>'id' IS DISTINCT FROM 'original'
+          AND coalesce(u#>>'{locator,coverage}','addressable') NOT IN ('held','original_only')
+      ))))::int AS prepared
+      FROM versions v LEFT JOIN LATERAL (SELECT units FROM reader_maps
+        WHERE project_id=$1 AND version_id=v.version_id ORDER BY created_at DESC,reader_version DESC LIMIT 1) m ON true`,
+    [projectId],
   );
   const active = rows.find((row) => row.processing) ?? rows.find((row) => row.inventoryOpen);
   return {

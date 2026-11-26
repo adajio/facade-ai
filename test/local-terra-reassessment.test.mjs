@@ -178,3 +178,19 @@ test('sheet reassessment carries an exact previous question and skips changed so
   assert.deepEqual(selection.priorProperties[0].at(-1),['L1']);
   assert.equal(selectReassessment(raw,{...report,receiptId:'other'},{reason:'sheet_applicability_v2'}),raw);
 });
+
+test('a targeted assessment can rebind a saved exact observation without opening its source again',async()=>{
+  const {selectReassessment}=await import('../infra/local-terra/reassessment.mjs');
+  const requirement={key:'finish',part:'Отделка'};
+  const inventory=[{versionId:'original',originalSha256:'a'.repeat(64)}];
+  const raw={...scope,requirements:[requirement],inventory,scopeNote:'Обзор.',lines:[],retrieval:{evidence:[]}};
+  const anchor=JSON.stringify({unitId:'drawing-sheet'});
+  const property={key:'assignment',label:'Назначение',status:'insufficient',sources:[],
+    scope:{kind:'undetermined',sources:[{...inventory[0],anchor,quote:'Панель цвета RAL 7015.'},
+      {...inventory[0],anchor,quote:'Легенда отделки.'},{...inventory[0],anchor,quote:'Вариант неразличим.',limitation:'Нет доказательства.'}]},
+    letter:{kind:'omit',text:'Требуется сверка области.'}};
+  const report={...raw,rows:[{...requirement,analysis:{properties:[property]}}]};
+  const selected=selectReassessment(raw,report,{reason:'requirements:finish'});
+  assert.deepEqual(selected.lines.map(line=>line.text),['Панель цвета RAL 7015.','Легенда отделки.']);
+  assert.deepEqual(selected.priorProperties[0].at(-1),selected.priorLineIds);
+});

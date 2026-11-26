@@ -5,7 +5,7 @@ type ReadingBoundary = { projectId: string; receiptId: string; preparationId: st
 
 const primaryMetrics = [
   'requestBytes', 'promptBytes', 'wireBytes', 'imageBytes', 'imageCount', 'estimatedInputTokens', 'maxInputTokens', 'maxRequestBytes',
-  'inputTokens', 'outputTokens', 'totalFiles', 'selectedFiles', 'coveredFiles',
+  'inputTokens', 'outputTokens', 'totalFiles', 'selectedFiles', 'coveredFiles', 'evidenceFiles', 'visualFiles',
   'totalLines', 'selectedLines', 'remainingLines', 'elapsedMs', 'providerElapsedMs', 'timeToFirstUsefulMs',
 ] as const;
 

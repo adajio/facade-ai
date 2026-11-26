@@ -1,4 +1,4 @@
-import { verifyStoredDwgDerivative } from './dwg-derivative.js';
+import { reuseStoredDwgDerivative, verifyStoredDwgDerivative } from './dwg-derivative.js';
 import { dxfEncodingRecoveryVersion, dxfEncodingRevision, dxfFramingRevision, dxfGroupRecoveryVersion, isDxfEncodingHold, isDxfGroupHold, isOdaDwgVersion, isOdaRejection } from '../formats/dwg-profile.js';
 import { listPinnedDwgPredecessors } from '../intake/dwg-predecessor.js';
 import { createHash, randomUUID } from 'node:crypto';
@@ -364,7 +364,12 @@ export function createReaderService(db: Pool, deps: ReaderDependencies, adapters
   async function insertMap(
     source: SourceRef, original: Original, version: string, adapter: ReaderAdapter, path: string, client?: PoolClient,
   ): Promise<PageMap> {
-    const units = await adapter.inspect(path, source);
+    const old = adapter.format === 'dwg' ? await lookupMap(source, version, client) : undefined;
+    const priorHash = old?.units.find(unit => typeof unit.locator?.derivativeSha256 === 'string')?.locator?.derivativeSha256;
+    const expected = typeof priorHash === 'string' ? priorHash : undefined;
+    const reusable = adapter.format === 'dwg' && (!old || expected)
+      ? await reuseStoredDwgDerivative(client ?? db,source,version,expected) : undefined;
+    const units = reusable ?? await adapter.inspect(path, source, expected);
     if (new Set(units.map(({ id }) => id)).size !== units.length || units.some(({ id }) => !id || id.length > 200)) {
       throw new ReaderError('reader_inventory_invalid', 'Reader вернул недопустимую карту физических единиц', 422);
     }

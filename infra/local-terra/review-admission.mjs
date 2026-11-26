@@ -25,6 +25,14 @@ export async function unsettledReview(stateDir,scope) {
     catch(error) { if (error.code==='ENOENT') continue; throw error; }
     if (!['sending','unknown'].includes(entry.state)) continue;
     const prior=entry.snapshot;
+    // A revision from independently completed observations cannot replay the lost overview.
+    // Keep historical and still-sending attempts subject to the original receipt-level hold.
+    if (entry.state==='unknown' && prior?.independentReadingAfterTimeout && scope.reportId && scope.facts?.length) continue;
+    if (entry.state==='unknown' && prior?.drawingBatchVersions?.length) {
+      const pending = new Set(prior.drawingBatchVersions);
+      if (scope.drawingBatchVersions?.length && scope.drawingBatchVersions.every(id=>!pending.has(id))) continue;
+      if (scope.reportId && scope.facts?.length && scope.facts.every(fact=>fact.versionId && !pending.has(fact.versionId))) continue;
+    }
     if (prior?.projectId===scope.projectId && prior.receiptId===receipt && prior.preparationId===scope.preparationId &&
         prior.catalogVersionId===scope.catalogVersionId && prior.stage===scope.stage &&
         (!prior.inventory || !scope.inventory || JSON.stringify(prior.inventory)===JSON.stringify(scope.inventory))) return true;

@@ -104,3 +104,97 @@ test('DWG derivative and pinned parts survive a restarted reader without convert
     await rm(root,{recursive:true,force:true});
   }
 });
+
+test('same DWG bytes get separate durable version addresses and keep legacy and new derivative pins readable',async t=>{
+  const {createFormatAdapters}=await load('formats/index.js');
+  const {openDwgIndex,buildDwgIndex}=await load('formats/dwg-index.js');
+  const {verifyDwgFile}=await load('formats/dwg-durable.js');
+  const {reuseStoredDwgDerivative}=await load('pdf/dwg-derivative.js');
+  const root=await mkdtemp(join(tmpdir(),'dwg-version-reuse-'));
+  const priorDir=process.env.FACADE_DATA_DIR, priorSocket=process.env.FACADE_CONVERTER_SOCKET;
+  const socket=join(root,'convert.sock'), original=join(root,'same.dwg');
+  process.env.FACADE_DATA_DIR=root;
+  process.env.FACADE_CONVERTER_SOCKET=socket;
+  t.after(async()=>{
+    if (priorDir===undefined) delete process.env.FACADE_DATA_DIR; else process.env.FACADE_DATA_DIR=priorDir;
+    if (priorSocket===undefined) delete process.env.FACADE_CONVERTER_SOCKET; else process.env.FACADE_CONVERTER_SOCKET=priorSocket;
+    await rm(root,{recursive:true,force:true});
+  });
+  const originalBytes=Buffer.from('AC1015 same DWG');
+  await writeFile(original,originalBytes);
+  const dxf=text=>Buffer.from(`0\nSECTION\n2\nENTITIES\n0\nTEXT\n5\nA\n10\n1\n20\n2\n40\n5\n1\n${text}\n0\nENDSEC\n0\nEOF\n`);
+  const first=dxf('Prior pinned note'), changed=dxf('Nondeterministic new conversion');
+  const identity='sha256:'+'9'.repeat(64);
+  let payload=first, calls=0;
+  const server=createServer((_req,res)=>res.end(JSON.stringify({dwgEngine:'oda',dwg:'sha256:'+'8'.repeat(64),
+    dwgIdentity:identity,dwgClientTimeoutMs:4000,dwgReserveBytes:1})));
+  server.on('checkContinue',(req,res)=>{
+    calls++;
+    res.writeContinue();
+    req.on('end',()=>{
+      res.writeHead(200,{'x-converter-bytes':String(payload.length),trailer:'x-converter-result, x-converter-bytes, x-converter-sha256'});
+      res.write(payload);
+      res.addTrailers({'x-converter-result':'ok','x-converter-sha256':sha(payload),'x-converter-bytes':String(payload.length)});
+      res.end();
+    });
+    req.resume();
+  });
+  server.listen(socket);
+  await once(server,'listening');
+  try {
+    const adapter=createFormatAdapters().find(item=>item.format==='dwg'), version=await adapter.version();
+    const duplicate=source=>({...source,versionId:randomUUID(),documentId:randomUUID()});
+    const source={projectId:randomUUID(),documentId:randomUUID(),versionId:randomUUID(),sha256:sha(originalBytes)};
+    const copy=duplicate(source), fallback=duplicate(source), missing=duplicate(source);
+    const map=await adapter.inspect(original,source);
+    const stored=await adapter.durableInfo(source,map,version);
+    assert.equal(calls,1);
+    // Move the test index to the namespace used before the derivative became part of its key.
+    const indexDir=join(root,'dwg-index');
+    for (const name of await readdir(indexDir)) await rm(join(indexDir,name));
+    const legacyPin={source,converter:identity,reserve:0};
+    const handle=await open(join(root,stored.storageKey),'r');
+    try { await (await buildDwgIndex(handle,stored.sha256,identity,legacyPin)).close(); } finally { await handle.close(); }
+    const request=units=>({representation:'native',address:{unitId:units[0].id}});
+    const old=await adapter.readCached(source,request(map),map[0],version);
+    const db={async query(sql,[projectId,originalSha,profile,converter,versionId,expected]){
+      assert.match(sql,/m.original_sha256=d.original_sha256/u);
+      assert.match(sql,/d.project_id=\$1 AND d.original_sha256=\$2 AND d.reader_version=\$3 AND d.converter_identity=\$4/u);
+      assert.equal(projectId,source.projectId);
+      assert.equal(originalSha,source.sha256);
+      assert.equal(profile,version);
+      assert.equal(converter,identity);
+      assert.notEqual(versionId,source.versionId);
+      return {rows:[{documentId:source.documentId,versionId:source.versionId,derivative:stored.sha256,
+        byteSize:stored.size,storageKey:stored.storageKey,units:map}].filter(row=>!expected || expected===row.derivative)};
+    }};
+    payload=changed;
+    // The original revision can restore its metadata from verified bytes without a sibling.
+    assert.deepEqual(await adapter.inspect(original,source,stored.sha256),map);
+    assert.equal(calls,1);
+    const reused=await reuseStoredDwgDerivative(db,copy,version);
+    assert.deepEqual(reused,map);
+    assert.equal(calls,1);
+    const copied=await adapter.durableInfo(copy,reused,version);
+    assert.equal(copied.sha256,stored.sha256);
+    assert.notEqual(copied.storageKey,stored.storageKey);
+    assert.deepEqual((await adapter.readCached(copy,request(reused),reused[0],version)).bytes,old.bytes);
+
+    const saved=await verifyDwgFile(source,stored.sha256,stored.size);
+    await rm(saved.path);
+    assert.equal(await reuseStoredDwgDerivative(db,missing,version),undefined);
+    const fresh=await adapter.inspect(original,fallback);
+    assert.equal(calls,2);
+    assert.equal((await adapter.durableInfo(fallback,fresh,version)).sha256,sha(changed));
+    assert.deepEqual((await adapter.readCached(source,request(map),map[0],version)).bytes,old.bytes);
+    assert.notDeepEqual((await adapter.readCached(fallback,request(fresh),fresh[0],version)).bytes,old.bytes);
+    const separate=await openDwgIndex({...legacyPin,source:fallback,derivative:sha(changed)});
+    assert.equal(separate.identity.derivative,sha(changed));
+    await separate.close();
+    await assert.rejects(adapter.inspect(original,source,stored.sha256),{code:'dwg_index_identity_changed'});
+    assert.equal(await verifyDwgFile(source,sha(changed)),undefined);
+  } finally {
+    server.closeAllConnections();
+    await new Promise(resolveClose=>server.close(resolveClose));
+  }
+});

@@ -9,6 +9,7 @@ import { replaySavedSheets } from './replay-sheets.mjs';
 import { replayAddressed } from './replay-addressed.mjs';
 import { renderQuestions } from './review-analysis.mjs';
 import { loadReport } from './revise.mjs';
+import { isDrawingBatch, preserveUnrevisitedRows, selectDrawingBatch } from './drawing-batches.mjs';
 import { duration, emitActivity, modelFailure, remainingRequestBytes, responseUsage } from './request-budget.mjs';
 
 const digest = value => createHash('sha256').update(JSON.stringify(value)).digest('hex');
@@ -22,7 +23,7 @@ export function reassessmentKey(scope,reason) {
 }
 
 export async function queueReassessment(stateDir,scope,reason) {
-  if (!(reason==='operator' || /^(?:replay_)?sheet_applicability_v[12]$/.test(reason) || reason==='index_complete' || /^replay_saved_v[1-3]$/.test(reason) || /^requirements:[a-z0-9_.-]+(?:,[a-z0-9_.-]+)*$/.test(reason)) || !/^[a-zA-Z0-9_-]+$/.test(scope.receiptId) || !scope.preparationId) throw Error('invalid_reassessment_scope');
+  if (!(isDrawingBatch(reason) || reason==='operator' || /^(?:replay_)?sheet_applicability_v[12]$/.test(reason) || reason==='index_complete' || /^replay_saved_v[1-3]$/.test(reason) || /^requirements:[a-z0-9_.-]+(?:,[a-z0-9_.-]+)*$/.test(reason)) || !/^[a-zA-Z0-9_-]+$/.test(scope.receiptId) || !scope.preparationId) throw Error('invalid_reassessment_scope');
   const key = reassessmentKey(scope,reason);
   const folder = join(stateDir,'addressed',scope.receiptId);
   await mkdir(folder,{recursive:true,mode:0o700});
@@ -66,36 +67,46 @@ export async function queuedReasons(stateDir,scope) {
     }
     if (ticket?.key===reassessmentKey(scope,ticket.reason)) reasons.push(ticket.reason);
   }
-  return reasons;
+  return reasons.sort((a,b)=>Number(isDrawingBatch(b))-Number(isDrawingBatch(a)) || (isDrawingBatch(a) ? a.localeCompare(b) : 0));
 }
 
 // A bounded review must be able to revisit what the engineer already sees. Reuse
 // exact, previously accepted quotations only for the same version and preparation.
 export function withPreviousEvidence(raw,report) {
-  if (raw.preparationId!==report.preparationId || raw.projectId!==report.projectId ||
+  if (!Array.isArray(raw.inventory) || raw.preparationId!==report.preparationId || raw.projectId!==report.projectId ||
       raw.receiptId!==report.receiptId || raw.catalogVersionId!==report.catalogVersionId || raw.stage!==report.stage) return raw;
   const hashes=new Map(raw.inventory.map(item=>[item.versionId,item.originalSha256]));
   const lines=[...raw.lines], priorProperties=[], priorLineIds=[];
   const byAddress=new Map();
   const addressKey=line=>JSON.stringify([line.versionId,line.anchor]);
-  for (const line of lines) byAddress.set(addressKey(line),line);
+  const track=line=>{
+    const key=addressKey(line);
+    const alternatives=byAddress.get(key) ?? [];
+    alternatives.push(line);
+    byAddress.set(key,alternatives);
+  };
+  for (const line of lines) track(line);
   let sequence=lines.reduce((maximum,line)=>Math.max(maximum,Number(/^L(\d+)$/u.exec(line.id)?.[1]) || 0),0);
-  const groups=report.rows.map(row=> (row.analysis?.properties ?? []).filter(prop=>prop.letter.kind==='ask' || prop.status==='confirmed')
+  const allowed = new Set(raw.requirements?.map(requirement=>requirement.key) ?? report.rows.map(row=>row.key));
+  const groups=report.rows.filter(row=>allowed.has(row.key)).map(row=> (row.analysis?.properties ?? []).filter(
+    prop=>prop.letter.kind==='ask' || prop.status==='confirmed' || prop.scope?.sources.length)
     .map(prop=>({row,prop})).sort((a,b)=>Number(b.prop.letter.kind==='ask')-Number(a.prop.letter.kind==='ask')));
   for (let rank=0;rank<16 && priorProperties.length<40;rank++) for (const group of groups) {
     const record=group[rank];
     if (!record || priorProperties.length>=40) continue;
     const {row,prop}=record, ids=[];
-    for (const src of prop.sources.slice(0,3)) {
+    const cited=[...prop.sources,...(prop.scope?.sources ?? []),...(prop.response?.sources ?? [])];
+    const distinct=new Map(cited.map(src=>[JSON.stringify([src.versionId,src.anchor,src.quote,src.limitation]),src]));
+    for (const src of [...distinct.values()].slice(0,6)) {
       if (src.limitation || !src.quote || src.quote.length>4000 || hashes.get(src.versionId)!==src.originalSha256) continue;
       try { if (!JSON.parse(src.anchor)?.unitId) continue; } catch { continue; }
       const key=addressKey(src);
-      let line=byAddress.get(key);
-      if (!line?.text.includes(src.quote)) {
+      let line=byAddress.get(key)?.find(candidate=>candidate.text?.includes(src.quote));
+      if (!line) {
         line={id:'L'+(++sequence),versionId:src.versionId,originalSha256:src.originalSha256,anchor:src.anchor,text:src.quote};
-        byAddress.set(key,line); lines.push(line);
+        track(line); lines.push(line);
       }
-      ids.push(line.id);
+      if (!ids.includes(line.id)) ids.push(line.id);
       if (!priorLineIds.includes(line.id)) priorLineIds.push(line.id);
     }
     priorProperties.push([row.key,prop.key,prop.label,prop.status,prop.letter.kind,prop.letter.text,ids]);
@@ -104,7 +115,8 @@ export function withPreviousEvidence(raw,report) {
 }
 
 export function selectReassessment(raw,report,ticket) {
-  if (ticket.reason==='operator') return raw;
+  if (isDrawingBatch(ticket.reason)) return selectDrawingBatch(raw,ticket.reason);
+  if (ticket.reason==='operator') return withPreviousEvidence(raw,report);
   if (['sheet_applicability_v1','sheet_applicability_v2'].includes(ticket.reason)) return withPreviousEvidence(raw,report);
   const active=new Set(report.rows.map(row=>row.key));
   let selected;
@@ -137,8 +149,8 @@ export function selectReassessment(raw,report,ticket) {
   const priorProperties=report.rows.filter(row=>selected.has(row.key)).flatMap(row=>(row.analysis?.properties ?? [])
     .map(property=>[row.key,property.key,property.label,property.status,property.letter.kind,property.letter.text]));
   priorProperties.sort((a,b)=>Number(b[4]==='ask')-Number(a[4]==='ask'));
-  return {...raw,requirements,priorProperties,requestLimitBytes:Math.min(60000,32000+Math.max(0,requirements.length-1)*5000),lines:raw.lines.filter(line=>lines.has(line.id)),retrieval:{...raw.retrieval,evidence:hits},
-    scopeNote:raw.scopeNote+' В этой редакции повторно проверены требования: '+requirements.map(item=>item.part).join(', ')+'. По остальным сохранены предыдущие выводы.'};
+  return withPreviousEvidence({...raw,requirements,priorProperties,requestLimitBytes:Math.min(60000,32000+Math.max(0,requirements.length-1)*5000),lines:raw.lines.filter(line=>lines.has(line.id)),retrieval:{...raw.retrieval,evidence:hits},
+    scopeNote:raw.scopeNote+' В этой редакции повторно проверены требования: '+requirements.map(item=>item.part).join(', ')+'. По остальным сохранены предыдущие выводы.'},report);
 }
 
 // Most polls finish at a tiny local file lookup. The membership/reader query runs only for a pending completion.
@@ -159,6 +171,8 @@ export async function runReassessment(run,scope,reason) {
   const base=join(stateDir,'addressed',scope.receiptId,key);
   const ticket=await read(base+'.ticket');
   if (!ticket) return 'idle';
+  if (ticket.key!==key || ticket.reason!==reason) throw Error('invalid_reassessment_scope');
+  const drawingBatch=isDrawingBatch(reason);
   if (/^replay_sheet_applicability_v[12]$/.test(reason)) return replaySavedSheets(run,scope,key,base);
   if (/^replay_saved_v[1-3]$/.test(reason)) return replayAddressed(run,scope,key,base);
   const path=base+'.json';
@@ -190,17 +204,23 @@ export async function runReassessment(run,scope,reason) {
       await notify('published',scope,{reviewId:publication.id,selectedFacts:0});
       return 'published';
     }
-    const snapshot=preparePromptSnapshot({...(run.withSkills ? await run.withSkills(selected) : selected),reviewContract:2});
+    const snapshot=preparePromptSnapshot({...(run.withSkills ? await run.withSkills(selected) : selected),reviewContract:2,factScopeVersion:1});
     const request=makeRequest(snapshot);
+    if (drawingBatch) snapshot.drawingBatchVersions=selected.files.map(file=>file.versionId);
     snapshot.requestSha256=digest(request);
     const startedAt=Date.now();
-    if (remainingRequestBytes(snapshot.budget)<0) {
-      await atomicWrite(path,{state:'rejected',snapshot,startedAt,error:'request_limit'});
-      await notify('rejected',snapshot,snapshot.budget,'primary_request_limit');
+    if (remainingRequestBytes(snapshot.budget)<0 || drawingBatch && !snapshot.budget.evidenceFiles) {
+      const error=drawingBatch ? 'drawing_batch_limit' : 'request_limit';
+      await atomicWrite(path,{state:'rejected',snapshot,startedAt,error});
+      await notify(drawingBatch ? 'partial' : 'rejected',snapshot,snapshot.budget,
+        drawingBatch ? 'drawing_batch_limit' : 'primary_request_limit');
       return 'rejected';
     }
     const admission=await admitRecordedClaim(admitClaim,stateDir,snapshot,()=>claim(path,{...snapshot,startedAt,parentId:report.reportId},saved));
-    if (admission!=='claimed') return admission;
+    if (admission!=='claimed') {
+      if (drawingBatch) await notify('waiting',snapshot,snapshot.budget,admission);
+      return admission;
+    }
     await notify('sending',snapshot,snapshot.budget);
     let response;
     try { response=await modelCall(request); }
@@ -237,7 +257,13 @@ export async function runReassessment(run,scope,reason) {
       return 'superseded';
     }
   }
-  const updated=mergeSelection(input,current.rows);
+  let updated=mergeSelection(input,current.rows);
+  if (drawingBatch) {
+    updated=preserveUnrevisitedRows(updated,current.rows,input.rows);
+    updated.draftText=renderQuestions(updated.rows);
+    updated.scopeNote=(current.scopeNote ?? '').slice(0,9000)+
+      ` Дополнительная партия DWG — файлов с источниками: ${snapshot.budget.evidenceFiles} из ${snapshot.files.length}, с графикой: ${snapshot.budget.visualFiles}.`;
+  }
   const publication=await publish(db,{...updated,previousReportId:current.reportId,revisionKey:key});
   await atomicWrite(path,{...saved,state:'published',parentId:current.reportId,reviewId:publication.id,publishedAt:new Date().toISOString()});
   await notify('published',snapshot,{...fields,reviewId:publication.id});

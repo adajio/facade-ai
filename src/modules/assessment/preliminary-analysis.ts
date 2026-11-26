@@ -9,7 +9,7 @@ const scopeFields = ["element","zone","purpose","variant"] as const;
 export type ReviewScopeSide = { element: string; zone?: string; purpose?: string; variant?: string };
 export type ReviewFactScope<S = ReviewSource> = {
   kind: "applicable" | "unrelated" | "undetermined"; target: ReviewScopeSide; observed?: ReviewScopeSide;
-  reason: string; sources: S[];
+  reason: string; sources: S[]; basis?: "literal";
 };
 export type ReviewAnalysis<S = ReviewSource> = {
   applicability: { kind: "included" | "excluded" | "undetermined"; reason: string; sources: S[] };
@@ -51,7 +51,7 @@ export function enrichReviewAnalysis(analysis: ReviewAnalysis<ReviewSourceInput>
   if (!Array.isArray(properties) || properties.length > 16 || !Array.isArray(tensions) || tensions.length > 12)
     invalidInput("Некорректный состав разбора свойства или противоречия.");
 
-  const propertyKeys = new Set<string>(), held = new Set<string>();
+  const propertyKeys = new Set<string>(), held = new Set<string>(), literal = new Set<string>();
   const checkedProperties = properties.map(property => {
     if (!property || !key(property.key) || propertyKeys.has(property.key) || !text(property.label,120) ||
         !["confirmed", "unanswered", "not_mentioned", "insufficient", "conflicting"].includes(property.status) || !text(property.finding,550))
@@ -77,7 +77,8 @@ export function enrichReviewAnalysis(analysis: ReviewAnalysis<ReviewSourceInput>
       invalidInput("Вопрос без открытого свойства или адресного основания.");
     let checkedScope: ReviewFactScope | undefined;
     if (scope !== undefined) {
-      if (!scope || !["applicable","unrelated","undetermined"].includes(scope.kind) || !text(scope.reason,420))
+      if (!scope || !["applicable","unrelated","undetermined"].includes(scope.kind) || !text(scope.reason,420) ||
+          scope.basis !== undefined && scope.basis !== "literal")
         invalidInput("Некорректная проверка области инженерного свойства.");
       const context = sources(scope.sources);
       const observed = scope.observed === undefined ? undefined : scopeSide(scope.observed);
@@ -88,7 +89,14 @@ export function enrichReviewAnalysis(analysis: ReviewAnalysis<ReviewSourceInput>
           invalidInput("Для свойства с непроверенной областью оставьте результат на внутреннюю сверку.");
         held.add(property.key);
       }
-      checkedScope = {kind:scope.kind,target:scopeSide(scope.target),...(observed && {observed}),reason:scope.reason,sources:context};
+      if (scope.kind === "applicable" && scope.basis === "literal" &&
+          (property.status !== "confirmed" || letter.kind !== "omit" || checkedResponse || evidence.length !== 1 ||
+            !evidence[0].quote || evidence[0].limitation ||
+            property.finding !== 'В источнике указано: «' + evidence[0].quote.trim() + '».'))
+        invalidInput("Дословная запись требует одной подтверждённой цитаты.");
+      if (scope.basis === "literal") literal.add(property.key);
+      checkedScope = {kind:scope.kind,target:scopeSide(scope.target),...(observed && {observed}),reason:scope.reason,sources:context,
+        ...(scope.basis && {basis:scope.basis})};
     }
     return {key:property.key,label:property.label,status:property.status,finding:property.finding,sources:evidence,
       ...(checkedScope && {scope:checkedScope}),
@@ -97,7 +105,7 @@ export function enrichReviewAnalysis(analysis: ReviewAnalysis<ReviewSourceInput>
 
   const tensionKeys = new Set<string>(), openTensions = new Set<string>();
   const checkedTensions = tensions.map(tension => {
-    if (!tension || !key(tension.key) || tensionKeys.has(tension.key) || !propertyKeys.has(tension.propertyKey) || held.has(tension.propertyKey) ||
+    if (!tension || !key(tension.key) || tensionKeys.has(tension.key) || !propertyKeys.has(tension.propertyKey) || held.has(tension.propertyKey) || literal.has(tension.propertyKey) ||
         !["open","resolved"].includes(tension.status) || !text(tension.finding,550) ||
         !Array.isArray(tension.sides) || tension.sides.length < 2 || tension.sides.length > 4)
       invalidInput("Некорректное противоречие.");
@@ -123,8 +131,22 @@ export function enrichReviewAnalysis(analysis: ReviewAnalysis<ReviewSourceInput>
   return {applicability:applies,properties:checkedProperties,tensions:checkedTensions};
 }
 
-export function renderPreliminaryQuestions(rows: { title: string; analysis?: ReviewAnalysis }[]) {
-  return rows.flatMap(row => (row.analysis?.properties ?? []).flatMap(property => property.letter.kind === "ask" && (!property.scope || property.scope.kind === "applicable")
-    ? [`${row.title} — ${property.label}. ${property.letter.text.trim()}`] : [])).join("\n\n")
-    || "По доступным основаниям адресных вопросов для письма не установлено.";
+const normalizeQuestion = (value: string) => value.normalize("NFC").toLocaleLowerCase("ru").replaceAll("ё","е")
+  .replace(/\s+/gu," ").trim().replace(/[.!?]+$/u,"");
+
+export function renderPreliminaryQuestions(rows: { title: string; status: ReviewStatus; analysis?: ReviewAnalysis }[]) {
+  const seen = new Set<string>();
+  return rows.flatMap(row => (row.analysis?.properties ?? []).flatMap(property => {
+    if (property.letter.kind !== "ask" || property.scope && property.scope.kind !== "applicable") return [];
+    const target = property.scope?.target;
+    const identity = JSON.stringify([normalizeQuestion(property.letter.text),target
+      ? scopeFields.map(field=>normalizeQuestion(target[field] ?? "")) : normalizeQuestion(property.label)]);
+    if (seen.has(identity)) return [];
+    seen.add(identity);
+    return [`${row.title} — ${property.label}. ${property.letter.text.trim()}`];
+  })).join("\n\n") || (!rows.length || rows.some(row=>row.analysis?.applicability.kind !== "excluded" &&
+    (["partial","unassessed"].includes(row.status) || row.analysis?.applicability.kind === "undetermined" ||
+      row.analysis?.properties.some(property=>property.status !== "confirmed")))
+    ? "Вопросы пока не сформированы. Для адресных вопросов недостаточно проверенных сведений."
+    : "По результатам проверки открытых адресных вопросов для письма нет.");
 }

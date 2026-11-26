@@ -29,7 +29,7 @@ const textPerPart = 2 * 1024 ** 2;
 const hash = (value: string) => createHash("sha256").update(value).digest("hex");
 const short = (value: string) => hash(value).slice(0, 24);
 
-type Pin = { source: SourceRef; converter: string; reserve: number; profile?: typeof dwgReaderProfile | typeof historicalDwgReaderProfile };
+type Pin = { source: SourceRef; converter: string; reserve: number; derivative?: string; profile?: typeof dwgReaderProfile | typeof historicalDwgReaderProfile };
 type IndexedUnit = { unit: Unit; digest: string };
 type IndexIdentity = { converter: string; derivative: string; kind: "dxf" | "dwg-json"; fonts?: string };
 
@@ -37,6 +37,7 @@ function location(pin: Pin, fonts: CadFontAssets) {
   if (!process.env.FACADE_DATA_DIR) return;
   return join(process.env.FACADE_DATA_DIR, "dwg-index", hash(JSON.stringify([
     pin.profile ?? dwgReaderProfile, pin.source.projectId, pin.source.sha256, pin.converter, fonts.identity,
+    ...(pin.derivative ? [pin.derivative] : []),
   ])));
 }
 
@@ -107,6 +108,19 @@ export class DwgIndex {
 }
 
 export async function openDwgIndex(pin: Pin, fonts = dwgFontAssets()): Promise<DwgIndex | undefined> {
+  const current = await openIndexAt(pin, fonts);
+  if (current || !pin.derivative) return current;
+  // Old indexes used one slot per original and profile. Admit a legacy slot only for its exact derivative.
+  try {
+    const legacy = await openIndexAt({ ...pin, derivative: undefined }, fonts);
+    if (legacy?.identity.derivative === pin.derivative) return legacy;
+    await legacy?.close();
+  } catch (error) {
+    if (!(error instanceof ReaderError) || !['dwg_index_invalid','dwg_index_identity_changed'].includes(error.code)) throw error;
+  }
+}
+
+async function openIndexAt(pin: Pin, fonts: CadFontAssets): Promise<DwgIndex | undefined> {
   const path = location(pin, fonts);
   if (!path) return;
   if (!(await stat(path).catch((error: NodeJS.ErrnoException) => {
@@ -117,6 +131,7 @@ export async function openDwgIndex(pin: Pin, fonts = dwgFontAssets()): Promise<D
     db = new DatabaseSync(path, { readOnly: true, allowExtension: false });
     const index = new DwgIndex(db);
     if (index.identity.converter !== pin.converter || index.identity.fonts !== fonts.identity
+        || (pin.derivative && index.identity.derivative !== pin.derivative)
         || (index.identity.kind !== "dxf" && (index.identity.kind !== "dwg-json" || pin.profile !== historicalDwgReaderProfile))) throw new ReaderError(
       "dwg_index_identity_changed", "Профиль сохранённой производной DWG изменился", 409);
     return index;
@@ -135,6 +150,9 @@ function budget(db: DatabaseSync, bytes: bigint) {
 export async function buildDwgIndex(
   file: FileHandle, sha: string, converter: string, pin?: Pin, fonts = dwgFontAssets(),
 ): Promise<DwgIndex> {
+  if (pin?.derivative && pin.derivative !== sha) {
+    throw new ReaderError("dwg_index_identity_changed", "Индекс DWG закреплён за другой производной", 409);
+  }
   try {
     return await compileDwgIndex(file, sha, converter, pin, fonts, false);
   } catch (error) {
@@ -413,7 +431,7 @@ async function compileDwgIndex(
       if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
     }
     await clean();
-    const cached = await openDwgIndex(pin!, fonts);
+    const cached = await openIndexAt(pin!, fonts);
     if (!cached || cached.identity.derivative !== sha || cached.identity.kind !== kind) {
       await cached?.close();
       throw new ReaderError("dwg_index_identity_changed", "Производная DWG изменилась при сохранении индекса", 409);

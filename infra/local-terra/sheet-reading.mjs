@@ -55,12 +55,12 @@ function contentAddress(line, readerVersion) {
 
 function normalizedOptions(options) {
   const within = (x,fallback,max) => Number.isSafeInteger(x) && x >= 0 ? Math.min(x,max) : fallback;
-  return { sourceRoot:options.sourceRoot ?? root, maxImages:within(options.maxImages,4,4),
+  return { sourceRoot:options.sourceRoot ?? root, excludeDwg:options.excludeDwg===true, maxImages:within(options.maxImages,4,4),
     maxBytes:within(options.maxBytes,maxPngBytes,maxPngBytes), timeoutMs:within(options.timeoutMs,18_000,30_000),
     elementTimeoutMs:within(options.elementTimeoutMs,5_000,8_000) };
 }
 
-async function readScopedMaps(client,snapshot,seeds) {
+async function readScopedMaps(client,snapshot,seeds,excludeDwg) {
   const sql = `WITH scoped AS (
     SELECT prep.manifest,cur.manifest_id FROM intake_package_preparation_current cur
     JOIN intake_package_preparations prep ON prep.project_id=cur.project_id AND prep.receipt_id=cur.receipt_id AND prep.id=cur.manifest_id
@@ -78,7 +78,7 @@ async function readScopedMaps(client,snapshot,seeds) {
       AND rm.original_sha256=item->>'originalSha256' AND rm.format=item->>'format'
     JOIN intake_document_versions v ON v.project_id=rm.project_id AND v.document_id=rm.document_id AND v.id=rm.version_id
     JOIN intake_originals o ON o.project_id=v.project_id AND o.id=v.original_id AND o.sha256=rm.original_sha256
-    WHERE item->>'kind'='document' AND item->>'state'='available' AND rm.format IN ('pdf','dxf','dwg')
+    WHERE item->>'kind'='document' AND item->>'state'='available' AND rm.format=ANY($6::text[])
       AND EXISTS (SELECT FROM intake_occurrences occ WHERE occ.project_id=v.project_id AND occ.receipt_id=$2
         AND occ.version_id=v.id AND occ.state='accepted')
     ORDER BY rm.version_id
@@ -109,7 +109,7 @@ async function readScopedMaps(client,snapshot,seeds) {
     ORDER BY coalesce($4::jsonb->v.version_id::text ? (u->>'id'),false) DESC,n
     LIMIT ${maxUnitsPerSource}
   ) candidate ON true ORDER BY v.version_id,candidate.n`;
-  return (await client.query(sql,[snapshot.projectId,snapshot.receiptId,snapshot.preparationId,JSON.stringify(seeds),titleTerms])).rows;
+  return (await client.query(sql,[snapshot.projectId,snapshot.receiptId,snapshot.preparationId,JSON.stringify(seeds),titleTerms,excludeDwg ? ['pdf','dxf'] : ['pdf','dxf','dwg']])).rows;
 }
 
 async function findMoreTitles(client,snapshot,candidates) {
@@ -260,7 +260,7 @@ async function collect(db,snapshot,limits) {
   try {
     await client.query('BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY');
     await client.query("SELECT set_config('statement_timeout',$1,true)",[String(Math.max(1,Math.min(2500,limits.timeoutMs)))]);
-    const records = await readScopedMaps(client,snapshot,seeds);
+    const records = await readScopedMaps(client,snapshot,seeds,limits.excludeDwg);
     const prepared = buildCandidates(records,titles,fileByVersion);
     const preliminary = diverseOrder(prepared,maxCandidates);
     const pending = [...new Map(preliminary.filter(candidate=>candidate.source==='map_label' || candidate.source==='page')

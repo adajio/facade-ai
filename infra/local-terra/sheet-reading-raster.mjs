@@ -147,7 +147,7 @@ export async function createRasterSession(sourceRoot, scratch) {
         if (!await verifyDwgFile(source, derivativeSha256, derivative.byteSize, true)) fail('sheet_derivative_unavailable');
         selectedFonts = pin.fonts === emptyDwgFontAssets.identity ? emptyDwgFontAssets : fonts;
         if (pin.fonts !== selectedFonts.identity) fail('sheet_reader_profile_changed');
-        index = await openDwgIndex({ source, converter:pin.converter, profile:pin.profile, reserve:0 }, selectedFonts);
+        index = await openDwgIndex({ source, converter:pin.converter, profile:pin.profile, reserve:0, derivative:derivativeSha256 }, selectedFonts);
         if (!index) fail('sheet_dwg_index_unavailable');
         if (index.identity.derivative !== derivativeSha256 || index.identity.kind !== derivativeFormat) {
           fail('sheet_derivative_mismatch');

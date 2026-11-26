@@ -2,8 +2,10 @@
   import type { SourceAddress } from './copilot';
   export type TerraReading = {
     enabled: boolean;
-    receipt: { receiptId: string; receiptNumber: number; inventoryOpen: boolean; acceptedVersions: number; rootFiles: number; rootArchives: number; directChildren: number; deeperChildren: number; officeParts: number } | null;
-    report: { id: string; createdAt: string; summary: { present: number; partial: number; notFound: number; unassessed: number }; draftAvailable: boolean } | null;
+    receipt: { receiptId: string; receiptNumber: number; inventoryOpen: boolean; acceptedVersions: number; rootFiles: number; rootArchives: number; directChildren: number; deeperChildren: number; officeParts: number;
+      preparation?: { available: number; total: number; archives: number; technical: number } | null;
+      primaryRequest?: { status: string; totalFiles?: number; evidenceFiles?: number; visualFiles?: number } | null } | null;
+    report: { id: string; createdAt: string; summary: { present: number; partial: number; notFound: number; unassessed: number }; draftAvailable: boolean; hasQuestions?: boolean | null } | null;
     progress: { totalWindows: number; mappedVersions: number; completed: number; covered: number; partial?: number; noMatch: number; refused: number; held: number; reading: number; queued: number; unassigned: number; heldReasons: { reason: string; count: number }[]; observations: number;
       deep?: { status: string; reason: string | null; started: number; limit: number } | null;
       directed?: { mode: 'ordinary' | 'waiting_report' | 'waiting_index' | 'planning' | 'enough_evidence' | 'no_new_targets' | 'directed'; openRequirements: number;
@@ -39,6 +41,15 @@
   <p class="meta">Стадия 1. Распознавание входящих документов{receipt ? ' · Поступление №' + count(receipt.receiptNumber) : ''}</p>
   <h2 id="terra-title">Комплектность поступления</h2>
   {#if error}<p role="alert">Не удалось обновить данные. {error}. Показаны последние полученные сведения.</p>{/if}
+  {#if receipt?.preparation}
+    <p>Готово к чтению {count(receipt.preparation.available)} из {count(receipt.preparation.total)} документов.{#if receipt.preparation.archives} Архивов в описи · {count(receipt.preparation.archives)}.{/if}{#if receipt.preparation.technical} Служебных файлов · {count(receipt.preparation.technical)}.{/if}</p>
+  {/if}
+  {#if receipt?.primaryRequest?.evidenceFiles !== undefined && ['completed', 'published', 'partial'].includes(receipt.primaryRequest.status)}
+    <p>В первичном запросе переданы текст или изображения из {count(receipt.primaryRequest.evidenceFiles)} файлов{receipt.primaryRequest.totalFiles !== undefined ? ' из ' + count(receipt.primaryRequest.totalFiles) : ''}.{#if receipt.primaryRequest.visualFiles} С изображениями · {count(receipt.primaryRequest.visualFiles)}.{/if}</p>
+  {/if}
+  {#if receipt?.primaryRequest?.status === 'unknown'}
+    <p>Ответ первичного запроса не подтверждён. Сохранённые результаты отдельных участков доступны по требованиям.</p>
+  {/if}
   {#if report}
     <p class="lead">Предварительные результаты есть по <strong>{count(evaluated)} из {count(total)}</strong> требований.</p>
     <dl class="outcomes" aria-label="Результаты по требованиям">
@@ -48,7 +59,7 @@
       {#if report.summary.unassessed}<div><dt><PreliminaryStatusBadge status="unassessed" /></dt><dd>{count(report.summary.unassessed)}</dd></div>{/if}
     </dl>
     <p>Инженеру нужно сверить основания по требованиям и решить, какие вопросы включить в письмо заказчику.</p>
-    <div class="actions"><a class="button primary" href={scopedUrl(slice.projectId, 'completeness', { scope: slice.scopeId, context: slice.assessment?.contextId })}>Открыть требования и источники</a>{#if report.draftAvailable}<a class="button" href={scopedUrl(slice.projectId, 'letters', { scope: slice.scopeId })}>Открыть черновик письма</a>{/if}</div>
+    <div class="actions"><a class="button primary" href={scopedUrl(slice.projectId, 'completeness', { scope: slice.scopeId, context: slice.assessment?.contextId })}>Открыть требования и источники</a>{#if report.draftAvailable}<a class="button" href={scopedUrl(slice.projectId, 'letters', { scope: slice.scopeId })}>{report.hasQuestions === false ? 'Посмотреть, почему в письме пока нет вопросов' : 'Открыть черновик письма'}</a>{/if}</div>
     <p class="meta">Предварительный разбор сохранён {date(report.createdAt)}.</p>
   {:else if receipt}
     <p>Разбор по требованиям ещё не готов.</p>
@@ -67,7 +78,7 @@
         {:else if deep.reason === 'no_new_targets'}Адресное чтение завершено. Для оставшихся вопросов система не нашла новых участков.
         {:else if deep.reason === 'no_readable_windows'}Адресное чтение остановлено. В подготовленном пакете нет доступных участков для уточнения требований.
         {:else if deep.reason === 'enough_evidence'}Адресное чтение завершено. Для автоматической оценки требований собрано достаточно подтверждений.
-        {:else if deep.status === 'held'}Чтение приостановлено. Требуется сверить исход последнего запроса.
+        {:else if deep.status === 'held'}Ожидается сверка ответа по приостановленному участку. Сохранённые результаты доступны.
         {:else}Начато адресное чтение. Выбрано участков · {count(deep.started)} из {count(deep.limit)} разрешённых.{/if}
       </p>
     {/if}
@@ -116,7 +127,7 @@
     <p>Поступление №{count(receipt.receiptNumber)}. {receipt.inventoryOpen ? 'Опись открыта.' : 'Опись закрыта.'}</p>
     <p>На верхнем уровне архивов · {count(receipt.rootArchives)}, отдельных файлов · {count(receipt.rootFiles)}. Вложений первого уровня · {count(receipt.directChildren)}, более глубоких вложений · {count(receipt.deeperChildren)}.</p>
     {#if receipt.officeParts}<p>При распаковке документа Word в опись попали его служебные части · {count(receipt.officeParts)}. Они входят в общее число принятых версий.</p>{/if}
-    {#if slice.files}<p>Файлов проекта с картой страниц, листов или других адресуемых частей · {count(slice.files.prepared)} из {count(slice.files.accepted)} принятых версий.</p>{/if}
+    {#if slice.files}<p>Файлов проекта с картой страниц, листов или других адресуемых частей · {count(slice.files.prepared)} из {count(slice.files.documents ?? slice.files.accepted)} документов проекта.</p>{/if}
     <a href={scopedUrl(slice.projectId, 'receipts', { scope: slice.scopeId }, receipt.receiptId)}>Открыть опись поступления</a>
   </details>
 {/if}

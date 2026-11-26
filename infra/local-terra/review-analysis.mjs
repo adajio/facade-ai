@@ -1,13 +1,14 @@
 import {
   applyAnalysisFactApplicability, factScopeFields, factScopeKinds, factScopeLabelLimit,
-  factScopeReasonLimit, factScopeSources, missingFactScope,
+  factScopeReasonLimit, factScopeSources, literalFactBasis, missingFactScope,
 } from './fact-applicability.mjs';
 
 export const applicabilityKinds = ['included', 'excluded', 'undetermined'];
 export const propertyStatuses = ['confirmed', 'unanswered', 'not_mentioned', 'insufficient', 'conflicting'];
 export const responseStates = ['received', 'not_received'];
 export const tensionStatuses = ['open', 'resolved'];
-export const noOpenQuestions = 'По доступным основаниям адресных вопросов для письма не установлено.';
+export const noOpenQuestions = 'Вопросы пока не сформированы. Для адресных вопросов недостаточно проверенных сведений.';
+const noRemainingQuestions = 'По результатам проверки открытых адресных вопросов для письма нет.';
 export const validText = (value, max) => typeof value === 'string' && value.trim().length > 0 && value.length <= max;
 const textSchema = maxLength => ({type:'string',minLength:1,maxLength});
 const enumSchema = values => ({type:'string',enum:values});
@@ -21,7 +22,7 @@ export function analysisFields(references, {requireFactScope = false} = {}) {
   const scopeSide = record(Object.fromEntries(factScopeFields.map(field => [field,textSchema(factScopeLabelLimit)])),
     factScopeFields.slice(1));
   const scope = record({kind:enumSchema(factScopeKinds),target:scopeSide,observed:scopeSide,
-    reason:textSchema(factScopeReasonLimit),...references},['observed']);
+    reason:textSchema(factScopeReasonLimit),basis:enumSchema([literalFactBasis]),...references},['observed','basis']);
   const applicability = record({kind:enumSchema(applicabilityKinds),reason:textSchema(420),...references});
   const properties = arraySchema(record({
     key:keySchema,label:textSchema(120),status:enumSchema(propertyStatuses),finding:textSchema(550),
@@ -103,9 +104,11 @@ function readScopeSide(value, check) {
 }
 
 function readScope(raw, resolve, check) {
-  const {kind,target,observed,reason} = raw;
+  const {kind,target,observed,reason,basis} = raw;
   check(factScopeKinds.includes(kind) && validText(reason,factScopeReasonLimit), 'invalid_fact_scope');
+  check(basis === undefined || basis === literalFactBasis,'invalid_fact_scope_basis');
   return {kind,target:readScopeSide(target,check),...(observed && {observed:readScopeSide(observed,check)}),
+    ...(basis && {basis}),
     reason,sources:resolve(raw.citations ?? raw.ids)};
 }
 
@@ -144,8 +147,24 @@ export function mergeSources(...groups) {
   ])).values()];
 }
 
+const normalizeQuestion = value => value.normalize('NFC').toLocaleLowerCase('ru').replaceAll('ё','е')
+  .replace(/\s+/gu,' ').trim().replace(/[.!?]+$/u,'');
+
+export function questionIdentity(property) {
+  const target = property.scope?.target;
+  return JSON.stringify([normalizeQuestion(property.letter.text),target
+    ? factScopeFields.map(field=>normalizeQuestion(target[field] ?? '')) : normalizeQuestion(property.label)]);
+}
+
 export function renderQuestions(rows) {
-  const questions = rows.flatMap(row => (row.analysis?.properties ?? []).flatMap(property =>
-    property.letter.kind === 'ask' && (!property.scope || property.scope.kind === 'applicable') ? [`${row.title ?? row.key} — ${property.label}. ${property.letter.text.trim()}`] : []));
-  return questions.join('\n\n') || noOpenQuestions;
+  const seen = new Set();
+  return rows.flatMap(row => (row.analysis?.properties ?? []).flatMap(property => {
+    if (property.letter.kind !== 'ask' || property.scope && property.scope.kind !== 'applicable') return [];
+    const identity = questionIdentity(property);
+    if (seen.has(identity)) return [];
+    seen.add(identity);
+    return [`${row.title ?? row.key} — ${property.label}. ${property.letter.text.trim()}`];
+  })).join('\n\n') || (!rows.length || rows.some(row=>row.analysis?.applicability.kind!=='excluded' &&
+    (['partial','unassessed'].includes(row.status) || row.analysis?.applicability.kind==='undetermined' ||
+      row.analysis?.properties.some(property=>property.status!=='confirmed'))) ? noOpenQuestions : noRemainingQuestions);
 }

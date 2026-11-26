@@ -198,9 +198,9 @@
           <ol>
             {#each questions as question (question.key)}
               <li>
-                <strong>{question.requirement} · {question.property}</strong>
+                <strong>{[...question.subjects].join(' / ')}</strong>
                 <p>{question.text}</p>
-                <PreliminarySources sources={question.sources} label={'Основания вопроса по свойству «' + question.property + '»'} />
+                <PreliminarySources sources={question.sources} label={question.subjects.size === 1 ? 'Основания вопроса по свойству «' + question.property + '»' : 'Источники этого вопроса'} />
               </li>
             {/each}
           </ol>

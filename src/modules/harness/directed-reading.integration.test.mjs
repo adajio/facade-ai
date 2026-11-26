@@ -175,7 +175,23 @@ test('held-out directed reading preserves an open gap and stops after the select
   assert.equal(remaining.progress.totalWindows-remaining.progress.completed,32);
   assert.equal(remaining.progress.directed.openRequirements,0);
 
-  await report(5,[rows[0],{key:'R2',status:'present',sources:[ref(25)]},{key:'R3',status:'present',sources:[ref(30)]}]);
+  const closedRow={key:'R3',status:'present',sources:[ref(30)]};
+  const inscription={key:'printed_subject',label:'Кронштейн',status:'confirmed',sources:[ref(14)],
+    scope:{kind:'applicable',basis:'literal'}};
+  const partial={...rows[1],status:'partial',analysis:{properties:[inscription]}};
+  await report(5,[rows[0],partial,closedRow]);
+  const coverage=await plan();
+  assert.equal(coverage.openRequirements,1,'the literal record leaves overall coverage open');
+  assert.deepEqual(coverage.windowIds,[windowIds[25]],'the closed literal does not make its own address a generic target');
+  await report(6,[rows[0],{...partial,analysis:{properties:[inscription,{
+    key:'application',label:'Вылет кронштейна',status:'insufficient',sources:[],
+    scope:{kind:'undetermined',sources:[ref(14)]},
+  }]}},closedRow]);
+  const scopePlan=await plan();
+  assert.equal(scopePlan.openRequirements,1);
+  assert.ok(scopePlan.windowIds.includes(windowIds[14]),'a separately addressed open property may revisit the same window');
+
+  await report(7,[rows[0],{key:'R2',status:'present',sources:[ref(25)]},closedRow]);
   const firstPoll = await readTerraReading(db,project,db);
   assert.equal(firstPoll.progress.directed.mode,'planning');
   assert.ok(firstPoll.report?.id,'the saved review is immediately visible on a cold planner');

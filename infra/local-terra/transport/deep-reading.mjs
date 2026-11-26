@@ -63,7 +63,10 @@ export async function deepReadingWork(tx,target,kind) {
     max((SELECT max(e.created_at) FROM gateway_outbox e
       WHERE e.job_id=j.id AND e.lease_epoch=j.lease_epoch AND e.event_type IN ('finished','suspended')))
       FILTER (WHERE gen.current AND pinned.id=$4 AND j.state IN ('done','held')) AS "lastFinishedAt",
-    (SELECT id::text FROM local_terra_calls WHERE project_id=$1 AND state IN ('unknown','sending') ORDER BY created_at LIMIT 1) AS unknown
+    bool_or(gen.current AND pinned.id=$4
+      AND j.payload#>>'{packageWindow,productionReview,catalogVersionId}'=$5
+      AND j.payload#>>'{packageWindow,productionReview,stage}'=$6
+      AND EXISTS (SELECT 1 FROM local_terra_calls WHERE job_id=j.id AND state='unknown')) AS unknown
     FROM intake_package_preparations pinned JOIN gateway_jobs j ON j.project_id=pinned.project_id
       AND j.payload#>>'{packageWindow,preparationId}'=pinned.id::text AND j.kind=$3
     JOIN gateway_generations gen ON gen.generation_id=j.generation_id
@@ -100,7 +103,7 @@ export async function deepReadingActivity(tx,target,status,reason,counters) {
   return rowCount > 0;
 }
 
-export async function installDeepLedger(db,kind) {
+export async function installDeepLedger(db) {
   const { rows:[schema] } = await db.query(`SELECT EXISTS (SELECT 1 FROM pg_constraint
     WHERE conrelid='local_terra_calls'::regclass AND conname='local_terra_calls_state_check'
       AND strpos(pg_get_constraintdef(oid),'''rejected''')>0) AS ready`);
@@ -108,8 +111,4 @@ export async function installDeepLedger(db,kind) {
     ADD COLUMN IF NOT EXISTS failure_code text,
     DROP CONSTRAINT IF EXISTS local_terra_calls_state_check,
     ADD CONSTRAINT local_terra_calls_state_check CHECK (state IN ('sending','completed','unknown','rejected'))`);
-  // Called under the exclusive worker lock. An old sending row may have reached
-  // the Mac even if the process died before its response was made durable.
-  await db.query(`UPDATE local_terra_calls attempt SET state='unknown',finished_at=clock_timestamp()
-    FROM gateway_jobs j WHERE attempt.job_id=j.id AND j.kind=$1 AND attempt.state='sending'`,[kind]);
 }

@@ -80,6 +80,8 @@ export interface ReaderOutput {
   mediaType: 'application/json' | 'image/png' | 'image/jpeg' | 'image/webp';
   lines?: ReaderLine[];
   transform?: ImageTransform;
+  /** Bounds of the CAD part in the coordinate space of ReaderLine.drawingBounds. */
+  drawingFrame?: Box;
   limitations?: string[];
   /** The exact image provided to local OCR, when applicable. */
   inputImage?: {
@@ -91,7 +93,7 @@ export interface ReaderOutput {
 export interface ReaderAdapter {
   format: string;
   version(): Promise<string>;
-  inspect(path: string, source?: SourceRef): Promise<ReaderUnit[]>;
+  inspect(path: string, source?: SourceRef, expectedDerivative?: string): Promise<ReaderUnit[]>;
   durableInfo?(source: SourceRef, units: readonly ReaderUnit[], readerVersion: string): Promise<{ storageKey: string; sha256: string; size: number; format: 'dxf' | 'dwg-json'; converter: string } | undefined>;
   read(path: string, request: ReadRequest, unit: ReaderUnit, containedWords?: boolean, source?: SourceRef, readerVersion?: string): Promise<ReaderOutput>;
   readCached?(source: SourceRef, request: ReadRequest, unit: ReaderUnit, readerVersion?: string): Promise<ReaderOutput | undefined>;

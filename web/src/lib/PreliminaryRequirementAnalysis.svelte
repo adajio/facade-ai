@@ -45,7 +45,7 @@
         <p><strong>{statusLabel(property)}</strong> · {property.finding}</p>
         {#if property.scope}
           <div class="scope">
-            <p><strong>{factScope[property.scope.kind]}</strong> · {property.scope.reason}</p>
+            <p><strong>{property.scope.basis === 'literal' ? 'Надпись в источнике' : factScope[property.scope.kind]}</strong> · {property.scope.reason}</p>
             <dl>
               <dt>Область вопроса</dt>
               <dd>{scopeLabel(property.scope.target)}</dd>

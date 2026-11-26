@@ -8,7 +8,7 @@ export type PreliminarySource = {
 export type PreliminaryPropertyStatus = 'confirmed' | 'unanswered' | 'not_mentioned' | 'insufficient' | 'conflicting';
 export type PreliminaryScopeSide = { element: string; zone?: string; purpose?: string; variant?: string };
 export type PreliminaryFactScope = {
-  kind: 'applicable' | 'unrelated' | 'undetermined'; target: PreliminaryScopeSide; observed?: PreliminaryScopeSide;
+  basis?: 'literal'; kind: 'applicable' | 'unrelated' | 'undetermined'; target: PreliminaryScopeSide; observed?: PreliminaryScopeSide;
   reason: string; sources: PreliminarySource[];
 };
 export type PreliminaryAnalysis = {
@@ -51,15 +51,25 @@ export function preliminaryQuestions(rows: PreliminaryRow[]) {
   const unique = (sources: PreliminarySource[]) => [...new Map(sources.map(source => [
     JSON.stringify([source.versionId,source.anchor,source.quote,source.limitation]), source,
   ])).values()];
-  return rows.flatMap(row => row.analysis?.properties.flatMap(property => property.letter.kind === 'ask' &&
-      (!property.scope || property.scope.kind === 'applicable') ? [{
-    key: `${row.key}/${property.key}`, requirement: row.title, property: property.label, text: property.letter.text,
-    sources: unique([
-      ...property.sources, ...(property.response?.sources ?? []), ...(property.scope?.sources ?? []),
-      ...(row.analysis?.tensions.filter(tension => tension.propertyKey === property.key)
-        .flatMap(tension => tension.sides.flatMap(side => side.sources)) ?? []),
-    ]),
-  }] : []) ?? []);
+  const normalize = (text: string) => text.normalize('NFC').toLocaleLowerCase('ru')
+    .replaceAll('ё','е').replace(/\s+/gu,' ').trim().replace(/[.!?]+$/u,'');
+  const questions = new Map<string, { key: string; subjects: Set<string>; property: string; text: string; sources: PreliminarySource[] }>();
+  for (const row of rows) {
+    for (const property of row.analysis?.properties ?? []) {
+      if (property.letter.kind !== 'ask' || property.scope && property.scope.kind !== 'applicable') continue;
+      const target = property.scope?.target;
+      const identity = JSON.stringify([normalize(property.letter.text),target
+        ? [target.element,target.zone,target.purpose,target.variant].map(value => normalize(value ?? ''))
+        : normalize(property.label)]);
+      const question = questions.get(identity) ?? { key: identity, subjects: new Set<string>(), property: property.label, text: property.letter.text, sources: [] };
+      question.subjects.add(row.title + ' · ' + property.label);
+      question.sources = unique([...question.sources, ...property.sources, ...(property.response?.sources ?? []),
+        ...(property.scope?.sources ?? []), ...(row.analysis?.tensions.filter(tension => tension.propertyKey === property.key)
+          .flatMap(tension => tension.sides.flatMap(side => side.sources)) ?? [])]);
+      questions.set(identity,question);
+    }
+  }
+  return [...questions.values()];
 }
 
 type ParsedPlace = {label: string; page?: number};

@@ -517,7 +517,7 @@
         {/if}
         </div>
         </div>
-        <details class="verification-details"><summary>Подробности машинной и независимой проверки</summary>
+        <details class="verification-details" open={current === 'partial' || current === 'remainder'}><summary>Подробности машинной и независимой проверки</summary>
         <p>Формальный машинный вывод · {machineResult(active)}</p>
         {#if active.machine.outcome === 'covered' && active.semanticRemainder?.state === 'open'}
           <p>По открытым источникам есть адресные опоры. Для вывода по всему требованию проверьте оставшиеся места и допустимые замены.</p>

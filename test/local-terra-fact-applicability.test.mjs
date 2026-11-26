@@ -446,3 +446,106 @@ test('an already answered dimension does not widen an earlier scoped question or
     if (expected===1) assert.doesNotMatch(report.draftText,/Какова толщина/);
   }
 });
+
+test('a primary review salvages a legend entry and an addressed question from a malformed row',async()=>{
+  const {validatedPartial}=await import('../infra/local-terra/partial-result.mjs');
+  const catalog=JSON.parse(await (await import('node:fs/promises')).readFile(
+    new URL('../infra/catalogs/intake-stage-1.json',import.meta.url)));
+  const legend=source('note','Облицовка: фиброцементная панель, RAL 7015.');
+  const elevation=source('elevation','Фасад 4 — маркировка шва Ш3.');
+  const color=element('фиброцементная панель');
+  const joint=element('шва Ш3',{zone:'Фасад 4'});
+  const legendRecord=rawProperty({...rawScope(color,color,legend),basis:'literal'},[legend],{
+    key:'legend_finish',label:'Запись облицовки',finding:'Все фасады выполнены из указанной панели.',
+  });
+  const falseAssignment=rawProperty(rawScope({...color,zone:'Фасад 4'},color,legend),[legend],{
+    key:'assigned_finish',label:'Назначение отделки',finding:'Фасаду 4 назначен RAL 7015.',
+  });
+  const question=rawProperty(rawScope(joint,joint,elevation),[elevation],{
+    key:'joint_dimension',label:'Неуточнённый размер шва',status:'insufficient',finding:'В обозначении размер шва не указан.',
+    letter:{kind:'ask',text:'Укажите ширину шва Ш3 фасада 4.'},
+  });
+  const bogus=rawProperty(undefined,[source('invented','Произвольный текст.')],{key:'fabricated'});
+  const snapshot={reviewContract:2,factScopeVersion:1,requirements:catalog.requirements,scopeNote:'Синтетический обзор.',
+    lines:[legend,elevation].map(item=>({...item,id:item.anchor,text:item.quote})),inventory:[legend]};
+  const cases=catalog.requirements.map(({key},index)=>({key,status:index?'unassessed':'present',
+    finding:'Материалы рассматриваются.',citations:index?[]:[{id:'invented',quote:'Произвольный текст.'}],
+    analysis:rawAnalysis(index===0?[legendRecord,falseAssignment,question,bogus]:index===1?[question]:[])}));
+  const published=validatedPartial(snapshot,{rows:cases});
+  assert.equal(published.rows.length,16);
+  assert.equal(published.rows[0].status,'partial');
+  const properties=published.rows[0].analysis.properties;
+  assert.deepEqual(properties.map(property=>[property.key,property.status]),[
+    ['legend_finish','confirmed'],['assigned_finish','insufficient'],['joint_dimension','insufficient'],
+  ]);
+  assert.match(properties[0].finding,/В источнике указано: «Облицовка/);
+  assert.doesNotMatch(published.rows[0].finding,/Все фасады|Фасаду 4 назначен/);
+  assert.equal(properties[1].scope.sources[0].quote,legend.quote);
+  assert.equal(published.rows[1].status,'unassessed');
+  assert.match(published.draftText,/Укажите ширину шва Ш3 фасада 4/);
+  assert.equal(published.draftText.match(/Укажите ширину/g).length,1);
+  assert.equal(published.rows[1].analysis.properties[0].sources[0].quote,elevation.quote);
+});
+
+test('a literal quotation stays local and cannot change an earlier engineering property',async()=>{
+  const observed=source('color','Цвет RAL 7015 для панели А.');
+  const area=element('панели А');
+  const original=rawProperty(rawScope(area,area,observed),[observed],{finding:'Цвет панели А — RAL 7015.'});
+  const prior=makeRow([original],[observed]);
+  const relabelled=makeRow([{...original,scope:{...original.scope,basis:'literal'}}],[observed]);
+  const {reconcilePreliminaryReview}=await import('../infra/local-terra/review-continuity.mjs');
+  const held=reconcilePreliminaryReview({rows:[relabelled],inventory:[observed],factScopeVersion:1},[prior]);
+  assert.equal(relabelled.status,'partial');
+  assert.equal(held.rows[0].analysis.properties[0].scope.basis,undefined);
+  assert.equal(held.rows[0].analysis.properties[0].finding,original.finding);
+});
+
+test('present requires a verified material finding and closed properties',async()=>{
+  const {validate}=await import('../infra/local-terra/producer.mjs');
+  const evidence=source('sheet','Кронштейн К2, вылет 120 мм.');
+  const target=element('Кронштейн К2');
+  const scope=rawScope(target,target,evidence);
+  const snapshot={reviewContract:2,factScopeVersion:1,requirements:[{key:'bracket',part:'Кронштейн'}],
+    lines:[{...evidence,id:evidence.anchor,text:evidence.quote}],inventory:[evidence],scopeNote:'Синтетический обзор.'};
+  const gap=rawProperty(scope,[evidence],{key:'gap',status:'insufficient',
+    finding:'Применение кронштейна требует внутренней сверки.'});
+  const present=rawProperty(scope,[evidence],{key:'reach',finding:'Подтверждён вылет 120 мм.'});
+  const publish=properties=>validate(snapshot,{rows:[{key:'bracket',status:'present',finding:'Требование выполнено.',
+    citations:[cite(evidence)],analysis:rawAnalysis(properties)}]});
+  const onlyOpen=publish([gap]);
+  assert.equal(onlyOpen.rows[0].status,'unassessed');
+  assert.match(onlyOpen.draftText,/Вопросы пока не сформированы/u);
+  const mixed=publish([gap,present]);
+  assert.equal(mixed.rows[0].status,'partial');
+  assert.match(mixed.rows[0].finding,/120 мм/u);
+  assert.match(mixed.draftText,/Вопросы пока не сформированы/u);
+  assert.equal(publish([present]).rows[0].status,'present');
+  assert.match(publish([present]).draftText,/открытых адресных вопросов для письма нет/u);
+});
+
+test('a saved native quotation from a held visual reading can only confirm a literal record',async()=>{
+  const {applyRevision,prepareRevisionSnapshot}=await import('../infra/local-terra/revise.mjs');
+  const addr={unitId:'drawing',locator:{page:1}};
+  const quote='Панель П2 из стали.';
+  const observed={element:'Панель П2'};
+  const priorRow={key:'req',title:'Панели',status:'unassessed',finding:'Нужна сверка.',sources:[],
+    analysis:{applicability:{kind:'included',reason:'Область работ.',sources:[]},properties:[],tensions:[]}};
+  const fact={id:'fact-native',versionId:'native',originalSha256:'a'.repeat(64),address:addr,quote,
+    lineId:'1',grounding:'text',evidenceMode:'literal',label:'Фасад.pdf'};
+  const previous={rows:[priorRow],inventory:[fact],requirements:[{key:'req',part:'Панели'}],scopeNote:'Синтетическая проверка.'};
+  const {snapshot,request}=prepareRevisionSnapshot(previous,[fact],1);
+  assert.equal(JSON.parse(request.messages[1].content).facts[0].evidence,'literal');
+  const property={key:'panel',label:'Панель П2',finding:'На всём фасаде установлены панели П2.',
+    ids:['O1'],status:'confirmed',letter:{kind:'omit',text:'Сведения установлены.'},
+    scope:{kind:'applicable',observed,target:observed,reason:'Дословной записи достаточно.',ids:['O1']}};
+  const run=property=>applyRevision(snapshot,{changes:[{key:'req',status:'present',finding:property.finding,ids:['O1'],
+    analysis:{applicability:null,properties:[property],tensions:[]}}]}).rows[0];
+  const held=run(property);
+  assert.equal(held.status,'unassessed');
+  assert.equal(held.analysis.properties[0].status,'insufficient');
+  const verified=run({...property,scope:{...property.scope,basis:'literal'}});
+  assert.equal(verified.status,'partial');
+  assert.equal(verified.analysis.properties[0].status,'confirmed');
+  assert.match(verified.finding,/Панель П2 из стали/u);
+  assert.doesNotMatch(verified.finding,/всём фасаде/u);
+});

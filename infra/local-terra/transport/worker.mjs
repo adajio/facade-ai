@@ -45,6 +45,8 @@ process.once('SIGTERM', () => controller.abort());
 const routeId = 'codex-subscription-terra';
 const revision = production ? 'codex-subscription-production-v1' : 'codex-subscription-v1';
 const localKind = production ? productionDeepReading.kind : 'local_terra_research';
+const unknownOutcome = 'subscription_outcome_unknown';
+const reconcileAttempt = 'Проверить состояние транспорта и сохранённую попытку подписки.';
 const settings = { routeId, model:'gpt-6.1-terra', dataClass:'customer', maxTokens:2048, maxTurns:production ? productionDeepReading.turnsPerWindow : 32, maxKnownRejections:1 };
 const profile = { A:settings, B:null, lead:null };
 const profileHash = hash([revision, settings]);
@@ -64,7 +66,24 @@ try {
     const stateDir = join(base,'state');
     await mkdir(stateDir,{recursive:true,mode:0o700});
     console.info('Terra production deep reading activation',await production.activate(db,stateDir,{research:true}));
-    await installDeepLedger(db,localKind);
+    await installDeepLedger(db);
+  }
+  // The exclusive worker lock makes every surviving sending row from this
+  // profile an interrupted dispatch. Preserve its identity for reconciliation.
+  await db.query(`UPDATE local_terra_calls attempt SET state='unknown',finished_at=clock_timestamp()
+    FROM gateway_jobs j WHERE attempt.job_id=j.id AND j.kind=$1 AND attempt.state='sending'`,[localKind]);
+  // Older workers could suspend a job on another job's attempt. Only resume
+  // holds that name that sibling attempt and have no uncertainty of their own.
+  const {rows:legacyHolds} = await db.query(`SELECT j.id FROM gateway_jobs j
+    JOIN gateway_generations g USING(generation_id)
+    JOIN local_terra_calls other ON other.project_id=j.project_id AND other.job_id<>j.id
+      AND j.next_action=$3 || ' ' || other.id::text
+    WHERE g.current AND j.kind=$1 AND j.state='held' AND j.reason=$2
+      AND NOT EXISTS (SELECT 1 FROM local_terra_calls own WHERE own.job_id=j.id AND own.state IN ('sending','unknown'))`,
+  [localKind,unknownOutcome,reconcileAttempt]);
+  for (const {id} of legacyHolds) {
+    if (signal.aborted) break;
+    await queue.resume(id,[unknownOutcome]);
   }
   storage = createIntakeStorage(config.dataDir);
   const {withSharedReaderSlot}=await load('src/modules/harness/index.js');
@@ -74,7 +93,7 @@ try {
   const workGateway = Object.create(queue);
   workGateway.call = async input => {
     const hold = (code, id) => ({
-      status:'held', code, nextAction:'Проверить состояние транспорта и сохранённую попытку подписки.',
+      status:'held', code, nextAction:reconcileAttempt,
       ...(id ? {attemptId:id} : {}), ...(production && retryableDeepReason(code) ? {retryAt:new Date(Date.now()+15_000)} : {}),
     });
     if (input.routeId !== routeId || input.dataClass !== 'customer' || input.request?.model !== settings.model) return hold('local_route_denied');
@@ -122,12 +141,13 @@ try {
       }
       if (p.packageWindow.preparationId && (!preparation || !await verifyCurrentPreparation(
         tx,preparation,p.packageWindow.preparationId,p.packageWindow.id))) return {denied:true};
+      if (signal.aborted) return {denied:true};
       if (production) {
-        if (signal.aborted || !pending || !await currentDeepReceipt(tx,pending)) return {denied:true};
+        if (!pending || !await currentDeepReceipt(tx,pending)) return {denied:true};
         const held = await production.hold(tx,pending,{research:true});
         if (held) return {held};
       }
-      const unsettled = await tx.query("SELECT id FROM local_terra_calls WHERE project_id=$1 AND state IN ('sending','unknown') LIMIT 1",[j.project_id]);
+      const unsettled = await tx.query("SELECT id FROM local_terra_calls WHERE job_id=$1 AND state IN ('sending','unknown') LIMIT 1",[input.lease.jobId]);
       if (unsettled.rowCount) return {unsettled:unsettled.rows[0].id};
       if (prior) {
         await tx.query(`UPDATE local_terra_calls SET state='sending',failure_code=NULL,finished_at=NULL WHERE id=$1`,[prior.id]);
@@ -139,11 +159,11 @@ try {
     });
     if (decision.denied) return hold('local_assignment_denied');
     if (decision.held) return hold(decision.held);
-    if (decision.unsettled) return hold('subscription_outcome_unknown',decision.unsettled);
+    if (decision.unsettled) return hold(unknownOutcome,decision.unsettled);
     if (decision.previous) {
       const prev = decision.previous;
       if (prev.job_id !== input.lease.jobId || prev.request_hash !== requestHash) return hold('effect_conflict',prev.id);
-      if (prev.state !== 'completed') return hold(prev.state === 'rejected' ? prev.failure_code : 'subscription_outcome_unknown',prev.id);
+      if (prev.state !== 'completed') return hold(prev.state === 'rejected' ? prev.failure_code : unknownOutcome,prev.id);
       return {status:'subscription_completed',attemptId:prev.id,output:prev.response};
     }
     const attemptId = decision.sendingId;
@@ -153,7 +173,7 @@ try {
     } catch (error) {
       if (!production) {
         await db.query("UPDATE local_terra_calls SET state='unknown',finished_at=clock_timestamp() WHERE id=$1 AND state='sending'",[attemptId]);
-        return hold('subscription_outcome_unknown',attemptId);
+        return hold(unknownOutcome,attemptId);
       }
       const failure = deepCallFailure(error);
       await db.query(`UPDATE local_terra_calls SET state=$2,failure_code=$3,finished_at=clock_timestamp()
@@ -180,7 +200,6 @@ try {
           return true;
         };
         if (status.active) return false;
-        if (status.unknown) return note('held','subscription_outcome_unknown');
         if (plan.mode === 'enough_evidence') return note('completed','enough_evidence');
         // Give the matrix revision an opportunity to incorporate this window
         // before committing another target against the earlier findings.
@@ -189,6 +208,7 @@ try {
         const w = await chooseDeepWindow(tx,target,plan);
         if (!w) {
           if (plan.indexPendingVersions > 0) return false;
+          if (status.unknown) return note('held',unknownOutcome);
           return note('partial',status.started ? 'no_new_targets' : 'no_readable_windows');
         }
         const held = await production.hold(tx,target,{research:true});
@@ -229,7 +249,6 @@ try {
         LEFT JOIN (SELECT project_id,max(created_at) AS latest FROM gateway_jobs WHERE kind=$1 GROUP BY project_id) turns
           ON turns.project_id=w.project_id
         WHERE project.intake_mode AND (m.refusal IS NULL OR m.refusal='physical_inventory_unverified') AND ${preparedPackageWindow}
-        AND NOT EXISTS (SELECT 1 FROM local_terra_calls attempt WHERE attempt.project_id=w.project_id AND attempt.state='unknown')
         AND NOT EXISTS
           (SELECT 1 FROM harness_package_branches b WHERE b.window_id=w.id AND b.branch='A' AND b.active)
         AND EXISTS (SELECT 1 FROM intake_occurrences o WHERE o.project_id=w.project_id AND o.version_id=w.version_id AND o.state='accepted')

@@ -79,7 +79,9 @@ const scopeStamp = `md5(jsonb_build_array((SELECT manifest_id FROM intake),(SELE
 export function directedReadingPlanSql(project: string, research = false) {
   return String.raw`${directedReadingScopeSql(project,research)}, open AS MATERIALIZED (
     SELECT req->>'key' AS requirement,coalesce(property->>'key','') AS property_key,req,
-      property->>'label' AS property_label,coalesce(property->'sources',review->'sources') AS sources
+      property->>'label' AS property_label,CASE
+        WHEN property#>>'{scope,kind}'='undetermined' AND property->'sources'='[]'::jsonb THEN property#>'{scope,sources}'
+        ELSE coalesce(property->'sources',review->'sources') END AS sources
     FROM intake i CROSS JOIN report rp
     CROSS JOIN LATERAL jsonb_array_elements(i.requirements) req
     LEFT JOIN LATERAL (
@@ -87,17 +89,27 @@ export function directedReadingPlanSql(project: string, research = false) {
     ) results(review) ON true
     LEFT JOIN LATERAL (
       SELECT prop FROM jsonb_array_elements(review#>'{analysis,properties}') prop
-      WHERE prop->>'status' IS DISTINCT FROM 'confirmed' OR NOT EXISTS (
+      WHERE prop->>'status' IS DISTINCT FROM 'confirmed'
+        OR prop ? 'scope' AND prop#>>'{scope,kind}' IS DISTINCT FROM 'applicable' OR NOT EXISTS (
         SELECT 1 FROM jsonb_array_elements(prop->'sources') ref
         WHERE length(btrim(ref->>'quote'))>=3 AND ref->>'limitation' IS NULL
       )
     ) open_property(property) ON true
     WHERE (req->>'applicability' IS NULL OR req->>'applicability' !~* '^stage:'
         OR lower(trim(substr(req->>'applicability',7)))=lower(i.project_stage))
+      AND review#>>'{analysis,applicability,kind}' IS DISTINCT FROM 'excluded'
       AND (property IS NOT NULL OR review->>'status' IS DISTINCT FROM 'present' OR NOT EXISTS (
         SELECT 1 FROM jsonb_array_elements(review->'sources') reference
         WHERE length(btrim(reference->>'quote'))>=3 AND reference->>'limitation' IS NULL
       ))
+  ), literal_places AS MATERIALIZED (
+    SELECT review->>'key' AS requirement,ref->>'versionId' AS version,ref->>'anchor' AS anchor
+    FROM report rp
+    CROSS JOIN LATERAL jsonb_array_elements(rp.rows) review
+    CROSS JOIN LATERAL jsonb_array_elements(review#>'{analysis,properties}') property
+    CROSS JOIN LATERAL jsonb_array_elements(property->'sources') ref
+    WHERE property->>'status'='confirmed' AND property#>>'{scope,kind}'='applicable'
+      AND property#>>'{scope,basis}'='literal' AND length(btrim(ref->>'quote'))>=3 AND ref->>'limitation' IS NULL
   ), terms AS MATERIALIZED (
     SELECT o.requirement,o.property_key,(array_agg(w.term ORDER BY w.weight DESC,w.term))[1:${maxTermsPerProperty}] AS tokens
     FROM open o CROSS JOIN LATERAL (
@@ -141,17 +153,21 @@ export function directedReadingPlanSql(project: string, research = false) {
     FROM index_status ix JOIN documents d ON ix.pending=0 CROSS JOIN terms t CROSS JOIN LATERAL unnest(t.tokens) token
     WHERE lower(d.label) ~ ('\m'||token) GROUP BY d.version_id,t.requirement,t.property_key
   ), signals AS (
-    SELECT p.id,p.version_id,p.ordinal,h.requirement,h.property_key,h.weight,p.visual
+    SELECT p.id,p.version_id,p.ordinal,p.unit,h.requirement,h.property_key,h.weight,p.visual
     FROM place_index p JOIN lexical_hits h ON h.block=p.block
-    UNION ALL SELECT p.id,p.version_id,p.ordinal,h.requirement,h.property_key,h.weight,true
+    UNION ALL SELECT p.id,p.version_id,p.ordinal,p.unit,h.requirement,h.property_key,h.weight,true
     FROM place_index p JOIN label_hits h ON h.version_id=p.version_id WHERE p.visual
-    UNION ALL SELECT DISTINCT p.id,p.version_id,p.ordinal,o.requirement,o.property_key,24,true
+    UNION ALL SELECT DISTINCT p.id,p.version_id,p.ordinal,p.unit,o.requirement,o.property_key,24,true
     FROM open o CROSS JOIN LATERAL jsonb_array_elements(o.sources) s
     JOIN place_index p ON p.visual AND s->>'versionId'=p.version_id::text
       AND strpos(s->>'anchor','"unitId":'||to_json(p.unit)::text)>0
   ), candidates AS MATERIALIZED (
     SELECT id,version_id,ordinal,requirement,property_key,sum(weight)+CASE WHEN bool_or(visual) THEN 2 ELSE 0 END AS score
-    FROM signals GROUP BY id,version_id,ordinal,requirement,property_key
+    FROM signals s WHERE s.property_key<>'' OR NOT EXISTS (
+      -- A generic coverage task cannot be justified only by a literal record already used at this address.
+      SELECT 1 FROM literal_places checked WHERE checked.requirement=s.requirement AND checked.version=s.version_id::text
+        AND strpos(checked.anchor,'"unitId":'||to_json(s.unit)::text)>0
+    ) GROUP BY id,version_id,ordinal,requirement,property_key
   ), ranked AS (
     SELECT *,row_number() OVER (PARTITION BY requirement,property_key ORDER BY score DESC,ordinal,version_id,id) AS per_property
     FROM candidates

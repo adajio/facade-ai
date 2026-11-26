@@ -151,7 +151,7 @@ test('the authorized work slice freezes totals, receipt pages and sealed invento
   }
   const [initial, concurrent] = await requests;
   assert.equal(concurrent.workSliceId, initial.workSliceId);
-  assert.deepEqual(initial.files, { accepted: 71, prepared: 1 });
+  assert.deepEqual(initial.files, { accepted: 71, documents: 71, archives: 0, technical: 0, prepared: 1 });
   assert.deepEqual(initial.stops, [{ jobId: mapped[70].job, branch: 'A', reason: 'unknown_charge',
     nextAction: 'operator_reconcile_attempt', receiptId: mapped[70].receipt, versionId: mapped[70].version, label: 'synthetic.pdf' }]);
   assert.deepEqual(initial.totals, { all: 135, open: 90, processing: 70 });
@@ -219,6 +219,11 @@ test('the authorized work slice freezes totals, receipt pages and sealed invento
   assert.equal((await get(list(initial), viewer)).statusCode, 404);
   assert.equal((await get(list(initial) + '/' + closed + '/inventory', viewer)).statusCode, 404);
 
+  // An accepted archive is a container even while its preparation manifest is pending.
+  await db.query(`INSERT INTO import_jobs(id,project_id,receipt_id,occurrence_id,version_id,root_occurrence_id,depth,relative_path,status)
+    SELECT gen_random_uuid(),project_id,receipt_id,id,version_id,id,1,'source.zip','completed'
+      FROM intake_occurrences WHERE project_id=$1 AND version_id=$2`, [project,mapped[1].version]);
+  assert.deepEqual((await success('/current')).files, { accepted: 71, documents: 70, archives: 1, technical: 0, prepared: 1 });
   const beforeExpiry = await success('/current');
   await db.query("UPDATE work_slices SET expires_at=now()-interval '1 second' WHERE id=$1", [beforeExpiry.workSliceId]);
   const expired = await get(list(beforeExpiry));

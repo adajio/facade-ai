@@ -28,7 +28,7 @@ export type WorkSlice = Position & {
   readingService?: { enabled: boolean; observedAt: string; validUntil: string } | null;
   confirmedBytes: number;
   acceptedOccurrences: number;
-  files?: { accepted: number; prepared: number };
+  files?: { accepted: number; prepared: number; documents?: number; archives?: number; technical?: number };
   totals: Record<WorkReceiptFilter, number>;
   filters: { filter: WorkReceiptFilter; total: number }[];
   readings: { state: 'ready' | 'leased' | 'done' | 'held'; branch: 'A' | 'B' | null; total: number }[];
@@ -74,6 +74,8 @@ export function readingStatus(slice: WorkSlice, now: number) {
     return 'Часть заданий выполняется. Для остановленных заданий проверьте причину и следующее действие.';
   if (slice.readings.some((row) => row.state === 'leased')) return 'Идёт автоматическое чтение. Принятые оригиналы уже доступны.';
   const current = signal && Date.parse(signal.validUntil) > now;
+  if (slice.readings.some((row) => row.state === 'held') && slice.readings.some((row) => row.state === 'ready'))
+    return 'Часть заданий приостановлена. Независимые задания остаются в очереди.';
   if (slice.readings.some((row) => row.state === 'held')) return 'Есть приостановленные задания. Откройте документ, чтобы увидеть причину и разрешённое продолжение.';
   if (current && !signal.enabled && (!slice.readings.length || slice.readings.some((row) => row.state === 'ready'))) return 'Автоматическое чтение отключено. Включить разрешённый маршрут может оператор. Оригиналы доступны для ручной сверки.';
   if (slice.readings.some((row) => row.state === 'ready')) return 'Чтение в очереди. Система продолжит при доступности исполнителя и маршрута.';

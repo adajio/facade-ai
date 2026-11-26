@@ -283,7 +283,7 @@ test('PostgreSQL selects normal terminal production facts for the pinned scope o
     await db.query(`INSERT INTO preliminary_package_reviews(project_id,receipt_id,catalog_version_id,model,stage,input_generation,inventory,scope_note,rows,draft_text,content_hash,preparation_id)
       VALUES($1,$2,$3,'gpt-6.1-terra','РД',0,$4,'Обзор',$5,'Передайте ведомость.',$6,$7)`,
       [project,receipt,catalog,JSON.stringify(inventory),JSON.stringify([row('R1','Ведомость не установлена.')]),hash,manifest]);
-    return {project,receipt,window,manifest,version,job,quote};
+    return {project,receipt,window,manifest,version,job,quote,source,address,evidence,observation};
   }
   const selected = await projectFixture('Ведомость 1');
   const foreign = await projectFixture('Посторонний источник');
@@ -326,6 +326,104 @@ test('PostgreSQL selects normal terminal production facts for the pinned scope o
   assert.equal(await run({},visual),'published');
   await update('held','turn_limit_final',{requiresVisual:undefined});
   assert.equal(await run({modelCall:assert.fail,publish:assert.fail}),'published');
+  async function savedReceipt(target,{kind='native',parts=0}={}) {
+    const {source,address,job,evidence,observation}=target;
+    await db.query("UPDATE harness_package_maps SET reader_version='fixture' WHERE version_id=$1",[target.version]);
+    await db.query('UPDATE reader_evidence SET payload=$2 WHERE id=$1',[evidence,JSON.stringify({
+      source,address,representation:kind,sha256:hash,...(kind==='render' && {mediaType:'image/png'}),
+    })]);
+    const pin={source,address,quote:target.quote,grounding:kind==='render'?'visual':'text',
+      ...(kind==='native' && {lineId:'row1'})};
+    await db.query('UPDATE reader_observations SET payload=$2 WHERE id=$1',[observation,JSON.stringify(pin)]);
+    const events=[
+      ...(kind==='render' ? [{kind:'tool',reply:{readKind:'zoom',evidence:{evidenceId:evidence,sha256:hash},image:{data:'iVBORw0KGgo'}}},
+        ...Array.from({length:parts},(_,index)=>({kind:'model',inputRefs:[evidence],
+          visualReceipts:[{evidenceId:evidence,part:index+1,total:2}]}))] : []),
+      {kind:'tool',reply:{observation:{id:observation,qualified:true}}},
+    ];
+    for (const [index,event] of events.entries()) await db.query(
+      'INSERT INTO harness_research_events(job_id,sequence,event) VALUES($1,$2,$3)',[job,index+1,JSON.stringify(event)]);
+  }
+  await savedReceipt(selected);
   await update('held','repeated_rejected_action');
   assert.equal(await run(),'published');
+
+  const pinned = await projectFixture('Нативная надпись у оси Б','dwg');
+  await savedReceipt(pinned);
+  await update('held','subscription_outcome_unknown',{requiresVisual:true},pinned);
+  assert.equal(await run({},pinned),'published');
+
+  const incomplete = await projectFixture('Открыта только первая плитка','dwg');
+  await savedReceipt(incomplete,{kind:'render',parts:1});
+  await update('held','subscription_outcome_unknown',{requiresVisual:true},incomplete);
+  assert.equal(await run({modelCall:assert.fail,publish:assert.fail},incomplete),'published');
+
+  const complete = await projectFixture('Подпись на увеличении вида','dwg');
+  await savedReceipt(complete,{kind:'render',parts:2});
+  await update('held','subscription_outcome_unknown',{requiresVisual:true},complete);
+  assert.equal(await run({},complete),'published');
+});
+
+test('an independent proposal survives an unsupported sibling and its refusal is journaled',async t=>{
+  const {state,run,fact,resultPaths}=await fixture(t);
+  const analysis={applicability:{kind:'undetermined',reason:'Нужно сопоставление',sources:[]},properties:[],tensions:[]};
+  state.r.rows=state.r.rows.map(row=>({...row,analysis}));
+  state.facts[0]={...fact,quote:'Надпись: фиброцементная панель.'};
+  const limited={...fact,id:randomUUID(),quote:'Другой вариант',value:'99',unit:'мм',grounding:'limited',limitation:'Вариант неразличим.'};
+  const wrong={...fact,id:randomUUID(),originalSha256:'b'.repeat(64),quote:'Непредъявленная редакция.'};
+  state.facts.push(limited,wrong);
+  const good={key:'inscription',label:'Надпись',status:'confirmed',finding:'Заявление о фасаде целиком.',ids:['O1'],
+    scope:{kind:'applicable',basis:'literal',target:{element:'фиброцементная панель'},observed:{element:'фиброцементная панель'},
+      reason:'Дословная запись.',ids:['O1']},letter:{kind:'omit',text:'Надпись зафиксирована.'}};
+  const bad={...good,key:'unsupported',ids:[],scope:{...good.scope,ids:[]}};
+  assert.equal(await run({modelCall:async request=>{
+    const {facts}=JSON.parse(request.messages[1].content);
+    assert.equal(facts.length,2);
+    assert.equal(facts[0].evidence,'direct');
+    assert.equal(facts[1].evidence,'context');
+    assert.equal(facts[1].value,undefined);
+    return response({changes:[{key:'R1',status:'present',finding:'Предложения.',ids:['O1'],
+      analysis:{applicability:null,properties:[bad,good],tensions:[]}}]});
+  }}),'published');
+  const [published]=state.r.rows;
+  assert.equal(published.status,'partial');
+  assert.deepEqual(published.analysis.properties.map(item=>item.key),['inscription']);
+  assert.match(published.finding,/фиброцементная панель/);
+  assert.doesNotMatch(published.finding,/фасаде целиком/);
+  const stored=await read((await resultPaths())[0]);
+  assert(stored.rejectedProposals.some(item=>item.propertyKey==='unsupported'&&item.reason==='property_without_new_evidence'));
+  assert.ok(stored.response);
+});
+
+test('rebasing a partial revision cannot activate a rejected proposal through another row’s new aliases',async t=>{
+  const {r,state,run,pendingPath,fact,resultPaths}=await fixture(t);
+  const analysis={applicability:{kind:'undetermined',reason:'Нужна сверка.',sources:[]},properties:[],tensions:[]};
+  state.r.rows=state.r.rows.map(row=>({...row,analysis}));
+  state.facts[0]={...fact,quote:'Штамп: фасад 4.'};
+  const property={key:'inscription',label:'Подпись фасада',status:'confirmed',finding:'Прочитана подпись.',ids:['O1'],
+    scope:{kind:'applicable',basis:'literal',target:{element:'фасад 4'},observed:{element:'фасад 4'},
+      reason:'Дословная подпись.',ids:['O1']},letter:{kind:'omit',text:'Подпись прочитана.'}};
+  const bad={...property,scope:{...property.scope,ids:['R1','O1']}};
+  const edit=(key,property)=>({key,status:'partial',finding:'Прочитана подпись фасада.',ids:['O1'],
+    analysis:{applicability:null,properties:[property],tensions:[]}});
+  const answer={changes:[edit('R1',property),edit('R2',bad)]};
+  let concurrent;
+  assert.equal(await run({
+    modelCall:async()=>response(answer),
+    publish:async ()=>{
+      concurrent={...state.r.rows[1],finding:'Обновлено иным чтением.',sources:[{
+        versionId:fact.versionId,originalSha256:fact.originalSha256,anchor:JSON.stringify({unitId:'p17'}),quote:'Штамп: фасад 4.',
+      }]};
+      state.r={...r,reportId:randomUUID(),rows:[state.r.rows[0],concurrent]};
+      throw rejected();
+    },
+  }),'revision_rebase_pending');
+  assert.equal(await run({modelCall:assert.fail}),'revision_rebased');
+  const pending=await read(pendingPath);
+  assert.deepEqual(pending.rebaseProposal.changes.map(({key})=>key),['R1']);
+  assert.equal(await run({modelCall:assert.fail}),'published');
+  assert.equal(state.r.rows[0].status,'partial');
+  assert.deepEqual(state.r.rows[1],concurrent);
+  const stored=await read((await resultPaths())[0]);
+  assert(stored.rejectedProposals.some(item=>item.key==='R2'));
 });
