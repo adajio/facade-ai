@@ -1,13 +1,15 @@
 <script lang="ts">
-  import { preliminarySourcePlace, preliminarySourceUrl, preliminaryStatusLabels, type PreliminaryReview, type PreliminaryStatus } from './preliminary-review';
+  import { preliminaryStatusLabels, type PreliminaryReview, type PreliminaryStatus } from './preliminary-review';
   import { date } from './format';
   import { denied, describe, id, interrupted, type Api } from './http';
   import { projectV1 } from './workspace';
   import Notice from './Notice.svelte';
+  import PreliminaryRowChange from './PreliminaryRowChange.svelte';
+  import PreliminarySources from './PreliminarySources.svelte';
   import PreliminaryStatusBadge from './PreliminaryStatusBadge.svelte';
 
   type ReadingProgress = { totalWindows: number; mappedVersions: number; acceptedVersions: number;
-    completed: number; covered: number; noMatch: number; refused: number; held: number; reading: number };
+    completed: number; covered: number; partial?: number; noMatch: number; refused: number; held: number; reading: number };
   let { api, projectId, refreshKey, mode }: { api: Api; projectId: string; refreshKey: number; mode: 'review' | 'letter' } = $props();
   let reviews = $state<PreliminaryReview[]>([]);
   let selectedId = $state('');
@@ -57,6 +59,7 @@
   $effect(() => {
     const reviewId = progressReviewId;
     const project = projectId;
+    void refreshKey;
     progress = undefined;
     progressError = '';
     if (!reviewId) return;
@@ -100,12 +103,13 @@
 {#if selected}
   <section class="card preliminary-review" aria-label={mode === 'review' ? 'Предварительный разбор пакета' : 'Черновик письма по результатам проверки'}>
     <h2>{mode === 'review' ? 'Предварительный разбор пакета' : 'Черновик письма по результатам проверки'}</h2>
-    <p class="notice">Предварительный результат. Решение инженера отображается в строке каждого требования.</p>
+    <p class="notice">{mode === 'review' ? 'Предварительный результат. Решение инженера отображается в строке каждого требования.'
+      : 'Предварительный проект по результатам разбора. Редакции писем инженера хранятся в списке писем.'}</p>
     {#if reviews.length > 1}
-      <label>Поступление
+      <label>Разбор
         <select bind:value={selectedId} onchange={() => { manuallySelected = true; copied = ''; }}>
-          {#each reviews as item, index (item.id)}
-            <option value={item.id} title={item.receiptId}>Разбор {index + 1} · {date(item.createdAt)} · {item.isCurrent ? 'актуальное' : 'историческое'}</option>
+          {#each reviews as item (item.id)}
+            <option value={item.id} title={item.receiptId}>{date(item.createdAt)} · {item.isCurrent ? 'Актуальный' : 'Исторический'}</option>
           {/each}
         </select>
       </label>
@@ -119,11 +123,14 @@
         <p role="status" class="meta">Постраничное чтение:
           {#if progress.mappedVersions < progress.acceptedVersions || progress.acceptedVersions === 0}
             строится карта файлов ({progress.mappedVersions} из {progress.acceptedVersions}).
-            {#if progress.totalWindows > 0} Завершено {progress.completed} из {progress.totalWindows} участков.{/if}
+            {#if progress.totalWindows > 0} Результат по {progress.completed} из {progress.totalWindows} участков.{/if}
           {:else if progress.totalWindows === 0}
             в карте нет участков для чтения.
           {:else}
-            завершено {progress.completed} из {progress.totalWindows} участков: с находками {progress.covered}, без совпадений {progress.noMatch}, с отказом {progress.refused}.
+            результат по {progress.completed} из {progress.totalWindows} участков.
+          {/if}
+          {#if progress.totalWindows > 0}
+            С находками {progress.covered}, без совпадений {progress.noMatch}, с отказом {progress.refused}{#if progress.partial !== undefined}, частично прочитано {progress.partial}{/if}.
           {/if}
           {#if progress.held > 0} Ожидают разбора: {progress.held}.{/if}
           Сейчас читается {progress.reading}.
@@ -142,16 +149,38 @@
           {#each selected.rows as row (row.key)}
             <tr><td>{row.title}</td><td><PreliminaryStatusBadge status={row.status} /></td><td>
               <p>{row.finding}</p>
-              {#if row.sources.length}
-                <ul>{#each row.sources as source}
-                  <li><a href={preliminarySourceUrl(source)} target="_blank" rel="noopener noreferrer">{source.label}</a> · {preliminarySourcePlace(source).label}</li>
-                {/each}</ul>
-              {/if}
+              {#if row.sources.length}<PreliminarySources sources={row.sources} />{/if}
+              <PreliminaryRowChange {row} changes={selected.changes} />
             </td></tr>
           {/each}
         </tbody>
       </table></div></details>
     {:else}
+      {#if !selected.changes}
+        <p class="meta">Нет данных для сравнения с первоначальным проектом письма.</p>
+      {:else if selected.changes.baselineId === null}
+        <p class="meta">Первоначальный проект письма.</p>
+      {:else if !selected.changes.letter.changed}
+        <p class="meta">Проект письма с первоначального разбора без изменений.</p>
+      {:else}
+        {@const changes = selected.changes}
+        <p>Проект письма изменился после первоначального разбора{changes.baselineAt ? ' от ' + date(changes.baselineAt) : ''}.</p>
+        {#if changes.letter.removed.length || changes.letter.added.length}
+          <details class="letter-changes">
+            <summary>Изменения проекта письма</summary>
+            <div class="form-row">
+              <div>
+                <h3>Первоначальный текст</h3>
+                {#each changes.letter.removed as text}<p>{text}</p>{:else}<p>Фрагменты не исключены.</p>{/each}
+              </div>
+              <div>
+                <h3>Текст в этой редакции</h3>
+                {#each changes.letter.added as text}<p>{text}</p>{:else}<p>Фрагменты не добавлены.</p>{/each}
+              </div>
+            </div>
+          </details>
+        {/if}
+      {/if}
       <label>Текст предварительного черновика
         <textarea bind:this={textArea} readonly rows="18" value={selected.draftText}></textarea>
       </label>
@@ -162,4 +191,8 @@
 
 <style>
   textarea { width: 100%; min-height: 18em; field-sizing: content; }
+  .letter-changes { margin-block-end: .85rem; }
+  .letter-changes .form-row { align-items: start; }
+  .letter-changes .form-row > div { flex: 1 1 15rem; min-width: 0; margin-block-start: .5rem; }
+  .letter-changes p { white-space: pre-wrap; overflow-wrap: anywhere; }
 </style>

@@ -1,17 +1,20 @@
 import { createHash } from 'node:crypto';
 import type { PoolClient } from 'pg';
 import { archiveFormat } from '../imports/policy.js';
+import { isThumbsDbName, thumbnailCacheUnits, windowsThumbnailCache } from '../formats/windows-thumbnail-cache.js';
 import { lockIntakeProject } from './gate.js';
 import { inventoryOpen } from './receipts.js';
 
 export type DerivativeProof = { readerVersion: string; derivativeSha256: string; byteSize: number };
 export type PreparationInput = { projectId: string; receiptId: string;
   expectedReaderVersions: Record<string, string | null>; verifiedDerivatives?: Record<string, DerivativeProof> };
+type RelatedPdf = { occurrenceId: string; documentId: string; versionId: string; label: string };
 export type PreparationItem = { occurrenceId: string | null; documentId: string | null; versionId: string | null;
   label: string; state: 'waiting' | 'available' | 'unavailable' | 'excluded'; reason: string | null;
   kind: 'document' | 'archive' | 'technical' | 'import_entry'; derivativeAvailable: boolean;
   originalId?: string; originalSha256?: string; readerVersion?: string | null; requestedReaderVersion?: string | null;
-  mapFingerprint?: string; windowIds?: string[]; format?: string; limitations?: string[]; derivative?: DerivativeProof & { format: string } };
+  mapFingerprint?: string; windowIds?: string[]; format?: string; limitations?: string[]; derivative?: DerivativeProof & { format: string };
+  relatedPdf?: RelatedPdf };
 export type PreparationCounts = { total: number; available: number; unavailable: number; waiting: number;
   archives: number; technical: number; restrictions: number };
 export type PreparationManifest = { projectId: string; receiptId: string; counts: PreparationCounts;
@@ -20,7 +23,7 @@ export type PreparationView = { state: 'waiting' | 'ready'; manifestId: string |
   counts: PreparationCounts; items: PreparationItem[]; restrictions: PreparationManifest['restrictions']; reasons: string[] };
 
 type Occurrence = { occurrenceId: string; parentId: string | null; label: string; media: string; documentId: string;
-  versionId: string; originalId: string; sha256: string; restriction: string | null; format: string | null;
+  versionId: string; originalId: string; sha256: string; originalSize: string; restriction: string | null; format: string | null;
   fingerprint: string | null; readerVersion: string | null; requested: string | null; refusal: string | null;
   physicalLimitation: string | null; units: unknown[] | null; windows: { id: string; unitId: string }[]; readerOriginalSha: string | null;
   derivativeSha: string | null; derivativeSize: string | null; derivativeFormat: string | null; derivativeKey: string | null };
@@ -53,7 +56,7 @@ async function evaluate(tx: PoolClient, input: PreparationInput) {
   const { rows } = await tx.query<Occurrence>(
     `SELECT o.id AS "occurrenceId",o.parent_occurrence_id AS "parentId",o.relative_path AS label,
        v.media_type AS media,v.document_id AS "documentId",v.id AS "versionId",v.original_id AS "originalId",
-       orig.sha256,o.restriction,m.format,m.fingerprint,m.reader_version AS "readerVersion",
+       orig.sha256,orig.size AS "originalSize",o.restriction,m.format,m.fingerprint,m.reader_version AS "readerVersion",
        m.requested_reader_version AS requested,m.refusal,m.physical_limitation AS "physicalLimitation",
        rm.units,rm.original_sha256 AS "readerOriginalSha",
        coalesce((SELECT jsonb_agg(jsonb_build_object('id',w.id,'unitId',w.place->>'unitId') ORDER BY w.ordinal)
@@ -79,10 +82,46 @@ async function evaluate(tx: PoolClient, input: PreparationInput) {
     }
     return false;
   }
+  // Word replaces the first two characters of the open document's name with "~$" in its tiny owner file.
+  const companionKeys = new Set(rows.flatMap(row => {
+    const file = row.label.split('/').at(-1) ?? '';
+    if (file.startsWith('~$') || !/\.docx?$/iu.test(file) || !usefulUnits(row.units).length || row.readerOriginalSha !== row.sha256) return [];
+    const directory = row.label.slice(0,row.label.length-file.length);
+    return [JSON.stringify([row.parentId,directory,[...file].slice(2).join('').toLowerCase()])];
+  }));
+  function officeOwnerFile(row: Occurrence) {
+    const file = row.label.split('/').at(-1) ?? '';
+    if (!/^~\$.+\.docx?$/iu.test(file) || Number(row.originalSize)>512 || usefulUnits(row.units).length) return false;
+    const directory = row.label.slice(0,row.label.length-file.length);
+    return companionKeys.has(JSON.stringify([row.parentId,directory,file.slice(2).toLowerCase()]));
+  }
+  const readablePdfs = new Map<string, Occurrence[]>();
+  for (const row of rows) {
+    if (row.format !== 'pdf' || row.refusal || !row.fingerprint || !row.readerVersion ||
+      row.requested !== expectedReaderVersions[row.versionId] || row.readerOriginalSha !== row.sha256 || insideOffice(row)) continue;
+    const readable = new Set(usefulUnits(row.units).map((unit) => (unit as { id: string }).id));
+    if (!row.windows.some((window) => readable.has(window.unitId))) continue;
+    const group = readablePdfs.get(row.sha256) ?? [];
+    group.push(row);
+    readablePdfs.set(row.sha256, group);
+  }
+  function signatureCompanion(row: Occurrence) {
+    if (row.format !== 'sig' || row.refusal || !row.readerVersion || row.readerOriginalSha !== row.sha256) return;
+    const locator = (row.units?.[0] as { locator?: { signatureKind?: string; embeddedSha256?: string } } | undefined)?.locator;
+    if (locator?.signatureKind === 'signature_detached') return { reason: 'signature_detached' };
+    if (locator?.signatureKind !== 'embedded_pdf' || !locator.embeddedSha256) return;
+    const candidates = readablePdfs.get(locator.embeddedSha256);
+    const expectedName = row.label.replace(/\.sig$/iu, '').normalize('NFC').toLowerCase();
+    const related = candidates?.find(({ label }) => label.normalize('NFC').toLowerCase() === expectedName) ?? candidates?.[0];
+    if (!related) return;
+    const { occurrenceId, documentId, versionId, label } = related;
+    return { reason: 'signature_pdf_duplicate', relatedPdf: { occurrenceId, documentId, versionId, label } };
+  }
   const items: PreparationItem[] = rows.map((row) => {
     const base: PreparationItem = { occurrenceId: row.occurrenceId, documentId: row.documentId, versionId: row.versionId,
       label: row.label, originalId: row.originalId, originalSha256: row.sha256, state: 'waiting', reason: null,
       kind: 'document', derivativeAvailable: false };
+    if (officeOwnerFile(row)) return { ...base, kind: 'technical', state: 'excluded', reason: 'office_owner_file' };
     if (insideOffice(row)) return { ...base, kind: 'technical', state: 'excluded', reason: 'office_internal_part' };
     if (!office(row.label, row.media, row.refusal || !row.readerVersion || !usefulUnits(row.units).length || row.readerOriginalSha !== row.sha256 ? null : row.format) && archiveFormat(row.label, row.media))
       return { ...base, kind: 'archive', state: 'excluded', reason: row.restriction };
@@ -91,6 +130,11 @@ async function evaluate(tx: PoolClient, input: PreparationInput) {
     const mapped = { ...base, readerVersion: row.readerVersion, requestedReaderVersion: row.requested,
       mapFingerprint: row.fingerprint, format: row.format ?? undefined,
       limitations: row.physicalLimitation ? [row.physicalLimitation] : [] };
+    if (isThumbsDbName(row.label) && row.readerOriginalSha === row.sha256 && thumbnailCacheUnits(row.format, row.units)) {
+      return { ...mapped, kind: 'technical', state: 'excluded', reason: windowsThumbnailCache };
+    }
+    const companion = signatureCompanion(row);
+    if (companion) return { ...mapped, ...companion, kind: 'technical', state: 'excluded' };
     if (row.refusal && !(row.refusal === 'physical_inventory_unverified' && usefulUnits(row.units).length))
       return { ...mapped, state: 'unavailable', reason: row.refusal };
     if (!row.readerVersion || !row.units || row.readerOriginalSha !== row.sha256 || row.windows.length === 0)

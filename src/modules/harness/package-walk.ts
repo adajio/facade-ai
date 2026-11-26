@@ -3,6 +3,7 @@ import type { WorkQueue } from '../gateway/queue.js';
 import { hash, transaction } from '../gateway/types.js';
 import { lockIntakeProject } from '../intake/gate.js';
 import { publishProjectEvent } from '../supplements/events.js';
+import { pdfPageFormat } from '../pdf/types.js';
 import { getCatalog, getProject, matchesDefaultProfile } from '../access/project-state.js';
 import { deliveredLines } from '../questions/attribute-aliases.js';
 import { ReaderRefusal, jobSchema, type BlockCheck, type PackageBlock, type PackageDiscovery, type PackageSemanticCheck, type Place, type ReaderContext, type ScheduledResearchJob } from './contracts.js';
@@ -54,7 +55,9 @@ export function structureFromLines(format:string,lines:{id:string;locator?:Recor
   limitations:string[],frame?:Place['box']) {
   const seen=new Set<string>();
   const unique=lines.filter(({id})=>{ if(seen.has(id))return false;seen.add(id);return true; });
-  const blocks:PackageBlock[]=format==='pdf'?[{id:'page-detail',kind:'visual',...(frame?{box:frame}:{})}]:[];
+  const pagedPdf=pdfPageFormat(format);
+  const visualPage=pagedPdf||format==='image';
+  const blocks:PackageBlock[]=visualPage?[{id:'page-detail',kind:'visual',...(frame?{box:frame}:{})}]:[];
   const batch=Math.max(32,Math.ceil(unique.length/4000));
   for(let offset=0;offset<unique.length;) {
     let end=Math.min(offset+batch,unique.length);
@@ -69,16 +72,16 @@ export function structureFromLines(format:string,lines:{id:string;locator?:Recor
       ...(typeof first==='number'&&typeof last==='number'?{rows:{first,last}}:{})});
     offset=end;
   }
-  const reason=limitations.find((item)=>!(format==='pdf'&&item==='pdf_native_empty'));
+  const reason=limitations.find((item)=>!(pagedPdf&&item==='pdf_native_empty'||format==='image'&&item==='raster_ocr_empty'));
   return {blocks,limitation:unique.length!==lines.length?'structure_duplicate_line_ids':
-    reason??(format==='pdf'&&!frame?'structure_visual_geometry_unavailable':!blocks.length?'structure_unavailable':null)};
+    reason??(visualPage&&!frame?'structure_visual_geometry_unavailable':!blocks.length?'structure_unavailable':null)};
 }
 
 export async function scanPackageStructure(db: Pool, service: Pick<ReaderService,'open'>) {
   const { rows: [row] } = await db.query<{ id: string; projectId: string; place: Place; version: string; format: string; width:number|null;height:number|null }>(
     `SELECT w.id,w.project_id AS "projectId",w.place,m.reader_version AS version,m.format,(unit.item->>'width')::float8 AS width,(unit.item->>'height')::float8 AS height
      FROM ${activeWindows}
-     LEFT JOIN reader_maps rm ON rm.version_id=w.version_id AND rm.reader_version=m.reader_version AND m.format='pdf'
+     LEFT JOIN reader_maps rm ON rm.version_id=w.version_id AND rm.reader_version=m.reader_version AND m.format IN ('pdf','sig','image')
      LEFT JOIN LATERAL (SELECT item FROM jsonb_array_elements(rm.units) item WHERE item->>'id'=w.place->>'unitId' LIMIT 1) unit ON true
      WHERE m.refusal IS NULL AND m.reader_version IS NOT NULL AND ${activeSource}
        AND NOT EXISTS (SELECT 1 FROM harness_package_structures t WHERE t.window_id=w.id)
@@ -486,7 +489,7 @@ async function dispatchUnseededFacadeScan(tx:PoolClient,queue:WorkQueue) {
       AND NOT EXISTS(SELECT 1 FROM harness_package_facts f LEFT JOIN harness_facade_discovery d ON d.fact_id=f.id
         WHERE f.project_id=w.project_id AND f.window_id=w.id AND f.job_id=j.id
           AND NOT coalesce(d.resolved AND d.discovery_version=${facadeDiscoveryVersion},false))
-      AND (history.job_id IS NULL OR (history.state='done' AND history.result->>'kind' IN ('covered','reviewed_no_match')
+      AND (history.job_id IS NULL OR (history.state='done' AND history.result->>'kind' IN ('covered','reviewed_no_match','partial')
           OR history.state='held' AND history.reason='turn_limit_final') AND EXISTS (
           SELECT 1 FROM harness_package_block_checks c WHERE c.job_id=history.job_id AND c.reviewed AND history.blocks?c.block_id))
       AND NOT ${unsettledFollowupRoot}

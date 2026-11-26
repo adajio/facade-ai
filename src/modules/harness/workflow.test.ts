@@ -16,9 +16,9 @@ const receipt = (name: string, args: unknown, finishReason = 'tool_calls') => ({
     choices: [{
       finish_reason: finishReason,
       message: {
-        role: 'assistant', content: null,
+        role: 'assistant' as const, content: null,
         reasoning_details: [{ type: 'reasoning.encrypted', data: 'test-reasoning' }],
-        tool_calls: [{ id: `call-${randomUUID()}`, type: 'function', function: { name, arguments: JSON.stringify(args) } }],
+        tool_calls: [{ id: `call-${randomUUID()}`, type: 'function' as const, function: { name, arguments: JSON.stringify(args) } }],
       },
     }],
   },
@@ -270,20 +270,20 @@ test('a new turn omits a truncated reasoning-only assistant and can replay an ex
   ports.call = async ({ request: wire, effectKey }) => {
     assert.equal(effectKey, `${task.jobId}:model:2`);
     hashes.push(hashBytes(JSON.stringify(wire)));
-    if (hashes.length === 1) {
-      assert.deepEqual(wire, { ...original, messages: original.messages.filter(({role}) => role !== 'assistant') });
+    if (hashes.length < 3) {
+      const messages = original.messages.filter(({role}) => role !== 'assistant');
+      assert.deepEqual(wire, request(task.job, messages, 'current', undefined, hashes.length === 1));
       return { status: 'held', code: 'effect_conflict', attemptId: oldAttempt.attemptId, nextAction: 'inspect_original_effect' };
     }
     assert.deepEqual(wire, original);
     return oldAttempt;
   };
   assert.deepEqual(await advance(task, ports), { status: 'continue' });
-  assert.equal(hashes.length, 2);
-  assert.notEqual(hashes[0], hashes[1]);
+  assert.equal(new Set(hashes).size, 3);
   const last = events.at(-1);
   assert.equal(last?.kind, 'model');
   assert.equal(last.attemptId, oldAttempt.attemptId);
-  assert.equal(last.requestHash, hashes[1]);
+  assert.equal(last.requestHash, hashes.at(-1));
   assert.equal(last.compoundContract, true);
 });
 
@@ -461,32 +461,35 @@ test('a reserved old request keeps its original shape and a bad support argument
     const survey = wire.tools.find(({ function: tool }) => tool.name === 'survey')!.function.parameters;
     switch (sent.length) {
       case 1:
-      case 3:
       case 4:
+      case 5:
         assert.ok(!Object.hasOwn(survey.properties ?? {}, 'support'));
         return { status: 'held', code: 'effect_conflict', attemptId: oldReceipt.attemptId, nextAction: 'inspect_original_effect' };
       case 2:
+        assert.deepEqual(wire, request(task.job, initialMessages(task.job)));
+        return { status: 'held', code: 'effect_conflict', attemptId: oldReceipt.attemptId, nextAction: 'inspect_original_effect' };
+      case 3:
         assert.deepEqual(wire, request(task.job, initialMessages(task.job), 'compound-v1'));
         return { status: 'held', code: 'effect_conflict', attemptId: oldReceipt.attemptId, nextAction: 'inspect_original_effect' };
-      case 5:
+      case 6:
         assert.deepEqual(wire, oldRequest);
         return oldReceipt;
-      case 6: {
+      case 7: {
         assert.ok(!Object.hasOwn(survey.properties ?? {}, 'support'));
         assert.deepEqual(wire.messages.at(-1), { role: 'tool', tool_call_id: oldReceipt.output.choices[0].message.tool_calls[0].id,
           content: JSON.stringify({ ok: false, code: 'foreign_branch', nextAction: 'Повторите survey с {}. Страница уже закреплена за вашим заданием.' }) });
         assert.deepEqual(reads, []);
         return receipt('survey', { support: 'B' });
       }
-      case 7:
+      case 8:
         assert.match(String(wire.messages.at(-1)?.content), /Повторите survey с \{\}/);
         assert.deepEqual(reads, []);
         return receipt('survey', { page: 7 });
-      case 8:
+      case 9:
         assert.match(String(wire.messages.at(-1)?.content), /invalid_arguments/);
         assert.deepEqual(reads, []);
         return receipt('survey', {});
-      case 9:
+      case 10:
         assert.equal(reads.length, 1);
         return receipt('finish_reading', { status: 'no_match', explanation: 'Reviewed assigned page.' });
       default: return assert.fail('Unexpected model send');
@@ -500,6 +503,7 @@ test('a reserved old request keeps its original shape and a bad support argument
   assert.equal(sent[0], sent[2]);
   assert.equal(sent[0], sent[3]);
   assert.equal(sent[0], sent[4]);
+  assert.equal(sent[0], sent[5]);
   const first = events[0];
   assert.equal(first.kind === 'model' && first.requestHash, hashBytes(JSON.stringify(oldRequest)));
 });
@@ -621,8 +625,9 @@ test('new package tool schema is compact and an established request is recovered
     return { status: 'held', code: 'effect_conflict', attemptId: saved.attemptId, nextAction: 'inspect_original_effect' };
   };
   assert.deepEqual(await advance(task, ports), { status: 'continue' });
-  assert.equal(sent.length, 2);
-  assert.notEqual(sent[0], originalHash);
+  assert.equal(sent.length, 3);
+  assert.equal(sent[1], hashBytes(JSON.stringify(request(task.job, initialMessages(task.job)))));
+  assert.equal(sent.at(-1), originalHash);
   const last = events.at(-1);
   assert.equal(last?.kind, 'model');
   assert.equal(last.attemptId, saved.attemptId);
@@ -946,4 +951,93 @@ test('package turn exhaustion records the last request and permits exactly one b
   assert.equal(final.status==='suspended'&&final.hold.reason,'turn_limit_final');
   await runResearchWorkflow(task,ports,signal);
   assert.deepEqual(attempts,[`${task.jobId}:model:1`,`${task.jobId}:model:2`]);
+});
+
+test('partial reading preserves accepted sources and limitations across a historical refusal and replay', async () => {
+  const { task, ports, events, overviewId, textId } = setup();
+  assert.ok(task.job.mode === 'primary');
+  task.scopeId = null;
+  task.job.packageWindow = { id: randomUUID(), readerVersion: 'test', routeRevision: 'r1', walkProtocol: 1 };
+  task.job.observationProtocol = 2;
+  const native = Buffer.from(JSON.stringify({ lines: [{ id: 'line-1', text: 'Размер 1200 мм' }] }));
+  const originalRead = ports.reader.read;
+  ports.reader.read = async (context, input) => input.kind === 'survey' ? originalRead(context, input) : ({
+    evidenceId: textId, place: (await originalRead(context, input)).place, readerVersion: 'test',
+    mediaType: 'application/json', bytes: native, sha256: hashBytes(native),
+  });
+  const observationId = randomUUID();
+  const limitationId = randomUUID();
+  const recorded: string[] = [];
+  ports.reader.record = async (_tx, _context, observation) => {
+    assert.equal(observation.evidence.evidenceId, textId);
+    const id = observation.limitation ? limitationId : observationId;
+    recorded.push(id);
+    return { observationId: id };
+  };
+  const explanation = 'Левая таблица прочитана, в правой подписи перекрыты.';
+  const partial = { status: 'partial', explanation };
+  const responses = [
+    receipt('survey', {}), receipt('extract', {}),
+    receipt('save_observation', { evidenceId: textId, quote: 'Размер 1200 мм', lineId: 'line-1' }),
+    receipt('save_observation', { evidenceId: textId, limitation: 'В правой таблице подписи перекрыты.' }),
+  ];
+  ports.call = async () => responses.shift() ?? assert.fail('Unexpected paid turn');
+  while (events.length < 12) assert.deepEqual(await advance(task, ports), { status: 'continue' });
+  const historical = receipt('finish_reading', partial);
+  events.push({
+    kind: 'model', turn: 5, attemptId: historical.attemptId, finishReason: 'tool_calls',
+    message: historical.output.choices[0].message, inputRefs: [overviewId, textId], requestHash: 'old-hash', compoundContract: true,
+  }, {
+    kind: 'tool', turn: 5, index: 0, reply: { body: { ok: false, code: 'partial_coverage',
+      nextAction: 'Откройте оставшийся участок этого места. Если прочитать его нельзя, сохраните адресное limitation и укажите соответствующий исход.' } },
+  });
+  ports.call = async ({ request: wire }) => {
+    assert.match(wire.tools.find(({ function: tool }) => tool.name === 'finish_reading')!.function.description, /Use partial to finish/);
+    assert.match(String(wire.messages.at(-1)?.content), /Откройте оставшийся участок этого места/);
+    return receipt('finish_reading', partial);
+  };
+  assert.deepEqual(await advance(task, ports), { status: 'continue' });
+  assert.deepEqual(await advance(task, ports), { status: 'continue' });
+  const expected = { status: 'done', outcome: { kind: 'partial', reason: explanation, evidenceIds: [overviewId, textId],
+    observationIds: [observationId], limitationIds: [limitationId] } };
+  assert.deepEqual(await advance(task, ports), expected);
+  ports.call = async () => assert.fail('Replay reopened a model turn');
+  assert.deepEqual(await advance(task, ports), expected);
+  assert.deepEqual(recorded, [observationId, limitationId]);
+});
+
+test('partial reading requires real delivered material and its own limitation', async (t) => {
+  for (const { read, content, limitation, expected } of [
+    { read: 'search', content: [{ text: 'Материал' }], limitation: true, expected: 'partial_grounding_required' },
+    { read: 'extract', content: [{ text: '  ' }], limitation: true, expected: 'partial_grounding_required' },
+    { read: 'extract', content: [{ text: 'Материал' }], limitation: false, expected: 'partial_grounding_required' },
+    { read: 'extract', content: [{ text: 'Материал' }], limitation: true, expected: 'partial' },
+  ]) {
+    await t.test(`${read}, ${JSON.stringify(content)}, limitation ${limitation}`, async () => {
+      const { task, ports, events, textId, observationId } = setup();
+      assert.ok(task.job.mode === 'primary');
+      task.job.branch = 'B';
+      const { page: _page, ...place } = task.job.place;
+      task.job.place = place;
+      const bytes = Buffer.from(JSON.stringify({ lines: content }));
+      ports.reader.read = async () => ({ place, evidenceId: textId, readerVersion: 'fixture',
+        bytes, sha256: hashBytes(bytes), mediaType: 'application/json' });
+      const responses = [receipt(read, read === 'search' ? { query: 'Материал' } : {}),
+        ...(limitation ? [receipt('save_observation', { evidenceId: textId, limitation: 'Подпись перекрыта.' })] : []),
+        receipt('finish_reading', { status: 'partial', explanation: 'Подпись недоступна.' })];
+      ports.call = async () => responses.shift() ?? assert.fail('Unexpected paid turn');
+      const steps = responses.length * 2;
+      for (let index = 0; index < steps; index++) assert.deepEqual(await advance(task, ports), { status: 'continue' });
+      const terminal = events.at(-1);
+      assert.equal(terminal?.kind, 'tool');
+      if (expected === 'partial') {
+        assert.deepEqual(await advance(task, ports), { status: 'done', outcome: {
+          kind: 'partial', reason: 'Подпись недоступна.', evidenceIds: [textId], observationIds: [], limitationIds: [observationId],
+        } });
+      } else {
+        assert.equal(terminal.outcome, undefined);
+        assert.equal((terminal.reply.body as { code: string }).code, expected);
+      }
+    });
+  }
 });

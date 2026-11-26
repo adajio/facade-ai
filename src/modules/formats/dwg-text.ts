@@ -33,18 +33,35 @@ export async function* derivativeText(file: FileHandle): AsyncGenerator<string> 
   if (decoder) yield decode(decoder);
 }
 
+export function dxfLineEnding(text: string) {
+  return text.match(/\r\n|[\r\n]/u)?.[0];
+}
+
+const maxDxfLine = 1024 ** 2;
 export async function* derivativeLines(source: AsyncIterable<string>): AsyncGenerator<string> {
   let pending = "";
-  let splitCrlf = false;
+  let ending: string | undefined;
   for await (const chunk of source) {
     if (!chunk) continue;
-    const text: string = pending + (splitCrlf && chunk[0] === "\n" ? chunk.slice(1) : chunk);
-    splitCrlf = text.endsWith("\r");
-    const lines = text.split(/\r\n|[\r\n]/u);
+    pending += chunk;
+    if (!ending) {
+      // The first separator establishes framing. A CR at the end of a chunk may belong to CRLF.
+      ending = dxfLineEnding(pending);
+      if (ending === "\r" && pending.indexOf("\r") === pending.length - 1) ending = undefined;
+      if (!ending) {
+        if (pending.length > maxDxfLine) throw new FormatHold("dxf_line_limit");
+        continue;
+      }
+    }
+    const lines = pending.split(ending);
     pending = lines.pop()!;
-    if (pending.length > 1024 ** 2) throw new FormatHold("dxf_line_limit");
-    yield* lines;
+    for (const line of lines) {
+      if (line.length > maxDxfLine) throw new FormatHold("dxf_line_limit");
+      yield line;
+    }
+    if (pending.length > maxDxfLine) throw new FormatHold("dxf_line_limit");
   }
+  if (!ending && pending.endsWith("\r")) pending = pending.slice(0, -1);
   if (pending) yield pending;
 }
 

@@ -84,6 +84,70 @@ test.beforeEach(async ({ page }) => {
   });
 });
 
+test('Карточка TIFF показывает разные физические страницы и ссылку на закреплённый оригинал', async ({ page }) => {
+  const filename = 'Синтетические страницы.tiff';
+  const sha256 = 'a'.repeat(64);
+  const content = `/api/documents/${documentId}/versions/${versionId}/content`;
+  const reader = `/api/v1/documents/${documentId}/versions/${versionId}/reader`;
+  await page.route('**' + api + '/work-slices/' + currentSlice + '/receipts/' + receiptId + '/inventory*', (route) => route.fulfill({ json: {
+    ...inventory, workSliceId: currentSlice, inventoryRevision: '1:1', historical: true,
+    occurrences: [{ ...inventory.occurrences[0], relativePath: filename, sha256, mediaType: 'image/tiff' }],
+  } }));
+  await page.route('**' + content, (route) => route.fulfill({ headers: { etag: `"sha256-${sha256}"`, 'content-type': 'image/tiff' }, body: '' }));
+  await page.route('**' + reader + '/units', (route) => route.fulfill({ json: {
+    source: { documentId, versionId, sha256 }, readerVersion: 'raster-fixture', format: 'image',
+    units: [1, 2].map((page) => ({ id: String(page), width: 40, height: 40, locator: { page, rasterFormat: 'tiff' } })),
+  } }));
+  const png = [
+    'iVBORw0KGgoAAAANSUhEUgAAACgAAAAoCAIAAAADnC86AAAACXBIWXMAAAPoAAAD6AG1e1JrAAAARElEQVRYhe3YsQkAMAwDwd9/aWUHN2kO3BuErUdq9WWyOFLPceWdYiBjmYFEsBgsBouDxWAxWBwsSosJ5qkipnzprMEDqvU6G9n0iCIAAAAASUVORK5CYII=',
+    'iVBORw0KGgoAAAANSUhEUgAAACgAAAAoCAIAAAADnC86AAAACXBIWXMAAAPoAAAD6AG1e1JrAAAAQElEQVRYhe3VsQ0AQAgDsdt/6fwONN9YokeKIK71Z7I4Uc9x5Z1SIFOZQSIshsWwOCyGxbA4LIbFYTEshsUdM3hw2zobUxOamgAAAABJRU5ErkJggg==',
+  ];
+  await page.route('**' + reader + '/pages/*', (route) => route.fulfill({
+    headers: { etag: `"sha256-${sha256}"`, 'content-type': 'image/png' },
+    body: Buffer.from(png[Number(new URL(route.request().url()).pathname.at(-1)) - 1], 'base64'),
+  }));
+
+  await page.setViewportSize({ width: 480, height: 900 });
+  await page.goto(receipts + '/' + receiptId + '?workSlice=' + currentSlice);
+  await page.getByRole('link', { name: 'Карточка документа' }).click();
+  await expect(page.getByRole('link', { name: 'Скачать оригинал' })).toHaveAttribute('href', content);
+  await page.getByRole('button', { name: 'Открыть оригинал' }).press('Enter');
+  await expect(page.getByRole('heading', { name: 'Оригинал изображения' })).toBeFocused();
+  for (const [ordinal, color] of [[1, [255, 0, 0]], [2, [0, 255, 0]]] as const) {
+    const image = page.getByRole('img', { name: 'Оригинал изображения, страница ' + ordinal });
+    await expect(image).toBeVisible();
+    expect(await image.evaluate(async (element: HTMLImageElement) => {
+      await element.decode();
+      const context = document.createElement('canvas').getContext('2d')!;
+      context.drawImage(element, 0, 0);
+      return [...context.getImageData(1, 1, 1, 1).data].slice(0, 3);
+    })).toEqual(color);
+    if (ordinal === 1) await page.getByRole('button', { name: 'Следующая страница' }).press('Enter');
+  }
+  await expect(page.getByRole('button', { name: 'Следующая страница' })).toBeDisabled();
+  await expect(page).toHaveURL(/[?&]page=2(?:&|$)/);
+});
+
+test('Опись показывает сохранённый оригинал подписи и открывает PDF с теми же байтами', async ({ page }) => {
+  const signatureDocument = '70000000-7000-4000-8000-000000000001';
+  const signatureVersion = '80000000-8000-4000-8000-000000000001';
+  await page.route(`**/api/receipts/${receiptId}/inventory`, (route) => route.fulfill({ json: inventory }));
+  await page.route(`**/api/v1/projects/${projectId}/receipts/${receiptId}/preparation`, (route) => route.fulfill({ json: {
+    projectId, receiptId, state: 'ready', manifestId: 'fixture', revision: 1,
+    counts: { total: 1, available: 1, unavailable: 0, waiting: 0, archives: 0, technical: 1, restrictions: 0 },
+    items: [{ occurrenceId: 'signature-occurrence', documentId: signatureDocument, versionId: signatureVersion,
+      label: 'закреплённый лист.pdf.sig', state: 'excluded', kind: 'technical', reason: 'signature_pdf_duplicate',
+      relatedPdf: { occurrenceId, documentId, versionId, label: 'закреплённый лист.pdf' } }], restrictions: [], reasons: [],
+  } }));
+  await page.goto(receipts + '/' + receiptId);
+  await page.getByText('Файлы подписи · 1', { exact: true }).click();
+  await expect(page.getByText('Действительность электронной подписи здесь не проверялась.')).toBeVisible();
+  await expect(page.getByRole('link', { name: 'Скачать оригинал подписи' })).toHaveAttribute('href',
+    `/api/documents/${signatureDocument}/versions/${signatureVersion}/content`);
+  await page.getByRole('link', { name: 'Связанный PDF · закреплённый лист.pdf' }).click();
+  await expect(page.getByRole('heading', { name: 'закреплённый лист.pdf' })).toBeVisible();
+});
+
 test('Читает первую страницу нового среза и восстанавливает строку при возврате из карточки', async ({ page }) => {
   const closedInventoryRequests: string[] = [];
   page.on('request', request => {

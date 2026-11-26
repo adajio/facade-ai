@@ -76,7 +76,8 @@ export function convertFact(fact: PackageFact, accepted: Map<string, AcceptedVer
   provenFacade: boolean, links?: ReadonlyMap<string, DocumentFacadeLink>): FacadeFact | null {
   const { source, quote, value, unit, evidenceId, receiptId, runId, lineId, address, components, deliveryStatement } = fact.observation;
   const acceptedOriginal = accepted.get(source.versionId);
-  const format = formats.get(fact.windowId);
+  const storedFormat = formats.get(fact.windowId);
+  const format = storedFormat === 'sig' && address.locator?.signatureKind === 'embedded_pdf' ? 'pdf' : storedFormat;
   if (!acceptedOriginal || acceptedOriginal.sha256 !== source.sha256 || acceptedOriginal.documentId !== source.documentId || !format) return null;
   const { state, candidates, actorId } = fact.binding;
   const anchored = Boolean(fact.binding.quote || actorId);
@@ -219,13 +220,14 @@ export function facadeObservation(fact: PackageFact, originalLine?: string) {
 }
 
 export type FacadeObservation = ReturnType<typeof facadeObservation>;
-export type ComparisonRead = { branch: PackageFact["branch"]; state: "route_required" | "ready" | "leased" | "held" | "done" };
+export type ComparisonRead = { branch: PackageFact["branch"]; state: "route_required" | "ready" | "leased" | "held" | "done" | "partial" };
 
 async function comparisonReads(tx: PoolClient, projectId: string, windows: PackageAnalysis["windows"], facts: PackageFact[],
   targetIds: string[]) {
   const { rows } = await tx.query<ComparisonRead & { windowId: string; lineId: string; property: string }>(
     `SELECT f.window_id AS "windowId",f.branch,
-      CASE WHEN j.state='leased' AND j.lease_until<=clock_timestamp() THEN 'ready' ELSE j.state END AS state,
+      CASE WHEN j.state='leased' AND j.lease_until<=clock_timestamp() THEN 'ready'
+        WHEN j.state='done' AND j.result->>'kind'='partial' THEN 'partial' ELSE j.state END AS state,
       j.payload#>>'{packageWindow,followup,comparison,lineId}' AS "lineId",
       j.payload#>>'{packageWindow,followup,comparison,property}' AS property
      FROM harness_package_followups f JOIN gateway_jobs j ON j.id=f.job_id

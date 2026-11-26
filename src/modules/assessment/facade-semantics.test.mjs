@@ -57,6 +57,16 @@ test("completed windows, missing semantic checks, and complete position proof re
   windows[1].structure.branches.B.completedFollowupId = "followup-schedule-B";
   assert.equal(completedReaderJob(windows[1], "B"), "followup-schedule-B");
   assert.equal(assess([...paired("drawing"), ...followed]).remainder.verifiedWindows, 2);
+  windows[1].branches.B = { status: "partial", reason: "Unreadable part", jobId: "schedule-B" };
+  windows[1].structure.branches.B.followup = { jobId: "partial-followup", status: "partial" };
+  windows[1].structure.branches.B.completedFollowupId = null;
+  const partial = assess([...paired("drawing"), ...paired("schedule")]);
+  assert.equal(partial.remainder.state, "open");
+  assert.equal(partial.remainder.verifiedWindows, 1);
+  assert.equal(partial.remainder.items[0].reason, "reading_partial");
+  assert.deepEqual(partial.basisIds, []);
+  windows[1].structure.branches.B.completedFollowupId = "followup-schedule-B";
+  assert.equal(completedReaderJob(windows[1], "B"), "followup-schedule-B");
   const complete = assess([...paired("drawing"), ...paired("schedule")]);
   assert.equal(complete.remainder.state, "complete");
   assert.equal(complete.basisIds.length, 4);

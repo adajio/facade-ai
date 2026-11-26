@@ -208,7 +208,7 @@ export async function register(
     if (!/^[1-9]\d{0,6}$/u.test(request.params.page)) throw unavailable();
     const map = await reader().latestMap(document);
     if (!map) throw unavailable();
-    const bytes = await transaction(app.db, (tx) => reader().previewPdfPage(map.source, Number(request.params.page), tx));
+    const bytes = await transaction(app.db, (tx) => reader().previewPage(map.source, Number(request.params.page), tx));
     await authorize(app.db, await readSession(app.db, request), { action: 'project:read', projectId: document.projectId });
     return reply.header('X-Content-Type-Options', 'nosniff').header('ETag', '"sha256-' + map.source.sha256 + '"')
       .type('image/png').send(bytes);

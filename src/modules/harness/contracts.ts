@@ -250,6 +250,7 @@ export class ReaderRefusal extends Error {
 export type ResearchOutcome =
   | { kind: 'covered'; observationIds: string[] }
   | { kind: 'reviewed_no_match'; evidenceIds: string[] }
+  | { kind: 'partial'; reason: string; evidenceIds: string[]; observationIds: string[]; limitationIds: string[] }
   | { kind: 'final_refusal'; reason: string; evidenceIds: string[] }
   | { kind: 'proposal'; aObservationId: string; bObservationId: string; explanation: string; checks?: PairChecks;
       evidenceIds?: string[]; verifiedPair?: VerifiedPairEvidence }

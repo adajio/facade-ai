@@ -1,7 +1,7 @@
 import type { Pool, PoolClient } from 'pg';
 import { verifyPhysicalInventory } from '../formats/physical-inventory.js';
 import type { createRuntimePdfService } from '../pdf/index.js';
-import { ReaderError, type NativeBlock, type PageMap, type ReaderAddress, type SourceRef } from '../pdf/types.js';
+import { pdfPageFormat, ReaderError, type NativeBlock, type PageMap, type ReaderAddress, type SourceRef } from '../pdf/types.js';
 import { blockId, folded, memoryVersion, type MemoryRemainder } from './contracts.js';
 
 type MemoryIndexer = Pick<ReturnType<typeof createRuntimePdfService>, 'map' | 'materializeNative'>;
@@ -32,8 +32,9 @@ async function dequeue(db: Pool | PoolClient) {
 }
 
 function physicalLimitation(map: PageMap) {
-  if (map.format === 'pdf') return map.units.length > 0 && map.units.every((unit, index) =>
-    unit.locator?.page === index + 1 && unit.width && unit.height) ? null : 'pdf_physical_inventory_unavailable';
+  if (pdfPageFormat(map.format) && map.units.length > 0 && map.units.every((unit, index) =>
+    unit.locator?.page === index + 1 && unit.width && unit.height)) return null;
+  if (map.format === 'pdf') return 'pdf_physical_inventory_unavailable';
   const proof = verifyPhysicalInventory(map);
   return 'limitation' in proof ? proof.limitation : null;
 }
@@ -80,11 +81,15 @@ function summarize(format: string, block: NativeBlock) {
   const limitations = new Set([...(block.presentation?.limitations ?? []), ...(block.limitation ? [block.limitation] : [])]);
   const remaining = new Set<MemoryRemainder>();
   if (!block.artifact || ['held', 'original_only'].includes(String(block.unit.locator?.coverage))) remaining.add('native');
-  if (format === 'pdf') {
+  if (pdfPageFormat(format) && block.unit.locator?.page !== undefined) {
     remaining.add('graphics');
     remaining.add('ocr');
     limitations.add('pdf_non_native_unreviewed');
-  } else if (['dxf', 'dwg', 'ifc', 'rvt', 'image'].includes(format) ||
+  } else if (format === 'image') {
+    remaining.add('graphics');
+    if ([...limitations].some((code) => code.startsWith('raster_ocr_') && code !== 'raster_ocr_empty')) remaining.add('ocr');
+    limitations.add('raster_graphics_unreviewed');
+  } else if (['dxf', 'dwg', 'ifc', 'rvt'].includes(format) ||
     [...limitations].some((code) => /graphics|drawing|inline_content|sheet_features/.test(code))) {
     remaining.add('graphics');
   }
@@ -151,7 +156,7 @@ export async function indexNextProjectMemory(db: Pool, reader: MemoryIndexer, si
         const map = job.targetReaderVersion ? await targetMap(conn,job) : await reader.map(job);
         await writeMap(conn, map);
       } else {
-        await reader.materializeNative(job, job.readerVersion, job.ordinal, job.format === 'pdf' ? 1 : 8, async (block) => {
+        await reader.materializeNative(job, job.readerVersion, job.ordinal, pdfPageFormat(job.format!) || job.format === 'image' ? 1 : 8, async (block) => {
           signal?.throwIfAborted();
           await writeBlock(conn, job, block);
         });

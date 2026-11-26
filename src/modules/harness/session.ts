@@ -103,6 +103,7 @@ function restore(task: ResearchTask, events: ResearchEvent[]) {
   const delivered = new Set<string>();
   const sentParts = new Map<string, Map<number, VisualReceipt>>();
   const observations: NonNullable<ToolReply['observation']>[] = [];
+  const limitations = new Map<string, string>();
   const failedActions = new Map<string, { turn: number; code: string; nextAction: string; progress: string }>();
   let stop: ResearchStop | undefined;
   let limitStop: ResearchStop | undefined;
@@ -169,7 +170,16 @@ function restore(task: ResearchTask, events: ResearchEvent[]) {
         if (correction) failedActions.set(key, { turn: event.turn, ...correction, progress: progressKey(delivered, observations) });
         else if (!event.stop) failedActions.delete(key);
         if (evidence) replies.set(evidence.evidenceId, event.reply);
-        if (observation) observations.push(observation);
+        if (observation) {
+          observations.push(observation);
+          // Older receipts record qualification but keep the limitation and address in the paired tool call.
+          if (!observation.qualified && call.function.name === 'save_observation') {
+            const submitted = decodeArguments(call.function.arguments) as Partial<Pick<ObservationInput, 'limitation'> & { evidenceId: string }> | null;
+            if (typeof submitted?.limitation === 'string' && submitted.limitation.trim() && typeof submitted.evidenceId === 'string') {
+              limitations.set(observation.id, submitted.evidenceId);
+            }
+          }
+        }
         outcome ??= event.outcome;
         if (pending.results.length === pending.calls.length) {
           const { model, calls, results } = pending;
@@ -200,7 +210,7 @@ function restore(task: ResearchTask, events: ResearchEvent[]) {
   const currentMessages = emptyTruncations.size
     ? previousCurrentMessages.filter((_, index) => !emptyTruncations.has(index)) : previousCurrentMessages;
   return { messages, currentMessages, previousCurrentMessages,
-    roleMessages: render(legacyCorrections), replies, delivered, sentParts, observations, pending, latestModel, rejections, outcome,
+    roleMessages: render(legacyCorrections), replies, delivered, sentParts, observations, limitations, pending, latestModel, rejections, outcome,
     failedActions, stop, limitStop };
 }
 
@@ -300,6 +310,15 @@ function samePlace(a: EvidenceRef['place'], b: EvidenceRef['place']) {
   return sameSource(a.source, b.source) && a.unitId === b.unitId && a.page === b.page;
 }
 
+const physicalReadKinds = new Set(['survey', 'zoom', 'extract', 'ocr']);
+
+function isAddressedRead(reply: ToolReply) {
+  if (reply.readKind === 'zoom') return Boolean(reply.image?.data);
+  if (reply.readKind !== 'extract' && reply.readKind !== 'ocr') return false;
+  const { content } = reply.body as { content?: string };
+  return deliveredLines(content ?? null).some(({ text }) => text.trim().length > 0);
+}
+
 const failedTool = (code: string, nextAction?: string): ToolReply => ({ body: { ok: false, code, nextAction } });
 
 function argumentCorrection(name: string, code: unknown): string | undefined {
@@ -342,6 +361,8 @@ const groundingCorrection: Record<string, string> = {
   no_match: 'Для no_match нужна хотя бы одна полученная выдача и ни одного наблюдения. При сохранённом ограничении используйте unreadable, если место полностью недоступно для ответа.',
   partial: 'Откройте оставшийся участок этого места. Если прочитать его нельзя, сохраните адресное limitation и укажите соответствующий исход.',
 };
+const partialGrounding = 'Откройте читаемый фрагмент назначенного места через extract, ocr или zoom. Сохраните адресное limitation по недоступной части и объясните, что осталось непроверенным.';
+
 const readerCorrections: Record<string, string> = {
   reader_quote_mismatch: 'Для текста скопируйте дословную цитату одной полученной строки и её lineId. Можно убрать box, чтобы reader закрепил рамку строки. Для изображения используйте box вместо lineId.',
   reader_statement_invalid: 'Укажите дословное утверждение о передаче. Предмет должен входить в quote или в дословный context той же выдачи.',
@@ -373,7 +394,7 @@ function recordedCorrection(call: FunctionCall, code: unknown, task: ResearchTas
 }
 
 const preconditionRefusals = new Set(['evidence_not_delivered', 'survey_required', 'grounding_required',
-  'partial_coverage', 'both_supports_required']);
+  'partial_coverage', 'partial_grounding_required', 'both_supports_required']);
 const stableRefusals = new Set(['invalid_arguments', 'unknown_tool', 'foreign_branch', 'support_required',
   'value_not_in_quote', 'unit_not_in_evidence', 'visual_box_required', 'source_role_unassigned',
   'package_non_delivery_unproven',
@@ -670,12 +691,29 @@ async function executeTool(
     case 'finish_reading': {
       const input = commands.finish_reading.parse(parsed.data);
       const observationIds = [...new Set(state.observations.filter(({ qualified }) => qualified).map(({ id }) => id))];
-      if (input.status === 'partial') return { reply: failedTool('partial_coverage', groundingCorrection.partial) };
       if (task.job.mode !== 'primary') throw new Error('Reading outcome from a non-primary job');
       const evidenceIds = [...state.delivered].filter((id) => state.replies.get(id)?.readKind !== 'open_context');
       const delivered = evidenceIds.map((id) => state.replies.get(id));
       if (task.job.place.page && !delivered.some((reply) => reply?.readKind === 'survey' && reply.image)) {
         return { reply: failedTool('survey_required', 'Откройте и рассмотрите физическое окно.') };
+      }
+      if (input.status === 'partial') {
+        const { place } = task.job;
+        const addressed = [...state.delivered].flatMap((id) => {
+          const reply = state.replies.get(id);
+          return reply?.evidence && reply.readKind && physicalReadKinds.has(reply.readKind)
+            && samePlace(reply.evidence.place, place)
+            && (!place.box || reply.evidence.place.box && contains(place.box, reply.evidence.place.box))
+            ? [{ id, reply }] : [];
+        });
+        const assignedEvidenceIds = new Set(addressed.map(({ id }) => id));
+        const limitationIds = [...state.limitations].flatMap(([id, evidenceId]) => assignedEvidenceIds.has(evidenceId) ? [id] : []);
+        if (!addressed.some(({ reply }) => isAddressedRead(reply)) || !limitationIds.length) {
+          return { reply: failedTool('partial_grounding_required', partialGrounding) };
+        }
+        return { reply: { body: { ok: true } }, outcome: {
+          kind: 'partial', reason: input.explanation, evidenceIds: [...assignedEvidenceIds], observationIds, limitationIds,
+        } };
       }
       if (input.status === 'no_match' && evidenceIds.length && !state.observations.length) {
         return { reply: { body: { ok: true } }, outcome: {
@@ -748,7 +786,8 @@ export async function advance(task: ResearchTask, ports: SessionPorts): Promise<
     const awaitingVisual = ports.visual && ['finish_reading', 'propose_resolution', 'verify_resolution'].includes(call.function.name)
       && [...state.replies].some(([id, reply]) => reply.image && !state.delivered.has(id));
     const refused = state.failedActions.get(actionKey(call));
-    if (model.compoundContract && refused && refused.turn < model.turn && (stableRefusals.has(refused.code)
+    if (model.compoundContract && refused && refused.code !== 'partial_coverage' &&
+      refused.turn < model.turn && (stableRefusals.has(refused.code)
       || refused.progress === progressKey(state.delivered, state.observations))) {
       const reason = 'repeated_rejected_action' as const;
       const nextAction = `Измените отклонённое действие ${call.function.name}. ${refused.nextAction}`;
@@ -832,8 +871,9 @@ export async function advance(task: ResearchTask, ports: SessionPorts): Promise<
   }
   const turn = state.latestModel + 1;
   const toolWire = toolWireFor(task.job);
-  const modelRequest = request(task.job, state.currentMessages, toolWire,
-    task.earlyPair && task.pairScopeName ? { scopeName: task.pairScopeName } : undefined);
+  const pair = task.earlyPair && task.pairScopeName ? { scopeName: task.pairScopeName } : undefined;
+  const terminalPartial = task.job.mode === 'primary';
+  const modelRequest = request(task.job, state.currentMessages, toolWire, pair, terminalPartial);
   const visual = ports.visual && (ports.visualTurn ??= { policy: ports.visual, fragments: new Map() });
   const prepared = visual && prepareVisualTurn(modelRequest, visual, state.replies, state.delivered, state.sentParts);
   if (visual && !prepared) return {
@@ -865,6 +905,20 @@ export async function advance(task: ResearchTask, ports: SessionPorts): Promise<
         serialized = original;
         visualReceipts = undefined;
       }
+    }
+  }
+  if (terminalPartial && result.status === 'held' && result.code === 'effect_conflict' && result.attemptId) {
+    const historical = request(task.job, state.currentMessages, toolWire, pair);
+    const historicalVisual = visual && prepareVisualTurn(historical, visual, state.replies, state.delivered, state.sentParts);
+    const original = { request: historical, receipts: undefined };
+    const candidates = historicalVisual && historicalVisual.request !== historical ? [historicalVisual, original] : [original];
+    for (const candidate of candidates) {
+      const wire = JSON.stringify(candidate.request);
+      if (Buffer.byteLength(wire) > 16 * 1024 * 1024) continue;
+      result = await send(candidate.request);
+      serialized = wire;
+      visualReceipts = candidate.receipts;
+      if (result.status !== 'held' || result.code !== 'effect_conflict' || !result.attemptId) break;
     }
   }
   let compoundContract = true;

@@ -20,7 +20,9 @@ import type { CadDefinition, CadFontUse, Unit } from "./model.js";
 import { appendCadEntity, cadMetadata, cadSpace, convertedDxfRecords, first, recoveryCadRecords } from "./spatial.js";
 import type { Entity } from "./spatial.js";
 
-export const dwgReaderProfile = "formats-1.1.8";
+import { dwgReaderProfile } from "./dwg-profile.js";
+
+export { dwgReaderProfile } from "./dwg-profile.js";
 const rowsPerPart = 512;
 const shapesPerPart = 6000;
 const textPerPart = 2 * 1024 ** 2;

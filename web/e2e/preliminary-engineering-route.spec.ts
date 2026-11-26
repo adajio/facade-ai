@@ -9,7 +9,7 @@ const statuses = ['present', 'partial', 'not_found', 'unassessed'] as const;
 const labels = ['Представлено', 'Частично', 'Не найдено', 'Не оценено'];
 const base = `/projects/${projectId}/completeness`;
 
-async function fixture(page: Page, editable: boolean) {
+async function fixture(page: Page, editable: boolean, comparable = false) {
   const project = { id: projectId, name: 'Синтетический комплект', version: 1, intakeMode: true, scopes: [],
     stage: 'Стадия 1', actions: editable ? ['project:read', 'project:engineer'] : ['project:read'] };
   const questions = Array.from({ length: 16 }, (_, index) => ({
@@ -39,18 +39,39 @@ async function fixture(page: Page, editable: boolean) {
       sources: index ? [] : [{ documentId, versionId, label: 'Синтетический.pdf', anchor: 'Стр. 3–4' }],
     })),
   };
+  const baseline = { ...review, rows: review.rows.map((row, index) => index ? row : { ...row, status: 'partial' }),
+    changes: { baselineId: null, baselineAt: null, rows: [], letter: { changed: false, added: [], removed: [] } } };
+  const added = { documentId, versionId, label: 'Синтетический.pdf',
+    anchor: JSON.stringify({ address: { locator: { page: 7 } }, lineId: 'L14' }),
+    quote: 'Синтетическая цитата с листа', limitation: 'Требуется сверить ревизию листа' };
+  const detailed = { ...review, id: 'detailed', createdAt: '2026-11-26T01:00:00Z', draftText: 'Обновлённый проект письма',
+    rows: review.rows.map((row, index) => index ? row : { ...row, finding: 'Вывод после подробного чтения', sources: [...row.sources, added] }),
+    changes: { baselineId: baseline.id, baselineAt: baseline.createdAt, rows: baseline.rows.map((row, index) => ({
+      key: row.key, changed: !index, previousStatus: row.status, previousFinding: row.finding,
+      addedSources: index ? [] : [added], removedSources: [],
+    })), letter: { changed: true, added: ['Обновлённый проект письма'], removed: [review.draftText] } },
+  };
+  let published = false;
+  let reviewRequests = 0;
   await page.route('**/api/**', async (route) => {
     const request = route.request();
-    const path = new URL(request.url()).pathname;
+    const url = new URL(request.url());
+    const path = url.pathname;
     if (path === '/api/me') return route.fulfill({ json: { csrfToken: 'test', user: { id: 'engineer', login: 'test' }, projects: [project] } });
     if (path === `/api/projects/${projectId}`) return route.fulfill({ json: project });
-    if (path.endsWith('/snapshot')) return route.fulfill({ json: { cursor: '0', sliceId: '0', projectionVersion: '0' } });
-    if (path.endsWith('/events')) return route.fulfill({ json: { events: [], cursor: '0', hasMore: false } });
-    if (path.endsWith('/preliminary-package-reviews')) return route.fulfill({ json: { items: [review], nextCursor: null } });
+    if (path.endsWith('/snapshot')) return route.fulfill({ json: { cursor: published ? '1' : '0', sliceId: '0', projectionVersion: '0' } });
+    if (path.endsWith('/events')) return route.fulfill({ json: { events: published && url.searchParams.get('after') === '0'
+      ? [{ cursor: '1', type: 'package-analysis.changed', payload: {} }] : [], cursor: published ? '1' : '0', hasMore: false } });
+    if (path.endsWith('/preliminary-package-reviews')) {
+      reviewRequests += 1;
+      return route.fulfill({ json: { items: comparable ? published ? [detailed, { ...baseline, isCurrent: false }] : [baseline] : [review], nextCursor: null } });
+    }
     if (path.endsWith('/reading-progress')) return route.fulfill({ json: { totalWindows: 3, mappedVersions: 1, acceptedVersions: 1,
-      completed: 0, covered: 0, noMatch: 0, refused: 0, held: 0, reading: 1 } });
+      completed: published ? 2 : 0, covered: 0, partial: published ? 1 : undefined, noMatch: published ? 1 : 0, refused: 0, held: 0, reading: 1 } });
     if (path.endsWith('/facade-assessment')) return route.fulfill({ json: assessment() });
     if (path.endsWith('/facade-assessment/1')) return route.fulfill({ json: assessment(true) });
+    if (path.endsWith('/letters')) return route.fulfill({ json: { items: [], nextCursor: null } });
+    if (path.endsWith('/letters/eligible')) return route.fulfill({ json: { items: [], holds: [] } });
     if (path.endsWith('/questions/question-0/decisions') && request.method() === 'POST') {
       const body = request.postDataJSON() as Record<string, unknown>;
       submissions.push({ body, version: request.headers()['if-match'] });
@@ -59,7 +80,7 @@ async function fixture(page: Page, editable: boolean) {
     }
     return route.fulfill({ status: 404, json: { code: 'not_found' } });
   });
-  return { submissions };
+  return { submissions, publishDetailed: () => { published = true; }, reviewRequests: () => reviewRequests };
 }
 
 test('Комплектность показывает цвета и путь инженера до технических блоков, решение сохраняется и открывается снова', async ({ page }) => {
@@ -68,7 +89,7 @@ test('Комплектность показывает цвета и путь и�
   const table = page.getByRole('region', { name: 'Комплектность по требованиям' });
   const heading = table.getByRole('heading', { name: 'Требования · Весь комплект' });
   await expect(heading).toBeVisible();
-  const technical = page.getByText('Что вошло в проверку · версия 1', { exact: true });
+  const technical = page.getByText('Что вошло в проверку', { exact: true });
   const mentions = page.getByRole('heading', { name: 'Упоминания без установленного фасада' });
   await expect(technical).toBeVisible();
   await expect(mentions).toBeVisible();
@@ -82,6 +103,7 @@ test('Комплектность показывает цвета и путь и�
   })).toBe(true);
   const rows = table.locator('tbody tr');
   await expect(rows).toHaveCount(16);
+  await expect(rows.first()).toContainText('Нет данных для сравнения');
   const colors = [];
   for (let i = 0; i < 4; i++) {
     const badge = rows.nth(i).locator('.status-badge');
@@ -129,6 +151,47 @@ test('Комплектность показывает цвета и путь и�
   await page.reload();
   const firstRow = page.getByRole('region', { name: 'Комплектность по требованиям' }).locator('tbody tr').first();
   await expect(firstRow.locator('xpath=following-sibling::tr[1]')).toContainText(reason);
+});
+
+test('Подробное чтение обновляет изменения требования рядом с сохранённым вводом инженера и сохраняет историю письма', async ({ page }) => {
+  const { publishDetailed, reviewRequests } = await fixture(page, true, true);
+  await page.goto(base);
+  const matrix = page.getByRole('region', { name: 'Комплектность по требованиям' });
+  const rows = matrix.locator('tbody tr');
+  await expect(rows).toHaveCount(16);
+  await expect(rows.first()).toContainText('Первоначальный разбор');
+  await matrix.getByRole('link', { name: 'Сверить и решить · Требование 1', exact: true }).click();
+  const input = matrix.getByLabel('Основание решения');
+  await input.fill('Несохранённая инженерная запись');
+  await input.evaluate((element: HTMLTextAreaElement) => element.setSelectionRange(0, 0));
+  const source = rows.first().locator('xpath=following-sibling::tr[1]');
+  publishDetailed();
+  await expect(rows.first()).toContainText('Статус изменился с «Частично» на «Представлено»');
+  await expect(rows.nth(2)).toContainText('С первоначального разбора без изменений');
+  await expect(input).toHaveValue('Несохранённая инженерная запись');
+  await expect(input).toBeFocused();
+  expect(await input.evaluate((element: HTMLTextAreaElement) => element.selectionStart)).toBe(0);
+  await expect(source).toContainText('Синтетический вывод 1');
+  await expect(source).toContainText('Вывод после подробного чтения');
+  const addedSources = source.getByRole('list', { name: 'Добавленные основания' });
+  await expect(addedSources).toContainText('Синтетическая цитата с листа');
+  await expect(addedSources).toContainText('Требуется сверить ревизию листа');
+  await expect(addedSources.getByRole('link', { name: 'Синтетический.pdf' })).toHaveAttribute('href',
+    `/api/documents/${documentId}/versions/${versionId}/content#page=7`);
+  expect(reviewRequests()).toBeLessThan(8);
+  await matrix.getByRole('link', { name: 'Свернуть требование', exact: true }).click();
+  await expect(page.getByText(/частично прочитано 1/)).toBeVisible();
+  await page.goto(`/projects/${projectId}/letters`);
+  const letter = page.getByRole('region', { name: 'Черновик письма по результатам проверки' });
+  await expect(letter).toContainText('Проект письма изменился');
+  await letter.getByText('Изменения проекта письма', { exact: true }).click();
+  await expect(letter.getByText('Синтетический черновик', { exact: true })).toBeVisible();
+  await expect(letter.getByText('Обновлённый проект письма', { exact: true })).toBeVisible();
+  await expect(letter.getByLabel('Текст предварительного черновика')).toHaveValue('Обновлённый проект письма');
+  await letter.getByLabel('Разбор').selectOption('review');
+  await expect(letter).toContainText('Исторический разбор');
+  await expect(letter).toContainText('Первоначальный проект письма');
+  await expect(letter.getByLabel('Текст предварительного черновика')).toHaveValue('Синтетический черновик');
 });
 
 test('Историческая версия и пользователь без инженерных прав открывают основания без формы записи', async ({ page }) => {

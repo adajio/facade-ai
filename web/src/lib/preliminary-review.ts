@@ -1,11 +1,23 @@
 import { originalUrl } from './copilot';
 
 export type PreliminaryStatus = 'present' | 'partial' | 'not_found' | 'unassessed';
-export type PreliminarySource = { documentId: string; versionId: string; label: string; anchor: string };
+export type PreliminarySource = {
+  documentId: string; versionId: string; label: string; anchor: string;
+  originalSha256?: string; quote?: string; limitation?: string;
+};
 export type PreliminaryRow = { key: string; title: string; status: PreliminaryStatus; finding: string; sources: PreliminarySource[] };
+export type PreliminaryChanges = {
+  baselineId: string | null;
+  baselineAt: string | null;
+  rows: {
+    key: string; changed: boolean; previousStatus: PreliminaryStatus | null; previousFinding: string | null;
+    addedSources: PreliminarySource[]; removedSources: PreliminarySource[];
+  }[];
+  letter: { changed: boolean; added: string[]; removed: string[] };
+};
 export type PreliminaryReview = {
   id: string; receiptId: string; catalogVersionId: string; model: string; createdAt: string; stage: string;
-  scopeNote: string; isCurrent: boolean; draftText: string; rows: PreliminaryRow[];
+  scopeNote: string; isCurrent: boolean; draftText: string; rows: PreliminaryRow[]; changes?: PreliminaryChanges;
 };
 export const preliminaryStatusLabels: Record<PreliminaryStatus, string> = {
   present: 'Представлено', partial: 'Частично', not_found: 'Не найдено', unassessed: 'Не оценено',
@@ -17,16 +29,25 @@ export function preliminarySourcePlace(source: PreliminarySource): ParsedPlace {
   if (original.startsWith('{')) {
     try {
       const anchor = JSON.parse(original);
-      const at = anchor?.address?.locator ?? {};
+      const address = anchor?.address;
+      const at = address?.locator ?? {};
       const page = Number(at.page);
       const validPage = Number.isSafeInteger(page) && page > 0;
       const parts = [
         validPage && `Стр. ${page}`,
-        at.sheet && `Лист ${at.sheet}`, at.cell && `Ячейка ${at.cell}`,
+        (at.sheet ?? at.sheetName) && `Лист ${at.sheet ?? at.sheetName}`,
+        at.cell && `Ячейка ${at.cell}`, at.range && `Диапазон ${at.range}`,
+        at.row && `Строка ${at.row}`, at.paragraph && `Абзац ${at.paragraph}`, at.table && `Таблица ${at.table}`,
         at.layout && `Лист чертежа ${at.layout}`, at.layer && `Слой ${at.layer}`,
       ].filter(Boolean);
-      if (!parts.length && typeof anchor?.unitId === 'string') parts.push(anchor.unitId);
+      const unitId = address?.unitId ?? anchor?.unitId;
+      if (!parts.length && typeof unitId === 'string') parts.push(unitId);
       if (typeof anchor?.lineId === 'string' && anchor.lineId.length <= 40) parts.push(`Строка ${anchor.lineId}`);
+      if (address?.box) {
+        const { x, y, width, height } = address.box;
+        const coordinates = [x, y, width, height];
+        if (coordinates.every(Number.isFinite)) parts.push(`Область ${coordinates.map((value) => Math.round(value * 100) / 100).join(', ')} пт`);
+      }
       if (parts.length) return {label:parts.join(' · '), page:validPage ? page : undefined};
     } catch { /* Plain-text addresses from previous reviews remain readable. */ }
   }

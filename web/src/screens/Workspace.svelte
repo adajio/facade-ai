@@ -44,7 +44,8 @@
   let revision = $derived(route.params.get('revision') ?? undefined);
   let objectId = $derived(route.objectId);
   let showPreliminary = $derived(project.intakeMode && !project.scopeId && !requestedScope &&
-    !masked && !revision && !objectId && !route.params.has('sent') && !route.params.has('response'));
+    !masked && !revision && !objectId && !route.params.has('sent') && !route.params.has('response') &&
+    !(section === 'completeness' && route.params.has('seen')));
   let evidenceId = $derived(route.params.get('evidence'));
   let observationId = $derived(route.params.get('observation') ?? undefined);
   let evidenceComponent = $derived(route.params.get('component'));

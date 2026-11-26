@@ -93,8 +93,8 @@ function registerRoutes(app: FastifyInstance, prefix: string, reader: () => Retu
       const input = await packagePreparationInput(tx, { projectId, receiptId }, reader());
       const preparation = await readPackagePreparation(tx, input);
       await touchSession(tx, session);
-      const items = preparation.items.map(({occurrenceId,documentId,versionId,label,state,kind,reason,derivativeAvailable,format,readerVersion}) =>
-        ({occurrenceId,documentId,versionId,label,state,kind,reason,derivativeAvailable,format,readerVersion}));
+      const items = preparation.items.map(({occurrenceId,documentId,versionId,label,state,kind,reason,derivativeAvailable,format,readerVersion,limitations,windowIds,relatedPdf}) =>
+        ({occurrenceId,documentId,versionId,label,state,kind,reason,derivativeAvailable,format,readerVersion,limitations,relatedPdf,readableParts:windowIds?.length ?? 0}));
       return { projectId, receiptId, state: preparation.state, manifestId: preparation.manifestId,
         revision: preparation.revision, counts: preparation.counts, reasons: preparation.reasons,
         restrictions: preparation.restrictions.map(({label,reason,sourceId}) => ({label,reason,sourceId})), items };

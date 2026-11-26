@@ -192,16 +192,19 @@ export const inventoryOpen = `(r.sealed_at IS NULL OR EXISTS (
 
 export async function listReceipts(db: Pool, input: { projectId: string; uploading: boolean; before: number | null }) {
   const { rows } = await db.query<{
-    receiptId: string; number: string; sealed: boolean; inventoryOpen: boolean; source: string; createdAt: Date;
+    receiptId: string; number: string; cursor: string; sealed: boolean; inventoryOpen: boolean; source: string; createdAt: Date;
   }>(
-    `SELECT r.id AS "receiptId", r.number, r.sealed_at IS NOT NULL AS sealed, ${inventoryOpen} AS "inventoryOpen",
+    `SELECT r.id AS "receiptId", r.number, r.server_sequence AS cursor, r.sealed_at IS NOT NULL AS sealed, ${inventoryOpen} AS "inventoryOpen",
             source, created_at AS "createdAt"
        FROM intake_receipts r WHERE project_id = $1 AND (NOT $2 OR ${inventoryOpen})
-        AND ($3::bigint IS NULL OR r.number < $3) ORDER BY r.number DESC LIMIT 51`,
+        AND ($3::bigint IS NULL OR r.number < coalesce(
+          (SELECT marker.number FROM intake_receipts marker WHERE marker.project_id=$1 AND marker.server_sequence=$3),
+          (SELECT max(older.number)+1 FROM intake_receipts older WHERE older.project_id=$1 AND older.server_sequence<$3),1))
+       ORDER BY r.number DESC LIMIT 51`,
     [input.projectId, input.uploading, input.before],
   );
-  const receipts = rows.slice(0, 50).map((r) => ({ ...r, number: Number(r.number) }));
-  return { receipts, nextCursor: rows.length > 50 ? receipts.at(-1)?.number : null };
+  const receipts = rows.slice(0, 50).map(({cursor, ...r}) => ({ ...r, number: Number(r.number) }));
+  return { receipts, nextCursor: rows.length > 50 ? Number(rows[49].cursor) : null };
 }
 
 export async function getInventory(db: Pool | PoolClient, input: ReceiptContext) {

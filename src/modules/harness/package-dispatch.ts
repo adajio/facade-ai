@@ -18,6 +18,7 @@ import { packageFollowupKind } from './package-walk.js';
 import { researchKind } from './runner.js';
 import { memoryVersion } from '../project-memory/contracts.js';
 import { profileHintLines,profileHintPatterns } from './facade-profile-hints.js';
+import { dxfGroupRecoveryVersion, dxfGroupRecoveryVersionPattern, legacyDxfGroupHold } from '../formats/dwg-profile.js';
 
 const branches = ['A', 'B'] as const;
 const mapContract = 'overlapping-windows-v1';
@@ -25,7 +26,8 @@ const readingContract = 'package-primary-v1';
 
 const packageSources = `JOIN projects p ON p.id=j.project_id
   JOIN LATERAL (
-    SELECT lower(substring(c.relative_path FROM '[.][a-zA-Z0-9]+$')) AS extension
+    SELECT CASE WHEN lower(regexp_replace(c.relative_path, '^.*/', ''))='thumbs.db' THEN 'thumbs.db'
+      ELSE lower(substring(c.relative_path FROM '[.][a-zA-Z0-9]+$')) END AS extension
     FROM intake_occurrences c WHERE c.version_id=j.version_id AND c.project_id=j.project_id AND c.state='accepted'
     ORDER BY (c.receipt_id=j.receipt_id) DESC,c.created_at,c.id LIMIT 1
   ) source ON true`;
@@ -56,22 +58,32 @@ export async function preparePackageMap(
   const { rows: formats } = await db.query<{ media: string; extension: string | null }>(
     `SELECT DISTINCT v.media_type AS media,source.extension FROM intake_reader_jobs j ${originalJoins} ${packageSources}
      WHERE ${enabledProject('$1')}`, [[...packageProjects]]);
-  const versions = await Promise.all(formats.map(async (input) => ({
-    ...input, version: await service.readerVersion(service.formatFor(input.media, input.extension ?? '')),
-  })));
+  const versions = await Promise.all(formats.map(async (input) => {
+    const version = await service.readerVersion(service.formatFor(input.media, input.extension ?? ''));
+    return { ...input, version, recovery: dxfGroupRecoveryVersion(version) };
+  }));
   const { rows: [job] } = await db.query<IntakeJob & { requested: string | null }>(
     `SELECT ${jobFields}, effective.version AS requested FROM intake_reader_jobs j ${originalJoins} ${packageSources}
-     JOIN jsonb_to_recordset($1::jsonb) AS expected(media text,extension text,version text)
+     JOIN jsonb_to_recordset($1::jsonb) AS expected(media text,extension text,version text,recovery text)
        ON expected.media=v.media_type AND expected.extension IS NOT DISTINCT FROM source.extension
      LEFT JOIN harness_package_maps m ON m.version_id=j.version_id AND m.active
-     CROSS JOIN LATERAL (SELECT CASE WHEN expected.version LIKE '%:dwg:unavailable:%' AND EXISTS (
-       SELECT 1 FROM dwg_derivatives d WHERE d.project_id=j.project_id AND d.version_id=j.version_id AND d.reader_version=m.reader_version
-     ) THEN m.requested_reader_version ELSE expected.version END AS version) effective
+     CROSS JOIN LATERAL (SELECT CASE
+       WHEN expected.version LIKE '%:dwg:unavailable:%' AND (m.reader_version LIKE $4 OR EXISTS (
+         SELECT 1 FROM dwg_derivatives d WHERE d.project_id=j.project_id AND d.version_id=j.version_id AND d.reader_version=m.reader_version
+       )) THEN m.requested_reader_version
+       WHEN expected.recovery IS NOT NULL AND EXISTS (
+         SELECT 1 FROM reader_maps history WHERE history.project_id=j.project_id AND history.document_id=j.document_id
+           AND history.version_id=j.version_id AND history.original_sha256=o.sha256 AND history.reader_version=expected.version
+           AND history.format='dwg' AND jsonb_array_length(history.units)=1 AND history.units @> $3::jsonb
+           AND history.units#>'{0,locator,dxfFraming}' IS NULL
+           AND NOT EXISTS (SELECT 1 FROM dwg_derivatives d WHERE d.project_id=j.project_id AND d.version_id=j.version_id
+             AND d.reader_version=expected.version)
+       ) THEN expected.recovery ELSE expected.version END AS version) effective
      WHERE ${enabledProject('$2')}
        AND (m.version_id IS NULL OR m.requested_reader_version IS DISTINCT FROM effective.version
          OR m.physical_basis_id IS NULL AND m.physical_limitation IS NULL)
        AND NOT EXISTS (SELECT 1 FROM harness_package_map_retries r WHERE r.version_id=j.version_id AND r.retry_at>clock_timestamp())
-     ORDER BY j.created_at,j.id LIMIT 1`, [JSON.stringify(versions), [...packageProjects]]);
+     ORDER BY j.created_at,j.id LIMIT 1`, [JSON.stringify(versions), [...packageProjects], JSON.stringify(legacyDxfGroupHold), dxfGroupRecoveryVersionPattern]);
   if (!job) return false;
   let map;
   try {

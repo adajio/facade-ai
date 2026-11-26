@@ -65,6 +65,8 @@ test('receipt preparation is atomic, replayable and admits only current readable
   const office = await add('spec.docx', 'application/vnd.openxmlformats-officedocument.wordprocessingml.document');
   const child = await add('word/document.xml', 'application/xml', office.occurrence);
   await map(office, 'docx', 'doc-v1', [{id:'paragraph-1'}]);
+  const ownerFile = await add('~$ec.docx', 'application/octet-stream');
+  await map(ownerFile, 'docx', 'doc-v1', [{id:'original',locator:{coverage:'held',limitations:'docx_invalid_or_unreadable'}}]);
   const unsupported = await add('unknown.xyz', 'application/octet-stream');
   await map(unsupported, 'unknown', 'unknown-v1', [{id:'original',locator:{coverage:'original_only',limitations:'format_original_only'}}]);
   const disguisedZip = await add('archive.doc', 'application/zip');
@@ -82,8 +84,9 @@ test('receipt preparation is atomic, replayable and admits only current readable
   input.verifiedDerivatives[dwg.version] = { readerVersion:'dwg-v1',derivativeSha256:derivativeSha,byteSize:10 };
   const ready = await tx(() => capture(client,input));
   assert.equal(ready.state,'ready');
-  assert.deepEqual(ready.manifest.counts,{total:5,available:4,unavailable:1,waiting:0,archives:2,technical:1,restrictions:2});
+  assert.deepEqual(ready.manifest.counts,{total:5,available:4,unavailable:1,waiting:0,archives:2,technical:2,restrictions:2});
   assert.ok(ready.manifest.restrictions.some(x=>x.reason==='excluded_by_owner'));
+  assert.equal(ready.manifest.items.find(x=>x.versionId===ownerFile.version).reason,'office_owner_file');
   assert.equal(ready.manifest.items.find(x=>x.versionId===child.version).kind, 'technical');
   assert.equal(ready.manifest.items.find(x=>x.versionId===disguisedZip.version).kind, 'archive');
   assert.equal(ready.manifest.items.find(x=>x.versionId===zipChild.version).kind, 'document');
@@ -107,4 +110,27 @@ test('receipt preparation is atomic, replayable and admits only current readable
   const newer = await tx(() => capture(client,input));
   assert.equal(newer.revision,ready.revision+1); assert.notEqual(newer.manifestId,ready.manifestId);
   assert.equal((await client.query('SELECT count(*)::int AS n FROM gateway_jobs')).rows[0].n,0);
+
+  const signature = await add('plan.pdf.sig', 'application/octet-stream');
+  const onlyCopy = await add('drawing.pdf.sig', 'application/octet-stream', disguisedZip.occurrence);
+  const detached = await add('detached.sig', 'application/octet-stream');
+  const unknown = await add('unknown.sig', 'application/octet-stream');
+  const page = (embeddedSha256) => ({ id: '1', locator: { page: 1, signatureKind: 'embedded_pdf', embeddedSha256 } });
+  await map(signature, 'sig', 'cms-v1', [page(pdf.sha)]);
+  await map(onlyCopy, 'sig', 'cms-v1', [page(onlyCopy.sha)]);
+  await map(detached, 'sig', 'cms-v1', [{ id: 'original', locator: { signatureKind: 'signature_detached', coverage: 'original_only' } }]);
+  await map(unknown, 'sig', 'cms-v1', null, { refusal: 'signature_format_unsupported' });
+  const withSignatures = await tx(() => capture(client, input));
+  const byVersion = new Map(withSignatures.manifest.items.map((item) => [item.versionId, item]));
+  assert.equal(byVersion.get(signature.version).reason, 'signature_pdf_duplicate');
+  assert.equal(byVersion.get(signature.version).kind, 'technical');
+  assert.deepEqual(byVersion.get(signature.version).relatedPdf,
+    { occurrenceId: pdf.occurrence, documentId: pdf.document, versionId: pdf.version, label: 'plan.pdf' });
+  assert.equal(byVersion.get(onlyCopy.version).state, 'available');
+  assert.equal(byVersion.get(detached.version).reason, 'signature_detached');
+  assert.equal(byVersion.get(unknown.version).state, 'unavailable');
+  assert.equal(byVersion.get(unknown.version).originalSha256, unknown.sha);
+  const admitted = await client.query('SELECT version_id FROM intake_package_preparation_items WHERE manifest_id=$1 AND version_id=ANY($2::uuid[])',
+    [withSignatures.manifestId, [signature.version, onlyCopy.version, detached.version, unknown.version]]);
+  assert.deepEqual(admitted.rows.map(({ version_id }) => version_id), [onlyCopy.version]);
 });

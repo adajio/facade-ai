@@ -86,7 +86,7 @@ export async function readTerraReading(tx: PoolClient, projectId: string) {
          WHERE cur.project_id=r.project_id AND cur.receipt_id=r.receipt_id AND cur.manifest_id=r.preparation_id))
      GROUP BY r.id ORDER BY r.created_at DESC,r.id DESC LIMIT 1`, [projectId, receipt.receiptId, model]);
   const { rows: [progress] } = await tx.query<{
-    totalWindows: number; mappedVersions: number; completed: number; covered: number; noMatch: number;
+    totalWindows: number; mappedVersions: number; completed: number; covered: number; partial: number; noMatch: number;
     refused: number; held: number; reading: number; queued: number; unassigned: number; heldReasons: unknown; observations: number;
   }>(`WITH accepted AS (SELECT DISTINCT version_id FROM intake_occurrences
        WHERE project_id=$1 AND receipt_id=$2 AND state='accepted'), maps AS (
@@ -104,8 +104,9 @@ export async function readTerraReading(tx: PoolClient, projectId: string) {
          AND (o.run_id=j.job_id OR EXISTS (SELECT 1 FROM harness_package_followups f
            WHERE f.root_job_id=j.job_id AND f.job_id=o.run_id AND f.window_id=j.id AND f.branch='A')))
      SELECT (SELECT count(*)::int FROM windows) AS "totalWindows",(SELECT count(DISTINCT version_id)::int FROM maps) AS "mappedVersions",
-       count(*) FILTER (WHERE state='done' AND result->>'kind' IN ('covered','reviewed_no_match','final_refusal'))::int AS completed,
+       count(*) FILTER (WHERE state='done' AND result->>'kind' IN ('covered','partial','reviewed_no_match','final_refusal'))::int AS completed,
        count(*) FILTER (WHERE state='done' AND result->>'kind'='covered')::int AS covered,
+       count(*) FILTER (WHERE state='done' AND result->>'kind'='partial')::int AS partial,
        count(*) FILTER (WHERE state='done' AND result->>'kind'='reviewed_no_match')::int AS "noMatch",
        count(*) FILTER (WHERE state='done' AND result->>'kind'='final_refusal')::int AS refused,
        count(*) FILTER (WHERE state='held')::int AS held,count(*) FILTER (WHERE state='leased')::int AS reading,

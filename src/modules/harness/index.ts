@@ -179,6 +179,15 @@ async function withReaderSlot<T>(db: Pool, work: () => Promise<T>): Promise<T> {
   }
 }
 
+/** Use the same heavy-reader slot as archive extraction in every worker profile. */
+export function withSharedReaderSlot(db:Pool, base:ReturnType<typeof createRuntimePdfService>) {
+  return {
+    ...base,
+    map: (...args: Parameters<typeof base.map>) => withReaderSlot(db, () => base.map(...args)),
+    open: (...args: Parameters<typeof base.open>) => withReaderSlot(db, () => base.open(...args)),
+  };
+}
+
 export async function startWorker(context: WorkerContext, test?: ManagedTestOptions): Promise<void> {
   const { db, logger, config } = context;
   const profile = test?.profile ?? loadResearchProfile();
@@ -234,11 +243,7 @@ export async function startWorker(context: WorkerContext, test?: ManagedTestOpti
     if (packageEnabled) await activatePackageProjects(db, gateway, packageProjects);
     const base = createRuntimePdfService(db, config, { storage, adapters: createFormatAdapters() });
     runtimeReader = base;
-    const service = {
-      ...base,
-      map: (...args: Parameters<typeof base.map>) => withReaderSlot(db, () => base.map(...args)),
-      open: (...args: Parameters<typeof base.open>) => withReaderSlot(db, () => base.open(...args)),
-    };
+    const service = withSharedReaderSlot(db,base);
     const publish = publication(db, gateway, profile);
     const reader = connectReader(db, service, publish.observation);
     const inquiry = createRuntimeInquiryPorts(db, service, storage.objects);

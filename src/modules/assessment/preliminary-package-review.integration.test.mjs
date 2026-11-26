@@ -25,7 +25,7 @@ test('preliminary review publication and receipt-scoped reading progress', { ski
     for (const name of (await readdir(directory)).filter((n) => n.endsWith('.sql') && !n.startsWith('01_')).sort()) {
       await db.query(await readFile(resolve(directory, name), 'utf8'));
     }
-    const { publishPreliminaryPackageReview, readPreliminaryReadingProgress } = await import(pathToFileURL(resolve(
+    const { publishPreliminaryPackageReview, readPreliminaryReadingProgress, readPreliminaryPackageReviews } = await import(pathToFileURL(resolve(
       process.env.ASSESSMENT_BUILD_ROOT ?? 'dist', 'src/modules/assessment/preliminary-package-review.js')).href);
     const { readTerraReading } = await import(pathToFileURL(resolve(process.env.ASSESSMENT_BUILD_ROOT ?? 'dist', 'src/modules/assessment/terra-reading.js')).href);
     const [org,user,cat,project,receipt,foreignReceipt,original,document,version,occurrence] = Array.from({ length: 10 }, randomUUID);
@@ -70,7 +70,7 @@ test('preliminary review publication and receipt-scoped reading progress', { ski
     await db.query('DELETE FROM intake_receipts WHERE id=$1', [foreignReceipt]);
     const report = await publishPreliminaryPackageReview(db, input);
     assert.deepEqual(await publishPreliminaryPackageReview(db, input), report);
-    const zero = {totalWindows:0,mappedVersions:0,acceptedVersions:1,completed:0,covered:0,noMatch:0,refused:0,held:0,reading:0};
+    const zero = {totalWindows:0,mappedVersions:0,acceptedVersions:1,completed:0,covered:0,partial:0,noMatch:0,refused:0,held:0,reading:0};
     assert.deepEqual(await readPreliminaryReadingProgress(db, project, report.id), zero);
     await assert.rejects(readPreliminaryReadingProgress(db, randomUUID(), report.id), { statusCode:404 });
     const [generation, windowId, jobId] = Array.from({length:3}, randomUUID);
@@ -79,7 +79,8 @@ test('preliminary review publication and receipt-scoped reading progress', { ski
     await db.query('INSERT INTO gateway_generations(project_id,scope_id,generation_id) VALUES($1,NULL,$2)', [project,generation]);
     await db.query('INSERT INTO harness_package_projects(project_id,generation_id) VALUES($1,$2)', [project,generation]);
     await db.query("INSERT INTO harness_package_maps(project_id,version_id,fingerprint,format) VALUES($1,$2,'fixture','pdf')", [project,version]);
-    await db.query("INSERT INTO harness_package_windows(id,project_id,version_id,map_fingerprint,ordinal,place) VALUES($1,$2,$3,'fixture',1,'{}')", [windowId,project,version]);
+    const place = {source:{projectId:project,documentId:document,versionId:version,sha256:hash},unitId:'page-1',page:1};
+    await db.query("INSERT INTO harness_package_windows(id,project_id,version_id,map_fingerprint,ordinal,place) VALUES($1,$2,$3,'fixture',1,$4)", [windowId,project,version,JSON.stringify(place)]);
     await db.query("INSERT INTO gateway_primary(generation_id,id,branch,place) VALUES($1,'primary-a','A','fixture')", [generation]);
     await db.query(`INSERT INTO gateway_jobs(id,project_id,scope_id,generation_id,job_key,kind,purpose,subject_id,obligation_id,spec_hash,payload,priority,state,result)
       VALUES($1,$2,NULL,$3,'fixture','fixture','primary_a','fixture','primary-a','fixture','{}',1,'done','{"kind":"covered"}')`, [jobId,project,generation]);
@@ -97,11 +98,56 @@ test('preliminary review publication and receipt-scoped reading progress', { ski
     assert.equal(overview.progress.observations, 1);
     assert.equal(overview.activity[0].quote, 'Окно');
     assert.equal(overview.activity[0].anchor.locator.page, 1);
+    const { WorkQueue } = await import(pathToFileURL(resolve(
+      process.env.ASSESSMENT_BUILD_ROOT ?? 'dist', 'src/modules/gateway/queue.js')).href);
+    const { readPackageAnalysis } = await import(pathToFileURL(resolve(
+      process.env.ASSESSMENT_BUILD_ROOT ?? 'dist', 'src/modules/harness/package-analysis.js')).href);
+    const limitation = randomUUID();
+    const reason = 'В правой части листа подписи перекрыты.';
+    await db.query(`INSERT INTO reader_observations(id,project_id,version_id,run_id,branch,operation_key,request_sha256,evidence_id,scope_id,payload)
+      VALUES($1,$2,$3,$4,'A','limit',$5,$6,NULL,$7)`, [limitation,project,version,jobId,hash,evidence,
+      JSON.stringify({address:{unitId:'page-1',locator:{page:1}},limitation:reason})]);
+    await db.query("UPDATE gateway_jobs SET state='ready',result=NULL WHERE id=$1", [jobId]);
+    const queue = new WorkQueue(db);
+    const work = await queue.claim({ workerId:'partial-fixture', kinds:['fixture'], leaseMs:10_000 });
+    assert.equal(work.lease.jobId, jobId);
+    const partial = { kind:'partial', reason, evidenceIds:[evidence], observationIds:[observation], limitationIds:[limitation] };
+    assert.equal(await queue.finish(work.lease,partial,{state:'partial',evidenceRef:limitation}),true);
+    assert.deepEqual((await db.query("SELECT state,evidence_ref FROM gateway_primary WHERE generation_id=$1 AND id='primary-a'",[generation])).rows,
+      [{state:'partial',evidence_ref:limitation}]);
+    const afterPartial = await readTerraReading(db, project);
+    const { completed, partial: partlyRead, covered, noMatch, refused, observations } = afterPartial.progress;
+    assert.deepEqual({ completed, partlyRead, covered, noMatch, refused, observations },
+      { completed:1, partlyRead:1, covered:0, noMatch:0, refused:0, observations:2 });
+    assert.ok(afterPartial.activity.some(({ limitation })=>limitation===reason));
+    assert.ok(afterPartial.activity.some(({ quote })=>quote==='Окно'));
+    assert.deepEqual(await readPreliminaryReadingProgress(db, project, report.id),
+      {...zero,totalWindows:1,mappedVersions:1,completed:1,partial:1});
+    const reading = await readPackageAnalysis(db, project);
+    assert.deepEqual(reading.windows[0].branches.A, {
+      status:'partial', reason, jobId, nextAction:null, evidenceIds:[evidence], observationIds:[observation], limitationIds:[limitation],
+    });
+    assert.equal(reading.coverage.completedWindows,0);
     await db.query("INSERT INTO harness_package_windows(id,project_id,version_id,map_fingerprint,ordinal,place) VALUES($1,$2,$3,'fixture',2,'{}')", [randomUUID(),project,version]);
     const pendingOverview = await readTerraReading(db, project);
-    assert.equal(pendingOverview.progress.totalWindows, 2);
+    assert.equal(pendingOverview.progress.totalWindows, 1, 'exclude unassigned windows until preparation admits them');
     assert.equal(pendingOverview.progress.queued, 0);
-    assert.equal(pendingOverview.progress.unassigned, 1);
+    assert.equal(pendingOverview.progress.unassigned, 0);
+    assert.equal(pendingOverview.progress.partial, 1);
+    const revision = {...input,previousReportId:report.id,revisionKey:'9'.repeat(64),draftText:'Уточните узел',
+      rows:[{...input.rows[0],status:'partial',finding:'Приложен узел с ограничением',sources:[...input.rows[0].sources,
+        {versionId:version,originalSha256:hash,anchor:'стр. 2',quote:'Узел 2',limitation:'Выноска обрезана'}]}]};
+    const newer = await publishPreliminaryPackageReview(db,revision);
+    assert.deepEqual(await publishPreliminaryPackageReview(db,revision),newer);
+    await assert.rejects(publishPreliminaryPackageReview(db,{...revision,revisionKey:'8'.repeat(64)}));
+    const listing = await readPreliminaryPackageReviews(db,project);
+    const delta = listing.items.find(r=>r.id===newer.id).changes;
+    assert.equal(delta.baselineId,report.id);
+    assert.equal(delta.rows[0].previousStatus,'present');
+    assert.equal(delta.rows[0].addedSources[0].limitation,'Выноска обрезана');
+    assert.deepEqual(delta.letter,{changed:true,added:['Уточните узел'],removed:['Черновик']});
+    assert.equal(listing.items.find(r=>r.id===report.id).changes.baselineId,null);
+    await db.query('DELETE FROM preliminary_package_reviews WHERE id=$1',[newer.id]);
     const [zipVersion,docxVersion,xmlVersion,zipOcc,docxOcc,xmlOcc] = Array.from({length:6}, randomUUID);
     for (const id of [zipVersion,docxVersion,xmlVersion]) await db.query("INSERT INTO intake_document_versions(id,project_id,document_id,original_id,media_type) VALUES($1,$2,$3,$4,'application/octet-stream')", [id,project,document,original]);
     await db.query("INSERT INTO intake_occurrences(id,project_id,receipt_id,parent_occurrence_id,relative_path,declared_media_type,version_id,state) VALUES($1,$4,$5,NULL,'source.zip','application/zip',$6,'accepted'),($2,$4,$5,$1,'part.docx','application/zip',$7,'accepted'),($3,$4,$5,$2,'word/document.xml','application/xml',$8,'accepted')", [zipOcc,docxOcc,xmlOcc,project,receipt,zipVersion,docxVersion,xmlVersion]);

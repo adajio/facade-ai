@@ -229,6 +229,8 @@ const currentGuidance: Partial<Record<keyof typeof commands, string>> = {
   verify_resolution: 'To say supported, include evidence IDs freshly opened from both assigned supports. Unclear may omit supporting IDs by passing an empty array.',
 };
 
+const terminalPartialGuidance = 'PDF requires a previously delivered visual survey. Use covered after a qualified saved observation, unreadable after a saved addressed limitation, and no_match after reading with evidence and zero observations. Use partial to finish with a saved limitation on the assigned place. Keep any confirmed findings from the readable part. Open actual lines with extract or ocr, or open a detailed image with zoom. Explain what remains unchecked and why. Use request_next to continue reading this place. A no_match result records the search; it is not evidence of absence.';
+
 const functionCall = z.looseObject({
   id: z.string().min(1).max(180),
   type: z.literal('function'),
@@ -335,7 +337,9 @@ export function toolWireFor(job: ResearchJob): ToolWire {
 
 type PairWire = { scopeName: string } | { legacy: true };
 
-export function request(job: ResearchJob, messages: Message[], wire: ToolWire = toolWireFor(job), pair?: PairWire) {
+export function request(
+  job: ResearchJob, messages: Message[], wire: ToolWire = toolWireFor(job), pair?: PairWire, terminalPartial = false,
+) {
   const earlyPair = pair !== undefined;
   const compactPackage = wire === 'package-observation-v2';
   const hasCompound = compactPackage || wire === 'current' || wire === 'compound-v1';
@@ -398,7 +402,8 @@ export function request(job: ResearchJob, messages: Message[], wire: ToolWire = 
           const forms = z.toJSONSchema(verificationArguments, { io: 'input' });
           Object.assign(parameters, forms.oneOf ? { oneOf: forms.oneOf } : { anyOf: forms.anyOf });
         }
-        const guidance = name === 'save_observation' && job.mode === 'primary' && job.packageWindow ? undefined : currentGuidance[name];
+        const guidance = name === 'save_observation' && job.mode === 'primary' && job.packageWindow ? undefined
+          : name === 'finish_reading' && terminalPartial ? terminalPartialGuidance : currentGuidance[name];
         if (guidance) description += ` ${guidance}`;
       }
       if ((wire === 'current' || compactPackage) && name === 'save_compound_observation') {

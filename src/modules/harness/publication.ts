@@ -150,11 +150,12 @@ async function updateQuestion(
     .find(({ id, active }) => id === target.id && active);
   if (!question) return;
   const { rows: [coverage] } = await tx.query<{
-    sealed: boolean; pending: boolean; refused: boolean; input_generation: string;
+    sealed: boolean; pending: boolean; refused: boolean; partial: boolean; input_generation: string;
   }>(
     `SELECT g.sealed,h.input_generation,
        coalesce(bool_or(p.state='pending'),true) AS pending,
-       coalesce(bool_or(p.state='final_refusal'),false) AS refused
+       coalesce(bool_or(p.state='final_refusal'),false) AS refused,
+       coalesce(bool_or(p.state='partial'),false) AS partial
      FROM harness_generations h JOIN gateway_generations g ON g.generation_id=h.id
      LEFT JOIN harness_primary_places hp ON hp.generation_id=h.id AND hp.question_id=$2
      LEFT JOIN gateway_primary p ON p.generation_id=h.id AND p.id=hp.obligation_id::text
@@ -216,6 +217,7 @@ async function updateQuestion(
     ...(!coverage.sealed ? ['inventory_open'] : []),
     ...(coverage.pending ? ['primary_coverage_pending'] : []),
     ...(coverage.refused ? ['primary_place_unreadable'] : []),
+    ...(coverage.partial ? ['primary_place_partially_read'] : []),
     ...(pending ? ['dispute_pending'] : []),
     ...(unclear ? ['dispute_unresolved'] : []),
     ...[...pairLimits].sort(),

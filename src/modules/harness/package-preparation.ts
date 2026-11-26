@@ -2,6 +2,7 @@ import type { Pool, PoolClient } from 'pg';
 import { transaction } from '../gateway/types.js';
 import { capturePackagePreparation, listPackagePreparationVersions, type PreparationInput } from '../intake/package-preparation.js';
 import { verifyStoredDwgDerivative } from '../pdf/index.js';
+import { dxfGroupRecoveryVersion, isDxfGroupRecoveryVersion } from '../formats/dwg-profile.js';
 import type { ReaderService } from './reader.js';
 
 type Receipt = { projectId: string; receiptId: string };
@@ -18,7 +19,10 @@ export async function packagePreparationInput(tx: PoolClient, target: Receipt, r
     if (format === 'dwg') {
       const document = { projectId: target.projectId, documentId: item.documentId, versionId: item.versionId };
       const offline = !version || version.includes(':unavailable');
-      const pinnedVersion = offline ? item.activeReaderVersion ?? version : version;
+      const recovered = item.activeReaderVersion && (offline ? isDxfGroupRecoveryVersion(item.activeReaderVersion)
+        : item.activeReaderVersion === dxfGroupRecoveryVersion(version));
+      const pinnedVersion = offline || recovered ? item.activeReaderVersion ?? version : version;
+      if (recovered) version = pinnedVersion;
       if (pinnedVersion) {
         try {
           const stored = await verifyStoredDwgDerivative(tx, document, pinnedVersion);

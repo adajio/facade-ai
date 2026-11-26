@@ -11,27 +11,32 @@ import { convert, converterFor, withDwgDerivative } from "./conversion.js";
 import type { Converter, Legacy } from "./conversion.js";
 import { buildDwgIndex, dwgReaderProfile, openDwgIndex } from "./dwg-index.js";
 import type { DwgIndex } from "./dwg-index.js";
+import { dxfFramingRevision, dwgVersionPin } from "./dwg-profile.js";
 import { FormatHold, originalOnly, parseText, readInput, readerVersion } from "./model.js";
 import type { Locator, Parsed, Row, Unit } from "./model.js";
 import { cellAddress, parseDocx, parseWordPackage, parseXlsx } from "./office.js";
 import { stampPhysicalInventory } from "./physical-inventory.js";
+import { createRasterAdapter } from "./raster.js";
+import { createSignatureAdapter } from "./cms-signature.js";
+import { isThumbsDbName, parseThumbsDb, thumbsDbFormat } from "./windows-thumbnail-cache.js";
 import { parseDxf, parseIfc } from "./spatial.js";
 
-const formats = ["docx", "xlsx", "txt", "csv", "tsv", "dxf", "ifc", "doc", "xls", "dwg", "rvt", "image", "unknown"] as const;
+const formats = ["docx", "xlsx", "txt", "csv", "tsv", "dxf", "ifc", "doc", "xls", "dwg", "rvt", "image", "sig", thumbsDbFormat, "unknown"] as const;
 type Format = typeof formats[number];
 const supports = new Set<string>(formats);
 const converterFormats = ["doc", "xls", "dwg"] as const;
 const rasterExtensions = new Set(["png", "jpg", "jpeg", "webp", "bmp", "gif", "tiff", "tif", "avif", "heic"]);
 const native = new Map<Format, (input: Buffer, checkInventory: boolean) => Parsed | Promise<Parsed>>([
   ["docx", parseDocx], ["xlsx", parseXlsx], ["txt", parseText], ["csv", parseText], ["tsv", parseText],
-  ["dxf", parseDxf], ["ifc", parseIfc],
+  ["dxf", parseDxf], ["ifc", parseIfc], [thumbsDbFormat, parseThumbsDb],
 ]);
 
 export function resolveFormat(name: string): Format | "pdf" {
+  if (isThumbsDbName(name)) return thumbsDbFormat;
   const extension = /\.([a-z0-9]+)$/i.exec(name)?.[1].toLowerCase();
   if (extension === "pdf") return "pdf";
   if (extension && rasterExtensions.has(extension)) return "image";
-  return extension && supports.has(extension) ? extension as Format : "unknown";
+  return extension && extension !== thumbsDbFormat && supports.has(extension) ? extension as Format : "unknown";
 }
 
 function isLegacy(format: Format): format is Legacy {
@@ -150,7 +155,7 @@ function converted(derived: Parsed, converter: Converter, hash: string, kind: st
 
 function adapter(format: Format): ReaderAdapter {
   const legacy = isLegacy(format) ? format : undefined;
-  const profile = native.has(format) || format === "image" ? "formats-1.1.3"
+  const profile = native.has(format) ? "formats-1.1.3"
     : format === "dwg" ? dwgReaderProfile : format === "doc" ? "formats-1.1.4" : readerVersion;
   const fonts = format === "dwg" ? dwgFontAssets() : undefined;
   let configured: ReturnType<typeof converterFor> | undefined;
@@ -167,7 +172,6 @@ function adapter(format: Format): ReaderAdapter {
 
   async function parse(path: string, checkInventory = false): Promise<Parsed> {
     if (format === "rvt") return originalOnly("rvt_original_only", "original_only");
-    if (format === "image") return originalOnly("image_reader_unsupported", "original_only");
     if (format === "unknown") return originalOnly("format_original_only", "original_only");
     const converter = await resolve();
     try {
@@ -204,7 +208,7 @@ function adapter(format: Format): ReaderAdapter {
   }
 
   async function index(path?: string, source?: SourceRef, expected?: string | number, readerVersion?: string) {
-    const match = readerVersion?.match(/^formats-1\.1\.8:dwg:(sha256:[0-9a-f]{64}):fonts:sha256:([0-9a-f]{64})$/);
+    const match = readerVersion?.match(dwgVersionPin);
     if (match && fonts?.identity !== match[2]) throw new ReaderError("dwg_index_identity_changed", "Шрифты сохранённого DWG изменились", 409);
     const pinnedConverter = match?.[1];
     const cachedPin = source && pinnedConverter && { source, converter: pinnedConverter, reserve: 0 };
@@ -264,6 +268,9 @@ function adapter(format: Format): ReaderAdapter {
     } catch (error) {
       if (!(error instanceof FormatHold)) throw error;
       units = originalOnly(error.code, "held").units.map(mapUnit);
+      if (error.code === "dxf_group_invalid") {
+        units[0].locator = { ...units[0].locator, dxfFraming: dxfFramingRevision };
+      }
     }
     return stampPhysicalInventory(units, { units: [], inventory: { limitation: "dwg_original_inventory_unverified" } },
       format, await version());
@@ -369,7 +376,11 @@ function adapter(format: Format): ReaderAdapter {
 }
 
 export function createFormatAdapters(): ReaderAdapter[] {
-  return formats.map(adapter);
+  return formats.map((format) => {
+    if (format === "image") return createRasterAdapter();
+    if (format === "sig") return createSignatureAdapter();
+    return adapter(format);
+  });
 }
 
 // API endpoints are implemented by the shared reader and registered once.

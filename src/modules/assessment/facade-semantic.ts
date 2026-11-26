@@ -13,7 +13,7 @@ type SemanticItem = {
   box?: Box;
   pendingBranches: ("A" | "B")[];
   blockIds?: string[];
-  reason: "material_not_mapped" | "reading_pending" | "structural_remainder_open" |
+  reason: "material_not_mapped" | "reading_pending" | "reading_partial" | "structural_remainder_open" |
     "semantic_check_missing" | "semantic_independence_unproven";
   nextAction: string;
 };
@@ -46,7 +46,7 @@ const maxItems = 25;
 export function completedReaderJob(window: PackageWindow, branch: "A" | "B") {
   const root = window.branches[branch];
   if (terminal.has(root.status)) return root.jobId;
-  if (root.status !== "held" || !root.jobId || root.reason !== "turn_limit_final") return null;
+  if (!root.jobId || !(root.status === "partial" || root.status === "held" && root.reason === "turn_limit_final")) return null;
   const structure = window.structure?.branches[branch];
   if (!structure?.complete) return null;
   return structure.completedFollowupId ?? null;
@@ -116,13 +116,14 @@ export function assessSemanticRemainder(input: {
       const at = { windowId: window.id, versionId: window.place.source.versionId, unitId: window.place.unitId,
         ...(window.place.box ? { box: window.place.box } : {}) };
       const pending = branches.filter((branch) => !completedReaderJob(window, branch));
+      const partial = pending.some((branch) => window.branches[branch].status === "partial");
       const structural = branches.filter((branch) => !window.structure?.branches[branch].complete);
       const attemptsMissing = attempted.get(window.id) ?? [...branches];
       const blockIds = structural.flatMap((branch) => window.structure?.branches[branch].remaining.map(({ blockId }) => blockId) ?? []);
       items.push({ ...at, pendingBranches: pending.length ? pending : structural.length ? structural :
           attemptsMissing.length ? attemptsMissing : [...branches],
         ...(blockIds.length ? { blockIds: [...new Set(blockIds)].slice(0, maxItems) } : {}),
-        reason: pending.length ? "reading_pending" : structural.length ? "structural_remainder_open" :
+        reason: partial ? "reading_partial" : pending.length ? "reading_pending" : structural.length ? "structural_remainder_open" :
           attemptsMissing.length ? "semantic_check_missing" : "semantic_independence_unproven",
         nextAction: pending.length || structural.length ? resumeReading : checkContent });
       if (items.length >= maxItems) break collect;

@@ -6,7 +6,8 @@
 
   type Item = { occurrenceId: string | null; documentId: string | null; versionId: string | null; label: string;
     state: 'waiting' | 'available' | 'unavailable' | 'excluded'; reason: string | null;
-    kind: 'document' | 'archive' | 'technical' | 'import_entry'; derivativeAvailable: boolean };
+    kind: 'document' | 'archive' | 'technical' | 'import_entry'; derivativeAvailable: boolean; limitations?: string[]; readableParts?: number;
+    relatedPdf?: { occurrenceId: string; documentId: string; versionId: string; label: string } };
   type Preparation = { projectId: string; receiptId: string; state: 'waiting' | 'ready'; manifestId: string | null; revision: number | null;
     counts: { total: number; available: number; unavailable: number; waiting: number; archives: number; technical: number; restrictions: number }; items: Item[];
     restrictions: { label: string; reason: string; sourceId: string }[]; reasons: string[] };
@@ -16,6 +17,10 @@
   let preparation = $state<Preparation>();
   let error = $state('');
   let loadedKey = '';
+  let limited = $derived((preparation?.items ?? []).filter(item => item.state==='available' && item.limitations?.length));
+  let ownerFiles = $derived((preparation?.items ?? []).filter(item => item.reason==='office_owner_file'));
+  let thumbnailCaches = $derived((preparation?.items ?? []).filter(item => item.kind === 'technical' && item.reason === 'windows_thumbnail_cache'));
+  let signatureFiles = $derived((preparation?.items ?? []).filter(({ reason }) => reason === 'signature_pdf_duplicate' || reason === 'signature_detached'));
   let failures = $derived.by(() => {
     const items = (preparation?.items ?? []).filter((item) => item.state === 'unavailable' || item.kind === 'archive' && item.reason);
     const extra: Item[] = (preparation?.restrictions ?? []).filter((restriction) => !items.some((item) =>
@@ -32,7 +37,7 @@
       return true;
     });
   });
-  function card(item: Item) {
+  function card(item: Pick<Item, 'versionId' | 'occurrenceId'>) {
     return scopedUrl(projectId, 'receipts', { document: item.versionId, row: item.occurrenceId }, receiptId);
   }
   function derivative(item: Item) {
@@ -77,7 +82,7 @@
     {:else}
       <p role="status">Подготовка файлов завершена. Доступные документы могут быть переданы на анализ.</p>
     {/if}
-    <p>Документов: {count(counts.total)} · доступно для анализа: {count(counts.available)} · не подготовлено: {count(counts.unavailable)} · ожидают: {count(counts.waiting)}.</p>
+    <p>Документов: {count(counts.total)} · доступно для анализа: {count(counts.available)} · не удалось подготовить: {count(counts.unavailable)} · в очереди подготовки: {count(counts.waiting)}.</p>
     <p class="meta">Архивов: {count(counts.archives)} · служебных частей: {count(counts.technical)} · ограничений при приёме и раскрытии: {count(counts.restrictions)}.</p>
     {#if !preparation.manifestId}<p class="meta">Снимок подготовки этого поступления ещё не закреплён. Показано текущее состояние; ранее сохранённый разбор доступен отдельно.</p>{/if}
     {#if failures.length}
@@ -90,6 +95,41 @@
           {/if}
         </li>
       {/each}</ul>
+    {/if}
+    {#if limited.length}
+      <details><summary>Подготовлены с ограничениями · {count(limited.length)}</summary>
+        <ul>{#each limited as item (item.occurrenceId)}<li><strong>{item.label}</strong> · участков чтения: {count(item.readableParts ?? 0)}.
+          {item.limitations?.map(value => label(value)).join('. ')}.
+          {#if item.occurrenceId}<a href={card(item)}>Открыть документ</a>{/if}
+        </li>{/each}</ul>
+      </details>
+    {/if}
+    {#if ownerFiles.length}
+      <details><summary>Служебные файлы Word · {count(ownerFiles.length)}</summary>
+        <ul>{#each ownerFiles as item (item.occurrenceId)}<li>{item.label}</li>{/each}</ul>
+      </details>
+    {/if}
+    {#if thumbnailCaches.length}
+      <details><summary>Служебные файлы Windows · {count(thumbnailCaches.length)}</summary>
+        <ul>{#each thumbnailCaches as item (item.occurrenceId)}
+          <li><strong>{item.label}</strong> · Кэш миниатюр Windows
+            {#if item.documentId && item.versionId}
+              · <a href={originalUrl(item.documentId, item.versionId)} target="_blank" rel="noopener noreferrer">Открыть оригинал</a>
+            {/if}
+          </li>
+        {/each}</ul>
+      </details>
+    {/if}
+    {#if signatureFiles.length}
+      <details><summary>Файлы подписи · {count(signatureFiles.length)}</summary>
+        <ul>{#each signatureFiles as item (item.occurrenceId)}
+          <li><strong>{item.label}</strong> · {label(item.reason)}.
+            {#if item.documentId && item.versionId}<a href={originalUrl(item.documentId, item.versionId)} download>Скачать оригинал подписи</a>{/if}
+            {#if item.relatedPdf} · <a href={card(item.relatedPdf)}>Связанный PDF · {item.relatedPdf.label}</a>{/if}
+          </li>
+        {/each}</ul>
+        <p class="meta">Действительность электронной подписи здесь не проверялась.</p>
+      </details>
     {/if}
     {#if derivatives.length}
       <details><summary>Машиночитаемые версии DWG · {count(derivatives.length)}</summary>

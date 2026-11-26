@@ -4,7 +4,9 @@
   import { tick, untrack } from 'svelte';
   import TriageBar from '../lib/TriageBar.svelte';
   import PreliminaryStatusBadge from '../lib/PreliminaryStatusBadge.svelte';
-  import { preliminarySourcePlace, preliminarySourceUrl, type PreliminaryStatus, type PreliminaryReview } from '../lib/preliminary-review';
+  import PreliminaryRowChange from '../lib/PreliminaryRowChange.svelte';
+  import PreliminarySources from '../lib/PreliminarySources.svelte';
+  import type { PreliminaryStatus, PreliminaryReview } from '../lib/preliminary-review';
   import { evidenceCounts, hasRemainder, localFinding, matchesSelection, requirementChecked, requirementTitle, triageCounts, type Triage } from '../lib/triage';
   import { conflictMessage, conflictVersion } from '../lib/conflict';
   import { date, label } from '../lib/format';
@@ -413,6 +415,7 @@
     {/if}
     {#snippet selectedRequirement()}
       {#if active}
+      {@const reportRow = preliminaryFor(active)}
       <section class="requirement-detail" id={'review-' + active.id} aria-labelledby={'review-title-' + active.id}>
         <header class="review-header">
         <h2 id={'review-title-' + active.id} bind:this={heading} tabindex="-1">{requirementTitle(active.requirement)}</h2>
@@ -421,15 +424,13 @@
         <div class="requirement-review-grid">
         <div class="requirement-evidence">
           <h3>Что нашла система</h3>
-        {#if preliminaryFor(active)}
-          {@const initial = preliminaryFor(active)!}
-          <p><PreliminaryStatusBadge status={initial.status} /> · {initial.finding}</p>
+        {#if reportRow}
+          <p><PreliminaryStatusBadge status={reportRow.status} /> · {reportRow.finding}</p>
           <h4>Где проверить</h4>
-          {#if initial.sources.length}
-            <ul>{#each initial.sources as source}
-              <li><a href={preliminarySourceUrl(source)} target="_blank" rel="noopener noreferrer">{source.label}</a> · {preliminarySourcePlace(source).label}</li>
-            {/each}</ul>
+          {#if reportRow.sources.length}
+            <PreliminarySources sources={reportRow.sources} label="Основания вывода" />
           {:else}<p>В разборе нет ссылки на конкретный лист. <a href={receiptLink(preliminary!.receiptId)}>Открыть опись поступления</a></p>{/if}
+          <PreliminaryRowChange row={reportRow} changes={preliminary?.changes} />
         {:else}
           <p>{machineResult(active)}</p>
         {/if}
@@ -534,8 +535,7 @@
         {#if active.semanticRemainder}
           {@const remainder = active.semanticRemainder}
           <h3>Независимая проверка содержания</h3>
-          {#if preliminaryFor(active)}<p>Эти числа относятся к независимым проверкам окон A/B. Первичный разбор показан выше.</p>{/if}
-          <p>{remainder.verifiedWindows} из {remainder.totalWindows} окон · {remainder.state === 'open' ? 'Есть остаток' : 'Проверка окон завершена'}</p>
+          <p>Проверено {remainder.verifiedWindows} из {remainder.totalWindows} окон A/B · {remainder.state === 'open' ? 'Есть остаток' : 'Проверка окон завершена'}</p>
           {#if remainder.alternativesVerified !== undefined}
             <p>Альтернативы · {remainder.alternativesVerified ? 'Проверены' : 'Требуют сверки'}</p>
           {/if}
@@ -599,10 +599,15 @@
           <thead><tr><th>Требование</th>{#if showTerra}<th>Что нашла система</th>{:else}<th>Формальный машинный вывод</th><th>Независимая проверка содержания</th>{/if}<th>Решение инженера</th></tr></thead>
           <tbody>
             {#each questions as question (question.id)}
+              {@const reportRow = preliminaryFor(question)}
               <tr id={'matrix-row-' + question.id} class:selected-row={active?.id === question.id}>
                 <td><a id={'requirement-' + question.id} data-triage-row data-inline-requirement={question.id} aria-expanded={active?.id === question.id} aria-controls={active?.id === question.id ? 'review-' + question.id : undefined} onclick={() => { inlineNavigation = true; }} href={url(view, active?.id === question.id ? undefined : question, context.filter)} aria-current={active?.id === question.id ? 'true' : undefined}>{requirementTitle(question.requirement)}</a></td>
                 {#if showTerra}
-                <td>{#if preliminaryFor(question)}<PreliminaryStatusBadge status={preliminaryFor(question)!.status} /><br /><span class="finding-preview">{preliminaryFor(question)!.finding}</span>{:else}Нет текущего разбора по позиции{/if}</td>
+                <td>{#if reportRow}
+                  <PreliminaryStatusBadge status={reportRow.status} />
+                  <span class="finding-preview">{reportRow.finding}</span>
+                  <PreliminaryRowChange row={reportRow} changes={preliminary?.changes} compact />
+                {:else}Нет текущего разбора по позиции{/if}</td>
                 {:else}
                 <td>{machineResult(question)}</td>
                 <td>{question.semanticRemainder
@@ -735,7 +740,7 @@
   </section>
 
   {/if}
-  <details class="card"><summary>Что вошло в проверку · версия {summary.version}</summary>
+  <details class="card"><summary>Что вошло в проверку</summary>
     <div class="card-header">
       {#if overview}<a class="button" href={url()}>Открыть оценку</a>{/if}
       {#if historicalVersion}<a href={scopedUrl(context.project.id, 'completeness', { context: contextId })}>К актуальной оценке</a>{/if}
@@ -751,12 +756,12 @@
           <dt>Типы для выбора матрицы</dt><dd>{summary.profile.confirmedKinds.join(', ')}</dd>
         {/if}
       {/if}
-      <dt>Версия результата проверки</dt><dd>{summary.version}</dd>
+      <dt>Технический снимок входных данных</dt><dd>№{summary.version}. Обновляется при изменении описи, участков чтения и оснований проверки.</dd>
       {#each Object.entries(coverageLabels) as [key, text] (key)}
         {@const boundary = summary.coverage[key as keyof FacadeAssessment['coverage']]}
         <dt>{text}</dt><dd>{boundary.complete ? 'Подтверждено' : reason(boundary.reason ?? 'needs_review')}</dd>
       {/each}
-      <dt>Завершённые окна A/B</dt><dd>{summary.completedWindows} из {summary.activeWindows}</dd>
+      <dt>Окна с подтверждённым охватом A/B</dt><dd>{summary.completedWindows} из {summary.activeWindows}</dd>
       {#if summary.structurallyReviewedWindows !== undefined}
         <dt>Структура проверена обеими ветвями</dt><dd>{summary.structurallyReviewedWindows} из {summary.activeWindows}</dd>
       {/if}

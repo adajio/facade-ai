@@ -45,6 +45,10 @@ export interface ReaderAddress {
 
 export type Representation = 'render' | 'native' | 'ocr';
 
+export function pdfPageFormat(format: string) {
+  return format === 'pdf' || format === 'sig';
+}
+
 export interface ReadRequest {
   address: ReaderAddress;
   representation: Representation;

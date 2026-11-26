@@ -1,4 +1,5 @@
 import { verifyStoredDwgDerivative } from './dwg-derivative.js';
+import { dxfFramingRevision, dxfGroupRecoveryVersion, isDxfGroupHold } from '../formats/dwg-profile.js';
 import { createHash, randomUUID } from 'node:crypto';
 import { createWriteStream } from 'node:fs';
 import { mkdir, mkdtemp, rm, statfs } from 'node:fs/promises';
@@ -14,7 +15,7 @@ import {
   type ArtifactStore, type Box, type DocumentKey, type Evidence, type Observation, type ReaderComponentInput,
   type NativeArtifact, type NativeBlock, type NativePresentation, type ReaderOutput,
   type Original, type PageMap, type PinInput, type ReaderAdapter, type ReaderAddress, type ReaderLine, type ReaderUnit,
-  type ReadRequest, type ReadScope, type ResolveOriginal, type SourceRef, contains, ReaderError, validBox,
+  type ReadRequest, type ReadScope, type ResolveOriginal, type SourceRef, contains, pdfPageFormat, ReaderError, validBox,
 } from './types.js';
 
 const uuid = /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/;
@@ -322,7 +323,7 @@ export function createReaderService(db: Pool, deps: ReaderDependencies, adapters
     });
   }
 
-  async function previewPdfPage(sourceRef: SourceRef, page: number, tx: PoolClient) {
+  async function previewPage(sourceRef: SourceRef, page: number, tx: PoolClient) {
     const source = checkedSource(sourceRef);
     const { rows: [slot] } = await tx.query<{ acquired: boolean }>(
       "SELECT pg_try_advisory_xact_lock(hashtextextended('facade/heavy-local-slot',0)) AS acquired",
@@ -330,15 +331,17 @@ export function createReaderService(db: Pool, deps: ReaderDependencies, adapters
     if (!slot.acquired) throw new ReaderError('reader_resource_wait', 'Просмотрщик занят', 503);
     const { original, adapter, version } = await describe(source, tx);
     const unitId = String(page);
-    const unit = adapter.format === 'pdf' ? (await lookupMap(source, version, tx))?.units.find(({ id }) => id === unitId) : undefined;
+    const raster = adapter.format === 'image';
+    const unit = raster || pdfPageFormat(adapter.format) ? (await lookupMap(source, version, tx))?.units.find(({ id }) => id === unitId) : undefined;
     if (!unit?.width || !unit.height) throw new ReaderError('reader_address_invalid', 'Страница пока недоступна для предпросмотра', 422);
-    const dpi = Math.floor(Math.min(144, 72 * 1600 / Math.max(unit.width, unit.height)));
-    if (original.size > 32 * 1024 ** 2 || dpi < 36) {
+    const dpi = Math.floor(Math.min(raster ? 72 : 144, 72 * (raster ? 1120 : 1600) / Math.max(unit.width, unit.height)));
+    if (!raster && (original.size > 32 * 1024 ** 2 || dpi < 36)) {
       throw new ReaderError('pdf_preview_limit', 'Откройте страницу в полном просмотрщике PDF', 422);
     }
     return withOriginal(original, deps, async path => {
       const output = await adapter.read(path, { representation: 'render', address: { unitId }, dpi }, unit);
       if (output.address.unitId !== unitId || output.mediaType !== 'image/png' || output.bytes.length > 4 * 1024 ** 2) {
+        if (raster) throw new ReaderError('raster_preview_limit', 'Откройте оригинал растрового изображения', 422);
         throw new ReaderError('pdf_preview_limit', 'Откройте страницу в полном просмотрщике PDF', 422);
       }
       return output.bytes;
@@ -358,14 +361,14 @@ export function createReaderService(db: Pool, deps: ReaderDependencies, adapters
   }
 
   async function insertMap(
-    source: SourceRef, original: Original, version: string, adapter: ReaderAdapter, path: string,
+    source: SourceRef, original: Original, version: string, adapter: ReaderAdapter, path: string, client?: PoolClient,
   ): Promise<PageMap> {
     const units = await adapter.inspect(path, source);
     if (new Set(units.map(({ id }) => id)).size !== units.length || units.some(({ id }) => !id || id.length > 200)) {
       throw new ReaderError('reader_inventory_invalid', 'Reader вернул недопустимую карту физических единиц', 422);
     }
     const durable = await adapter.durableInfo?.(source,units,version);
-    return transaction(db, async tx => {
+    const save = async (tx: PoolClient) => {
       const old = adapter.format === 'dwg' ? await lookupMap(source, version, tx) : undefined;
       const oldHash = old?.units.find(unit => typeof unit.locator?.derivativeSha256 === 'string')?.locator?.derivativeSha256;
       const newHash = units.find(unit => typeof unit.locator?.derivativeSha256 === 'string')?.locator?.derivativeSha256;
@@ -392,6 +395,29 @@ export function createReaderService(db: Pool, deps: ReaderDependencies, adapters
         }
       }
       return stored;
+    };
+    return client ? save(client) : transaction(db, save);
+  }
+
+  async function recoverDxfGroup(source: SourceRef, original: Original, adapter: ReaderAdapter, retryVersion: string) {
+    async function existing(tx?: PoolClient) {
+      const current = await lookupMap(source, retryVersion, tx);
+      if (!current) return;
+      if (!current.units.every(({ locator }) => locator?.coverage === 'held' || locator?.coverage === 'original_only')
+        && !await verifyStoredDwgDerivative(tx ?? db, source, retryVersion)) {
+        throw new ReaderError('dwg_derivative_unavailable', 'Нет закреплённой производной после восстановления DWG', 424);
+      }
+      await original.check?.();
+      return current;
+    }
+    const cached = await existing();
+    if (cached) return cached;
+    return transaction(db, async tx => {
+      const { rows: [slot] } = await tx.query<{ acquired: boolean }>(
+        "SELECT pg_try_advisory_xact_lock(hashtextextended('facade/dwg-dxf-recovery/' || $1::text,0)) AS acquired",
+        [source.versionId]);
+      if (!slot.acquired) throw new ReaderError('reader_resource_wait', 'Восстановление этой версии DWG уже выполняется', 503);
+      return await existing(tx) ?? withOriginal(original, deps, path => insertMap(source, original, retryVersion, adapter, path, tx));
     });
   }
 
@@ -592,7 +618,9 @@ export function createReaderService(db: Pool, deps: ReaderDependencies, adapters
   }, tx: PoolClient): Promise<VerifiedNativeDeliveryLine | undefined> {
     const source = checkedSource(sourceRef);
     const { readerVersion, unitId, lineId, submittedEvidenceId, quote, issued } = input;
-    const cached = await indexedNative(source, readerVersion, 'pdf', { address: { unitId }, representation: 'native' });
+    const submitted = await findEvidence(source.projectId, submittedEvidenceId, tx);
+    if (!submitted || !pdfPageFormat(submitted.format)) return;
+    const cached = await indexedNative(source, readerVersion, submitted.format, { address: { unitId }, representation: 'native' });
     const fullAddress = cached?.output.address;
     const full = cached?.output.lines?.filter((line) => line.id === lineId);
     if (!cached || !fullAddress || fullAddress.locator?.page !== Number(unitId) || full?.length !== 1) return;
@@ -601,7 +629,7 @@ export function createReaderService(db: Pool, deps: ReaderDependencies, adapters
       const evidence = await findEvidence(source.projectId, evidenceId, tx);
       const frame = evidence?.address.box;
       if (!evidence || !frame || evidence.runId !== scope.runId || evidence.branch !== scope.branch
-        || evidence.format !== 'pdf' || evidence.representation !== 'native' || evidence.mediaType !== 'application/json'
+        || evidence.format !== submitted.format || evidence.representation !== 'native' || evidence.mediaType !== 'application/json'
         || evidence.readerVersion !== readerVersion || evidence.sha256 !== sha256 || !sameSource(source, evidence.source)
         || evidence.address.unitId !== unitId || evidence.address.locator?.page !== Number(unitId)
         || fingerprint(evidence.address.locator) !== fingerprint(fullAddress.locator)) continue;
@@ -629,7 +657,7 @@ export function createReaderService(db: Pool, deps: ReaderDependencies, adapters
       || evidence.runId !== scope.runId || evidence.branch !== scope.branch) {
       throw new ReaderError('reader_evidence_scope_mismatch', 'Выдача недоступна в этой версии, ветви или запуске', 422);
     }
-    if (evidence.format === 'pdf' && evidence.address.box && candidate.deliveryStatement?.status === 'not_delivered'
+    if (pdfPageFormat(evidence.format) && evidence.address.box && candidate.deliveryStatement?.status === 'not_delivered'
       && verifiedLine?.anchorEvidenceId !== evidence.id) {
       throw new ReaderError('package_non_delivery_unproven', 'Для отрицания по рамке PDF нужна сверенная каноническая строка', 422);
     }
@@ -714,16 +742,16 @@ export function createReaderService(db: Pool, deps: ReaderDependencies, adapters
         const partBytes = view === evidence ? bytes : await content(view);
         if (view.inputImage && view !== evidence) await content(view, 'ocr-input');
         const presentation = JSON.parse(partBytes.toString('utf8')) as NativePresentation;
-        if (view.format === 'pdf' && view.representation === 'native' && view.address.box
+        if (pdfPageFormat(view.format) && view.representation === 'native' && view.address.box
           && (!presentation.address || fingerprint(presentation.address) !== fingerprint(view.address))) {
           throw new ReaderError('reader_artifact_mismatch', 'Адрес сохранённого PDF-фрагмента расходится с выдачей', 424);
         }
         deliveredParts.set(id, { evidence: view, lines: presentation.lines });
       }
-      const needsCanonical = evidence.format === 'pdf' && evidence.representation === 'native' && evidence.address.box
+      const needsCanonical = pdfPageFormat(evidence.format) && evidence.representation === 'native' && evidence.address.box
         && parts.some(({ evidenceId, lineId, link }) => (link.kind === 'same_row' || link.kind === 'source_context')
           && lineId === anchor.lineId && parts[link.to]?.lineId === lineId && parts[link.to].evidenceId !== evidenceId);
-      const canonical = needsCanonical && await indexedNative(source, evidence.readerVersion, 'pdf', {
+      const canonical = needsCanonical && await indexedNative(source, evidence.readerVersion, evidence.format, {
         address: { unitId: evidence.address.unitId, locator: evidence.address.locator }, representation: 'native',
       }, tx);
       compound = groundComponents(parts, deliveredParts, canonical ? canonical.presentation : undefined);
@@ -774,6 +802,12 @@ export function createReaderService(db: Pool, deps: ReaderDependencies, adapters
       if (adapter.format === 'dwg') {
         const current = await lookupMap(source, version);
         if (current && await verifyStoredDwgDerivative(db, source, version)) { await original.check?.(); return current; }
+        const retryVersion = dxfGroupRecoveryVersion(version);
+        if (retryVersion && current && isDxfGroupHold(current.units)) {
+          const framing = current.units[0].locator?.dxfFraming;
+          if (framing === undefined) return recoverDxfGroup(source, original, adapter, retryVersion);
+          if (framing === dxfFramingRevision) { await original.check?.(); return current; }
+        }
         if (version.includes(':dwg:unavailable:')) {
           const { rows: candidates } = await db.query<MapRow>(`SELECT r.* FROM reader_maps r JOIN dwg_derivatives d
             ON d.project_id=r.project_id AND d.document_id=r.document_id AND d.version_id=r.version_id AND d.reader_version=r.reader_version
@@ -798,7 +832,7 @@ export function createReaderService(db: Pool, deps: ReaderDependencies, adapters
       return original.relativePath;
     },
     latestMap, previewDwg,
-    open, pin, findEvidence, content, readPdfFragment, previewPdfPage, materializeNative, readMaterializedNative, verifyNativeDeliveryLine,
+    open, pin, findEvidence, content, readPdfFragment, previewPage, materializeNative, readMaterializedNative, verifyNativeDeliveryLine,
     async findObservation(projectId: string, id: string): Promise<Observation | undefined> {
       const { rows } = await db.query<{ payload: Observation }>(
         'SELECT payload FROM reader_observations WHERE project_id = $1 AND id = $2', [projectId, id],

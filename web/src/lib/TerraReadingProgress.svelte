@@ -4,7 +4,7 @@
     enabled: boolean;
     receipt: { receiptId: string; receiptNumber: number; inventoryOpen: boolean; acceptedVersions: number; rootFiles: number; rootArchives: number; directChildren: number; deeperChildren: number; officeParts: number } | null;
     report: { id: string; createdAt: string; summary: { present: number; partial: number; notFound: number; unassessed: number }; draftAvailable: boolean } | null;
-    progress: { totalWindows: number; mappedVersions: number; completed: number; covered: number; noMatch: number; refused: number; held: number; reading: number; queued: number; unassigned: number; heldReasons: { reason: string; count: number }[]; observations: number } | null;
+    progress: { totalWindows: number; mappedVersions: number; completed: number; covered: number; partial?: number; noMatch: number; refused: number; held: number; reading: number; queued: number; unassigned: number; heldReasons: { reason: string; count: number }[]; observations: number } | null;
     activity: { kind: string; documentId: string; versionId: string; label: string; anchor: SourceAddress | null; text: string | null; quote: string | null; value: string | null; unit: string | null; limitation: string | null; createdAt: string }[];
   };
 </script>
@@ -55,7 +55,7 @@
   <section class="card terra" aria-labelledby="reading-title">
     <h2 id="reading-title">Подробное чтение документов</h2>
     {#if progress && progress.totalWindows}
-      <p data-reading-progress>Завершено участков чтения <strong>{count(progress.completed)} из {count(progress.totalWindows)}</strong>. Сохранено наблюдений <strong>{count(progress.observations)}</strong>.</p>
+      <p data-reading-progress>Результат чтения по <strong>{count(progress.completed)} из {count(progress.totalWindows)}</strong> участков. Сохранено наблюдений <strong>{count(progress.observations)}</strong>.</p>
       {#if progress.reading}<p>Система читает документ.</p>{:else if progress.queued || progress.unassigned}<p>Есть участки, ожидающие чтения.</p>{/if}
       {#if progress.held}<p>Приостановлено участков · {count(progress.held)}.</p>{/if}
       <a href={scopedUrl(slice.projectId, 'facts', { scope: slice.scopeId })}>Все найденные сведения</a>
@@ -72,7 +72,7 @@
       </div>
       <details>
         <summary>Ход чтения по участкам</summary>
-        <p>С находками · {count(progress.covered)}. Без совпадений · {count(progress.noMatch)}. Чтение завершилось отказом · {count(progress.refused)}.</p>
+        <p>С находками · {count(progress.covered)}. Без совпадений · {count(progress.noMatch)}. Чтение завершилось отказом · {count(progress.refused)}.{#if progress.partial !== undefined} Частично прочитано · {count(progress.partial)}.{/if}</p>
         <p>Читается · {count(progress.reading)}. В очереди · {count(progress.queued)}. Ожидают назначения · {count(progress.unassigned)}.</p>
         {#each progress.heldReasons as item}<p>{holdLabels[item.reason] ?? item.reason} · {count(item.count)}</p>{/each}
       </details>

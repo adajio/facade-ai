@@ -87,7 +87,7 @@ export type FacadeAssessment = {
       row?: { value: Citation & { lineId: string; address: SourceAddress }; context: Citation & { lineId: string };
         drawingView?: { title: Citation; scope: Citation; variant: { value: string; mark: string; citation: Citation };
           revision: { value: string; citation: Citation }; stage?: string } };
-      clarification?: { branch: 'A' | 'B'; state: 'route_required' | 'ready' | 'leased' | 'held' | 'done' }[] }[];
+      clarification?: { branch: 'A' | 'B'; state: 'route_required' | 'ready' | 'leased' | 'held' | 'done' | 'partial' }[] }[];
   }[] };
   unresolvedMentions?: { items: MentionSource[]; limited: boolean };
   stage: string | null;
@@ -102,7 +102,7 @@ export type FacadeAssessment = {
 };
 
 export const clarificationLabels = {
-  ready: 'ожидает выполнения', leased: 'выполняется', held: 'на удержании', done: 'завершено',
+  ready: 'ожидает выполнения', leased: 'выполняется', held: 'на удержании', done: 'завершено', partial: 'завершено частично',
 };
 
 export const coverageLabels = {
@@ -128,6 +128,7 @@ export const assessmentReasons: Record<string, string> = {
   inventory_import_incomplete: 'Не все операции импорта завершились успешно',
   material_not_mapped: 'Карта материала ещё не подготовлена',
   reading_pending: 'Ожидается чтение',
+  reading_partial: 'Чтение завершено частично',
   structural_remainder_open: 'Остались непрочитанные блоки',
   semantic_check_missing: 'Содержание ещё не проверено по этому требованию',
   semantic_independence_unproven: 'Независимость проверок не подтверждена',

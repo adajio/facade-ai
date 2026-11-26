@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import { decodeText, FormatHold, unit } from "./model.js";
+import { dxfLineEnding } from "./dwg-text.js";
 import { projectLengthAssignment } from './ifc-units.js';
 import type { CadShape, Locator, Parsed, Row, Unit } from "./model.js";
 import { inventoryLimitation, matchInventory } from "./physical-inventory.js";
@@ -12,8 +13,17 @@ type CadRecord = { entity: boolean; block?: boolean; record: Entity;
 export const first = (record: Entity, code: number): string | undefined =>
   record.groups.find((group) => group.code === code)?.value.trim();
 
+function checkDxfValue(record: Entity, code: number, value: string) {
+  // LibreDWG can emit raw newline bytes within CRLF-framed MTEXT chunks.
+  // A stray delimiter in any other value cannot be accepted as a framing repair.
+  if (/[\r\n]/u.test(value) && !(record.type === "MTEXT" && (code === 1 || code === 3) && !value.includes("\r"))) {
+    throw new FormatHold("dxf_group_invalid");
+  }
+}
+
 function dxfRecords(text: string): Entity[] {
-  const lines = text.split(/\r\n|\n|\r/u);
+  const ending = dxfLineEnding(text);
+  const lines = ending ? text.split(ending) : [text];
   // Preserve empty group values and consume only the physical final newline.
   if (lines.at(-1) === "") lines.pop();
   if (lines.length % 2 || lines.length > 500_000) throw new FormatHold("dxf_group_limit_or_invalid");
@@ -24,6 +34,7 @@ function dxfRecords(text: string): Entity[] {
     if (!/^\d{1,4}$/.test(key)) throw new FormatHold("dxf_group_invalid");
     const code = Number(key);
     const value = lines[offset + 1];
+    checkDxfValue(record, code, value);
     if (code === 0) {
       records.push(record);
       record = { type: value.trim().toUpperCase(), groups: [] };
@@ -128,6 +139,7 @@ export async function* convertedDxfRecords(
       code = Number(line);
       continue;
     }
+    checkDxfValue(record, code, line);
     const header = section === "HEADER" || (record.type === "SECTION" && first(record, 2) === "HEADER");
     if (code === 0) {
       const previous = finish();
