@@ -222,9 +222,33 @@ export function preparePromptSnapshot(snapshot) {
       addMetadata('drawingCoverage',[fileNumbers.get(drawing.versionId),drawing.totalUnits,drawing.nativeUnits.length,
         overview,detail,codes],reserve);
     }
-    // Admit substantive inscriptions before headings and raw glyph fragments. Keep one source
-    // per drawing in each pass and prefer distinct readings across the receipt.
+    // A complete catalog label may live in a caption that the broad material and heading
+    // scores would never admit. Reserve a bounded share, preferring panels actually attached.
     const seenTexts=new Set();
+    const catalog=new Map();
+    for (const drawing of drawings) for (const phrase of drawing.phrases) {
+      const line=lineById.get(phrase.literalId);
+      if (!line || !phrase.relativeBox || !phrase.catalogKeys?.length || Buffer.byteLength(line.text)>650) continue;
+      const {x,y,width,height}=phrase.relativeBox;
+      const visible=sheet.images.some(image=>{
+        const box=image.address.box;
+        return image.versionId===drawing.versionId && image.address.unitId===phrase.unitId && box
+          && x>=box.x && y>=box.y && x+width<=box.x+box.width && y+height<=box.y+box.height;
+      });
+      for (const key of phrase.catalogKeys) {
+        const previous=catalog.get(key);
+        if (!previous || visible && !previous.visible || visible===previous.visible && line.text.length<previous.line.text.length) {
+          catalog.set(key,{line,visible});
+        }
+      }
+    }
+    const drawingNoteReserve=Math.ceil(available*.72);
+    for (const {key} of snapshot.requirements) {
+      const line=catalog.get(key)?.line;
+      if (addLine(line,drawingNoteReserve)) seenTexts.add(line.text.normalize('NFC').toLowerCase().trim());
+    }
+
+    // Give each drawing an opportunity to contribute and prefer distinct material/heading notes.
     function pick(drawing,type,room,uniqueOnly=false) {
       const availableLines=drawing.phrases.filter(phrase=>!type || phrase.type===type)
         .map(phrase=>lineById.get(phrase.literalId)).filter(line=>line && !sent.has(line.id) && Buffer.byteLength(line.text)<=650);

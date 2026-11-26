@@ -43,12 +43,29 @@ test('CAD glyph groups keep coordinate order and exact underlying literals',()=>
   ]);
 });
 
-function syntheticDrawings({missingIndex=false,mismatch=false}={}) {
+test('a native space joins adjacent words but cannot bridge columns, lines or a formatting break',()=>{
+  const entity=(id,text,x,y,width)=>({...glyph(id,text,x,y),drawingBounds:{x,y,width,height:10}});
+  const first=entity('A','Архитектурные',0,20,80.6);
+  const space=entity('B','\\fCAD; ',89.3,20,223.2);
+  const last=entity('C','решения',92.4,20,43.4);
+  const catalog=text=>text==='Архитектурные решения' ? ['doc.architecture'] : [];
+  const [phrase]=groupDrawingPhrases([last,space,first],catalog);
+  assert.equal(phrase.display,'Архитектурные решения');
+  assert.deepEqual(phrase.catalogKeys,['doc.architecture']);
+  assert.deepEqual(phrase.parts.map(({handle})=>handle),['A','B','C']);
+  for (const lines of [[first,entity('B',' ',89.3,20,223.2),entity('C','решения',112,20,43.4)],
+      [first,space,entity('C','решения',92.4,35,43.4)],[first,entity('B','\\P',89.3,20,223.2),last]]) {
+    assert.equal(groupDrawingPhrases(lines,catalog).some(candidate=>candidate.catalogKeys.length),false);
+  }
+});
+
+function syntheticDrawings({missingIndex=false,mismatch=false,stampTitle=false}={}) {
   const files=Array.from({length:11},(_,index)=>({versionId:uuid(20+index),documentId:uuid(40+index),
     originalSha256:sha(`synthetic-dwg-${index}`),format:'dwg',path:`drawing-${index}.dwg`}));
   const source={projectId:uuid(1),receiptId:uuid(2),preparationId:uuid(3),catalogVersionId:uuid(4),stage:'Стадия 1',
     scopeNote:'Синтетический пакет',files,inventory:files.map(({versionId,originalSha256})=>({versionId,originalSha256})),lines:[],totalLines:22,
-    requirements:[{key:'facades',part:'Фасады'}],indexCursor:files.map(file=>({versionId:file.versionId,readerVersion:'dwg-fixture-v1',
+    requirements:[{key:'facades',part:'Фасады'},...(stampTitle ? [{key:'doc.architecture',part:'Раздел АР',
+      aliases:['Архитектурные решения','Лист']}] : [])],indexCursor:files.map(file=>({versionId:file.versionId,readerVersion:'dwg-fixture-v1',
       contract:3,processedUnits:3}))};
   const frame={width:240,height:170};
   const unit=(id,space)=>({id,label:id,...frame,locator:{coverage:'partial',space,candidateCount:5,entityCount:125,
@@ -59,6 +76,11 @@ function syntheticDrawings({missingIndex=false,mismatch=false}={}) {
   const text=new Map([['B1','Условные обозначения'],['B2','Лист 1'],['B3','Плитка'],['B4','под'],['B5','кирпич']]);
   const geometry=[{x:176,y:-9,width:100,height:10},{x:176,y:39,width:36,height:10},
     {x:176,y:83,width:33,height:10},{x:212,y:83,width:16.5,height:10},{x:231,y:83,width:33,height:10}];
+  if (stampTitle) {
+    for (const [id,value] of [['C1','Архитектурные'],['C2',' '],['C3','решения'],['C4','Наружная облицовка см. раздел АР']]) text.set(id,value);
+    for (const [x,width] of [[134,80.6],[223.3,223.2],[226.4,43.4]]) geometry.push({x,y:107,width,height:10});
+    geometry.push({x:134,y:121,width:149,height:6});
+  }
   const db={async query(sql,params){
     if (sql.startsWith('SELECT DISTINCT')) {
       assert.deepEqual(params.slice(0,3),[source.projectId,source.receiptId,source.preparationId]);
@@ -234,4 +256,23 @@ test('an indexed and native glyph mismatch withholds the reconstructed line',asy
   const snapshot=preparePromptSnapshot({...evidence,reviewContract:2});
   assert.ok(snapshot.lines.some(line=>line.text==='Условные обозначения'));
   assert.ok(snapshot.lines.every(line=>line.text!=='Плитка под кирпич'));
+});
+
+test('the ordinary request reserves a catalog name ahead of the isolated stamp attribute and keeps stable sources',async()=>{
+  const fixture=syntheticDrawings({stampTitle:true});
+  const build=async requirements=>preparePromptSnapshot({...(await attachReadingSkills(fixture.db,fixture.reader,'unused',
+    {...fixture.source,requirements})),reviewContract:2});
+  const selected=await build(fixture.source.requirements);
+  const query=makeRequest(selected);
+  const prompt=JSON.parse(query.messages[1].content[0].text);
+  const named=prompt.lines.find(row=>row[3]==='Архитектурные решения');
+  assert.match(named[0],/^P[a-f0-9]{24}$/u);
+  const source=selected.lines.find(line=>line.id===named[0]);
+  assert.deepEqual(JSON.parse(source.anchor).drawingText.parts,[['C1','C1'],['C2','C2'],['C3','C3']]);
+  assert.deepEqual(selected.sheetReading.drawings[0].phrases.find(phrase=>phrase.display.includes('см. раздел АР'))?.catalogKeys,[]);
+  assert.ok(prompt.lines.findIndex(row=>row[0]===named[0]) < prompt.lines.findIndex(row=>row[3]==='Плитка под кирпич'));
+  const prior=await build(fixture.source.requirements.slice(0,1));
+  const material=prior.lines.find(line=>line.text==='Плитка под кирпич');
+  assert.equal(selected.lines.find(line=>line.id===material.id)?.anchor,material.anchor);
+  assert.equal(selected.drawingTextVersion,2);
 });

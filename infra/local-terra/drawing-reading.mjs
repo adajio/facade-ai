@@ -19,7 +19,8 @@ const listedSpace = unit => unit.locator?.space;
 const isPaper = unit => Boolean(listedSpace(unit)) && !/^model$/iu.test(listedSpace(unit));
 const usable = unit => Number.isFinite(unit.width) && unit.width>0 && Number.isFinite(unit.height) && unit.height>0
   && !['held','original_only'].includes(unit.locator?.coverage);
-const ascii = part => part.replace(/\\[fFhHwWqQcCaAtT][^;]*;/gu,'')
+const formatting = /\\[fFhHwWqQcCaAtT][^;]*;/gu;
+const ascii = part => part.replace(formatting,'')
   .replace(/\\S([^;]*);/gu,(_sequence,stack)=>stack.replace(/[\^#]/gu,'/'))
   .replace(/\\P|\\~/gu,' ').replace(/\\[LlOoKk]/gu,'')
   .replace(/%%d/giu,'°').replace(/%%p/giu,'±').replace(/%%c/giu,'⌀')
@@ -44,19 +45,36 @@ const sourceHandle = locator => locator?.derivativeHandle ?? locator?.handle;
 const unitRank = (a,b) => Number(b.locator?.candidateCount ?? 0)-Number(a.locator?.candidateCount ?? 0)
   || Number(b.locator?.entityCount ?? 0)-Number(a.locator?.entityCount ?? 0);
 
-export function groupDrawingPhrases(lines) {
+
+const catalogWords = text => fold(text).replace(/[^\p{L}\p{N}]+/gu,' ').trim();
+
+function drawingCatalog(requirements) {
+  const labels=(requirements ?? []).flatMap(({key,part,aliases,equivalents})=>{
+    const values=[part,...(aliases ?? []),...(equivalents ?? [])].filter(value=>typeof value==='string').map(catalogWords);
+    return [...new Set(values)].filter(value=>value.split(' ').length>1).map(value=>({key,value:' '+value+' '}));
+  });
+  return text=>{
+    // A reference names a destination. It should not outrank the actual inscription.
+    const localText=text.split(/(?:^|[^\p{L}])(?:см\.|смотри(?=$|[^\p{L}])|ссылка\s+на)\s*/iu,1)[0];
+    const words=' '+catalogWords(localText)+' ';
+    return [...new Set(labels.filter(label=>words.includes(label.value)).map(({key})=>key))];
+  };
+}
+
+export function groupDrawingPhrases(lines,catalog=()=>[]) {
   const parts = [];
   for (const line of lines) {
     const box = line.drawingBounds;
     const handle = sourceHandle(line.locator);
     if (!handle || typeof line.text!=='string' || line.text.length>1120 || !box || ![box.x,box.y,box.width,box.height].every(Number.isFinite) || box.width<=0 || box.height<=0) continue;
     const display = ascii(line.text);
-    if (!display.trim() || /\\[a-z0-9]+;/iu.test(display)) continue;
+    const space=/^[ \u00a0]+$/u.test(line.text.replace(formatting,''));
+    if ((!space && !display.trim()) || /\\[a-z0-9]+;/iu.test(display)) continue;
     const widthRatio = box.width/box.height;
     const characters = [...display.trim()].length;
     const hiddenExtent = widthRatio > characters*1.4;
-    const advance = Math.min(box.width,box.height*(hiddenExtent ? .58 : .69)*Math.max(1,characters));
-    parts.push({line,handle,box,display,advance,characters,layer:line.details?.layer ?? null});
+    const advance = Math.min(box.width,box.height*(space ? .30 : hiddenExtent ? .58 : .69)*Math.max(1,characters));
+    parts.push({line,handle,box,display,advance,space,characters,layer:line.details?.layer ?? null});
   }
   parts.sort((a,b)=>a.box.y-b.box.y||a.box.x-b.box.x);
   const rows = [];
@@ -80,18 +98,31 @@ export function groupDrawingPhrases(lines) {
     let group=[], display='';
     function flush() {
       const text=clean(display);
-      if (text.length>=5 && text.length<=480 && /[а-яёa-z]{2}/iu.test(text) && textRank(text)>=4) {
+      const score=textRank(text), catalogKeys=catalog(text);
+      if (text.length>=5 && text.length<=480 && /[а-яёa-z]{2}/iu.test(text) && (score>=4 || catalogKeys.length)) {
         const x=group[0].box.x, y=Math.min(...group.map(part=>part.box.y));
         const right=Math.max(...group.map(part=>part.box.x+part.advance));
         const bottom=Math.max(...group.map(part=>part.box.y+part.box.height));
-        phrases.push({display:text,type:phraseType(text),box:{x,y,width:right-x,height:bottom-y},parts:group,score:textRank(text)});
+        phrases.push({display:text,type:phraseType(text),box:{x,y,width:right-x,height:bottom-y},parts:group,score,catalogKeys});
       }
       group=[];
       display='';
     }
-    for (const part of row.parts) {
+    for (const [position,part] of row.parts.entries()) {
       const previous=group.at(-1), height=Math.min(part.box.height,previous?.box.height ?? part.box.height);
       const gap=previous ? part.box.x-previous.box.x-previous.advance : 0;
+      if (part.space) {
+        const next=row.parts[position+1];
+        // Standalone DXF spaces can carry an inflated box. Use the insertion point and
+        // require close visible glyphs on both sides of this single marker.
+        const right=next ? next.box.x-part.box.x : Infinity;
+        if (previous && !previous.space && next && !next.space && group.length<maxPhraseParts-1
+          && gap>=-height*.32 && gap<=height*1.04 && right>0 && right<=Math.min(height,next.box.height)*.62) {
+          group.push(part);
+          display+=' ';
+        }
+        continue;
+      }
       if (previous?.display===part.display && Math.abs(part.box.x-previous.box.x)<height*.16) continue;
       if (previous && (gap>height*1.04 || gap< -height*.32 || group.length>=maxPhraseParts)) flush();
       const wordSpacing = part.characters>1 || previous?.characters>1 ? .24 : .36;
@@ -198,7 +229,7 @@ function phraseCrop(phrase,kind) {
   if (right>x && bottom>y) return {x,y,width:right-x,height:bottom-y};
 }
 
-async function readDrawing(reader,snapshot,map,deadline) {
+async function readDrawing(reader,snapshot,map,deadline,catalog) {
   const {versionId,documentId,originalSha256,readerVersion,mapFingerprint,units} = map;
   const source = {projectId:snapshot.projectId,documentId,versionId};
   const scope={...source,receiptId:snapshot.receiptId,preparationId:snapshot.preparationId,
@@ -251,31 +282,33 @@ async function readDrawing(reader,snapshot,map,deadline) {
       const pin=address.locator;
       const exactPin=pin?.derivativeFormat==='dxf' && digest.test(pin.derivativeSha256 ?? '') && digest.test(pin.partSha256 ?? '')
         && ['derivativeSha256','partSha256','converterIdentity'].every(key=>pin[key]===unit.locator?.[key]);
-      const groups=groupDrawingPhrases(lines);
+      const groups=groupDrawingPhrases(lines,catalog);
+      const selected=new Set(groups.filter(group=>group.catalogKeys.length));
       for (const type of ['material','heading','stamp','color','note']) {
-        const candidates=groups.filter(group=>group.type===type)
-          .map(phrase=>({...phrase,unit,frame:drawingFrame,pin:exactPin ? pin : undefined}));
-        opened.push(...candidates.slice(0,type==='material' ? 12 : 5));
+        for (const group of groups.filter(group=>group.type===type).slice(0,type==='material' ? 12 : 5)) selected.add(group);
       }
+      opened.push(...[...selected].map(phrase=>({...phrase,unit,frame:drawingFrame,pin:exactPin ? pin : undefined})));
     } catch(error) { note(reason(error,'dwg_native_unavailable'),unit.id); }
   }
   if (!opened.length) note('dwg_no_spatial_text');
   const candidates=opened.map(phrase=>({...phrase,relativeBox:withinFrame(phrase)}));
   candidates.sort((a,b)=>Number(Boolean(b.pin&&b.relativeBox))-Number(Boolean(a.pin&&a.relativeBox))
     || b.score-a.score || Number(b.unit===overviewUnit)-Number(a.unit===overviewUnit));
-  const seen=new Set();
+  const seen=new Set(), reserved=new Set();
   const limits={material:8,heading:4,stamp:1,color:3,note:2};
   for (const phrase of candidates) {
     const key=fold(phrase.display);
-    if (seen.has(key) || limits[phrase.type]<=0) continue;
+    const catalogFirst=phrase.pin && phrase.relativeBox && phrase.catalogKeys.some(requirement=>!reserved.has(requirement));
+    if (seen.has(key) || !catalogFirst && limits[phrase.type]<=0) continue;
     seen.add(key);
-    limits[phrase.type]--;
+    if (catalogFirst) for (const requirement of phrase.catalogKeys) reserved.add(requirement);
+    else limits[phrase.type]--;
 
     const parts=phrase.parts.map(part=>part.line);
     const id=stableId('P',[drawingTextVersion,versionId,originalSha256,readerVersion,phrase.unit.id,
       phrase.pin?.derivativeSha256,phrase.pin?.partSha256,parts.map(part=>part.id),phrase.display]);
     coverage.phrases.push({id,unitId:phrase.unit.id,display:phrase.display,box:phrase.box,relativeBox:phrase.relativeBox,
-      kind:detailKind(phrase),type:phrase.type,pin:phrase.pin,parts});
+      kind:detailKind(phrase),type:phrase.type,catalogKeys:phrase.catalogKeys,pin:phrase.pin,parts});
   }
 
   const detail = new Set();
@@ -317,11 +350,12 @@ export async function readDrawingEvidence(db,reader,snapshot) {
   try { maps=new Map((await readDrawingMaps(db,snapshot,files.map(file=>file.versionId))).map(map=>[map.versionId,map])); }
   catch { maps=new Map(); }
   const deadline=performance.now()+90_000;
+  const catalog=drawingCatalog(snapshot.requirements);
   // Fixed concurrency keeps separate originals independent while bounding CAD raster work.
   for (let i=0;i<files.length;i+=3) {
     const readings=await Promise.all(files.slice(i,i+3).map(async file=>{
       const map=maps.get(file.versionId);
-      if (map?.originalSha256===file.originalSha256 && Array.isArray(map.units)) return readDrawing(reader,snapshot,map,deadline);
+      if (map?.originalSha256===file.originalSha256 && Array.isArray(map.units)) return readDrawing(reader,snapshot,map,deadline,catalog);
       return {coverage:{versionId:file.versionId,totalUnits:0,attemptedUnits:[],nativeUnits:[],overviewIds:[],detailIds:[],phrases:[],
         limitations:[{reason:'dwg_pinned_map_unavailable'}]},images:[]};
     }));
