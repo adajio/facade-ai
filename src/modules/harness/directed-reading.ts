@@ -23,7 +23,7 @@ const maxTermsPerProperty = 12;
 const ignoredWords = '^(проект|документ|материал|налич|предостав|получ|необходим|указан|информац|данн|требован|провер|подтверж|сведени|файл|действующ|применим|текущ|долж|между|после|перед|для|содерж|соответ|drawing|document|source|provided|current|evidence|value|presence|exact|existing|project|required|verify|cannot|include|with|from|when|must)';
 
 // project is a trusted SQL column or parameter expression supplied by the caller.
-function directedReadingScopeSql(project: string) {
+function directedReadingScopeSql(project: string, research = false) {
   return String.raw`WITH intake AS MATERIALIZED (
     SELECT r.id,r.project_id,cur.manifest_id,prep.manifest,p.catalog_version_id,p.project_stage,cat.requirements,
       coalesce(gen.generation,0) AS generation,${inventoryOpen} AS inventory_open
@@ -57,6 +57,7 @@ function directedReadingScopeSql(project: string) {
     LEFT JOIN project_memory_versions pm ON pm.project_id=m.project_id AND pm.version_id=m.version_id
       AND pm.reader_version=m.reader_version AND pm.contract=${memoryVersion}
     WHERE item->>'kind'='document' AND item->>'state'='available'
+      ${research ? 'AND m.refusal IS NULL' : ''}
       AND EXISTS (SELECT 1 FROM intake_occurrences o
         WHERE o.project_id=i.project_id AND o.receipt_id=i.id AND o.version_id=pin.version_id AND o.state='accepted')
       AND NOT EXISTS (SELECT 1 FROM intake_document_versions newer JOIN intake_occurrences o ON o.project_id=newer.project_id
@@ -76,7 +77,7 @@ const scopeStamp = `md5(jsonb_build_array((SELECT manifest_id FROM intake),(SELE
    FROM documents))::text)`;
 
 export function directedReadingPlanSql(project: string, research = false) {
-  return String.raw`${directedReadingScopeSql(project)}, open AS MATERIALIZED (
+  return String.raw`${directedReadingScopeSql(project,research)}, open AS MATERIALIZED (
     SELECT req->>'key' AS requirement,coalesce(property->>'key','') AS property_key,req,
       property->>'label' AS property_label,coalesce(property->'sources',review->'sources') AS sources
     FROM intake i CROSS JOIN report rp
@@ -122,7 +123,7 @@ export function directedReadingPlanSql(project: string, research = false) {
   ), place_index AS MATERIALIZED (
     SELECT w.id,w.version_id,w.ordinal,w.place->>'unitId' AS unit,b.id AS block,
       coalesce(b.remaining && ARRAY['graphics','ocr']::text[],false) AS visual,
-      (d.format IN ('pdf','sig','dwg','dxf','png','jpg','jpeg','tiff','tif','bmp','webp','svg','image')
+      (d.format IN ('pdf','sig','dwg','dxf','image')
         AND coalesce(w.place#>>'{locator,coverage}','addressable')<>'native_only') AS can_open_image
     FROM intake i CROSS JOIN report rp CROSS JOIN documents d
     JOIN intake_package_preparation_windows pin ON pin.project_id=d.project_id AND pin.manifest_id=i.manifest_id
@@ -207,7 +208,7 @@ type DirectedState = { stamp: string; report: string | null; receiptId: string |
 
 const cache = new Map<string, { stamp: string; plan: DirectedReading; expires?: number }>();
 const planning = new Set<string>();
-const scopeStateSql = `${directedReadingScopeSql('$1::uuid')}
+const scopeStateSql = (research: boolean) => `${directedReadingScopeSql('$1::uuid',research)}
   SELECT (SELECT id FROM intake) AS "receiptId",(SELECT id FROM report) AS report,
     EXISTS (SELECT 1 FROM preliminary_package_reviews saved WHERE saved.project_id=$1 AND saved.model='gpt-6.1-terra') AS "earlierReview",
     ix.pending AS "indexPendingVersions",ix.complete AS "indexCompleteVersions",
@@ -225,7 +226,7 @@ export async function readProductionDirectedReadingPlan(tx: PoolClient, projectI
 }
 
 async function readPlan(tx: PoolClient, projectId: string, research: boolean, background?: Pool): Promise<DirectedReading> {
-  const { rows: [{ stamp, report, earlierReview, ...state }] } = await tx.query<DirectedState>(scopeStateSql, [projectId]);
+  const { rows: [{ stamp, report, earlierReview, ...state }] } = await tx.query<DirectedState>(scopeStateSql(research), [projectId]);
   if (!report) return { ...state, mode: earlierReview ? 'waiting_report' : 'ordinary',
     windowIds:[], requirementsByWindow:{}, preparationId:null, openRequirements:0 };
   const cacheKey = research ? projectId + ':production' : projectId;
