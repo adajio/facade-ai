@@ -3,7 +3,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import test from 'node:test';
 import pg from 'pg';
 import { readSnapshot } from '../../../infra/local-terra/producer.mjs';
-import { directedReadingPlanSql, directedWindowAllowed, readProductionDirectedReadingPlan } from '../../../dist/src/modules/harness/directed-reading.js';
+import { directedReadingPlanSql, directedWindowAllowed, readDirectedReadingPlan, readProductionDirectedReadingPlan, receiptReadingStopped } from '../../../dist/src/modules/harness/directed-reading.js';
 import { jobSchema } from '../../../dist/src/modules/harness/contracts.js';
 import { initialMessages } from '../../../dist/src/modules/harness/openrouter.js';
 import { packageStructure } from '../../../dist/src/modules/harness/package-walk.js';
@@ -183,10 +183,11 @@ test('held-out directed reading preserves an open gap and stops after the select
   const coverage=await plan();
   assert.equal(coverage.openRequirements,1,'the literal record leaves overall coverage open');
   assert.deepEqual(coverage.windowIds,[windowIds[25]],'the closed literal does not make its own address a generic target');
-  await report(6,[rows[0],{...partial,analysis:{properties:[inscription,{
+  const openRows=[rows[0],{...partial,analysis:{properties:[inscription,{
     key:'application',label:'Вылет кронштейна',status:'insufficient',sources:[],
     scope:{kind:'undetermined',sources:[ref(14)]},
-  }]}},closedRow]);
+  }]}},closedRow];
+  await report(6,openRows);
   const scopePlan=await plan();
   assert.equal(scopePlan.openRequirements,1);
   assert.ok(scopePlan.windowIds.includes(windowIds[14]),'a separately addressed open property may revisit the same window');
@@ -205,7 +206,16 @@ test('held-out directed reading preserves an open gap and stops after the select
   assert.equal(await deepReadingActivity(db,target,'completed','enough_evidence',{started:1,openRequirements:0}),true);
   assert.deepEqual(await admittedDeepReceipts(db,past),[]);
 
+  await report(8,openRows);
+  assert.equal((await readDirectedReadingPlan(db,project)).mode,'directed');
+  assert.equal(await receiptReadingStopped(db,project,receipt),false);
+  await deepReadingActivity(db,target,'partial','operator_stopped',{started:2});
+  assert.equal(await receiptReadingStopped(db,project,receipt),true);
+  assert.equal((await readDirectedReadingPlan(db,project)).mode,'operator_stopped');
+  assert.equal((await readProductionDirectedReadingPlan(db,project)).mode,'operator_stopped');
+  assert.equal(await directedWindowAllowed(db,project,windowIds[14],true,receipt),false);
+
   await db.query("INSERT INTO intake_receipts(project_id,source,created_by) VALUES($1,'upload',$2)",[project,user]);
-  assert.equal((await plan()).mode,'waiting_report');
+  assert.equal((await readDirectedReadingPlan(db,project)).mode,'waiting_report');
   assert.equal(await directedWindowAllowed(db,project,windowIds[25],true,receipt),false);
 });

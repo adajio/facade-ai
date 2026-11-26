@@ -3,7 +3,7 @@ import { inventoryOpen } from '../intake/receipts.js';
 import { memoryVersion } from '../project-memory/contracts.js';
 
 export type DirectedReading = {
-  mode: 'ordinary' | 'waiting_report' | 'waiting_index' | 'planning' | 'enough_evidence' | 'no_new_targets' | 'directed';
+  mode: 'ordinary' | 'waiting_report' | 'waiting_index' | 'planning' | 'enough_evidence' | 'no_new_targets' | 'operator_stopped' | 'directed';
   windowIds: string[];
   receiptId: string | null;
   preparationId: string | null;
@@ -219,13 +219,25 @@ export function directedReadingPlanSql(project: string, research = false) {
   FROM index_status ix CROSS JOIN planned`;
 }
 
-type DirectedState = { stamp: string; report: string | null; receiptId: string | null; earlierReview: boolean;
+type DirectedState = { stamp: string; report: string | null; receiptId: string | null; earlierReview: boolean; stopped: boolean;
   indexPendingVersions: number; indexCompleteVersions: number; indexPendingUnits: number; indexUnknownVersions: number };
 
 const cache = new Map<string, { stamp: string; plan: DirectedReading; expires?: number }>();
 const planning = new Set<string>();
+// The operator's decision follows this receipt across report revisions and restarts.
+const stoppedReceiptSql = (project: string, receipt: string) => `EXISTS (
+  SELECT 1 FROM project_reading_activity a WHERE a.project_id=${project} AND a.receipt_id=${receipt}
+    AND a.stage='deep_reading' AND a.status='partial' AND a.reason='operator_stopped')`;
+
+export async function receiptReadingStopped(tx: PoolClient, projectId: string, receiptId: string): Promise<boolean> {
+  const {rows:[row]} = await tx.query<{stopped:boolean}>(`SELECT ${stoppedReceiptSql('$1','$2')} AS stopped`,
+    [projectId,receiptId]);
+  return row.stopped;
+}
+
 const scopeStateSql = (research: boolean) => `${directedReadingScopeSql('$1::uuid',research)}
   SELECT (SELECT id FROM intake) AS "receiptId",(SELECT id FROM report) AS report,
+    ${stoppedReceiptSql('$1::uuid','(SELECT id FROM intake)')} AS stopped,
     EXISTS (SELECT 1 FROM preliminary_package_reviews saved WHERE saved.project_id=$1 AND saved.model='gpt-6.1-terra') AS "earlierReview",
     ix.pending AS "indexPendingVersions",ix.complete AS "indexCompleteVersions",
     ix.units AS "indexPendingUnits",ix.unknown AS "indexUnknownVersions",
@@ -242,7 +254,8 @@ export async function readProductionDirectedReadingPlan(tx: PoolClient, projectI
 }
 
 async function readPlan(tx: PoolClient, projectId: string, research: boolean, background?: Pool): Promise<DirectedReading> {
-  const { rows: [{ stamp, report, earlierReview, ...state }] } = await tx.query<DirectedState>(scopeStateSql(research), [projectId]);
+  const { rows: [{ stamp, report, earlierReview, stopped, ...state }] } = await tx.query<DirectedState>(scopeStateSql(research), [projectId]);
+  if (stopped) return { ...state, mode:'operator_stopped', windowIds:[], requirementsByWindow:{}, preparationId:null, openRequirements:0 };
   if (!report) return { ...state, mode: earlierReview ? 'waiting_report' : 'ordinary',
     windowIds:[], requirementsByWindow:{}, preparationId:null, openRequirements:0 };
   const cacheKey = research ? projectId + ':production' : projectId;

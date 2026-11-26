@@ -34,7 +34,7 @@ const [{ readConfig }, { openPool }, { WorkQueue }, { transaction, hash }, { cre
 
 const { packagePreparationSweep, preparedPackageWindow, preparedManifestForWindow, preflightPackageWindow, packagePreparationInput, verifyCurrentPreparation } =
   await load('src/modules/harness/package-preparation.js');
-const { readDirectedReadingPlans, currentDirectedWindow, readProductionDirectedReadingPlan, productionDeepReading } = await load('src/modules/harness/directed-reading.js');
+const { readDirectedReadingPlans, currentDirectedWindow, readProductionDirectedReadingPlan, productionDeepReading, receiptReadingStopped } = await load('src/modules/harness/directed-reading.js');
 const config = readConfig();
 const db = openPool(config.databaseUrl);
 const queue = new WorkQueue(db);
@@ -141,6 +141,7 @@ try {
       }
       if (p.packageWindow.preparationId && (!preparation || !await verifyCurrentPreparation(
         tx,preparation,p.packageWindow.preparationId,p.packageWindow.id))) return {denied:true};
+      if (pending && await receiptReadingStopped(tx,pending.projectId,pending.receiptId)) return {held:'operator_stopped'};
       if (signal.aborted) return {denied:true};
       if (production) {
         if (!pending || !await currentDeepReceipt(tx,pending)) return {denied:true};

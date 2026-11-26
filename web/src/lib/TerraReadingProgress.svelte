@@ -8,7 +8,7 @@
     report: { id: string; createdAt: string; summary: { present: number; partial: number; notFound: number; unassessed: number }; draftAvailable: boolean; hasQuestions?: boolean | null } | null;
     progress: { totalWindows: number; mappedVersions: number; completed: number; covered: number; partial?: number; noMatch: number; refused: number; held: number; reading: number; queued: number; unassigned: number; heldReasons: { reason: string; count: number }[]; observations: number;
       deep?: { status: string; reason: string | null; started: number; limit: number } | null;
-      directed?: { mode: 'ordinary' | 'waiting_report' | 'waiting_index' | 'planning' | 'enough_evidence' | 'no_new_targets' | 'directed'; openRequirements: number;
+      directed?: { mode: 'ordinary' | 'waiting_report' | 'waiting_index' | 'planning' | 'enough_evidence' | 'no_new_targets' | 'operator_stopped' | 'directed'; openRequirements: number;
         indexPendingVersions: number; indexCompleteVersions: number; indexPendingUnits: number; indexUnknownVersions: number; pendingTargets: number };
     } | null;
     activity: { kind: string; documentId: string; versionId: string; label: string; anchor: SourceAddress | null; text: string | null; quote: string | null; value: string | null; unit: string | null; limitation: string | null; createdAt: string }[];
@@ -74,7 +74,8 @@
     <h2 id="reading-title">Подробное чтение документов</h2>
     {#if deep}
       <p data-deep-reading>
-        {#if deep.reason === 'target_limit'}Адресное чтение остановлено с частичным результатом. Достигнут лимит в {count(deep.limit)} участка на поступление.
+        {#if deep.reason === 'operator_stopped'}Углублённое чтение остановлено по решению оператора. Матрица и черновик письма сохранены.
+        {:else if deep.reason === 'target_limit'}Адресное чтение остановлено с частичным результатом. Достигнут лимит в {count(deep.limit)} участка на поступление.
         {:else if deep.reason === 'no_new_targets'}Адресное чтение завершено. Для оставшихся вопросов система не нашла новых участков.
         {:else if deep.reason === 'no_readable_windows'}Адресное чтение остановлено. В подготовленном пакете нет доступных участков для уточнения требований.
         {:else if deep.reason === 'enough_evidence'}Адресное чтение завершено. Для автоматической оценки требований собрано достаточно подтверждений.

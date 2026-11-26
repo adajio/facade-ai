@@ -734,6 +734,32 @@ async function main() {
   const built = path => import(pathToFileURL(join(source,'dist',path)).href);
   const [{readConfig},{createRuntimePdfService},{transaction},{packagePreparationInput,verifyCurrentPreparation}] = await Promise.all([
     built('src/platform/config.js'),built('src/modules/pdf/index.js'),built('src/modules/gateway/types.js'),built('src/modules/harness/package-preparation.js')]);
+  const {receiptReadingStopped}=await built('src/modules/harness/directed-reading.js');
+  if (process.argv[2]==='--stop-receipt') {
+    try {
+      const receiptId=process.argv[3];
+      assert(/^[0-9a-f-]{36}$/i.test(receiptId ?? ''),'invalid_receipt');
+      const {lockIntakeProject}=await built('src/modules/intake/gate.js');
+      const {publishProjectEvent}=await built('src/modules/supplements/events.js');
+      await transaction(db,async tx=>{
+        const {rows:[receipt]}=await tx.query('SELECT project_id FROM intake_receipts WHERE id=$1',[receiptId]);
+        assert(receipt,'receipt_not_found');
+        const projectId=receipt.project_id;
+        await lockIntakeProject(tx,projectId);
+        if (await receiptReadingStopped(tx,projectId,receiptId)) return;
+        const result=await tx.query(`INSERT INTO project_reading_activity
+          (project_id,receipt_id,preparation_id,stage,status,reason,fields,attempt_key)
+          SELECT p.id,cur.receipt_id,cur.manifest_id,'deep_reading','partial','operator_stopped',
+            jsonb_build_object('catalogVersionId',p.catalog_version_id,'projectStage',p.project_stage),'operator_stop:' || cur.receipt_id::text
+          FROM intake_package_preparation_current cur JOIN projects p ON p.id=cur.project_id
+          WHERE cur.receipt_id=$1 AND cur.project_id=$2 ON CONFLICT DO NOTHING`,[receiptId,projectId]);
+        assert(result.rowCount===1,'prepared_receipt_required');
+        await publishProjectEvent(tx,projectId,{type:'package-analysis.changed',payload:{}});
+      });
+      console.log('operator_stopped',receiptId);
+    } finally { await db.end(); }
+    return;
+  }
   const reader=createRuntimePdfService(db,readConfig());
   const shutdown=new AbortController();
   const stop=()=>shutdown.abort();
@@ -746,6 +772,7 @@ async function main() {
       const current=await tx.query('SELECT 1 FROM projects WHERE id=$1 AND catalog_version_id=$2 AND project_stage=$3',
         [target.projectId,snapshot.catalogVersionId,snapshot.stage]);
       if (!current.rowCount) return 'waiting';
+      if (await receiptReadingStopped(tx,target.projectId,target.receiptId)) return 'operator_stopped';
       const held=await production?.hold(tx,snapshot);
       if (held) return held;
       if (shutdown.signal.aborted) return 'waiting';
