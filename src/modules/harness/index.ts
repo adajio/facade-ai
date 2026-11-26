@@ -6,7 +6,7 @@ import { randomUUID } from 'node:crypto';
 import { setTimeout as delay } from 'node:timers/promises';
 import type { Pool } from 'pg';
 import type { WorkerContext } from '../../platform/worker-context.js';
-import { sealManagedTestDatabase, toolHash } from '../../platform/runtime-boundary.js';
+import { releaseManagedTestDatabase, sealManagedTestDatabase, toolHash } from '../../platform/runtime-boundary.js';
 import { createFormatAdapters } from '../formats/index.js';
 import { createGateway, createLiveGateway, journalFromEnv, type CheaperInferenceProfile, type FeatherlessProfile, type OpenRouterProfile, type Step15Approval } from '../gateway/index.js';
 import { approvalIsCurrent } from '../gateway/admission.js';
@@ -317,8 +317,11 @@ export async function startWorker(context: WorkerContext, test?: ManagedTestOpti
   } finally {
     controller.abort();
     await Promise.allSettled(lanes);
-    seal?.release(true);
-    storage.objects.close();
-    await external?.close();
+    try {
+      if (seal) await releaseManagedTestDatabase(seal);
+    } finally {
+      storage.objects.close();
+      await external?.close();
+    }
   }
 }

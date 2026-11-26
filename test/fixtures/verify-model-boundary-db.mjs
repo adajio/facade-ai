@@ -6,7 +6,7 @@ import { createServer } from 'node:net';
 import { setTimeout as delay } from 'node:timers/promises';
 import pg from 'pg';
 import { WorkQueue } from '../../dist/src/modules/gateway/queue.js';
-import { sealManagedTestDatabase } from '../../dist/src/platform/runtime-boundary.js';
+import { releaseManagedTestDatabase, sealManagedTestDatabase } from '../../dist/src/platform/runtime-boundary.js';
 
 assert.match(new URL(process.env.DATABASE_URL).pathname, /^\/test_model_boundary_[a-f0-9]+$/u);
 assert.match(new URL(process.env.FACADE_GATEWAY_JOURNAL_URL).pathname, /^\/journal_model_boundary_[a-f0-9]+$/u);
@@ -80,7 +80,8 @@ try {
     if (job.state === 'held') break;
     await delay(100);
   }
-  assert.deepEqual(job, { state: 'held', reason: 'research_profile_unavailable', payload }, worker.output());
+  // The default reader profile is available even on a stand with no model transport.
+  assert.deepEqual(job, { state: 'held', reason: 'research_gateway_unconfigured', payload }, worker.output());
   assert.match(worker.output(), /mode: 'disabled'/);
   assert.equal((await db.query('SELECT 1 FROM gateway_attempts WHERE job_id=$1', [jobId])).rowCount, 0);
   const appName = new URL(env.DATABASE_URL).pathname.slice(1);
@@ -103,7 +104,7 @@ try {
   assert.deepEqual(await prepared.exited, [0, null], prepared.output());
   process.env.FACADE_MANAGED_TEST_RUN_ID = runId;
   const testConnection = await sealManagedTestDatabase(db);
-  testConnection.release(true);
+  await releaseManagedTestDatabase(testConnection);
   process.env.FACADE_GATEWAY_JOURNAL_URL = env.DATABASE_URL;
   try {
     await assert.rejects(sealManagedTestDatabase(db), /Managed model test journal database identity differs/);

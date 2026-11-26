@@ -75,6 +75,15 @@ export async function verifyManagedTestTarget(client: Pick<PoolClient, 'query'>,
   }
 }
 
+export async function releaseManagedTestDatabase(client: PoolClient) {
+  try {
+    // A new worker may start as soon as stop resolves. Socket close alone races PostgreSQL lock cleanup.
+    await client.query("SELECT pg_advisory_unlock(hashtextextended('facade/model-runtime',0))")
+  } finally {
+    client.release(true)
+  }
+}
+
 export async function sealManagedTestDatabase(db: Pool): Promise<PoolClient> {
   const client = await db.connect()
   try {
