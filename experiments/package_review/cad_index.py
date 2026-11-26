@@ -1,4 +1,4 @@
-"""Neutral, paged navigation of local LibreDWG JSON exports."""
+"""Paged navigation of archived DWG object JSON exports."""
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 import json
@@ -197,7 +197,7 @@ def _load_drawing(path, name):
     for raw in parsed['OBJECTS']:
         handle = _handle(raw.get('handle'))
         if not handle:
-            raise ValueError('Запись LibreDWG без ненулевого handle')
+            raise ValueError('Запись DWG без ненулевого handle')
         if handle in raw_objects:
             raise ValueError(f'Повтор handle {handle:X} в чертеже')
         raw_objects[handle] = raw
@@ -284,7 +284,7 @@ class CadIndex:
 
     @classmethod
     def from_directory(cls, path, mapping):
-        """Read <basename>.json for each dN in the caller-supplied mapping."""
+        """Read archived <basename>.json for each dN in the caller-supplied mapping."""
         directory = Path(path)
         drawings = {}
         for doc, basename in mapping.items():
@@ -299,7 +299,7 @@ class CadIndex:
 
     def overview(self):
         """Show every drawing and give equal entry points to its spaces and groups."""
-        lines = ['CAD | каталог записей локального разбора DWG.',
+        lines = ['CAD | каталог записей сохранённого разбора DWG.',
                  'browse("cad/<документ>") → пространства; далее layers, types и forms. '
                  'В карточках объектов <документ>:hHEX → исходная запись. '
                  'paragraphs и length группируют записи по объёму текста.',

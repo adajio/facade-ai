@@ -24,7 +24,7 @@ const operations = new Map([
   ["/v1/archive", { name: "archive", imageEnv: "FACADE_ARCHIVE_IMAGE" }],
   ["/v1/doc", { name: "doc", imageEnv: "FACADE_OFFICE_IMAGE" }],
   ["/v1/xls", { name: "xls", imageEnv: "FACADE_OFFICE_IMAGE" }],
-  ["/v1/dwg", { name: "dwg", imageEnv: "FACADE_DWG_IMAGE" }],
+  ["/v1/dwg", { name: "dwg" }],
 ]);
 
 class Rejected extends Error {}
@@ -55,22 +55,24 @@ function profileValue(key, fallback, max) {
   return value;
 }
 
-const dwgSeconds = profileValue("FACADE_DWG_TIMEOUT_SECONDS", 420, 3600);
-const dwgMemoryMiB = profileValue("FACADE_DWG_MEMORY_MIB", 1536, 65_536);
-const dwgReserveBytes = profileValue("FACADE_DWG_SCRATCH_RESERVE_BYTES", 1024 ** 3, 99_999_999_999);
-const dwgClientTimeoutMs = largeUploadMs + dwgSeconds * 1000 + dwgTransferMs + 60_000;
 const socketPath = absoluteEnv("FACADE_CONVERTER_SOCKET");
 const scope = createHash("sha256").update(socketPath).digest("hex").slice(0, 24);
 const label = `io.facade.converter-broker=${scope}`;
 const scratch = join(absoluteEnv("FACADE_CONVERTER_SCRATCH"), `broker-${scope}`);
 const images = Object.create(null);
-const dwgEngine = process.env.FACADE_DWG_ENGINE || "oda";
-let dwgIdentity;
-let odaMounts = [];
-const odaIsolation = ["--platform=linux/amd64"];
+let odaProfile;
+const odaIsolation = ["--platform=linux/amd64", "--entrypoint=/usr/local/bin/facade-oda-convert"];
 const tmpfs = "--tmpfs=/tmp:rw,noexec,nosuid,nodev,size=96m,mode=1777";
 
 async function probeOda(image) {
+  if (process.env.FACADE_DWG_ENGINE && process.env.FACADE_DWG_ENGINE !== "oda") {
+    throw new Error("Only ODA is supported for DWG");
+  }
+  if (!imageId.test(image)) throw new Error("FACADE_DWG_IMAGE must contain an image ID");
+  const seconds = profileValue("FACADE_DWG_TIMEOUT_SECONDS", 420, 3600);
+  const memoryMiB = profileValue("FACADE_DWG_MEMORY_MIB", 1536, 65_536);
+  const reserveBytes = profileValue("FACADE_DWG_SCRATCH_RESERVE_BYTES", 1024 ** 3, 99_999_999_999);
+  const clientTimeoutMs = largeUploadMs + seconds * 1000 + dwgTransferMs + 60_000;
   const root = absoluteEnv("FACADE_ODA_ROOT");
   const deps = absoluteEnv("FACADE_ODA_RUNTIME");
   const binaryPin = process.env.FACADE_ODA_BINARY_SHA256;
@@ -88,10 +90,10 @@ async function probeOda(image) {
   if (binary !== binaryPin || !/^[a-f0-9]{64}$/.test(runtime ?? "") || extra !== undefined) {
     throw new Error("ODA distribution identity mismatch");
   }
-  dwgIdentity = `sha256:${createHash("sha256")
+  const identity = `sha256:${createHash("sha256")
     .update(JSON.stringify(["oda", "27.10.0.151591", image, binary, runtime, "ACAD2013", "DXF", 0, 0]))
     .digest("hex")}`;
-  odaMounts = mounts;
+  return { identity, mounts, seconds, memoryMiB, reserveBytes, clientTimeoutMs };
 }
 const stopping = new AbortController();
 let ready = false;
@@ -171,7 +173,7 @@ async function run(id, signal, name, stream) {
     if (name === "archive" && state.ExitCode === 142) throw new Rejected("timeout");
     if (name === "dwg" && [73, 153].includes(state.ExitCode)) throw new Rejected("scratch_unavailable");
     if (state.Status !== "exited" || state.Error) throw new Rejected("unavailable");
-    if (name === "dwg" && dwgEngine === "oda") {
+    if (name === "dwg") {
       if (state.ExitCode === 69) throw new Rejected("oda_unavailable");
       if (state.ExitCode === 74) throw new Rejected("oda_rejected");
     }
@@ -191,13 +193,9 @@ async function streamDwg(path, output, signal) {
   if (!entry.isFile() || entry.nlink !== 1 || !entry.size) throw new Rejected("output_missing");
   const file = await open(path, "r");
   try {
-    const head = Buffer.alloc(128);
     const tail = Buffer.alloc(Math.min(entry.size, 128));
-    const { bytesRead } = await file.read(head, 0, head.length, 0);
     await file.read(tail, 0, tail.length, entry.size - tail.length);
-    const json = /^\s*\{/.test(head.toString("utf8", 0, bytesRead));
-    if (json ? !/}\s*$/.test(tail.toString("ascii"))
-      : !/(?:^|[\r\n])[ \t]*0[ \t]*[\r\n]+EOF[ \t\r\n]*$/.test(tail.toString("ascii"))) {
+    if (!/(?:^|[\r\n])[ \t]*0[ \t]*[\r\n]+EOF[ \t\r\n]*$/.test(tail.toString("ascii"))) {
       throw new Rejected("failed");
     }
 
@@ -233,22 +231,22 @@ async function handle(input, output, expectContinue = false) {
   const operation = operations.get(input.url);
   if (!ready) return reply(output, "unavailable");
   if (input.method === "GET" && input.url === "/v1/info") {
-    return output.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({ ...images, dwgEngine,
-      ...(images.dwg ? { dwgClientTimeoutMs, dwgReserveBytes, dwgIdentity } : dwgEngine === "oda" ? { dwgError: "oda_unavailable" } : {}),
+    return output.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({ ...images, dwgEngine: "oda",
+      ...(odaProfile ? { dwgClientTimeoutMs: odaProfile.clientTimeoutMs, dwgReserveBytes: odaProfile.reserveBytes,
+        dwgIdentity: odaProfile.identity } : { dwgError: "oda_unavailable" }),
     }));
   }
   if (input.method !== "POST" || !operation || input.httpVersion !== "1.1") return reply(output, "invalid_request");
   const { name } = operation;
   const image = images[name];
-  const oda = name === "dwg" && dwgEngine === "oda";
-  if (oda && !image) return reply(output, "oda_unavailable");
-  if (oda && input.headers["x-converter-profile"] !== dwgIdentity) return reply(output, "unavailable");
+  const dwg = name === "dwg";
+  if (dwg && !odaProfile) return reply(output, "oda_unavailable");
+  if (dwg && input.headers["x-converter-profile"] !== odaProfile.identity) return reply(output, "unavailable");
   if (!image || (name !== "archive" && input.headers["x-converter-image"] !== image)) {
     return reply(output, "unavailable");
   }
 
   const archive = name === "archive";
-  const dwg = name === "dwg";
   let size, expanded, entries;
   try {
     size = integer(input.headers["content-length"], archive || dwg ? receiptLimit : formatLimit);
@@ -275,15 +273,15 @@ async function handle(input, output, expectContinue = false) {
   let transferDeadline;
   try {
     const free = await statfs(scratch, { bigint: true });
-    if (free.bavail * free.bsize < BigInt(size) + (dwg ? BigInt(dwgReserveBytes) : 0n)) throw new Rejected("scratch_unavailable");
+    if (free.bavail * free.bsize < BigInt(size) + (dwg ? BigInt(odaProfile.reserveBytes) : 0n)) throw new Rejected("scratch_unavailable");
     directory = await mkdtemp(join(scratch, "job-"));
     const source = join(directory, "input");
     if (expectContinue) output.writeContinue();
     await stage(input, source, size, name, AbortSignal.any([active, uploadDeadline]));
     active.throwIfAborted();
 
-    const destination = archive ? "/source" : oda ? "/input/original.dwg" : `/original.${name}`;
-    const memory = dwg ? `${dwgMemoryMiB}m` : archive ? "1024m" : "512m";
+    const destination = archive ? "/source" : dwg ? "/input/original.dwg" : `/original.${name}`;
+    const memory = dwg ? `${odaProfile.memoryMiB}m` : archive ? "1024m" : "512m";
     const dwgOut = join(directory, "out");
     let dwgDiskArgs = [];
     if (dwg) {
@@ -292,7 +290,7 @@ async function handle(input, output, expectContinue = false) {
       await chmod(dwgOut, 0o733);
       const space = await statfs(dwgOut, { bigint: true });
       // A reader spool may use the same disk. Leave space for both copies and the reserve.
-      const budget = (space.bavail * space.bsize - BigInt(dwgReserveBytes)) / 2n;
+      const budget = (space.bavail * space.bsize - BigInt(odaProfile.reserveBytes)) / 2n;
       if (budget <= 0n) throw new Rejected("scratch_unavailable");
       dwgDiskArgs = ["--mount", `type=bind,src=${dwgOut},dst=/out`, "--ulimit", `fsize=${budget}:${budget}`,
         "--env", `FACADE_DWG_OUTPUT_BUDGET=${budget}`];
@@ -305,14 +303,14 @@ async function handle(input, output, expectContinue = false) {
       "--label", label, "--name", `facade-converter-${randomUUID()}`,
       "--mount", `type=bind,src=${source},dst=${destination},readonly`,
       ...(archive ? [] : [tmpfs]),
-      ...(oda ? [...odaIsolation, ...odaMounts] : []),
+      ...(dwg ? [...odaIsolation, ...odaProfile.mounts] : []),
       ...dwgDiskArgs,
       image, ...(archive ? [String(expanded), String(entries), String(archiveSeconds)] : [name]));
     if (!containerId.test(id)) throw new Error("Invalid container ID");
     creating = false;
     output.setHeader("trailer", dwg ? "x-converter-result, x-converter-sha256, x-converter-bytes" : "x-converter-result");
     output.setHeader("content-type", "application/octet-stream");
-    runDeadline = AbortSignal.timeout(dwg ? dwgSeconds * 1000 : archive ? archiveSeconds * 1000 + 3000 : 35_000);
+    runDeadline = AbortSignal.timeout(dwg ? odaProfile.seconds * 1000 : archive ? archiveSeconds * 1000 + 3000 : 35_000);
     // The extractor limits actual expanded bytes; this caps the framed transport.
     const stream = dwg ? undefined : { output, maxOutput: archive
       ? expanded + entries * 8256 + Math.ceil(expanded / 65_536) * 16 + 64 * 1024 ** 2 : formatLimit };
@@ -365,18 +363,15 @@ server.maxConnections = 32;
 
 try {
   for (const { name, imageEnv } of operations.values()) {
+    if (!imageEnv) continue;
     const id = process.env[imageEnv];
     if (!id) continue;
     if (!imageId.test(id)) throw new Error(`${imageEnv} must contain an image ID`);
     images[name] = id;
   }
-  if (!["oda", "libredwg"].includes(dwgEngine)) throw new Error("Unknown DWG engine");
-  const odaImage = dwgEngine === "oda" ? images.dwg : undefined;
-  if (odaImage) delete images.dwg;
   for (const id of new Set(Object.values(images))) {
     if (await docker("image", "inspect", "--format", "{{.Id}}", id) !== id) throw new Error("Image unavailable");
   }
-  if (images.dwg) dwgIdentity = images.dwg;
   const parent = await lstat(dirname(socketPath));
   if (!parent.isDirectory() || parent.uid !== process.getuid() || (parent.mode & 0o022)) {
     throw new Error("Socket parent must be owned by the broker and writable only by its owner");
@@ -387,12 +382,13 @@ try {
   process.umask(0o077);
   await recover();
   await prepareScratch();
+  const odaImage = process.env.FACADE_DWG_IMAGE;
   if (odaImage) {
     try {
-      await probeOda(odaImage);
+      odaProfile = await probeOda(odaImage);
       images.dwg = odaImage;
     } catch {
-      console.error("ODA unavailable: verify the pinned linux/amd64 launcher, binary hash and read-only mounts");
+      console.error("ODA unavailable: verify the linux/amd64 launcher, binary hash, read-only mounts and DWG settings");
     }
   }
   ready = true;

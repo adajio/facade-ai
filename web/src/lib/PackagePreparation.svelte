@@ -7,6 +7,7 @@
   type Item = { occurrenceId: string | null; documentId: string | null; versionId: string | null; label: string;
     state: 'waiting' | 'available' | 'unavailable' | 'excluded'; reason: string | null;
     kind: 'document' | 'archive' | 'technical' | 'import_entry'; derivativeAvailable: boolean; limitations?: string[]; readableParts?: number;
+    derivative?: { readerVersion: string };
     drawingPdf?: { occurrenceId: string; documentId: string; versionId: string; label: string };
     relatedPdf?: { occurrenceId: string; documentId: string; versionId: string; label: string } };
   type Preparation = { projectId: string; receiptId: string; state: 'waiting' | 'ready'; manifestId: string | null; revision: number | null;
@@ -43,7 +44,8 @@
     return scopedUrl(projectId, 'receipts', { document: item.versionId, row: item.occurrenceId }, receiptId);
   }
   function derivative(item: Item) {
-    return '/api/v1/documents/' + id(item.documentId!) + '/versions/' + id(item.versionId!) + '/dwg-derivative';
+    const path = '/api/v1/documents/' + id(item.documentId!) + '/versions/' + id(item.versionId!) + '/dwg-derivative';
+    return item.derivative ? path + '?readerVersion=' + encodeURIComponent(item.derivative.readerVersion) : path;
   }
   $effect(() => {
     const project = projectId;

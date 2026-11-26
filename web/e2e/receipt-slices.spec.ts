@@ -128,6 +128,51 @@ test('Карточка TIFF показывает разные физически
   await expect(page).toHaveURL(/[?&]page=2(?:&|$)/);
 });
 
+test('Скачивание DWG следует версии карты в карточке', async ({ page }) => {
+  const filename = 'Синтетический чертёж.dwg';
+  const sha256 = 'a'.repeat(64);
+  const content = `/api/documents/${documentId}/versions/${versionId}/content`;
+  const reader = `/api/v1/documents/${documentId}/versions/${versionId}`;
+  const first = 'formats-1.1.8:dwg:historical';
+  const next = 'formats-1.1.9-oda:dwg:current';
+  const derivative = (version: string) => reader + '/dwg-derivative?readerVersion=' + encodeURIComponent(version);
+  let readerVersion = first;
+  await page.route('**' + api + '/work-slices/' + currentSlice + '/receipts/' + receiptId + '/inventory*', (route) => route.fulfill({ json: {
+    ...inventory, workSliceId: currentSlice, inventoryRevision: '1:1', historical: true,
+    occurrences: [{ ...inventory.occurrences[0], relativePath: filename, sha256, mediaType: 'application/octet-stream' }],
+  } }));
+  await page.route('**' + content, (route) => route.fulfill({ headers: { etag: `"sha256-${sha256}"` }, body: '' }));
+  await page.route('**' + reader + '/reader/units', (route) => route.fulfill({ json: {
+    source: { documentId, versionId, sha256 }, readerVersion, format: 'dwg', units: [],
+  } }));
+  let releaseNext!: () => void;
+  const nextHead = new Promise<void>(resolve => { releaseNext = resolve; });
+  const checks: (string | null)[] = [];
+  await page.route('**' + reader + '/dwg-derivative*', async route => {
+    expect(route.request().method()).toBe('HEAD');
+    const checked = new URL(route.request().url()).searchParams.get('readerVersion');
+    checks.push(checked);
+    if (checked === next) await nextHead;
+    await route.fulfill({ status: 200, body: '' });
+  });
+
+  await page.goto(receipts + '/' + receiptId + '?workSlice=' + currentSlice);
+  await page.getByRole('link', { name: 'Карточка документа' }).click();
+  const download = page.getByRole('link', { name: 'Скачать машиночитаемую версию DWG' });
+  await expect(download).toHaveAttribute('href', derivative(first));
+
+  try {
+    readerVersion = next;
+    await page.locator('.sync-menu > summary').click();
+    await page.getByRole('button', { name: 'Обновить сейчас' }).click();
+    await expect.poll(() => checks).toEqual([first, next]);
+    await expect(download).toHaveCount(0);
+  } finally {
+    releaseNext();
+  }
+  await expect(download).toHaveAttribute('href', derivative(next));
+});
+
 test('Опись показывает сохранённый оригинал подписи и открывает PDF с теми же байтами', async ({ page }) => {
   const signatureDocument = '70000000-7000-4000-8000-000000000001';
   const signatureVersion = '80000000-8000-4000-8000-000000000001';

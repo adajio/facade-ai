@@ -14,7 +14,7 @@ export const first = (record: Entity, code: number): string | undefined =>
   record.groups.find((group) => group.code === code)?.value.trim();
 
 function checkDxfValue(record: Entity, code: number, value: string) {
-  // LibreDWG can emit raw newline bytes within CRLF-framed MTEXT chunks.
+  // Some DXF exports contain raw newline bytes within CRLF-framed MTEXT chunks.
   // A stray delimiter in any other value cannot be accepted as a framing repair.
   if (/[\r\n]/u.test(value) && !(record.type === "MTEXT" && (code === 1 || code === 3) && !value.includes("\r"))) {
     throw new FormatHold("dxf_group_invalid");

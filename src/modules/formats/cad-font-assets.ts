@@ -114,9 +114,11 @@ function readAssets(configured?: string) {
 }
 
 export type CadFontAssets = ReturnType<typeof readAssets>;
+export const emptyDwgFontAssets = readAssets();
 let loaded: { root?: string; fonts: CadFontAssets } | undefined;
 export function dwgFontAssets() {
   const root = process.env.FACADE_DWG_FONT_DIR;
+  if (!root) return emptyDwgFontAssets;
   if (!loaded || loaded.root !== root) loaded = { root, fonts: readAssets(root) };
   return loaded.fonts;
 }

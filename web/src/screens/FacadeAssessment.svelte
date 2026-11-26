@@ -608,6 +608,7 @@
                 <td>{#if reportRow}
                   <PreliminaryStatusBadge status={reportRow.status} />
                   <span class="finding-preview">{reportRow.finding}</span>
+                  {#if reportRow.retained}<small class="meta">В карточке есть основания из предыдущего разбора</small>{/if}
                   <PreliminaryRowChange row={reportRow} changes={preliminary?.changes} compact />
                 {:else}Нет текущего разбора по позиции{/if}</td>
                 {:else}

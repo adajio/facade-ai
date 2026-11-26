@@ -96,13 +96,11 @@ ODA File Converter 27.10. Поставка монтируется в конте�
 и 35 с на конвертацию. DWG использует потоковый вход до 10 ГиБ поступления
 и дисковую производную с бюджетом свободного места. Изолированный профиль
 DWG по умолчанию допускает 1536 МиБ RAM и 420 с. ODA запрашивает
-текстовый DXF R2013 с audit=0 и recursion=0. Явный профиль
-`FACADE_DWG_ENGINE=libredwg` использует прежний образ, режим R2013 для AC1027
-и восстановление JSON при неполном DXF. Одноразовый `/tmp` конвертера
+текстовый DXF R2013 с audit=0 и recursion=0. Одноразовый /tmp конвертера
 остаётся 96 МиБ. Контейнер получает один вход только для чтения.
 
 Приложение связывает ID образа и SHA-256 производной с выданным представлением.
-DWG reader версии `formats-1.1.4` обходит DXF потоком. Каждая сущность
+DWG reader обходит DXF потоком. Каждая сущность
 `ENTITIES` входит в одну основную часть. Часть ограничена 512 строками,
 6000 фигурами и 2 МиБ проекции строк. ID одиночного пространства сохраняется.
 Части многосоставного пространства различаются порядковым суффиксом.
@@ -134,7 +132,7 @@ SHA-256 частей. Временные сборки очищаются при 
 карты и уже записанные доказательства принадлежат своим версиям.
 
 - LibreOffice поставляется по MPL 2.0, новый код проекта доступен также по LGPL 3.0+. [Условия проекта](https://www.libreoffice.org/licenses/).
-- GNU LibreDWG поставляется по GPLv3+. Dockerfile закрепляет SHA-256 бинарного архива, а манифест сборки указывает архив исходников. [GNU LibreDWG](https://www.gnu.org/software/libredwg/manual/html_node/Overview.html).
+Поставка ODA подключена по отдельному пути, доступному оператору. [Условия применения](test/dwg-d4/oda-terms.md).
 
 ### Воспроизведение
 
@@ -157,79 +155,9 @@ worker с управляемыми чтениями и две ветви. Опц
 [Сценарии просмотрщика](test/viewer-scenarios.md) ·
 [Оригиналы](test/fixtures/) · [Контрольные места](test/gold/expected.json)
 
-### Готовый вход для стенда шага 14 · DWG
+### Проверка DWG на стенде
 
-`dwg` упаковывает тот же проверенный JLL-бинарник GNU LibreDWG 0.13.4+0
-с glibc. ARM64 и AMD64 имеют отдельные закреплённые SHA-256, а упаковка
-выбирает один архив для целевой архитектуры. В образ входят `dwg2dxf`,
-его библиотека и текст GPLv3+. [Манифест JLL](https://raw.githubusercontent.com/JuliaBinaryWrappers/LibreDWG_jll.jl/LibreDWG-v0.13.4%2B0/Artifacts.toml) ·
-[Исходник и рецепт сборки JLL](https://github.com/JuliaBinaryWrappers/LibreDWG_jll.jl/tree/LibreDWG-v0.13.4%2B0).
-
-Команды для владельца [стенда](../../../infra/test-stand/README.md) в Docker-контексте OrbStack
-на внешнем SSD. На Mac ARM64 явно выбран `linux/arm64`. Для будущего x86-64
-профиля подставляется `linux/amd64`.
-
-```bash
-docker --context orbstack build --platform linux/arm64 --target dwg \
-  --tag facade-ai-dwg:0.13.4-jll src/modules/formats
-dwg_image_id="$(docker --context orbstack image inspect --format '{{.Id}}' facade-ai-dwg:0.13.4-jll)"
-docker --context orbstack run --rm --pull=never --network=none --read-only \
-  "$dwg_image_id" version-dwg
-```
-
-Передайте `dwg_image_id` в `FACADE_DWG_IMAGE` брокера шага 14, подключите его
-Unix-сокет к worker и перезапустите worker. В новую синтетическую область
-загрузите [schedule.dwg](test/fixtures/schedule.dwg) обычным API или через
-интерфейс. Ожидаются две физические единицы Model и Paper и два независимых
-чтения Model. Контроль Model — B и C с разными составами и одинаковым
-итогом 70 mm. При чтении B исходный путь доступен через `versionId`, адрес
-производной — `space: Model, derivativeHandle: 2E`. Открытие возвращает
-`cad_converted_handle_unverified` и карту подстановки шрифта для этой фикстуры.
-Управляемый маршрут можно контролировать по выдаче с типом
-`application/json` и закреплённому PNG. Проверяйте назначенные места и
-фактическую выдачу с исходным SHA-256, затем карточку. У запуска с
-недоступным образом ожидается адресное удержание `dwg_converter_unavailable`.
-
-Архив ARM64, использованный в измерении, сохранён на внешнем SSD в каталоге
-`databases/test_step11_2d254d04f627/tmp/step11-check.NF38hU/dwg-reference/libredwg.tgz`
-под корнем стенда. Ожидаемый SHA-256
-`9564f3befabc1baca44747ce79f8caadbca774412846fccfa77e1e74d48f902f`.
-
-Работающий worker проверяется без OpenRouter на новой синтетической БД и
-отдельном журнале (`infra/test-stand/stand add-journal "$db_env"`). В окружение
-прогона передаётся адрес подключённого к DWG брокера.
-
-```bash
-FACADE_STEP11_STAND=1 FACADE_STEP11_WORKER_DWG=1 \
-  node --test src/modules/formats/test/stand.test.mjs
-```
-
-Сценарий загружает DWG штатным API, запускает `startWorker` и запрашивает
-обзор и извлечение у обеих ветвей через управляемый транспорт. Он сверяет
-SHA-256 фактически полученного PNG, обе строки Model, сохранённые наблюдения,
-адрес производной и нулевую сумму внешнего журнала.
-
-В текущем стенде закрепите DWG вместе с уже подключёнными семействами
-через `stand broker-up "$archive_image" "$office_image" "$dwg_image_id"`.
-Для закрытого теста на Linux используйте выделенную БД, журнал и текущий
-готовый reader-образ шага 14. Журнал доступен в закрытой Docker-сети.
-Сценарий можно запустить в одноразовом процессе со штатными модулями worker:
-
-```bash
-infra/test-stand/stand migrate "$image" "$db_env"
-run="$(dirname -- "$db_env")"
-docker --context orbstack run --rm --pull=never --init --read-only \
-  --user "$(id -u):$(id -g)" --network facade-ai-test-server_private \
-  --memory=768m --cpus=1 --env-file "$run/runtime.env" \
-  -e FACADE_DATA_DIR=/data/objects -e TMPDIR=/data/tmp -e FACADE_GATEWAY_LIVE_MODE= \
-  -e FACADE_CONVERTER_SOCKET=/run/facade-ai-stand-converters/broker.sock \
-  -e FACADE_STEP11_STAND=1 -e FACADE_STEP11_WORKER_DWG=1 \
-  --mount "type=bind,source=$run/objects,target=/data/objects" \
-  --mount "type=bind,source=$run/tmp,target=/data/tmp" \
-  --mount "type=bind,source=$(pwd)/src/modules/formats/test,target=/app/src/modules/formats/test,readonly" \
-  --mount type=volume,source=facade-ai-test-server_converter-socket,target=/run/facade-ai-stand-converters,readonly \
-  "$image" --test /app/src/modules/formats/test/stand.test.mjs
-```
+Запустите закреплённую обёртку ODA и подключите сокет к reader по [инструкции стенда](../../../infra/test-stand/README.md#брокер-конвертеров). Проверьте ответ /v1/info, SHA-256 и версию производной, затем откройте сохранённую строку или геометрию через приложение. При ошибке конкретного файла опись сохраняет его имя и причину. Изменение профиля чтения сохраняет происхождение ранее опубликованных доказательств.
 
 ### Адресная диагностика после слепого прогона
 

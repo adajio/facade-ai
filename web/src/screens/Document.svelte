@@ -32,8 +32,7 @@
   let readerError = $state('');
   let workError = $state('');
   let originalError = $state('');
-  let derivativeState = $state<{ versionId: string; available: boolean }>();
-  let derivativeError = $state('');
+  let derivativeState = $state<{ url: string; available: boolean; error?: string }>();
   let ready = $state(false);
   let heading: HTMLHeadingElement;
   let viewer = $state<HTMLHeadingElement>();
@@ -50,6 +49,9 @@
   const mapReady = $derived(work?.mapReady);
   const path = $derived('/api/documents/' + id(documentId) + '/versions/' + id(versionId));
   const original = $derived(path + '/content');
+  const derivativeUrl = $derived(!context.masked && cadVersion
+    ? V1 + path.slice(4) + '/dwg-derivative?readerVersion=' + encodeURIComponent(cadVersion) : undefined);
+  const derivative = $derived(derivativeState?.url === derivativeUrl ? derivativeState : undefined);
   const isPdf = $derived(occurrence.mediaType === 'application/pdf');
   const alternatePreview = $derived(previewMap?.versionId === versionId ? previewMap : undefined);
   const paged = $derived(isPdf || Boolean(alternatePreview));
@@ -164,25 +166,23 @@
   });
 
   $effect(() => {
-    const version = versionId;
-    const url = V1 + path.slice(4) + '/dwg-derivative';
-    const isDwg = /\.dwg$/iu.test(occurrence.relativePath) || Boolean(cadVersion);
+    const url = derivativeUrl;
     derivativeState = undefined;
-    derivativeError = '';
-    if (!isDwg || context.masked) return;
+    if (!url) return;
     const controller = new AbortController();
     let timer: ReturnType<typeof setTimeout> | undefined;
-    async function checkDerivative() {
+    const checkDerivative = async () => {
       try {
         await api.response(url, { method: 'HEAD', signal: controller.signal });
-        if (!controller.signal.aborted) { derivativeState = { versionId: version, available: true }; derivativeError = ''; }
+        if (!controller.signal.aborted) derivativeState = { url, available: true };
       } catch (error) {
         if (controller.signal.aborted || interrupted(error)) return;
-        derivativeState = { versionId: version, available: false };
-        derivativeError = error instanceof ApiError && error.status === 404 ? '' : describe(error);
+        derivativeState = {
+          url, available: false, error: error instanceof ApiError && error.status === 404 ? undefined : describe(error),
+        };
         timer = setTimeout(checkDerivative, 30_000);
       }
-    }
+    };
     void checkDerivative();
     return () => { controller.abort(); if (timer) clearTimeout(timer); };
   });
@@ -255,14 +255,14 @@
           {/if}
         {/if}
         <a class="button" href={original} download={occurrence.relativePath.split('/').at(-1)}>Скачать оригинал</a>
-        {#if derivativeState?.versionId === versionId && derivativeState.available}
-          <a class="button" href={V1 + path.slice(4) + '/dwg-derivative'}>Скачать машиночитаемую версию DWG</a>
+        {#if derivative?.available}
+          <a class="button" href={derivative.url}>Скачать машиночитаемую версию DWG</a>
         {/if}
       </div>
     {/if}
   </div>
   <Notice kind="error" message={originalError} />
-  {#if derivativeError}<Notice kind="error" message={'Машиночитаемая версия DWG · ' + derivativeError} />{/if}
+  {#if derivative?.error}<Notice kind="error" message={'Машиночитаемая версия DWG · ' + derivative.error} />{/if}
   {#if !ready && !originalError && !workError}<p role="status">Проверяем доступ к оригиналу…</p>{/if}
   {#if selectedPage !== undefined && ready && paged && !context.masked}
     <section class="original" aria-labelledby="document-viewer">

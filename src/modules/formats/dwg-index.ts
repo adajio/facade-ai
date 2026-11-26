@@ -20,7 +20,7 @@ import type { CadDefinition, CadFontUse, Unit } from "./model.js";
 import { appendCadEntity, cadMetadata, cadSpace, convertedDxfRecords, first, recoveryCadRecords } from "./spatial.js";
 import type { Entity } from "./spatial.js";
 
-import { dwgReaderProfile } from "./dwg-profile.js";
+import { dwgReaderProfile, historicalDwgReaderProfile } from "./dwg-profile.js";
 
 export { dwgReaderProfile } from "./dwg-profile.js";
 const rowsPerPart = 512;
@@ -29,14 +29,14 @@ const textPerPart = 2 * 1024 ** 2;
 const hash = (value: string) => createHash("sha256").update(value).digest("hex");
 const short = (value: string) => hash(value).slice(0, 24);
 
-type Pin = { source: SourceRef; converter: string; reserve: number };
+type Pin = { source: SourceRef; converter: string; reserve: number; profile?: typeof dwgReaderProfile | typeof historicalDwgReaderProfile };
 type IndexedUnit = { unit: Unit; digest: string };
 type IndexIdentity = { converter: string; derivative: string; kind: "dxf" | "dwg-json"; fonts?: string };
 
 function location(pin: Pin, fonts: CadFontAssets) {
   if (!process.env.FACADE_DATA_DIR) return;
   return join(process.env.FACADE_DATA_DIR, "dwg-index", hash(JSON.stringify([
-    dwgReaderProfile, pin.source.projectId, pin.source.sha256, pin.converter, fonts.identity,
+    pin.profile ?? dwgReaderProfile, pin.source.projectId, pin.source.sha256, pin.converter, fonts.identity,
   ])));
 }
 
@@ -116,7 +116,8 @@ export async function openDwgIndex(pin: Pin, fonts = dwgFontAssets()): Promise<D
   try {
     db = new DatabaseSync(path, { readOnly: true, allowExtension: false });
     const index = new DwgIndex(db);
-    if (index.identity.converter !== pin.converter || index.identity.fonts !== fonts.identity) throw new ReaderError(
+    if (index.identity.converter !== pin.converter || index.identity.fonts !== fonts.identity
+        || (index.identity.kind !== "dxf" && (index.identity.kind !== "dwg-json" || pin.profile !== historicalDwgReaderProfile))) throw new ReaderError(
       "dwg_index_identity_changed", "Профиль сохранённой производной DWG изменился", 409);
     return index;
   } catch (error) {
@@ -171,6 +172,7 @@ async function compileDwgIndex(
     const head = Buffer.alloc(128);
     const { bytesRead } = await file.read(head, 0, head.length, 0);
     const recovery = /^\s*\{/.test(head.toString("utf8", 0, bytesRead));
+    if (recovery && pin?.profile !== historicalDwgReaderProfile) throw new FormatHold("dwg_derivative_format_invalid");
     const kind = recovery ? "dwg-json" : "dxf";
     const utf16 = (head[0] === 0xff && head[1] === 0xfe) || (head[0] === 0xfe && head[1] === 0xff);
     const issues = new Set<string>();
@@ -411,7 +413,12 @@ async function compileDwgIndex(
       if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
     }
     await clean();
-    return (await openDwgIndex(pin!, fonts))!;
+    const cached = await openDwgIndex(pin!, fonts);
+    if (!cached || cached.identity.derivative !== sha || cached.identity.kind !== kind) {
+      await cached?.close();
+      throw new ReaderError("dwg_index_identity_changed", "Производная DWG изменилась при сохранении индекса", 409);
+    }
+    return cached;
   } catch (error) {
     records?.close();
     output?.close();

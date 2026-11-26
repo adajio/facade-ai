@@ -14,7 +14,8 @@ import { compactCatalog, duration, emitActivity, measureRequest, messageEntryByt
   prioritizeEvidence, remainingRequestBytes, responseUsage } from './request-budget.mjs';
 
 import { analysisFields, citationSchema, readAnalysis, record as reviewRecord, renderQuestions, validText } from './review-analysis.mjs';
-export { reconcilePreliminaryReview } from './review-continuity.mjs';
+import { recoverPreparationFindings } from './review-continuity.mjs';
+export { reconcilePreliminaryReview, recoverPreparationFindings } from './review-continuity.mjs';
 
 const MODEL = 'gpt-6.1-terra';
 const sha = s => createHash('sha256').update(s).digest('hex');
@@ -521,7 +522,8 @@ export async function processReceipt({db,receiptId,stateDir,modelCall,publish,ad
     await notify(saved.snapshot,'rejected',fingerprint,base,error.message);
     return `primary_rejected:${error.message}`;
   }
-  const publication=await publish(db,input);
+  const recovered=await recoverPreparationFindings(db,input,saved.snapshot.stage);
+  const publication=await publish(db,recovered);
   const publishedAt=Date.now();
   await atomicWrite(statePath,{...saved,state:'published',publishedAt:new Date(publishedAt).toISOString(),reviewId:publication?.id});
   await notify(saved.snapshot,'published',fingerprint,{...base,reviewId:publication?.id,

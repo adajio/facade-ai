@@ -1,5 +1,5 @@
 import { verifyStoredDwgDerivative } from './dwg-derivative.js';
-import { dxfEncodingRecoveryVersion, dxfEncodingRevision, dxfFramingRevision, dxfGroupRecoveryVersion, isDxfEncodingHold, isDxfGroupHold } from '../formats/dwg-profile.js';
+import { dxfEncodingRecoveryVersion, dxfEncodingRevision, dxfFramingRevision, dxfGroupRecoveryVersion, isDxfEncodingHold, isDxfGroupHold, isOdaDwgVersion, isOdaRejection } from '../formats/dwg-profile.js';
 import { listPinnedDwgPredecessors } from '../intake/dwg-predecessor.js';
 import { createHash, randomUUID } from 'node:crypto';
 import { createWriteStream } from 'node:fs';
@@ -428,7 +428,7 @@ export function createReaderService(db: Pool, deps: ReaderDependencies, adapters
       const cached = await adapter.readCached(source, request, unit, readerVersion);
       if (cached) return cached;
     }
-    return withOriginal(original, deps, path => adapter.read(path, request, unit, undefined, source));
+    return withOriginal(original, deps, path => adapter.read(path, request, unit, undefined, source, readerVersion));
   }
 
   async function previewDwg(document: DocumentKey, input: ReadRequest) {
@@ -463,7 +463,7 @@ export function createReaderService(db: Pool, deps: ReaderDependencies, adapters
       for (const unit of selected) {
         const request = { address: { unitId: unit.id }, representation: 'native' as const };
         try {
-          yield await adapter.read(path, request, unit, undefined, source);
+          yield await adapter.read(path, request, unit, undefined, source, readerVersion);
         } catch (error) {
           if (!(error instanceof ReaderError)) throw error;
           yield error;
@@ -494,7 +494,7 @@ export function createReaderService(db: Pool, deps: ReaderDependencies, adapters
       const cached = await adapter.readCachedNativeUnits(source, selected, readerVersion);
       if (cached) return consume(cached);
     }
-    await withOriginal(original, deps, path => consume(adapter.readNativeUnits?.(path, selected, source) ?? readUnits(path)));
+    await withOriginal(original, deps, path => consume(adapter.readNativeUnits?.(path, selected, source, readerVersion) ?? readUnits(path)));
   }
 
   async function readMaterializedNative(projectId: string, artifact: NativeArtifact) {
@@ -558,10 +558,13 @@ export function createReaderService(db: Pool, deps: ReaderDependencies, adapters
     }
     if (!output) {
       const map = await lookupMap(source, version);
+      if (!map && version !== described.version) {
+        throw new ReaderError('reader_map_unavailable', 'Закреплённая карта оригинала недоступна', 404);
+      }
       output = map ? await readMapped(source, original, adapter, request, selected(map), map.readerVersion)
         : await withOriginal(original, deps, async path => {
           const fresh = await insertMap(source, original, version, adapter, path);
-          return adapter.read(path, request, selected(fresh), undefined, source);
+          return adapter.read(path, request, selected(fresh), undefined, source, fresh.readerVersion);
         });
     }
     if (output.address.unitId !== request.address.unitId || (output.address.box && !validBox(output.address.box))) {
@@ -815,7 +818,8 @@ export function createReaderService(db: Pool, deps: ReaderDependencies, adapters
           return prior;
         }
         const current = await lookupMap(source, version);
-        if (current && await verifyStoredDwgDerivative(db, source, version)) { await original.check?.(); return current; }
+        if (current && (isOdaDwgVersion(version) && isOdaRejection(current.units)
+          || await verifyStoredDwgDerivative(db, source, version))) { await original.check?.(); return current; }
         const retryVersion = dxfGroupRecoveryVersion(version);
         if (retryVersion && current && isDxfGroupHold(current.units)) {
           const framing = current.units[0].locator?.dxfFraming;

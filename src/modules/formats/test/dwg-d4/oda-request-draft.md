@@ -19,7 +19,7 @@ location]. The participating users and beneficiaries would be
 [entity and location for each group]. Please identify the geographic,
 export and beneficiary conditions that apply to each of these uses.
 
-1. A one-time internal CLI comparison with LibreDWG, first on original
+1. A one-time internal CLI comparison against saved baseline results, first on original
    synthetic drawings and then, where permitted, on DWGs held internally
    with client permission. No drawings would be transmitted to ODA.
 2. Unattended installation of the pinned DEB from an authorized source

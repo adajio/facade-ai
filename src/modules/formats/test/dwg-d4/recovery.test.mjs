@@ -9,12 +9,12 @@ import {pathToFileURL} from "node:url";
 
 const root = process.env.FACADE_STEP11_DIST ?? resolve("dist");
 const load = (file) => import(pathToFileURL(join(root,"src/modules",file)).href);
-const [{buildDwgIndex},{derivativeLines},{parseDxf,convertedDxfRecords},{dxfEncodingRecoveryVersion,dxfEncodingRevision,dxfGroupRecoveryVersion,dxfFramingRevision,legacyDxfEncodingHold,legacyDxfGroupHold}] = await Promise.all([
+const [{buildDwgIndex},{derivativeLines},{parseDxf,convertedDxfRecords},{dxfEncodingRecoveryVersion,dxfEncodingRevision,dxfGroupRecoveryVersion,dxfFramingRevision,dwgReaderProfile,historicalDwgReaderProfile,legacyDxfEncodingHold,legacyDxfGroupHold}] = await Promise.all([
   load("formats/dwg-index.js"),load("formats/dwg-text.js"),load("formats/spatial.js"),load("formats/dwg-profile.js"),
 ]);
 const sha = value => createHash("sha256").update(value).digest("hex");
 const converter = `sha256:${"b".repeat(64)}`;
-const readerVersion = `formats-1.1.8:dwg:${converter}:fonts:sha256:${"c".repeat(64)}`;
+const readerVersion = `${historicalDwgReaderProfile}:dwg:${converter}:fonts:sha256:${"c".repeat(64)}`;
 
 function dxf(type, label, ending, invalidCode="20") {
   return ["0","SECTION","2","ENTITIES","0",type,"5","AB","10","1",invalidCode,"2","40","3",
@@ -229,52 +229,71 @@ test("reader and package dispatcher recover only historical DXF framing and enco
   assert.equal(input.verifiedDerivatives[recoverable.versionId].derivativeSha256,derivative);
   assert.equal(input.verifiedDerivatives[repairEncoding.versionId].derivativeSha256,derivative);
 
-  await t.test("one admitted predecessor retains old successes and holds and sends new versions to the new converter",async()=>{
+  await t.test("ODA upgrade keeps admitted evidence and records outcomes only for new or held DWG",async()=>{
     const [{capturePackagePreparation,readPackagePreparation},{transaction}]=await Promise.all([
       load("intake/package-preparation.js"),load("gateway/types.js"),
     ]);
     const old=await transaction(db,tx=>capturePackagePreparation(tx,input));
     assert.equal(old.state,"ready");
     const backup=process.env.FACADE_DWG_PREDECESSOR_ID, backupTime=process.env.FACADE_DWG_PREDECESSOR_BEFORE;
+    const backupReprocess=process.env.FACADE_DWG_REPROCESS_VERSION_IDS;
     try {
       process.env.FACADE_DWG_PREDECESSOR_ID=converter;
       process.env.FACADE_DWG_PREDECESSOR_BEFORE=(await db.query("SELECT clock_timestamp() AS ts")).rows[0].ts.toISOString();
       const nextConverter=`sha256:${"d".repeat(64)}`;
-      const nextVersion=readerVersion.replace(converter,nextConverter);
+      const nextVersion=readerVersion.replace(historicalDwgReaderProfile,dwgReaderProfile).replace(converter,nextConverter);
       const readCalls=[];
+      const rejection=[{id:"original",label:"Оригинал",locator:{coverage:"held",limitations:"converter_oda_rejected"}}];
       const nextService=createReaderService(db,deps,[{
         format:"dwg",version:async()=>nextVersion,
-        async inspect(_path,source){ readCalls.push(source.versionId);return usable; },
-        async durableInfo(source){ return durable(source,nextConverter); },
+        async inspect(_path,source){
+          readCalls.push(source.versionId);
+          return [healthy.versionId,invalidEncoding.versionId].includes(source.versionId) ? rejection : usable;
+        },
+        async durableInfo(source,units){ if (units[0].locator.derivativeSha256) return durable(source,nextConverter); },
       }]);
       const nextReader={...nextService,formatFor:()=>"dwg"};
       const view=()=>transaction(db,async tx=>readPackagePreparation(tx,await packagePreparationInput(tx,{projectId,receiptId},nextReader)));
-      const archived=await view();
-      assert.equal(archived.manifestId,old.manifestId);
-      assert.equal(archived.items.find(item=>item.versionId===healthy.versionId).state,"available");
-      assert.equal(archived.items.find(item=>item.versionId===invalidEncoding.versionId).reason,"text_encoding_unconfirmed");
+      process.env.FACADE_DWG_REPROCESS_VERSION_IDS=healthy.versionId; // Stale setting from the pre-fix candidate.
       assert.equal((await nextService.map(healthy)).readerVersion,readerVersion);
-      assert.equal((await nextService.map(invalidEncoding)).readerVersion,encodingRetry);
-      assert.equal(await preparePackageMap(db,queue,nextReader,[projectId]),false);
-      assert.deepEqual(readCalls,[]);
-
+      await db.query(`INSERT INTO reader_maps(project_id,document_id,version_id,reader_version,receipt_id,original_sha256,format,units)
+        VALUES($1,$2,$3,$4,$5,$6,'dwg',$7)`,
+      [projectId,healthy.documentId,healthy.versionId,nextVersion,receiptId,healthy.sha256,JSON.stringify(rejection)]);
       const fresh=await fixture("after-cutover",undefined);
-      assert.equal(await preparePackageMap(db,queue,nextReader,[projectId]),true);
-      const freshMap=await nextService.map(fresh);
-      assert.equal(freshMap.readerVersion,nextVersion);
-      assert.deepEqual(readCalls,[fresh.versionId]);
+      const replacements=[malformed,invalidEncoding,current,currentEncoding,fresh];
+      for (let i=0;i<replacements.length;i++) assert.equal(await preparePackageMap(db,queue,nextReader,[projectId]),true);
       assert.equal(await preparePackageMap(db,queue,nextReader,[projectId]),false);
+      for (const source of replacements) assert.equal((await nextService.map(source)).readerVersion,nextVersion);
+      assert.deepEqual((await nextService.map(invalidEncoding)).units,rejection);
+      assert.deepEqual(readCalls.toSorted(),replacements.map(source=>source.versionId).toSorted());
+      const currentPreparation=await view();
+      const healthyItem=currentPreparation.items.find(item=>item.versionId===healthy.versionId);
+      assert.equal(healthyItem.readerVersion,readerVersion);
+      assert.equal(healthyItem.state,"available");
+      assert.equal(healthyItem.derivative.derivativeSha256,derivative);
+      assert.equal(currentPreparation.items.find(item=>item.versionId===invalidEncoding.versionId).reason,"converter_oda_rejected");
+      const {rows:[snapshot]}=await db.query("SELECT manifest FROM intake_package_preparations WHERE id=$1",[old.manifestId]);
+      assert.equal(snapshot.manifest.items.find(item=>item.versionId===invalidEncoding.versionId).reason,"text_encoding_unconfirmed");
 
-      await rm(join(scratch,"dwg-derivatives",healthy.projectId,healthy.documentId,healthy.versionId,derivative));
-      assert.equal((await view()).items.find(item=>item.versionId===healthy.versionId).reason,"derivative_unverified");
-      await assert.rejects(nextService.map(healthy),{code:"dwg_predecessor_derivative_unavailable"});
+      const {rows: [active]}=await db.query(`SELECT fingerprint,reader_version FROM harness_package_maps
+        WHERE version_id=$1 AND active`,[healthy.versionId]);
+      assert.deepEqual(active,{fingerprint:"healthy",reader_version:readerVersion});
+      assert.equal((await nextService.map(healthy)).readerVersion,readerVersion);
+      assert.equal((await db.query("SELECT count(*)::int AS n FROM intake_package_preparation_items WHERE manifest_id=$1 AND version_id=$2",
+        [old.manifestId,healthy.versionId])).rows[0].n,1);
+
+      await rm(join(scratch,"dwg-derivatives",recoverable.projectId,recoverable.documentId,recoverable.versionId,derivative));
+      assert.equal((await view()).items.find(item=>item.versionId===recoverable.versionId).reason,"derivative_unverified");
+      await assert.rejects(nextService.map(recoverable),{code:"dwg_predecessor_derivative_unavailable"});
       assert.equal(await preparePackageMap(db,queue,nextReader,[projectId]),false);
-      assert.deepEqual(readCalls,[fresh.versionId]);
+      assert.deepEqual(readCalls.toSorted(),replacements.map(source=>source.versionId).toSorted());
     } finally {
       if (backup===undefined) delete process.env.FACADE_DWG_PREDECESSOR_ID;
       else process.env.FACADE_DWG_PREDECESSOR_ID=backup;
       if (backupTime===undefined) delete process.env.FACADE_DWG_PREDECESSOR_BEFORE;
       else process.env.FACADE_DWG_PREDECESSOR_BEFORE=backupTime;
+      if (backupReprocess===undefined) delete process.env.FACADE_DWG_REPROCESS_VERSION_IDS;
+      else process.env.FACADE_DWG_REPROCESS_VERSION_IDS=backupReprocess;
     }
   });
 });

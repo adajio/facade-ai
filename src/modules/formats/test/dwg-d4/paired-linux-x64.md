@@ -1,4 +1,4 @@
-# Синтетическое сравнение LibreDWG и ODA · Linux x86-64
+# Синтетическое сравнение архивного профиля и ODA · Linux x86-64
 
 24.11.2026, база `bdcf3829af87c7cb87231416f193e827873c3c76`.
 Входы — восемь записей [манифеста](corpus.json). До запуска и внутри
@@ -14,7 +14,7 @@
   `sha256:a3bba7dc7dbcc1f37c2856c51fc9a7fac96608f50cb87b1b4e4d8b8c85ae988e`.
   Сеть отключена, корень и входы read-only, лимиты 1 CPU, 512 МиБ,
   64 процесса, 96 МиБ tmpfs, 35 секунд на преобразование.
-- LibreDWG 0.13.4 JLL amd64, архив SHA-256
+- Архивный конвертер 0.13.4 JLL amd64, архив SHA-256
   `521216527b73f953c26c6202e972676ad14c8ad812fc15f9c4af31ae2681f0b4`.
   ODA File Converter DEB 27.10.0.0, build 27.10.0.151591, SHA-256
   `c432002cc688f89ddf6a68ad68e877cd16da1d99ab8729386009c552cf73beb5`.
@@ -38,7 +38,7 @@
 доступных строк reader по пространствам. Хэши указаны сокращённо.
 Значения в колонках времени относятся к одному запуску процесса.
 
-| DWG / SHA-256 | LibreDWG · выход и reader | ODA · выход и причина | LibreDWG / ODA, мс |
+| DWG / SHA-256 | Архивный профиль · выход и reader | ODA · выход и причина | Архивный профиль / ODA, мс |
 | --- | --- | --- | ---: |
 | `schedule` · `f2c9e2d20e11` | 14 226 Б, полный DXF, Model 8 / Paper 1, 3/3. Строки B/C имеют разные адреса 2E/2F | exit 0, DXF отсутствует, `AcDbDictionary` → `AcDbEntity` | 468 / 3904 |
 | `recovery` · `7153dd21a60e` | exit 0, усечённый DXF 6195 Б, отсутствуют `ENTITIES` и `EOF`. Отдельный JSON возвратил 2/2 | exit 0, DXF отсутствует, `Null object Id` | 213 / 1503 |
@@ -49,17 +49,17 @@
 | `xref-foreign` · `4e67ca02abf2` | 12 753 Б, полный DXF, Model 1, 1/1, 99 mm | exit 0, DXF отсутствует, `AcDbDictionary` → `AcDbEntity` | 299 / 1860 |
 | `cyrillic` · `0e420bdfb0ba` | 13 281 Б, полный DXF, Model 2 / Paper 1, 3/3 | exit 0, DXF отсутствует, `AcDbDictionary` → `AcDbEntity` | 343 / 1306 |
 
-LibreDWG дал **6/8 полных DXF**, в них 10/10 размеченных контролей.
+Архивный конвертер дал **6/8 полных DXF**, в них 10/10 размеченных контролей.
 JSON-восстановление и ожидаемый отказ учтены отдельно. ODA дал **0/8
 DXF**. Reader в повторе результатов ODA удержал восемь файлов. Причины
 `converter_output_missing` на семи файлах и `dwg_signature_invalid` на одном.
-Пик RSS LibreDWG 4 604–11 500 КиБ, ODA 107 768–109 980 КиБ. Эти времена
+Пик RSS архивного профиля 4 604–11 500 КиБ, ODA 107 768–109 980 КиБ. Эти времена
 ODA относятся к попыткам с ошибкой чтения. Сравнение скорости успешного
 преобразования и профиль производительности целевого VPS остаются открытыми.
 
 ## XREF и диагностика
 
-- При отсутствии, принятой, устаревшей и чужой соседней XREF LibreDWG
+- При отсутствии, принятой, устаревшей и чужой соседней XREF архивный конвертер
   вернул один SHA-256 DXF
   `4cbf6505e76a66915f5dcbe503e7cef66367a7a681060984e5ec25a52973d65c`.
   Во всех выходах есть путь `xref-target.dwg`, собственные 70 mm хоста
@@ -69,7 +69,7 @@ ODA относятся к попыткам с ошибкой чтения. Ср�
 - Отдельный повтор ODA `audit=1` на семи входах с DWG-сигнатурой.
   У всех exit 0 и прежняя ошибка в `.err`, DXF отсутствует. Заведомо
   неверная сигнатура исключена из этого повтора.
-- Отдельный `dwgread -O JSON` для `recovery` дал 10 935 Б, SHA-256
+- Отдельный экспорт объектов в JSON для `recovery` дал 10 935 Б, SHA-256
   `dfa012b55a356b55959174ee46f5dd13e787962766e077f923c78093bb533957`.
   Адаптер сохранил 5 строк Model, включая обе опоры 13.25 и 28.5 mm,
   `cad_dwg_json_recovery` и частичную точность адреса.
@@ -88,7 +88,7 @@ stderr пусты, DXF SHA-256
 Результат подтверждает работоспособность запуска, порядка аргументов
 и чтения DWG R2000, записанного ODA.
 
-Шесть однотипных ошибок ODA относятся к DWG из LibreDWG Write API или
+Шесть однотипных ошибок ODA относятся к DWG из архивного Write API или
 `dwgadd`: XREF создан через C API 0.14, кириллический контроль через
 `dwgadd` 0.14, ведомость через `dwgadd` старой серии. Отдельные
 `recovery` и `unreadable` специально проверяют обрыв и неверную сигнатуру.
@@ -97,38 +97,6 @@ stderr пусты, DXF SHA-256
 DWG-писатель и показывает другой исход. Проверенный обычный корпус,
 серверное использование и квалификация D4/D6 остаются отдельными задачами.
 
-## Повтор и артефакты
+## Воспроизведение действующего профиля
 
-В существующем локальном каталоге `run`: `tools` содержит проверенный
-архив LibreDWG, распакованный как `bin/dwg2dxf`, `bin/dwgread`,
-`lib/libredwg.so.0.0.13` с ссылкой `libredwg.so.0`.
-`desktop-runtime/root` содержит извлечённые Debian-пакеты системного слоя.
-Список исходных DEB зафиксирован в `desktop-runtime/packages.sha256`.
-Пакеты выбираются из Debian bookworm amd64 через
-`apt-get --download-only --no-install-recommends`: `xvfb`,
-`xfonts-base`, `fonts-dejavu-core`, `libegl1`, `libopengl0`,
-`libxkbcommon-x11-0`, `libx11-xcb1`, `libglib2.0-0`,
-`libdbus-1-3`, `time`, `libfontconfig1`, `libfreetype6`.
-Их извлечение — `dpkg-deb -x` в частный каталог. ODA приложение
-извлечено из проверенного DEB в отдельный частный путь `oda_app`.
-
-Из корня, с актуальным `npm run build:server` и локальными Node-зависимостями:
-
-```sh
-d4=src/modules/formats/test/dwg-d4
-node "$d4/pair.mjs" "$run/pair"
-FACADE_D4_ODA_APP="$oda_app" sh "$d4/run-pair-local.sh" "$run"
-node "$d4/batch-report.mjs" "$run/pair/pair-plan.json" "$run/raw" > "$run/paired-results.json"
-FACADE_D4_ODA_APP="$oda_app" FACADE_D4_ODA_AUDIT_FROM="$run/paired-results.json" \
-  sh "$d4/run-pair-local.sh" "$run"
-FACADE_D4_ODA_APP="$oda_app" FACADE_D4_ODA_CONTROL=1 sh "$d4/run-pair-local.sh" "$run"
-node "$d4/batch-report.mjs" "$run/pair/pair-plan.json" "$run/raw" \
-  "$run/audit-raw" "$run/control-raw" > "$run/paired-results-final.json"
-```
-
-Для повтора проверки уже записанных результатов используется последняя
-команда. `raw/` содержит основной парный протокол, `audit-raw/` и
-`control-raw/` — отдельные измерения. Первые два технических захода
-сохранены в `raw-first/` и `raw-oda-first/`. Первый выявил отсутствующую
-`libfontconfig.so.1`, второй — ошибку чтения чертежа при exit 0. В
-итоговом запуске проверены все восемь входов и дополнительные условия XREF.
+[Инструкция для ODA](README.md). Показатели выше относятся к указанным в протоколе версиям и корпусу.

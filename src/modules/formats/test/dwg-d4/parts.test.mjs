@@ -97,7 +97,7 @@ test("DWG does not silently accept a temporary index when persistent storage is 
   let payload = Buffer.from(drawing(520));
   let calls = 0;
   const server = createServer((_req, res) => res.end(JSON.stringify({
-    dwgEngine: "libredwg", dwg: image, dwgIdentity: image, dwgClientTimeoutMs: 4000, dwgReserveBytes: 1,
+    dwgEngine: "oda", dwg: image, dwgIdentity: "sha256:" + "c".repeat(64), dwgClientTimeoutMs: 4000, dwgReserveBytes: 1,
   })));
   server.on("checkContinue", (req, res) => {
     calls++;

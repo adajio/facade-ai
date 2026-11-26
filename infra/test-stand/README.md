@@ -82,8 +82,7 @@ export FACADE_RELEASE_READER_IMAGE="$(infra/test-stand/stand build reader <со�
 export FACADE_RELEASE_BROKER_IMAGE='<ID образа брокера кандидата>'
 export FACADE_RELEASE_OFFICE_IMAGE='<ID образа LibreOffice кандидата>'
 export FACADE_RELEASE_DWG_IMAGE='<ID образа конвертера DWG кандидата>'
-# Для профиля ODA передайте FACADE_ODA_ROOT, FACADE_ODA_RUNTIME и FACADE_ODA_BINARY_SHA256.
-# Для профиля LibreDWG задайте FACADE_DWG_ENGINE=libredwg и его образ.
+# Для DWG передайте FACADE_ODA_ROOT, FACADE_ODA_RUNTIME и FACADE_ODA_BINARY_SHA256.
 npm run test:release:mixed
 ```
 
@@ -100,7 +99,7 @@ Worker читает JPEG, PNG, PDF с растровыми страницами,
 CMS встроен единственный экземпляр PDF. Отдельная подпись без вложенного файла и настоящий тестовый
 `Thumbs.db` остаются служебными элементами; повреждённый DOC сохраняется с причиной недоступности.
 В синтетическом `mtext.dwg` строка `FACADE RIB` и размер `67.25 mm` разделены буквальным LF внутри
-одного объекта MTEXT. Файл подготовлен GNU LibreDWG на основе синтетического `schedule.dwg`.
+одного объекта MTEXT. Архивная сборка подготовила файл на основе синтетического `schedule.dwg`.
 Прогон на ODA проверяет адресуемость текста после преобразования LF в `^J`. Отдельный
 [компонентный тест DXF](../../src/modules/formats/test/dwg-d4/recovery.test.mjs) воспроизводит
 буквальный LF внутри значения в CRLF-производной.
@@ -212,13 +211,7 @@ FACADE_STAND_WITH_BROKER=1 infra/test-stand/stand run "$image" "$db_env"
 поставку, доступную оператору для этого испытания.
 [Официальный CLI ODA](https://www.opendesign.com/guestfiles/oda_file_converter)
 
-Явный откат на существующий LibreDWG сохраняет историю карт. После смены
-конвертера перезапустите reader и откройте актуальную карту.
-
-```bash
-FACADE_DWG_ENGINE=libredwg infra/test-stand/stand broker-up "$archive_image" "$office_image" "$libredwg_image"
-FACADE_STAND_WITH_BROKER=1 infra/test-stand/stand run "$image" "$db_env"
-```
+Состояние старых карт и доказательств привязано к версии чтения. При переходе проверяйте выдачу исторической производной по её версии.
 
 Пустой аргумент пропускает соответствующее семейство.
 

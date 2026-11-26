@@ -64,15 +64,28 @@ export async function persistDwgFile(source: SourceRef, file: FileHandle, sha: s
   } finally { if (temporary) await rm(temporary,{recursive:true,force:true}); }
 }
 
+export async function openStoredDwgFile(source: SourceRef, sha: string) {
+  const { path } = location(source, sha);
+  const file = await open(path,'r').catch((error: NodeJS.ErrnoException) => {
+    if (error.code === 'ENOENT') return;
+    throw new ReaderError('dwg_derivative_unavailable','Производная DWG недоступна',424);
+  });
+  return file && verifyOpenDwgFile(file, sha);
+}
+
 export async function openVerifiedDwgFile(path: string, sha: string, expectedSize: number) {
   let file: FileHandle;
   try { file = await open(path,'r'); } catch { throw new ReaderError('dwg_derivative_unavailable','Производная DWG недоступна',424); }
+  return verifyOpenDwgFile(file, sha, expectedSize);
+}
+
+async function verifyOpenDwgFile(file: FileHandle, sha: string, expectedSize?: number) {
   try {
     const before = await file.stat();
     const hash = createHash('sha256'); let size = 0;
     for await (const chunk of file.createReadStream({start:0,autoClose:false})) { hash.update(chunk as Buffer); size += (chunk as Buffer).length; }
     const after = await file.stat();
-    if (size !== expectedSize || hash.digest('hex') !== sha || before.size !== after.size || before.mtimeMs !== after.mtimeMs || before.ctimeMs !== after.ctimeMs)
+    if (!size || (expectedSize !== undefined && size !== expectedSize) || hash.digest('hex') !== sha || signature(before) !== signature(after))
       throw new ReaderError('dwg_derivative_invalid','Контрольная сумма производной DWG не совпадает',424);
     return file;
   } catch (error) { await file.close(); throw error; }

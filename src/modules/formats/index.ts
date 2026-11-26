@@ -1,17 +1,16 @@
 import { createHash } from "node:crypto";
-import { open } from "node:fs/promises";
 import type { FastifyInstance } from "fastify";
 import { ReaderError } from "../pdf/types.js";
 import type { ReaderAdapter, ReaderOutput, ReaderUnit, ReadRequest, SourceRef } from "../pdf/types.js";
-import { persistDwgFile, verifyDwgFile } from "./dwg-durable.js";
-import { dwgFontAssets } from "./cad-font-assets.js";
+import { openStoredDwgFile, persistDwgFile, verifyDwgFile } from "./dwg-durable.js";
+import { dwgFontAssets, emptyDwgFontAssets } from "./cad-font-assets.js";
 import type { CadFontAssets } from "./cad-font-assets.js";
 import { cadFrame, renderCad } from "./cad-render.js";
 import { convert, converterFor, withDwgDerivative } from "./conversion.js";
 import type { Converter, Legacy } from "./conversion.js";
-import { buildDwgIndex, dwgReaderProfile, openDwgIndex } from "./dwg-index.js";
+import { buildDwgIndex, openDwgIndex } from "./dwg-index.js";
 import type { DwgIndex } from "./dwg-index.js";
-import { dxfEncodingRevision, dxfFramingRevision, dwgVersionPin } from "./dwg-profile.js";
+import { dxfEncodingRevision, dxfFramingRevision, dwgReaderProfile, isOdaDwgVersion, parseDwgVersion } from "./dwg-profile.js";
 import { FormatHold, originalOnly, parseText, readInput, readerVersion } from "./model.js";
 import type { Locator, Parsed, Row, Unit } from "./model.js";
 import { cellAddress, parseDocx, parseWordPackage, parseXlsx } from "./office.js";
@@ -210,25 +209,30 @@ function adapter(format: Format): ReaderAdapter {
   }
 
   async function index(path?: string, source?: SourceRef, expected?: string | number, readerVersion?: string) {
-    const match = readerVersion?.match(dwgVersionPin);
-    if (match && fonts?.identity !== match[2]) throw new ReaderError("dwg_index_identity_changed", "Шрифты сохранённого DWG изменились", 409);
-    const pinnedConverter = match?.[1];
-    const cachedPin = source && pinnedConverter && { source, converter: pinnedConverter, reserve: 0 };
-    if (cachedPin) {
-      const cached = await openDwgIndex(cachedPin, fonts);
-      if (cached && (!expected || expected === cached.identity.derivative)) return cached;
-      if (cached) { await cached.close(); throw new ReaderError("dwg_index_identity_changed", "Производная DWG изменилась", 409); }
-      if (source && typeof expected === "string") {
-        const saved = await verifyDwgFile(source, expected);
-        if (saved) {
-          const file = await open(saved.path, "r");
-          try { return await buildDwgIndex(file, expected, pinnedConverter!, cachedPin, fonts); }
-          finally { await file.close(); }
-        }
+    const pinnedVersion = parseDwgVersion(readerVersion);
+    const pinnedFonts = pinnedVersion?.fonts === emptyDwgFontAssets.identity ? emptyDwgFontAssets : fonts;
+    if (pinnedVersion && pinnedFonts?.identity !== pinnedVersion.fonts) {
+      throw new ReaderError("dwg_index_identity_changed", "Шрифты сохранённого DWG изменились", 409);
+    }
+    if (source && pinnedVersion && typeof expected === "string") {
+      const pin = { source, converter: pinnedVersion.converter, profile: pinnedVersion.profile, reserve: 0 };
+      const cached = await openDwgIndex(pin, pinnedFonts);
+      if (cached?.identity.derivative === expected) return cached;
+      if (cached) {
+        await cached.close();
+        throw new ReaderError("dwg_index_identity_changed", "Производная DWG изменилась", 409);
+      }
+      const file = await openStoredDwgFile(source, expected);
+      if (file) {
+        try { return await buildDwgIndex(file, expected, pin.converter, pin, pinnedFonts); }
+        finally { await file.close(); }
       }
     }
+    if (readerVersion && (!isOdaDwgVersion(readerVersion) || pinnedFonts?.identity !== fonts?.identity)) {
+      throw new FormatHold("dwg_derivative_unavailable");
+    }
     const converter = await resolve();
-    if (converter?.format !== "dwg" || (pinnedConverter && pinnedConverter !== converter.identity)) throw new FormatHold("dwg_converter_unavailable");
+    if (converter?.format !== "dwg" || (pinnedVersion && pinnedVersion.converter !== converter.identity)) throw new FormatHold("dwg_converter_unavailable");
     const pin = source && { source, converter: converter.identity, reserve: converter.reserve };
     const cached = pin && await openDwgIndex(pin, fonts);
     if (cached) {
@@ -252,10 +256,15 @@ function adapter(format: Format): ReaderAdapter {
   }
 
   function output(index: DwgIndex, request: ReadRequest, selected: ReaderUnit) {
+    if ((selected.locator?.derivativeFormat && selected.locator.derivativeFormat !== index.identity.kind)
+        || (selected.locator?.converterIdentity && selected.locator.converterIdentity !== index.identity.converter)) {
+      throw new ReaderError("dwg_index_identity_changed", "Ожидаемый профиль производной DWG изменился", 409);
+    }
     const { unit, digest } = index.read(selected);
     const current = pinned(index, unit, digest);
     return rawOutput({ units: [], converter: index.identity.converter, representationSha256: index.identity.derivative },
-      current, request, block => index.definition(block), fonts);
+      current, request, block => index.definition(block),
+      index.identity.fonts === emptyDwgFontAssets.identity ? emptyDwgFontAssets : fonts);
   }
 
   async function inspectDwg(path: string, source?: SourceRef): Promise<ReaderUnit[]> {
@@ -293,7 +302,8 @@ function adapter(format: Format): ReaderAdapter {
       if (!(error instanceof FormatHold)) throw error;
       if (!path) return;
       if (unit.id !== "original") throw new ReaderError(error.code, "Часть DWG временно недоступна", 424);
-      const held = originalOnly(error.code, "held");
+      const reason = typeof unit.locator?.limitations === "string" ? unit.locator.limitations.split(",")[0] : error.code;
+      const held = originalOnly(reason, "held");
       return rawOutput(held, held.units[0], request);
     }
   }
@@ -314,7 +324,8 @@ function adapter(format: Format): ReaderAdapter {
       const sha = units[0]?.locator?.derivativeSha256;
       const kind = units[0]?.locator?.derivativeFormat;
       const converter = units[0]?.locator?.converterIdentity;
-      if (typeof sha !== "string" || (kind !== "dxf" && kind !== "dwg-json") || typeof converter !== "string" || !readerVersion.includes(converter)) return;
+      if (typeof sha !== "string" || kind !== "dxf" || typeof converter !== "string"
+          || !isOdaDwgVersion(readerVersion) || parseDwgVersion(readerVersion)?.converter !== converter) return;
       const stored = await verifyDwgFile(source, sha);
       return stored && { storageKey: stored.storageKey, sha256: sha, size: stored.size, format: kind, converter };
     } } : {}),
@@ -335,8 +346,8 @@ function adapter(format: Format): ReaderAdapter {
         }
       },
     } : {}),
-    async read(path, request, unit, _containedWords, source) {
-      if (format === "dwg") return (await readDwg(path, request, unit, source))!;
+    async read(path, request, unit, _containedWords, source, readerVersion) {
+      if (format === "dwg") return (await readDwg(path, request, unit, source, readerVersion))!;
       const parsed = await parse(path);
       const current = parsed.units.find(({ id }) => id === unit.id);
       if (!current) {
@@ -345,19 +356,19 @@ function adapter(format: Format): ReaderAdapter {
       }
       return rawOutput(parsed, current, request);
     },
-    async *readNativeUnits(path, units, source) {
+    async *readNativeUnits(path, units, source, readerVersion) {
       if (format === "dwg") {
         try {
-          const stored = (await index(path, source, units[0]?.locator?.derivativeSha256))!;
+          const stored = (await index(path, source, units[0]?.locator?.derivativeSha256, readerVersion))!;
           yield* nativeDwg(stored, units);
         } catch (error) {
           if (!(error instanceof FormatHold)) throw error;
-          const held = originalOnly(error.code, "held");
           for (const unit of units) {
-            if (unit.id === "original") yield rawOutput(held, held.units[0], {
-              address: { unitId: unit.id }, representation: "native",
-            });
-            else yield new ReaderError(error.code, "Часть DWG временно недоступна", 424);
+            if (unit.id === "original") {
+              const reason = typeof unit.locator?.limitations === "string" ? unit.locator.limitations.split(",")[0] : error.code;
+              const held = originalOnly(reason, "held");
+              yield rawOutput(held, held.units[0], { address: { unitId: unit.id }, representation: "native" });
+            } else yield new ReaderError(error.code, "Часть DWG временно недоступна", 424);
           }
         }
         return;

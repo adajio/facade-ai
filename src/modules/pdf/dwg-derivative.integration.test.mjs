@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import {createHash,randomBytes,randomUUID} from 'node:crypto';
 import {once} from 'node:events';
 import {createServer} from 'node:http';
-import {chmod,mkdtemp,readdir,readFile,rm,writeFile} from 'node:fs/promises';
+import {chmod,mkdir,mkdtemp,readdir,readFile,rm,writeFile} from 'node:fs/promises';
 import {tmpdir} from 'node:os';
 import {join,resolve} from 'node:path';
 import {Readable} from 'node:stream';
@@ -22,10 +22,10 @@ test('DWG durable derivative: historical map recovery, restart, permissions and 
   const admin=new pg.Pool({connectionString:url}); let db,app,reader; let stopped=false;
   const oldDir=process.env.FACADE_DATA_DIR, oldSocket=process.env.FACADE_CONVERTER_SOCKET;
   process.env.FACADE_DATA_DIR=root; process.env.FACADE_CONVERTER_SOCKET=join(root,'broker.sock');
-  const original=Buffer.from('AC1015A'), image='sha256:'+'a'.repeat(64);
+  const original=Buffer.from('AC1015A'), image='sha256:'+'a'.repeat(64), identity='sha256:'+'d'.repeat(64);
   let output=Buffer.from('0\nSECTION\n2\nENTITIES\n0\nLINE\n5\nA\n10\n1\n20\n2\n11\n3\n21\n4\n0\nENDSEC\n0\nEOF\n'), calls=0;
   const expected=Buffer.from(output);
-  const broker=createServer((_req,res)=>res.end(JSON.stringify({dwgEngine:'libredwg',dwg:image,dwgIdentity:image,dwgClientTimeoutMs:4000,dwgReserveBytes:1})));
+  const broker=createServer((_req,res)=>res.end(JSON.stringify({dwgEngine:'oda',dwg:image,dwgIdentity:identity,dwgClientTimeoutMs:4000,dwgReserveBytes:1})));
   broker.on('checkContinue',(req,res)=>{calls++;res.writeContinue();req.on('end',()=>{res.writeHead(200,{'x-converter-bytes':String(output.length),trailer:'x-converter-result, x-converter-bytes, x-converter-sha256'});res.write(output);res.addTrailers({'x-converter-result':'ok','x-converter-sha256':hash(output),'x-converter-bytes':String(output.length)});res.end();});req.resume();});
   try {
     await admin.query(`CREATE SCHEMA "${schema}"`);
@@ -60,6 +60,14 @@ test('DWG durable derivative: historical map recovery, restart, permissions and 
     const map=await reader.map(source); assert.equal(calls,1);
     const proof=await pdf.verifyStoredDwgDerivative(db,source,map.readerVersion);
     assert.equal(proof.derivativeSha256,hash(expected)); assert.equal(proof.byteSize,expected.length);
+    const {dwgReaderProfile,historicalDwgReaderProfile}=await load('formats/dwg-profile.js');
+    const oldIdentity='sha256:'+'b'.repeat(64);
+    const oldVersion=map.readerVersion.replace(dwgReaderProfile,historicalDwgReaderProfile).replace(identity,oldIdentity);
+    const untrackedVersion=oldVersion.replace(oldIdentity,'sha256:'+'c'.repeat(64));
+    await assert.rejects(reader.open(source,{runId:randomUUID(),branch:'A',operationKey:'historical-missing'}, {
+      readerVersion:untrackedVersion,representation:'native',address:{unitId:map.units[0].id},
+    }),{code:'reader_map_unavailable'});
+    assert.equal(calls,1);
     // Simulate a pre-upgrade map/index with no full derivative: changed conversion must not be accepted.
     const {findStoredDwgDerivative}=await load('pdf/dwg-derivative.js');
     const existing=await findStoredDwgDerivative(db,source,map.readerVersion);
@@ -100,6 +108,26 @@ test('DWG durable derivative: historical map recovery, restart, permissions and 
     assert.equal((await app.inject({method:'GET',url:path,headers:{cookie:`facade_session=${scopedSession}`}})).statusCode,404);
     const result=await app.inject({method:'GET',url:path,headers:{cookie}}); assert.equal(result.statusCode,200); assert.deepEqual(result.rawPayload,expected); assert.match(result.headers['content-disposition'],/filename\*=UTF-8''fixture\.dxf/);
     const head=await app.inject({method:'HEAD',url:path,headers:{cookie}}); assert.equal(head.statusCode,200); assert.equal(head.rawPayload.length,0); assert.equal(Number(head.headers['content-length']),expected.length); assert.equal(head.headers.etag, `"sha256-${hash(expected)}"`);
+    const archived=Buffer.from('{"OBJECTS":[]}');
+    const archivedHash=hash(archived), archivedKey=join('dwg-derivatives',project,doc,version,archivedHash);
+    const archivedPath=join(root,archivedKey);
+    await mkdir(join(archivedPath,'..'),{recursive:true});
+    await writeFile(archivedPath,archived);
+    await db.query(`INSERT INTO dwg_derivatives(project_id,document_id,version_id,original_sha256,reader_version,
+      converter_identity,derivative_sha256,byte_size,format,storage_key,created_at)
+      VALUES($1,$2,$3,$4,$5,$6,$7,$8,'dwg-json',$9,clock_timestamp()-interval '1 hour')`,
+    [project,doc,version,source.sha256,oldVersion,oldIdentity,archivedHash,archived.length,archivedKey]);
+    const pinned=await app.inject({method:'GET',url:path+'?readerVersion='+encodeURIComponent(oldVersion),headers:{cookie}});
+    assert.equal(pinned.statusCode,200);
+    assert.deepEqual(pinned.rawPayload,archived);
+    assert.equal(pinned.headers.etag,`"sha256-${archivedHash}"`);
+    assert.match(pinned.headers['content-disposition'],/fixture\.json/u);
+    const unknown=await app.inject({method:'GET',url:path+'?readerVersion='+encodeURIComponent(untrackedVersion),headers:{cookie}});
+    assert.equal(unknown.statusCode,404);
+    const falseOdaVersion=map.readerVersion.replace(identity,oldIdentity);
+    await db.query('UPDATE dwg_derivatives SET reader_version=$2 WHERE reader_version=$1',[oldVersion,falseOdaVersion]);
+    const incompatible=await app.inject({method:'GET',url:path+'?readerVersion='+encodeURIComponent(falseOdaVersion),headers:{cookie}});
+    assert.equal(incompatible.statusCode,424);
     const alias=await app.inject({method:'GET',url:path.replace('/api/v1/','/api/'),headers:{cookie}}); assert.equal(alias.statusCode,200); assert.deepEqual(alias.rawPayload,expected);
     const saved=await findStoredDwgDerivative(db,source,map.readerVersion); await chmod(saved.path,0o600);
     await writeFile(saved.path,Buffer.alloc(expected.length, 1));

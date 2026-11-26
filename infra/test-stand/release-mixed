@@ -7,6 +7,12 @@ root="$(cd -- "$here/../.." && pwd)"
 scenario="$root/test/acceptance/release-mixed"
 context="${FACADE_RELEASE_DOCKER_CONTEXT:-orbstack}"
 project="facade-release-$(openssl rand -hex 8)"
+if [[ "${FACADE_DWG_ENGINE:-oda}" != oda ]]; then
+  echo 'Remove the obsolete FACADE_DWG_ENGINE setting. DWG uses ODA.' >&2
+  exit 2
+fi
+: "${FACADE_ODA_ROOT:?Specify the pinned ODA installation}" "${FACADE_ODA_RUNTIME:?Specify the pinned ODA runtime}"
+: "${FACADE_ODA_BINARY_SHA256:?Specify the ODA binary SHA-256}"
 out_root="$(cd -- "${FACADE_RELEASE_DIR:?Set a private results directory outside the checkout}" && pwd -P)"
 case "$out_root/" in "$root/"*) echo 'Use a results directory outside the checkout.' >&2; exit 2 ;; esac
 out="$(mktemp -d "$out_root/$project.XXXXXXXX")"
@@ -40,16 +46,7 @@ wait_file() {
 reader_image="$(image_id "${FACADE_RELEASE_READER_IMAGE:?Specify the candidate reader image}")"
 broker_image="$(image_id "${FACADE_RELEASE_BROKER_IMAGE:?Specify the candidate broker image}")"
 office_image="$(image_id "${FACADE_RELEASE_OFFICE_IMAGE:?Specify the LibreOffice image}")"
-dwg_image="$(image_id "${FACADE_RELEASE_DWG_IMAGE:?Specify the DWG converter image}")"
-export FACADE_DWG_ENGINE="${FACADE_DWG_ENGINE:-oda}"
-case "$FACADE_DWG_ENGINE" in
-  oda)
-    : "${FACADE_ODA_ROOT:?Specify the pinned ODA installation}" "${FACADE_ODA_RUNTIME:?Specify the pinned ODA runtime}"
-    : "${FACADE_ODA_BINARY_SHA256:?Specify the ODA binary SHA-256}"
-    ;;
-  libredwg) ;;
-  *) echo 'FACADE_DWG_ENGINE must be oda or libredwg.' >&2; exit 2 ;;
-esac
+dwg_image="$(image_id "${FACADE_RELEASE_DWG_IMAGE:?Specify the ODA launcher image}")"
 
 # The candidate runs without model keys, external gateway profile, or Internet access.
 export FACADE_STAND_IMAGE="$reader_image" FACADE_STAND_BROKER_IMAGE="$broker_image"
@@ -93,7 +90,7 @@ docker run --rm --pull never --network none --entrypoint /bin/sh "$reader_image"
   'pdftotext -v; tesseract --version; tesseract --list-langs; python3 --version' > "$out/reader-tools.txt" 2>&1
 docker image inspect --format '{{.Id}} {{.Os}}/{{.Architecture}} {{with index .Config "Labels"}}{{index . "org.opencontainers.image.revision"}} {{index . "io.facade.source-manifest-sha256"}}{{end}}' -- \
   "$reader_image" "$broker_image" "$office_image" "$dwg_image" > "$out/images.txt"
-printf '%s\n' "$FACADE_DWG_ENGINE" > "$out/dwg-engine.txt"
+printf 'oda\n' > "$out/dwg-engine.txt"
 (
   cd "$root"
   git rev-parse HEAD
@@ -148,7 +145,7 @@ compose exec -T converter-broker node -e '
       assert.equal(response.statusCode, 200);
       assert.equal(profile.doc, process.env.FACADE_OFFICE_IMAGE);
       assert.equal(profile.dwg, process.env.FACADE_DWG_IMAGE);
-      assert.equal(profile.dwgEngine, process.env.FACADE_DWG_ENGINE);
+      assert.equal(profile.dwgEngine, "oda");
       assert.match(profile.dwgIdentity, /^sha256:[0-9a-f]{64}$/);
       console.log(JSON.stringify(profile));
     });

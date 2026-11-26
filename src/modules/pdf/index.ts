@@ -126,6 +126,7 @@ export function createRuntimePdfService(
 
 type EvidenceRoute = { Params: { id: string } };
 type UnitsRoute = { Params: { documentId: string; versionId: string } };
+type DwgDerivativeRoute = UnitsRoute & { Querystring: { readerVersion?: string } };
 
 export async function register(
   app: FastifyInstance, options: Parameters<typeof createRuntimePdfService>[2] = {},
@@ -174,10 +175,14 @@ export async function register(
   }
 
   for (const prefix of ['/api/v1', '/api']) {
-    app.get<UnitsRoute>(`${prefix}/documents/:documentId/versions/:versionId/dwg-derivative`, async (request, reply) => {
+    app.get<DwgDerivativeRoute>(`${prefix}/documents/:documentId/versions/:versionId/dwg-derivative`, async (request, reply) => {
       const document = await authorizedDocument(request);
+      const { readerVersion } = request.query;
+      if (readerVersion !== undefined && (typeof readerVersion !== "string" || !/^[a-zA-Z0-9:._-]{1,250}$/u.test(readerVersion))) {
+        throw new ReaderError('reader_address_invalid', 'Некорректный профиль производной DWG', 422);
+      }
       const originalPath = await reader().checkDocumentOriginal(document);
-      const saved = await findStoredDwgDerivative(app.db, document);
+      const saved = await findStoredDwgDerivative(app.db, document, readerVersion);
       if (!saved) throw new ReaderError('dwg_derivative_not_found', 'Сохранённая производная DWG отсутствует', 404);
       await authorize(app.db, await readSession(app.db, request), { action:'project:read', projectId:document.projectId });
       const ext = saved.format === 'dxf' ? 'dxf' : 'json';
