@@ -20,6 +20,7 @@
   let limited = $derived((preparation?.items ?? []).filter(item => item.state==='available' && item.limitations?.length));
   let ownerFiles = $derived((preparation?.items ?? []).filter(item => item.reason==='office_owner_file'));
   let thumbnailCaches = $derived((preparation?.items ?? []).filter(item => item.kind === 'technical' && item.reason === 'windows_thumbnail_cache'));
+  let folderAndCadFiles = $derived((preparation?.items ?? []).filter(item => item.kind==='technical' && ['cad_drawing_lock','windows_folder_settings'].includes(item.reason ?? '')));
   let signatureFiles = $derived((preparation?.items ?? []).filter(({ reason }) => reason === 'signature_pdf_duplicate' || reason === 'signature_detached'));
   let failures = $derived.by(() => {
     const items = (preparation?.items ?? []).filter((item) => item.state === 'unavailable' || item.kind === 'archive' && item.reason);
@@ -116,6 +117,15 @@
             {#if item.documentId && item.versionId}
               · <a href={originalUrl(item.documentId, item.versionId)} target="_blank" rel="noopener noreferrer">Открыть оригинал</a>
             {/if}
+          </li>
+        {/each}</ul>
+      </details>
+    {/if}
+    {#if folderAndCadFiles.length}
+      <details><summary>Настройки папок и файлы блокировки · {count(folderAndCadFiles.length)}</summary>
+        <ul>{#each folderAndCadFiles as item (item.occurrenceId)}
+          <li>{item.label} · {label(item.reason ?? '')}
+            {#if item.documentId && item.versionId} · <a href={originalUrl(item.documentId,item.versionId)} download>Скачать оригинал</a>{/if}
           </li>
         {/each}</ul>
       </details>

@@ -6,6 +6,7 @@
   import { chooseWorkArea, currentOperation, requirementsUrl, workReceiptFilters, workSliceApi, type WorkReceiptFilter, type WorkSlice } from '../lib/work-slice';
   import Notice from '../lib/Notice.svelte';
   import PackagePreparation from '../lib/PackagePreparation.svelte';
+  import ReceiptEvidenceChain from '../lib/ReceiptEvidenceChain.svelte';
   import WorkProgress from '../lib/WorkProgress.svelte';
   import TerraReadingProgress, { type TerraReading } from '../lib/TerraReadingProgress.svelte';
 
@@ -117,7 +118,12 @@
 
 {#if workSlice && facadeMode && terra?.enabled}
   <TerraReadingProgress data={terra} slice={workSlice} updatedAt={terraUpdated} error={terraError} canEdit={context.canEdit} />
-  {#if terra.receipt}<PackagePreparation {api} projectId={context.project.id} receiptId={terra.receipt.receiptId} refreshKey={context.refreshKey} compact />{/if}
+  {#if terra.receipt}
+    {#key terra.receipt.receiptId}
+      <ReceiptEvidenceChain {api} projectId={context.project.id} receiptId={terra.receipt.receiptId} refreshKey={context.refreshKey} />
+    {/key}
+    <PackagePreparation {api} projectId={context.project.id} receiptId={terra.receipt.receiptId} refreshKey={context.refreshKey} compact />
+  {/if}
 {:else if workSlice && facadeMode && !terra && terraError}
   <section class="card"><h2>Состояние разбора</h2><Notice kind="error" message={'Не удалось загрузить состояние чтения: ' + terraError} /><button onclick={refreshSlice}>Повторить</button></section>
 {:else if workSlice}

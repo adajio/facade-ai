@@ -18,7 +18,8 @@ import { packageFollowupKind } from './package-walk.js';
 import { researchKind } from './runner.js';
 import { memoryVersion } from '../project-memory/contracts.js';
 import { profileHintLines,profileHintPatterns } from './facade-profile-hints.js';
-import { dxfGroupRecoveryVersion, dxfGroupRecoveryVersionPattern, legacyDxfGroupHold } from '../formats/dwg-profile.js';
+import { dxfEncodingRecoveryVersion, dxfGroupRecoveryVersion, dxfRecoveryVersionPatterns, legacyDxfEncodingHold, legacyDxfGroupHold } from '../formats/dwg-profile.js';
+import { largeJpegRecoveryVersion, rasterDimensionLimit } from '../formats/raster-profile.js';
 
 const branches = ['A', 'B'] as const;
 const mapContract = 'overlapping-windows-v1';
@@ -26,7 +27,7 @@ const readingContract = 'package-primary-v1';
 
 const packageSources = `JOIN projects p ON p.id=j.project_id
   JOIN LATERAL (
-    SELECT CASE WHEN lower(regexp_replace(c.relative_path, '^.*/', ''))='thumbs.db' THEN 'thumbs.db'
+    SELECT CASE WHEN lower(regexp_replace(c.relative_path, '^.*/', '')) IN ('thumbs.db','desktop.ini') THEN lower(regexp_replace(c.relative_path, '^.*/', ''))
       ELSE lower(substring(c.relative_path FROM '[.][a-zA-Z0-9]+$')) END AS extension
     FROM intake_occurrences c WHERE c.version_id=j.version_id AND c.project_id=j.project_id AND c.state='accepted'
     ORDER BY (c.receipt_id=j.receipt_id) DESC,c.created_at,c.id LIMIT 1
@@ -60,35 +61,50 @@ export async function preparePackageMap(
      WHERE ${enabledProject('$1')}`, [[...packageProjects]]);
   const versions = await Promise.all(formats.map(async (input) => {
     const version = await service.readerVersion(service.formatFor(input.media, input.extension ?? ''));
-    return { ...input, version, recovery: dxfGroupRecoveryVersion(version) };
+    return { ...input, version, recovery: dxfGroupRecoveryVersion(version),
+      encoding_recovery: dxfEncodingRecoveryVersion(version),
+      raster_recovery: largeJpegRecoveryVersion(version,input.media,input.extension ?? '') };
   }));
-  const { rows: [job] } = await db.query<IntakeJob & { requested: string | null }>(
-    `SELECT ${jobFields}, effective.version AS requested FROM intake_reader_jobs j ${originalJoins} ${packageSources}
-     JOIN jsonb_to_recordset($1::jsonb) AS expected(media text,extension text,version text,recovery text)
+  const { rows: [job] } = await db.query<IntakeJob & { requested: string | null; baseVersion: string | null; rasterRecovery: string | null }>(
+    `SELECT ${jobFields}, effective.version AS requested,expected.version AS "baseVersion",expected.raster_recovery AS "rasterRecovery"
+       FROM intake_reader_jobs j ${originalJoins} ${packageSources}
+     JOIN jsonb_to_recordset($1::jsonb) AS expected(media text,extension text,version text,recovery text,encoding_recovery text,raster_recovery text)
        ON expected.media=v.media_type AND expected.extension IS NOT DISTINCT FROM source.extension
      LEFT JOIN harness_package_maps m ON m.version_id=j.version_id AND m.active
+     LEFT JOIN reader_maps old_dwg ON old_dwg.project_id=j.project_id AND old_dwg.document_id=j.document_id
+       AND old_dwg.version_id=j.version_id AND old_dwg.original_sha256=o.sha256 AND old_dwg.reader_version=expected.version
+       AND old_dwg.format='dwg' AND jsonb_array_length(old_dwg.units)=1
+       AND NOT EXISTS (SELECT 1 FROM dwg_derivatives d WHERE d.project_id=j.project_id AND d.version_id=j.version_id
+         AND d.reader_version=expected.version)
      CROSS JOIN LATERAL (SELECT CASE
-       WHEN expected.version LIKE '%:dwg:unavailable:%' AND (m.reader_version LIKE $4 OR EXISTS (
+       WHEN expected.raster_recovery IS NOT NULL AND m.reader_version IS NULL
+         AND (m.requested_reader_version=expected.raster_recovery OR
+           m.requested_reader_version=expected.version AND m.refusal=$5) THEN expected.raster_recovery
+       WHEN expected.version LIKE '%:dwg:unavailable:%' AND (m.reader_version LIKE ANY($4::text[]) OR EXISTS (
          SELECT 1 FROM dwg_derivatives d WHERE d.project_id=j.project_id AND d.version_id=j.version_id AND d.reader_version=m.reader_version
        )) THEN m.requested_reader_version
-       WHEN expected.recovery IS NOT NULL AND EXISTS (
-         SELECT 1 FROM reader_maps history WHERE history.project_id=j.project_id AND history.document_id=j.document_id
-           AND history.version_id=j.version_id AND history.original_sha256=o.sha256 AND history.reader_version=expected.version
-           AND history.format='dwg' AND jsonb_array_length(history.units)=1 AND history.units @> $3::jsonb
-           AND history.units#>'{0,locator,dxfFraming}' IS NULL
-           AND NOT EXISTS (SELECT 1 FROM dwg_derivatives d WHERE d.project_id=j.project_id AND d.version_id=j.version_id
-             AND d.reader_version=expected.version)
-       ) THEN expected.recovery ELSE expected.version END AS version) effective
+       WHEN expected.recovery IS NOT NULL AND old_dwg.units @> $3::jsonb
+         AND old_dwg.units#>'{0,locator,dxfFraming}' IS NULL THEN expected.recovery
+       WHEN expected.encoding_recovery IS NOT NULL AND old_dwg.units @> $6::jsonb
+         AND old_dwg.units#>'{0,locator,dxfEncoding}' IS NULL THEN expected.encoding_recovery
+       ELSE expected.version END AS version) effective
      WHERE ${enabledProject('$2')}
        AND (m.version_id IS NULL OR m.requested_reader_version IS DISTINCT FROM effective.version
          OR m.physical_basis_id IS NULL AND m.physical_limitation IS NULL)
        AND NOT EXISTS (SELECT 1 FROM harness_package_map_retries r WHERE r.version_id=j.version_id AND r.retry_at>clock_timestamp())
-     ORDER BY j.created_at,j.id LIMIT 1`, [JSON.stringify(versions), [...packageProjects], JSON.stringify(legacyDxfGroupHold), dxfGroupRecoveryVersionPattern]);
+     ORDER BY j.created_at,j.id LIMIT 1`, [JSON.stringify(versions), [...packageProjects], JSON.stringify(legacyDxfGroupHold), dxfRecoveryVersionPatterns, rasterDimensionLimit, JSON.stringify(legacyDxfEncodingHold)]);
   if (!job) return false;
   let map;
+  let requested = job.requested;
   try {
     map = await buildMap(job, service.map);
-    if (map.readerVersion && map.readerVersion !== job.requested) throw new Error('reader_profile_changed');
+    // Successful maps keep their ordinary reader identity. Failed large JPEG checks get a
+    // versioned attempt marker so only the older dimension refusals are prepared again.
+    if (job.rasterRecovery) {
+      if (requested === job.rasterRecovery && map.readerVersion) requested = job.baseVersion;
+      if (map.units[0]?.refusal === rasterDimensionLimit && !map.readerVersion) requested = job.rasterRecovery;
+    }
+    if (map.readerVersion && map.readerVersion !== requested) throw new Error('reader_profile_changed');
   } catch (error) {
     const code = typeof error === 'object' && error && 'code' in error && typeof error.code === 'string'
       ? error.code : 'reader_map_retry';
@@ -97,7 +113,7 @@ export async function preparePackageMap(
        ON CONFLICT(version_id) DO UPDATE SET reason=EXCLUDED.reason,retry_at=EXCLUDED.retry_at`, [job.versionId, code]);
     return true;
   }
-  const fingerprint = hash([mapContract, job.versionId, job.sha256, job.requested, map.format, map.units]);
+  const fingerprint = hash([mapContract, job.versionId, job.sha256, requested, map.format, map.units]);
   await transaction(db, async (tx) => {
     await lockIntakeProject(tx, job.projectId);
     const basis = 'basisId' in map.physical ? map.physical.basisId : null;
@@ -119,7 +135,7 @@ export async function preparePackageMap(
        VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) ON CONFLICT(version_id,fingerprint) DO UPDATE
        SET active=true,physical_proof=EXCLUDED.physical_proof,physical_basis_id=EXCLUDED.physical_basis_id,
          physical_limitation=EXCLUDED.physical_limitation`,
-      [job.projectId, job.versionId, fingerprint, map.readerVersion, job.requested, map.format,
+      [job.projectId, job.versionId, fingerprint, map.readerVersion, requested, map.format,
        map.units[0]?.refusal ?? null, Boolean(basis), basis, limitation]);
     const windows = map.units.map(({ id: unitId, refusal, ...address }) => ({
       place: { source: { projectId: job.projectId, versionId: job.versionId, documentId: job.documentId, sha256: job.sha256 },

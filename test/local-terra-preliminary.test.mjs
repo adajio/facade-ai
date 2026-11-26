@@ -4,12 +4,13 @@ import { createHash } from 'node:crypto';
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { validate, claim, processReceipt, readSnapshot, makeRequest, parseModelResponse } from '../infra/local-terra/producer.mjs';
+import { validate, claim, processReceipt, readSnapshot, makeRequest, parseModelResponse, preparePromptSnapshot } from '../infra/local-terra/producer.mjs';
+import {measureRequest, maxInputTokens, maxRequestBytes} from '../infra/local-terra/request-budget.mjs';
 const hash='b'.repeat(64);
-function fakeDb({published=false,service=false}={}) {
+function fakeDb({published=false,service=false,requirements=[{key:'1',part:'Чертёж'}]}={}) {
   const client={release(){},async query(sql){
     if (/BEGIN|COMMIT|ROLLBACK/.test(sql)) return {rows:[]};
-    if (/FROM intake_receipts r JOIN projects/.test(sql)) return {rows:[{id:'r',project_id:'p',catalog_version_id:'c',project_stage:'RD',requirements:[{key:'1',part:'Чертёж'}],ready:true,preparation_id:'m',manifest:{counts:{available:1},items:[
+    if (/FROM intake_receipts r JOIN projects/.test(sql)) return {rows:[{id:'r',project_id:'p',catalog_version_id:'c',project_stage:'RD',requirements,receipt_created_at:'2026-01-01T00:00:00.000Z',ready:true,preparation_id:'m',manifest:{counts:{available:1},items:[
       {kind:'document',state:'available',versionId:'v',originalSha256:hash,readerVersion:'pdf'},
       ...(service?[{kind:'technical',state:'excluded',versionId:'z',originalSha256:'a'.repeat(64)}]:[])],restrictions:[]}}]};
     if (/FROM intake_occurrences o JOIN intake_document_versions/.test(sql)) return {rows:[{versionId:'v',originalSha256:hash,path:'drawing.pdf',mediaType:'application/pdf',restricted:false,hasReaderJob:true},...(service?[{versionId:'z',originalSha256:'a'.repeat(64),path:'__MACOSX/._drawing',mediaType:'application/octet-stream',hasReaderJob:false}]:[])]};
@@ -18,7 +19,7 @@ function fakeDb({published=false,service=false}={}) {
     if (/WITH sequenced/.test(sql)) return {rows:[{version_id:'v',remaining:['graphics'],limitations:['drawing_unread'],first:2,last:4,first_unit:'p3',last_unit:'p5'}]};
     throw Error('unexpected query');
   }};
-  return {connect:async()=>client,query:async()=>({rowCount:published?1:0}),setPublished(){published=true;}};
+  return {connect:async()=>client,query:async()=>({rowCount:published?1:0,rows:published && typeof published==='object'?[published]:[]}),setPublished(review){published=review ?? true;}};
 }
 const admitClaim=async (_snapshot,reserve)=>await reserve() ? 'claimed' : 'claimed_elsewhere';
 const result={rows:[{key:'1',status:'present',finding:'37 мм',citations:[{id:'L1',quote:'37 мм'}]}],draftText:'Предварительный обзор'};
@@ -113,15 +114,18 @@ test('normal adapter entry returns the revision envelope and preserves known mal
 });
 
 test('large preliminary prompt enforces a byte bound across files, restrictions and grounded lines', async () => {
-  const {preparePromptSnapshot} = await import('../infra/local-terra/producer.mjs');
   const s = await readSnapshot(fakeDb(),'r');
   const noisy = {...s, lines:Array.from({length:5000}, (_, i) => ({...s.lines[0],id:'L'+(i+1),
     text:'Фасад '.repeat(25), anchor:JSON.stringify({unitId:'page-'+i,lineId:'x'.repeat(200)})})),
     unread:Array.from({length:1400},(_, i)=>({...s.unread[0],fromUnit:'p'+i,throughUnit:'p'+i})),
-    scopeNote:'Предварительный обзор'};
+    totalLines:5000,scopeNote:'Предварительный обзор'};
   const prepared = preparePromptSnapshot(noisy);
   const request = makeRequest(prepared);
-  assert.ok(Buffer.byteLength(JSON.stringify(request)) < 180_000);
+  const measured=measureRequest(request);
+  assert.ok(measured.requestBytes <= maxRequestBytes);
+  assert.ok(measured.estimatedInputTokens <= maxInputTokens);
+  assert.ok(measured.estimatedInputTokens > measured.promptBytes);
+  assert.equal(prepared.budget.remainingLines,noisy.lines.length-prepared.lines.length);
   assert.ok(prepared.lines.length > 0 && prepared.lines.length < noisy.lines.length);
   assert.match(prepared.scopeNote,/модели передано/i);
   assert.ok(!request.messages[1].content.includes(hash));
@@ -130,7 +134,6 @@ test('large preliminary prompt enforces a byte bound across files, restrictions 
 });
 
 test('an uncertain call permits exactly one explicitly authorized replacement with the exact request and preparation', async () => {
-  const {preparePromptSnapshot} = await import('../infra/local-terra/producer.mjs');
   const db=fakeDb(), snapshot=await readSnapshot(db,'r');
   const previous={...snapshot,preparationId:'previous'}, dir=await mkdtemp(join(tmpdir(),'preliminary-replacement-'));
   try {
@@ -146,4 +149,109 @@ test('an uncertain call permits exactly one explicitly authorized replacement wi
     assert.equal(calls,1);
     assert.equal(JSON.parse(await readFile(path)).state,'unknown');
   } finally {await rm(dir,{recursive:true,force:true});}
+});
+
+
+test('inventory compaction and source balance preserve evidence for a late criterion under both caps', async () => {
+  const base = await readSnapshot(fakeDb(), 'r');
+  const requirements = [
+    {key:'R1',part:'Ведомость окон'},
+    {key:'R2',part:'Огнезащитный пояс',completenessCriterion:'Указана нормативная высота и узел примыкания'},
+  ];
+  const files=Array.from({length:306},(_,index)=>({versionId:'V'+index,path:`папка/корпус-${index%4}/Лист-"№${index%80}"-⭕.pdf`}));
+  const source = (id,versionId,text) => ({...base.lines[0],id,versionId,text});
+  const lines = [
+    ...Array.from({length:3500},(_,index)=>source('L'+index,files[0].versionId,'Ведомость окон '.repeat(19))),
+    ...files.slice(1).map((file,index) => source('E'+index,file.versionId,'Указание на листе.')),
+    source('target',files.at(-1).versionId,'Узел примыкания: огнезащитный пояс 250 мм.'),
+  ];
+  const snapshot = preparePromptSnapshot({...base,files,lines,requirements,totalLines:12_000});
+  const {budget,promptData} = snapshot;
+  assert.equal(budget.selectedFiles,306);
+  assert.ok(budget.coveredFiles > 150);
+  assert.equal(budget.remainingLines,12_000-snapshot.lines.length);
+  assert.ok(budget.requestBytes <= maxRequestBytes && budget.estimatedInputTokens <= maxInputTokens);
+  assert.ok(snapshot.lines.some(line=>line.id==='target'));
+  const primary = promptData.lines.find(([id])=>id==='target');
+  const [folder,name] = promptData.files[primary[1]-1];
+  assert.equal(promptData.directories[folder-1]+'/'+promptData.names[name-1],files.at(-1).path);
+});
+
+test('full request sizes agree with UTF-8 bytes seen at the Python adapter boundary',async t=>{
+  const {invokeModel} = await import('../infra/local-terra/producer.mjs');
+  const dir=await mkdtemp(join(tmpdir(),'terra-body-'));
+  t.after(()=>rm(dir,{recursive:true,force:true}));
+  const script=join(dir,'inspect.py');
+  await writeFile(script,[
+    'import json, sys',
+    'body = sys.stdin.buffer.read()',
+    'request = json.loads(body)',
+    'prompt = json.dumps(dict(messages=request["messages"], available_functions=request["tools"]), ensure_ascii=False, separators=(",", ":")).encode()',
+    'print(json.dumps(dict(adapterBytes=len(body), promptBytes=len(prompt))))',
+  ].join('\n'));
+  const snap=await readSnapshot(fakeDb(),'r');
+  const request=makeRequest({...snap,lines:[{...snap.lines[0],text:'строка "Б" \n \t \u0001 \u{1F584} '}]});
+  const actual=await invokeModel(script,request);
+  const fields=measureRequest(request);
+  assert.equal(fields.promptBytes,actual.promptBytes);
+  assert.equal(fields.requestBytes,Math.max(actual.adapterBytes,actual.promptBytes));
+});
+
+test('oversize fixed context is rejected before claim and invocation', async t => {
+  const dir=await mkdtemp(join(tmpdir(),'terra-context-'));
+  t.after(()=>rm(dir,{recursive:true,force:true}));
+  const db=fakeDb({requirements:[{key:'1',part:'Чертёж',evidenceRule:'слово '.repeat(10000)}]});
+  const events=[];
+  assert.equal(await processReceipt({db,receiptId:'r',stateDir:dir,recordActivity:async(_db,event)=>events.push(event),
+    admitClaim:()=>assert.fail('oversize claimed'),modelCall:()=>assert.fail('oversize sent')}),'primary_request_limit');
+  assert.equal(events[0].reason,'primary_request_limit');
+  assert.equal(events[0].status,'rejected');
+  assert.ok(events[0].fields.requestBytes>maxRequestBytes);
+});
+
+test('primary activity records exact usage and recovers committed report after journal write is interrupted', async t => {
+  const dir=await mkdtemp(join(tmpdir(),'terra-activity-'));
+  t.after(()=>rm(dir,{recursive:true,force:true}));
+  const db=fakeDb(), snapshot=await readSnapshot(db,'r'), events=[];
+  const report={...snapshot,id:'28900b04-054b-4810-9847-0ad60bf9c44f',publishedAt:'2026-01-01T00:01:00.000Z'};
+  let calls=0;
+  const options={db,receiptId:'r',stateDir:dir,admitClaim,
+    recordActivity:async (_db,event)=>{
+      events.push(event);
+      if (event.status==='completed') throw Error('telemetry unavailable');
+    },
+    modelCall:async request=>{
+      calls++;
+      assert.equal(measureRequest(request).requestBytes,events[0].fields.requestBytes);
+      return {model:'gpt-6.1-terra',usage:{prompt_tokens:8921,completion_tokens:610},choices:[
+        {finish_reason:'tool_calls',message:{tool_calls:[{type:'function',function:{name:'submit_preliminary_review',arguments:JSON.stringify(result)}}]}},
+      ]};
+    },
+    publish:async()=>{
+      db.setPublished(report);
+      throw Error('connection lost after publication');
+    },
+  };
+  await assert.rejects(processReceipt(options),/after publication/);
+  assert.equal(await processReceipt(options),'published');
+  assert.equal(calls,1);
+  assert.deepEqual(events.map(event=>event.status),['sending','completed','published']);
+  assert.equal(new Set(events.map(event=>event.attemptKey)).size,1);
+  assert.equal(events.at(-1).fields.reviewId,report.id);
+  assert.equal(events.at(-1).fields.inputTokens,8921);
+  assert.equal(events.at(-1).fields.outputTokens,610);
+  assert.equal(events.at(-1).fields.timeToFirstUsefulMs,60000);
+  assert.equal(JSON.parse(await readFile(statePath(dir,snapshot))).reviewId,report.id);
+});
+
+test('adapter start failure, provider rejection and late unknown outcomes are distinct', async t => {
+  const {invokeModel}=await import('../infra/local-terra/producer.mjs');
+  const dir=await mkdtemp(join(tmpdir(),'terra-adapter-'));
+  t.after(()=>rm(dir,{recursive:true,force:true}));
+  const script=join(dir,'adapter.py');
+  await assert.rejects(invokeModel(script,{}),{message:'adapter_unavailable',state:'rejected'});
+  await writeFile(script,'import sys\nprint("codex_context_limit", file=sys.stderr)\nsys.exit(1)\n');
+  await assert.rejects(invokeModel(script,{}),{message:'provider_context_limit',state:'rejected'});
+  await writeFile(script,'import sys\nprint("internal diagnostic", file=sys.stderr)\nsys.exit(1)\n');
+  await assert.rejects(invokeModel(script,{}),{message:'adapter_failed_after_start',state:'unknown'});
 });

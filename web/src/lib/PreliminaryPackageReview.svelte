@@ -7,6 +7,7 @@
   import PreliminaryRowChange from './PreliminaryRowChange.svelte';
   import PreliminarySources from './PreliminarySources.svelte';
   import PreliminaryStatusBadge from './PreliminaryStatusBadge.svelte';
+  import ReceiptEvidenceChain from './ReceiptEvidenceChain.svelte';
 
   type ReadingProgress = { totalWindows: number; mappedVersions: number; acceptedVersions: number;
     completed: number; covered: number; partial?: number; noMatch: number; refused: number; held: number; reading: number };
@@ -187,6 +188,11 @@
       <div class="actions"><button type="button" onclick={copyDraft}>Скопировать текст</button><span role="status">{copied}</span></div>
     {/if}
   </section>
+  {#if mode === 'review'}
+    {#key selected.id}
+      <ReceiptEvidenceChain {api} {projectId} receiptId={selected.receiptId} reviewId={selected.id} {refreshKey} />
+    {/key}
+  {/if}
 {/if}
 
 <style>

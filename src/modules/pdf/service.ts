@@ -1,5 +1,5 @@
 import { verifyStoredDwgDerivative } from './dwg-derivative.js';
-import { dxfFramingRevision, dxfGroupRecoveryVersion, isDxfGroupHold } from '../formats/dwg-profile.js';
+import { dxfEncodingRecoveryVersion, dxfEncodingRevision, dxfFramingRevision, dxfGroupRecoveryVersion, isDxfEncodingHold, isDxfGroupHold } from '../formats/dwg-profile.js';
 import { createHash, randomUUID } from 'node:crypto';
 import { createWriteStream } from 'node:fs';
 import { mkdir, mkdtemp, rm, statfs } from 'node:fs/promises';
@@ -399,7 +399,7 @@ export function createReaderService(db: Pool, deps: ReaderDependencies, adapters
     return client ? save(client) : transaction(db, save);
   }
 
-  async function recoverDxfGroup(source: SourceRef, original: Original, adapter: ReaderAdapter, retryVersion: string) {
+  async function recoverDwg(source: SourceRef, original: Original, adapter: ReaderAdapter, retryVersion: string) {
     async function existing(tx?: PoolClient) {
       const current = await lookupMap(source, retryVersion, tx);
       if (!current) return;
@@ -805,8 +805,14 @@ export function createReaderService(db: Pool, deps: ReaderDependencies, adapters
         const retryVersion = dxfGroupRecoveryVersion(version);
         if (retryVersion && current && isDxfGroupHold(current.units)) {
           const framing = current.units[0].locator?.dxfFraming;
-          if (framing === undefined) return recoverDxfGroup(source, original, adapter, retryVersion);
+          if (framing === undefined) return recoverDwg(source, original, adapter, retryVersion);
           if (framing === dxfFramingRevision) { await original.check?.(); return current; }
+        }
+        const encodingVersion = dxfEncodingRecoveryVersion(version);
+        if (encodingVersion && current && isDxfEncodingHold(current.units)) {
+          const encoding = current.units[0].locator?.dxfEncoding;
+          if (encoding === undefined) return recoverDwg(source, original, adapter, encodingVersion);
+          if (encoding === dxfEncodingRevision) { await original.check?.(); return current; }
         }
         if (version.includes(':dwg:unavailable:')) {
           const { rows: candidates } = await db.query<MapRow>(`SELECT r.* FROM reader_maps r JOIN dwg_derivatives d

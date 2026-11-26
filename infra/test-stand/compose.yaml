@@ -60,7 +60,7 @@ services:
 
 networks:
   default:
-    name: facade-ai-test-server_private
+    name: ${FACADE_STAND_NETWORK:-facade-ai-test-server_private}
     internal: true
 
 secrets:

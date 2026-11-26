@@ -5,12 +5,14 @@ import { createServer as createTlsServer } from 'node:tls';
 
 const targets = { postgres: ['postgres', 5432], api: ['api', 3000], objects: ['objects', 3900] };
 
-if (process.argv[2] === 'host') {
-  const [docker, container, cert, key] = process.argv.slice(3);
+if (['host', 'host-api'].includes(process.argv[2])) {
+  const [docker, container, certOrContext, key] = process.argv.slice(3);
+  const apiOnly = process.argv[2] === 'host-api';
+  const context = apiOnly ? certOrContext : 'orbstack';
   function forward(service) {
     return (socket) => {
       const child = spawn(docker, [
-        '--context', 'orbstack', 'exec', '-i', container, 'node', '/relay.mjs', service,
+        '--context', context, 'exec', '-i', container, 'node', '/relay.mjs', service,
       ], { stdio: ['pipe', 'pipe', 'ignore'] });
       socket.setNoDelay(true);
       socket.pipe(child.stdin);
@@ -22,14 +24,19 @@ if (process.argv[2] === 'host') {
       child.stdin.on('error', () => socket.destroy());
     };
   }
-  createServer(forward('postgres')).listen(15432, '127.0.0.1');
-  createServer(forward('objects')).listen(13900, '127.0.0.1');
-  createServer(forward('api')).listen(18080, '127.0.0.1');
-  createTlsServer({
-    cert: readFileSync(cert),
-    key: readFileSync(key),
-    minVersion: 'TLSv1.2',
-  }, forward('api')).listen(18443, '127.0.0.1');
+  if (apiOnly) {
+    const server = createServer(forward('api'));
+    server.listen(0, '127.0.0.1', () => console.log(`http://127.0.0.1:${server.address().port}`));
+  } else {
+    createServer(forward('postgres')).listen(15432, '127.0.0.1');
+    createServer(forward('objects')).listen(13900, '127.0.0.1');
+    createServer(forward('api')).listen(18080, '127.0.0.1');
+    createTlsServer({
+      cert: readFileSync(certOrContext),
+      key: readFileSync(key),
+      minVersion: 'TLSv1.2',
+    }, forward('api')).listen(18443, '127.0.0.1');
+  }
 } else {
   const [host, port] = targets[process.argv[2]];
   const upstream = createConnection({ host, port });

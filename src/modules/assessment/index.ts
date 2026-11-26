@@ -1,3 +1,4 @@
+import { readReceiptEvidenceChain } from "./receipt-evidence-chain.js";
 import { readPackagePreparation } from "../intake/package-preparation.js";
 import { packagePreparationInput } from "../harness/package-preparation.js";
 import { createRuntimePdfService } from "../pdf/index.js";
@@ -100,6 +101,22 @@ function registerRoutes(app: FastifyInstance, prefix: string, reader: () => Retu
         restrictions: preparation.restrictions.map(({label,reason,sourceId}) => ({label,reason,sourceId})), items };
     });
   });
+  app.get<{ Params: Project & { receiptId: string }; Querystring: { reviewId?: string; versionId?: string; after?: string } }>(
+    `${prefix}/projects/:projectId/receipts/:receiptId/evidence-chain`, async (request) => {
+      const projectId = identifier(request.params.projectId);
+      const receiptId = identifier(request.params.receiptId);
+      const { reviewId, versionId, after } = request.query;
+      return transaction(db, async (tx) => {
+        const session = await readSession(tx, request);
+        await authorize(tx, session, { action: "project:read", projectId });
+        const result = await readReceiptEvidenceChain(tx, { projectId, receiptId,
+          reviewId: reviewId === undefined ? undefined : identifier(reviewId),
+          versionId: versionId === undefined ? undefined : identifier(versionId),
+          after: after === undefined ? undefined : identifier(after) });
+        await touchSession(tx, session);
+        return result;
+      });
+    });
   app.get<{ Params: Project; Querystring: { after?: string } }>(`${prefix}/projects/:projectId/preliminary-package-reviews`, async (request) => {
     const projectId = identifier(request.params.projectId);
     const after = request.query.after === undefined ? undefined : identifier(request.query.after);

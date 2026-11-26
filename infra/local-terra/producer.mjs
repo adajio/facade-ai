@@ -1,13 +1,14 @@
 import { reviseReceipt } from './revise.mjs';
 import { createHash } from 'node:crypto';
 import { spawn } from 'node:child_process';
-import { mkdir, open, readdir, readFile, rename } from 'node:fs/promises';
+import { access, mkdir, open, readdir, readFile, rename } from 'node:fs/promises';
 import { join } from 'node:path';
 import { createRequire } from 'node:module';
 import { pathToFileURL } from 'node:url';
+import { duration, emitActivity, measureRequest, messageEntryBytes, ModelTransportError, modelFailure,
+  prioritizeEvidence, remainingRequestBytes, responseUsage } from './request-budget.mjs';
 
 const MODEL = 'gpt-6.1-terra';
-const MAX_CHARS = 100_000;
 const sha = s => createHash('sha256').update(s).digest('hex');
 const json = v => JSON.stringify(v);
 const assert = (b, message) => { if (!b) throw Error(message); };
@@ -31,14 +32,13 @@ export async function claim(path, snapshot) {
   } catch (e) { if (e.code === 'EEXIST') return false; throw e; }
 }
 
-// The adapter serializes the text message once more when wrapping it for the CLI.
-// Budget that escaped representation, including filenames and source limitations.
-const promptDataBudget = 150_000;
-const wireBytes = value => Buffer.byteLength(json(json(value)));
+const shortLabel = (value, limit) => {
+  const points = Array.from(value);
+  return points.length > limit ? '…'+points.slice(1-limit).join('') : value;
+};
 
 export function preparePromptSnapshot(snapshot) {
-  const byPath = new Map();
-  const byVersion = new Map();
+  const byPath = new Map(), byVersion = new Map();
   for (const entry of snapshot.unread ?? []) {
     const grouped = entry.versionId ? byVersion : byPath;
     const key = entry.versionId ?? entry.path;
@@ -48,44 +48,76 @@ export function preparePromptSnapshot(snapshot) {
     }
     grouped.set(key, reasons);
   }
+  const files = snapshot.files ?? [];
+  const fileByVersion = new Map(files.map(file => [file.versionId,file]));
+  const totalLines = snapshot.totalLines ?? snapshot.lines.length;
+  const note = (selectedFiles, coveredFiles, selectedLines, remainingLines) =>
+    `${snapshot.scopeNote ?? ''} Модели передано файлов: ${selectedFiles} из ${files.length}; с адресными строками: ${coveredFiles}; текстовых строк: ${selectedLines} из ${totalLines} в индексе; осталось: ${remainingLines}. Полные адреса сохранены в сервисе.`;
+  // Reserve the longest counts up front. Final counts can only make the body smaller.
   const promptData = {
-    stage:snapshot.stage, requirements:snapshot.requirements, scope:snapshot.scopeNote,
-    layout:'Файлы: [номер, путь, ограничения по файлу или отдельным участкам]. Строки: [id для цитаты, номер файла, участок, дословный текст]. Перечень ограничений сгруппирован по файлу.',
-    totalFiles:snapshot.files?.length ?? 0, sampledLines:snapshot.lines.length,
-    files:[], lines:[],
+    stage:snapshot.stage, requirements:snapshot.requirements, scope:note(files.length,files.length,totalLines,totalLines),
+    layout:'Номера в списках начинаются с 1. Файлы: [номер папки, номер имени, номера ограничений файла или участков, число непереданных ограничений]. Папки и имена могут быть сокращены. Строки: [id для цитаты, номер файла, участок, дословный текст].',
+    totalFiles:files.length, totalLines, directories:[], names:[], limitations:[], files:[], lines:[],
   };
-  let availableBytes = promptDataBudget - wireBytes(promptData);
-  assert(availableBytes > 0, 'catalog_exceeds_preliminary_input');
-  const fileNumbers = new Map();
-  // Reserve space for evidence even when the package contains thousands of filenames.
-  let fileBudget = Math.floor(availableBytes * 0.6);
-  for (const file of snapshot.files ?? []) {
-    const reasons = new Set([...(byVersion.get(file.versionId) ?? []), ...(byPath.get(file.path) ?? [])]);
-    const number = promptData.files.length + 1;
-    const entry = [number, file.path, [...reasons]];
-    const bytes = wireBytes(entry) + 1;
-    if (bytes > fileBudget) continue;
+  let available = remainingRequestBytes(measureRequest(makeRequest({...snapshot,promptData})));
+  const ordered = prioritizeEvidence(snapshot.lines,snapshot.requirements,line =>
+    ({source:line.versionId,text:line.text,label:fileByVersion.get(line.versionId)?.path}));
+  const fileNumbers = new Map(), covered = new Set(), lines = [];
+  const dictionaries = {directories:new Map(),names:new Map(),limitations:new Map()};
+  const addFile = (file, reserve = 0) => {
+    if (fileNumbers.has(file.versionId)) return true;
+    const reasons = [...new Set([...(byVersion.get(file.versionId) ?? []), ...(byPath.get(file.path) ?? [])])];
+    const additions = [];
+    const lookup = (key, raw, limit) => {
+      const value = shortLabel(raw,limit);
+      const previous = dictionaries[key].get(value) ?? additions.find(entry=>entry.key===key && entry.value===value)?.index;
+      if (previous) return previous;
+      const index = dictionaries[key].size+1+additions.filter(entry=>entry.key===key).length;
+      additions.push({key,value,index});
+      return index;
+    };
+    const slash = file.path.lastIndexOf('/');
+    const entry = [lookup('directories',file.path.slice(0,Math.max(0,slash)),120),lookup('names',file.path.slice(slash+1),160)];
+    if (reasons.length) entry.push(reasons.slice(0,8).map(reason=>lookup('limitations',reason,100)));
+    if (reasons.length>8) entry.push(reasons.length-8);
+    const bytes = messageEntryBytes(entry)+additions.reduce((size,{value})=>size+messageEntryBytes(value),0);
+    if (bytes > available-reserve) return false;
+    for (const {key,value,index} of additions) {
+      dictionaries[key].set(value,index);
+      promptData[key].push(value);
+    }
     promptData.files.push(entry);
-    fileNumbers.set(file.versionId, number);
-    fileBudget -= bytes;
-    availableBytes -= bytes;
+    fileNumbers.set(file.versionId,promptData.files.length);
+    available -= bytes;
+    return true;
+  };
+  // Reserve room for evidence even with thousands of filenames. Give sources with likely
+  // criterion matches first access to the inventory space, then list unindexed sources.
+  const fileReserve = Math.ceil(available*0.58);
+  const orderedFiles = new Set([...ordered.map(line=>fileByVersion.get(line.versionId)).filter(Boolean), ...files]);
+  if (available >= 0) {
+    for (const file of orderedFiles) addFile(file,fileReserve);
+    for (const line of ordered) {
+      const file = fileByVersion.get(line.versionId);
+      if (!file) continue;
+      const {unitId} = JSON.parse(line.anchor);
+      const entry = [line.id,fileNumbers.get(line.versionId) ?? fileNumbers.size+1,unitId,line.text];
+      const bytes = messageEntryBytes(entry);
+      if (bytes > available || !addFile(file,bytes)) continue;
+      promptData.lines.push(entry);
+      lines.push(line);
+      covered.add(line.versionId);
+      available -= bytes;
+    }
+    for (const file of orderedFiles) addFile(file);
   }
-  const lines = [];
-  for (const line of snapshot.lines) {
-    const number = fileNumbers.get(line.versionId);
-    if (!number) continue;
-    const {unitId} = JSON.parse(line.anchor);
-    const entry = [line.id, number, unitId, line.text];
-    const bytes = wireBytes(entry) + 1;
-    if (bytes > availableBytes) continue;
-    promptData.lines.push(entry);
-    lines.push(line);
-    availableBytes -= bytes;
-  }
-  const note = `Модели передано файлов: ${promptData.files.length} из ${promptData.totalFiles}; текстовых строк: ${lines.length} из ${snapshot.lines.length} в выборке. Полные адреса сохраняются в сервисе.`;
-  const scopeNote = `${snapshot.scopeNote} ${note}`;
+  const coverage = {totalFiles:files.length,selectedFiles:fileNumbers.size,coveredFiles:covered.size,
+    totalLines,selectedLines:lines.length,remainingLines:totalLines-lines.length};
+  const scopeNote = note(coverage.selectedFiles,coverage.coveredFiles,coverage.selectedLines,coverage.remainingLines);
   promptData.scope = scopeNote;
-  return {...snapshot, lines, scopeNote, promptData};
+  const prepared = {...snapshot,lines,scopeNote,promptData};
+  const budget = {...measureRequest(makeRequest(prepared)), ...coverage};
+  return {...prepared,budget};
 }
 
 export function makeRequest(snapshot) {
@@ -125,7 +157,7 @@ export async function readSnapshot(db, receiptId) {
   const client = await db.connect();
   try {
     await client.query('BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY');
-    const {rows:[r]} = await client.query(`SELECT r.id, r.project_id, p.catalog_version_id, p.project_stage, c.requirements, prep.id AS preparation_id, prep.manifest,
+    const {rows:[r]} = await client.query(`SELECT r.id, r.project_id, r.created_at AS receipt_created_at, p.catalog_version_id, p.project_stage, c.requirements, prep.id AS preparation_id, prep.manifest,
       r.sealed_at IS NOT NULL AND NOT EXISTS (SELECT 1 FROM intake_occurrences o WHERE o.receipt_id=r.id AND (o.state='declared' OR o.inventory_pending))
       AND NOT EXISTS (SELECT 1 FROM intake_imports i WHERE i.receipt_id=r.id AND i.state IN ('queued','running','paused')) AS ready
       FROM intake_receipts r JOIN projects p ON p.id=r.project_id LEFT JOIN catalog_versions c ON c.id=p.catalog_version_id
@@ -178,21 +210,19 @@ export async function readSnapshot(db, receiptId) {
       FROM project_memory_blocks b JOIN project_memory_lines l ON l.block_id=b.id
       JOIN LATERAL (SELECT max(contract) AS contract FROM project_memory_versions m WHERE m.project_id=b.project_id AND m.version_id=b.version_id) latest ON latest.contract=b.contract
       WHERE b.project_id=$1 AND b.version_id=ANY($2::uuid[]))
-      SELECT * FROM ranked ORDER BY sample_rank,"versionId" LIMIT 5001`,[r.project_id,availableIds]);
+      SELECT *,count(*) OVER () AS "totalLines" FROM ranked ORDER BY sample_rank,"versionId",block,ordinal,"lineId" LIMIT 5000`,[r.project_id,availableIds]);
     await client.query('COMMIT');
-    const capped = all.length > 5000; if (capped) all.pop();
+    const totalLines=Number(all[0]?.totalLines ?? all.length);
     const inventoryById = new Map(inventory.map(x=>[x.versionId,x]));
-    const lines=[]; let chars=0;
-    for (const l of all) {
-      if (l.text.length > 4000 || chars+l.text.length > MAX_CHARS) continue;
-      const source=inventoryById.get(l.versionId); chars+=l.text.length;
-      lines.push({id:`L${lines.length+1}`,versionId:l.versionId,originalSha256:source.originalSha256,
-        anchor:json({unitId:l.unitId,lineId:l.lineId,address:l.address}),text:l.text});
-    }
-    const omissions = all.length-lines.length;
-    const scopeNote=`Предварительный обзор сохранённых текстовых строк по закрытой описи; ${lines.length} из ${capped ? 'выборки 5000' : all.length} строк, ${inventory.length} принятых версий. Графика, OCR, непроиндексированные и недоступные фрагменты могут быть не охвачены. Пропущено строк в выборке по лимиту: ${omissions}${capped ? '; остальные строки за пределами обзора' : ''}. Без индекса как контейнеры или служебные элементы: ${exempt.length}; с физическими ограничениями: ${states.filter(s=>s.physical_limitation || s.last_error).length}. Непрочитанных записей: ${unread.length}. Отсутствие не устанавливалось; требуется проверка инженером.`;
-    return {projectId:r.project_id,receiptId:r.id,preparationId:r.preparation_id,unread,restrictions:r.manifest.restrictions,catalogVersionId:r.catalog_version_id,stage:r.project_stage,requirements:r.requirements,
-      inventory:inventory.map(({versionId,originalSha256})=>({versionId,originalSha256})),files:inventory.filter(file=>preparedItems.get(file.versionId)?.kind==='document'),lines,scopeNote};
+    const lines=all.flatMap((l,index)=> {
+      if (l.text.length > 4000) return [];
+      const source=inventoryById.get(l.versionId);
+      return [{id:`L${index+1}`,versionId:l.versionId,originalSha256:source.originalSha256,
+        anchor:json({unitId:l.unitId,lineId:l.lineId,address:l.address}),text:l.text}];
+    });
+    const scopeNote=`Предварительный обзор сохранённых текстовых строк по закрытой описи из ${inventory.length} принятых версий. Графика, OCR, непроиндексированные и недоступные фрагменты могут быть не охвачены. Без индекса как контейнеры или служебные элементы: ${exempt.length}; с физическими ограничениями: ${states.filter(s=>s.physical_limitation || s.last_error).length}. Непрочитанных записей: ${unread.length}. Отсутствие не устанавливалось. Требуется проверка инженером.`;
+    return {projectId:r.project_id,receiptId:r.id,receiptCreatedAt:r.receipt_created_at,preparationId:r.preparation_id,unread,restrictions:r.manifest.restrictions,catalogVersionId:r.catalog_version_id,stage:r.project_stage,requirements:r.requirements,
+      inventory:inventory.map(({versionId,originalSha256})=>({versionId,originalSha256})),files:inventory.filter(file=>preparedItems.get(file.versionId)?.kind==='document'),lines,totalLines,scopeNote};
   } catch(e) { await client.query('ROLLBACK').catch(()=>{}); throw e; } finally { client.release(); }
 }
 export function parseModelResponse(res) {
@@ -202,23 +232,65 @@ export function parseModelResponse(res) {
     calls[0].function?.name==='submit_preliminary_review' && typeof calls[0].function.arguments==='string','invalid_model_tool');
   try { return JSON.parse(calls[0].function.arguments); } catch { throw Error('invalid_model_arguments'); }
 }
-export function invokeModel(script, request) {
+const knownTransportRejections = new Map([
+  ['codex_context_limit','provider_context_limit'], ['codex_request_too_large','provider_request_too_large'],
+  ['codex_usage_limit','provider_usage_limit'], ['codex_login_required','provider_auth_required'],
+  ['input_too_large','adapter_input_too_large'], ['unsupported_model','adapter_unsupported_model'],
+  ['invalid_function_arguments','invalid_model_arguments'], ['invalid_codex_response','invalid_model_response'],
+  ['unknown_function','invalid_model_tool'],
+]);
+
+export async function invokeModel(script, request) {
+  try { await access(script); }
+  catch { throw new ModelTransportError('rejected','adapter_unavailable'); }
   return new Promise((resolve,reject)=>{
-    const p=spawn('/usr/bin/python3',[script],{stdio:['pipe','pipe','pipe']}); let out='';
-    p.stdout.setEncoding('utf8'); p.stdout.on('data',x=>out+=x); p.stderr.resume();
-    p.on('error',()=>reject(Error('model_adapter_unavailable')));
-    p.on('close',code=>{ if(code!==0) return reject(Error('model_adapter_failed'));
-      const revision=request.tools?.[0]?.function?.name==='revise_package_review';
-      try { const response=JSON.parse(out); resolve(revision ? response : parseModelResponse(response)); }
-      catch { if (revision) resolve({error:'invalid_adapter_json'}); else reject(Error('invalid_model_response')); } });
-    p.stdin.on('error',()=>{}); p.stdin.end(json(request));
+    const p=spawn('/usr/bin/python3',[script],{stdio:['pipe','pipe','pipe']});
+    let out='', error='';
+    p.stdout.setEncoding('utf8');
+    p.stdout.on('data',chunk=>out+=chunk);
+    p.stderr.setEncoding('utf8');
+    p.stderr.on('data',chunk=>{ error = (error+chunk).slice(-4_096); });
+    p.on('error',()=>reject(new ModelTransportError('rejected','adapter_unavailable')));
+    p.on('close',code=>{
+      if (code!==0) {
+        const known = knownTransportRejections.get(error.trim().split('\n').at(-1));
+        return reject(new ModelTransportError(known ? 'rejected' : 'unknown',known ?? 'adapter_failed_after_start'));
+      }
+      try { resolve(JSON.parse(out)); }
+      catch { resolve({error:'invalid_adapter_json'}); }
+    });
+    p.stdin.on('error',()=>{});
+    p.stdin.end(json(request));
   });
 }
-export async function processReceipt({db,receiptId,stateDir,modelCall,publish,admitClaim}) {
-  const published=await db.query(`SELECT 1 FROM preliminary_package_reviews pr
+
+const primaryKey = snapshot => sha(json({projectId:snapshot.projectId,receiptId:snapshot.receiptId,
+  catalogVersionId:snapshot.catalogVersionId,stage:snapshot.stage,
+  inventory:snapshot.inventory.map(({versionId,originalSha256})=>({versionId,originalSha256})),
+  preparationId:snapshot.preparationId}));
+async function readState(path) {
+  try { return JSON.parse(await readFile(path,'utf8')); }
+  catch (error) { if (error.code==='ENOENT') return null; throw error; }
+}
+function firstUseful(from, to) {
+  const {elapsedMs} = duration(from,to);
+  return elapsedMs === undefined ? {} : {timeToFirstUsefulMs:elapsedMs};
+}
+function answerResult(response) {
+  // Saved journals before usage reporting, and injected test transports, contain the parsed body.
+  return Array.isArray(response?.rows) ? response : parseModelResponse(response);
+}
+
+export async function processReceipt({db,receiptId,stateDir,modelCall,publish,admitClaim,recordActivity}) {
+  const notify = (snapshot,status,attemptKey,fields,reason) =>
+    emitActivity(recordActivity,db,snapshot,'primary_review',status,attemptKey,fields,reason);
+  const published=await db.query(`SELECT pr.id, pr.project_id AS "projectId",pr.receipt_id AS "receiptId",
+    pr.catalog_version_id AS "catalogVersionId",pr.stage,pr.inventory,pr.preparation_id AS "preparationId",
+    pr.created_at AS "publishedAt",r.created_at AS "receiptCreatedAt"
+    FROM preliminary_package_reviews pr
     JOIN projects p ON p.id=pr.project_id AND p.catalog_version_id=pr.catalog_version_id AND p.project_stage=pr.stage
     JOIN intake_receipts r ON r.id=pr.receipt_id AND r.project_id=pr.project_id
-    WHERE r.id=$1 AND r.sealed_at IS NOT NULL
+    WHERE r.id=$1 AND r.sealed_at IS NOT NULL AND pr.previous_report_id IS NULL
       AND (pr.preparation_id IS NULL OR EXISTS (SELECT 1 FROM intake_package_preparation_current cur
         WHERE cur.project_id=r.project_id AND cur.receipt_id=r.id AND cur.manifest_id=pr.preparation_id))
       AND NOT EXISTS (SELECT 1 FROM intake_occurrences o WHERE o.receipt_id=r.id AND (o.state='declared' OR o.inventory_pending))
@@ -227,49 +299,106 @@ export async function processReceipt({db,receiptId,stateDir,modelCall,publish,ad
         FROM (SELECT DISTINCT v.id,orig.sha256 FROM intake_occurrences o
           JOIN intake_document_versions v ON v.id=o.version_id AND v.project_id=o.project_id
           JOIN intake_originals orig ON orig.id=v.original_id AND orig.project_id=v.project_id
-          WHERE o.receipt_id=r.id AND o.state='accepted') s) LIMIT 1`,[receiptId]);
-  if (published.rowCount) return 'published';
-  const sourceSnapshot=await readSnapshot(db,receiptId); if (!sourceSnapshot) return 'waiting';
-  const snapshot=preparePromptSnapshot(sourceSnapshot);
-  const fingerprint=sha(json({projectId:snapshot.projectId,receiptId:snapshot.receiptId,
-    catalogVersionId:snapshot.catalogVersionId,stage:snapshot.stage,inventory:snapshot.inventory,preparationId:snapshot.preparationId}));
+          WHERE o.receipt_id=r.id AND o.state='accepted') s)
+    ORDER BY (pr.preparation_id IS NOT NULL) DESC,pr.created_at DESC,pr.id DESC LIMIT 1`,[receiptId]);
+  if (published.rowCount) {
+    const row = published.rows?.[0];
+    if (row?.preparationId) {
+      const key=primaryKey(row), path=join(stateDir,`${receiptId}-${key}.json`);
+      const saved=await readState(path);
+      const publishedAt=new Date(row.publishedAt).valueOf();
+      const fields={...saved?.snapshot?.budget,...saved?.transport,reviewId:row.id,
+        ...firstUseful(row.receiptCreatedAt,publishedAt),...duration(saved?.startedAt,publishedAt)};
+      await notify(row,'published',key,fields);
+      if (saved?.state==='responded') await atomicWrite(path,{...saved,state:'published',publishedAt:row.publishedAt,reviewId:row.id});
+    }
+    return 'published';
+  }
+  const source=await readSnapshot(db,receiptId); if (!source) return 'waiting';
+  const fingerprint=primaryKey(source);
   const statePath=join(stateDir,`${receiptId}-${fingerprint}.json`);
-  let saved; try { saved=JSON.parse(await readFile(statePath,'utf8')); } catch(e) { if(e.code!=='ENOENT') throw e; }
+  let saved=await readState(statePath);
   if (!saved) {
     // Older producer revisions used a single receipt file. Never bypass an uncertain legacy request.
-    try {
-      const legacy=JSON.parse(await readFile(join(stateDir,`${receiptId}.json`),'utf8'));
-      if (['sending','unknown','responded'].includes(legacy.state)) return 'held_legacy_attempt';
-    } catch(e) { if(e.code!=='ENOENT') throw e; }
+    const legacy=await readState(join(stateDir,`${receiptId}.json`));
+    if (['sending','unknown','responded'].includes(legacy?.state)) {
+      await notify(source,'unknown',fingerprint,{},'held_legacy_attempt');
+      return 'held_legacy_attempt';
+    }
+    const snapshot=preparePromptSnapshot(source);
+    const request=makeRequest(snapshot);
+    snapshot.requestSha256=sha(json(request));
     // A changed preparation may reuse the same originals. An operator may authorize one
     // different prepared input while retaining the earlier unknown outcome and its journal.
     for (const file of await readdir(stateDir)) {
       if (!file.startsWith(receiptId+'-') || !file.endsWith('.json') || join(stateDir,file)===statePath) continue;
-      const prior=JSON.parse(await readFile(join(stateDir,file),'utf8'));
-      const authorization = prior.retryAuthorization;
-      if (prior.state==='unknown' && authorization?.preparationId===snapshot.preparationId &&
-          authorization.preparationId!==prior.snapshot?.preparationId && authorization.requestSha256===sha(json(makeRequest(snapshot)))) continue;
-      if (['sending','unknown','responded'].includes(prior.state) && prior.snapshot?.catalogVersionId===snapshot.catalogVersionId &&
-          prior.snapshot?.stage===snapshot.stage && json(prior.snapshot.inventory)===json(snapshot.inventory)) return 'held_legacy_attempt';
+      const prior=await readState(join(stateDir,file));
+      const authorization = prior?.retryAuthorization;
+      if (prior?.state==='unknown' && authorization?.preparationId===snapshot.preparationId &&
+          authorization.preparationId!==prior.snapshot?.preparationId && authorization.requestSha256===snapshot.requestSha256) continue;
+      if (['sending','unknown','responded'].includes(prior?.state) && prior.snapshot?.catalogVersionId===snapshot.catalogVersionId &&
+          prior.snapshot?.stage===snapshot.stage && json(prior.snapshot.inventory)===json(snapshot.inventory)) {
+        await notify(source,'unknown',fingerprint,{},'held_legacy_attempt');
+        return 'held_legacy_attempt';
+      }
     }
-  }
-  if (saved?.state === 'published') return 'held_input_changed';
-  if (saved?.state === 'sending') return 'unknown';
-  if (!saved) {
-    const reserve = () => claim(statePath,snapshot);
+    if (remainingRequestBytes(snapshot.budget)<0) {
+      await notify(snapshot,'rejected',fingerprint,{...snapshot.budget,...duration(source.receiptCreatedAt)},'primary_request_limit');
+      return 'primary_request_limit';
+    }
+    const startedAt=Date.now();
+    const reserve = () => claim(statePath,{...snapshot,startedAt});
     const admission = await admitClaim(snapshot,reserve);
-    if (admission !== 'claimed') return admission;
-    let result;
-    try { result=await modelCall(makeRequest(snapshot)); }
-    catch(e) { await atomicWrite(statePath,{state:'unknown',snapshot,error:'model_request_failed_or_unknown'}); return 'unknown'; }
-    // Persist even invalid responses: no implicit paid retry after a malformed answer.
-    await atomicWrite(statePath,{state:'responded',snapshot,result}); saved={state:'responded',snapshot,result};
+    if (admission !== 'claimed') {
+      if (admission==='waiting') await notify(snapshot,'waiting',fingerprint,snapshot.budget,'prepared_input_changed');
+      return admission;
+    }
+    await notify(snapshot,'sending',fingerprint,snapshot.budget);
+    const providerStarted=Date.now();
+    let response, result, failure;
+    try { response=await modelCall(request); }
+    catch (error) { failure=modelFailure(error); }
+    const transport={...responseUsage(response),providerElapsedMs:Date.now()-providerStarted};
+    if (!failure) {
+      try { result=answerResult(response); }
+      catch (error) {
+        const reason=response?.error==='invalid_adapter_json' ? 'invalid_adapter_json' : error.message;
+        failure={state:'rejected',reason};
+      }
+    }
+    if (failure) {
+      const {state,reason}=failure;
+      await atomicWrite(statePath,{state,snapshot,startedAt,transport,error:reason});
+      await notify(snapshot,state,fingerprint,{...snapshot.budget,...transport,...duration(startedAt)},reason);
+      return state==='rejected' ? `primary_rejected:${reason}` : state;
+    }
+    saved={state:'responded',snapshot,result,startedAt,transport};
+    await atomicWrite(statePath,saved);
   }
-  if (saved.state === 'unknown') return 'unknown';
-  assert(saved.state === 'responded','invalid_state');
-  const input=validate(saved.snapshot,saved.result);
-  await publish(db,input);
-  await atomicWrite(statePath,{...saved,state:'published',publishedAt:new Date().toISOString()});
+  const base={...saved.snapshot?.budget,...saved.transport,...duration(saved.startedAt ?? saved.snapshot?.startedAt)};
+  if (saved.state==='published') return 'held_input_changed';
+  if (saved.state==='sending' || saved.state==='unknown') {
+    await notify(saved.snapshot,'unknown',fingerprint,base,saved.error ?? 'model_outcome_unknown');
+    return 'unknown';
+  }
+  if (saved.state==='rejected') {
+    await notify(saved.snapshot,'rejected',fingerprint,base,saved.error);
+    return `primary_rejected:${saved.error}`;
+  }
+  assert(saved.state==='responded','invalid_state');
+  await notify(saved.snapshot,'completed',fingerprint,base);
+  let input;
+  try { input=validate(saved.snapshot,saved.result); }
+  catch (error) {
+    await atomicWrite(statePath,{...saved,state:'rejected',error:error.message});
+    await notify(saved.snapshot,'rejected',fingerprint,base,error.message);
+    return `primary_rejected:${error.message}`;
+  }
+  const publication=await publish(db,input);
+  const publishedAt=Date.now();
+  await atomicWrite(statePath,{...saved,state:'published',publishedAt:new Date(publishedAt).toISOString(),reviewId:publication?.id});
+  await notify(saved.snapshot,'published',fingerprint,{...base,reviewId:publication?.id,
+    ...duration(saved.startedAt,publishedAt),...firstUseful(source.receiptCreatedAt,publishedAt)});
   return 'published';
 }
 async function main() {

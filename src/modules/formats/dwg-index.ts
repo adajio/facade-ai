@@ -13,7 +13,7 @@ import type { CadFontAssets } from "./cad-font-assets.js";
 import { dwgCadText, mergeFontUses } from "./dwg-cad-text.js";
 import { dwgMaskContext } from "./dwg-mask-context.js";
 import { cadPaintOrder, cadShapeBounds } from "./cad-bounds.js";
-import { derivativeLines, derivativeText, dxfBytes, dxfValue } from "./dwg-text.js";
+import { declaresLegacyDxfCodePage, derivativeLines, derivativeText, dxfBytes, dxfValue, isolateLegacyOpaqueValues, legacyDxfValue } from "./dwg-text.js";
 import { recoveryObjects } from "./dwg-recovery.js";
 import { FormatHold, unit } from "./model.js";
 import type { CadDefinition, CadFontUse, Unit } from "./model.js";
@@ -134,6 +134,17 @@ function budget(db: DatabaseSync, bytes: bigint) {
 export async function buildDwgIndex(
   file: FileHandle, sha: string, converter: string, pin?: Pin, fonts = dwgFontAssets(),
 ): Promise<DwgIndex> {
+  try {
+    return await compileDwgIndex(file, sha, converter, pin, fonts, false);
+  } catch (error) {
+    if (!(error instanceof FormatHold) || error.code !== "text_encoding_unconfirmed" || !await declaresLegacyDxfCodePage(file)) throw error;
+    return compileDwgIndex(file, sha, converter, pin, fonts, true);
+  }
+}
+
+async function compileDwgIndex(
+  file: FileHandle, sha: string, converter: string, pin: Pin | undefined, fonts: ReturnType<typeof dwgFontAssets>, legacy: boolean,
+): Promise<DwgIndex> {
   let path = pin && location(pin, fonts);
   if (pin && !path) throw new ReaderError("dwg_storage_unavailable", "Не настроено постоянное хранилище DWG", 503);
   let root = path ? join(path, "..") : tmpdir();
@@ -163,9 +174,11 @@ export async function buildDwgIndex(
     const kind = recovery ? "dwg-json" : "dxf";
     const utf16 = (head[0] === 0xff && head[1] === 0xfe) || (head[0] === 0xfe && head[1] === 0xff);
     const issues = new Set<string>();
+    const dxfLines = derivativeLines(dxfBytes(file));
     const source = recovery ? recoveryCadRecords(recoveryObjects(derivativeText(file)), issues)
       : utf16 ? convertedDxfRecords(derivativeLines(derivativeText(file)))
-        : convertedDxfRecords(derivativeLines(dxfBytes(file)), dxfValue);
+        : legacy ? convertedDxfRecords(isolateLegacyOpaqueValues(dxfLines, issues), legacyDxfValue)
+          : convertedDxfRecords(dxfLines, dxfValue);
     records = new DatabaseSync(join(tmp, "records"));
     budget(records, capacity / 3n);
     records.exec(`

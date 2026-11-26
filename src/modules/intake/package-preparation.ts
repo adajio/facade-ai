@@ -38,9 +38,9 @@ const office = (path: string, media: string, format: string | null) =>
 
 /** Determine the exact versions for which runtime must resolve its current reader profile. */
 export async function listPackagePreparationVersions(tx: PoolClient, input: Pick<PreparationInput, 'projectId' | 'receiptId'>) {
-  const { rows } = await tx.query<{ versionId: string; documentId: string; media: string; label: string; activeReaderVersion: string | null }>(
+  const { rows } = await tx.query<{ versionId: string; documentId: string; media: string; label: string; activeReaderVersion: string | null; activeRequestedVersion: string | null }>(
     `SELECT DISTINCT ON (v.id) v.id AS "versionId",v.document_id AS "documentId",v.media_type AS media,o.relative_path AS label,
-       m.reader_version AS "activeReaderVersion"
+       m.reader_version AS "activeReaderVersion",m.requested_reader_version AS "activeRequestedVersion"
        FROM intake_occurrences o JOIN intake_document_versions v ON v.id=o.version_id AND v.project_id=o.project_id
        LEFT JOIN harness_package_maps m ON m.project_id=o.project_id AND m.version_id=v.id AND m.active
       WHERE o.project_id=$1 AND o.receipt_id=$2 AND o.state='accepted' ORDER BY v.id,o.created_at,o.id`,
@@ -95,6 +95,21 @@ async function evaluate(tx: PoolClient, input: PreparationInput) {
     const directory = row.label.slice(0,row.label.length-file.length);
     return companionKeys.has(JSON.stringify([row.parentId,directory,file.slice(2).toLowerCase()]));
   }
+  // Confirm a CAD lock against its drawing in the same archive directory.
+  const siblingKey=(row:Occurrence, extension:string) => JSON.stringify([row.parentId,row.label.normalize('NFC').toLowerCase().replace(/\.[^./]+$/u,extension)]);
+  const drawings=new Set(rows.filter(row=>row.format==='dwg' && row.readerOriginalSha===row.sha256).map(row=>siblingKey(row,'.dwg')));
+  const lockInfo=(row:Occurrence) => {
+    if(row.readerOriginalSha!==row.sha256 || row.units?.length!==1)return undefined;
+    return (row.units[0] as {locator?:{lockPair?:string;limitations?:string}}).locator;
+  };
+  const xmlLocks=new Set(rows.filter(row=>row.format==='dwl2' && lockInfo(row)?.limitations==='cad_lock_candidate')
+    .map(row=>JSON.stringify([siblingKey(row,'.dwg'),lockInfo(row)?.lockPair])));
+  function companionReason(row:Occurrence){
+    const held=lockInfo(row);
+    if(row.format==='desktopini' && held?.limitations==='windows_folder_settings')return 'windows_folder_settings';
+    if((row.format==='dwl'||row.format==='dwl2') && held?.limitations==='cad_lock_candidate' && held.lockPair &&
+        drawings.has(siblingKey(row,'.dwg')) && xmlLocks.has(JSON.stringify([siblingKey(row,'.dwg'),held.lockPair]))) return 'cad_drawing_lock';
+  }
   const readablePdfs = new Map<string, Occurrence[]>();
   for (const row of rows) {
     if (row.format !== 'pdf' || row.refusal || !row.fingerprint || !row.readerVersion ||
@@ -133,6 +148,8 @@ async function evaluate(tx: PoolClient, input: PreparationInput) {
     if (isThumbsDbName(row.label) && row.readerOriginalSha === row.sha256 && thumbnailCacheUnits(row.format, row.units)) {
       return { ...mapped, kind: 'technical', state: 'excluded', reason: windowsThumbnailCache };
     }
+    const technicalReason=companionReason(row);
+    if(technicalReason)return {...mapped,kind:'technical',state:'excluded',reason:technicalReason};
     const companion = signatureCompanion(row);
     if (companion) return { ...mapped, ...companion, kind: 'technical', state: 'excluded' };
     if (row.refusal && !(row.refusal === 'physical_inventory_unverified' && usefulUnits(row.units).length))

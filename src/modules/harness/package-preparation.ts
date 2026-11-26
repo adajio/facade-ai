@@ -2,7 +2,8 @@ import type { Pool, PoolClient } from 'pg';
 import { transaction } from '../gateway/types.js';
 import { capturePackagePreparation, listPackagePreparationVersions, type PreparationInput } from '../intake/package-preparation.js';
 import { verifyStoredDwgDerivative } from '../pdf/index.js';
-import { dxfGroupRecoveryVersion, isDxfGroupRecoveryVersion } from '../formats/dwg-profile.js';
+import { dxfEncodingRecoveryVersion, dxfGroupRecoveryVersion, isDxfRecoveryVersion } from '../formats/dwg-profile.js';
+import { largeJpegRecoveryVersion } from '../formats/raster-profile.js';
 import type { ReaderService } from './reader.js';
 
 type Receipt = { projectId: string; receiptId: string };
@@ -19,8 +20,8 @@ export async function packagePreparationInput(tx: PoolClient, target: Receipt, r
     if (format === 'dwg') {
       const document = { projectId: target.projectId, documentId: item.documentId, versionId: item.versionId };
       const offline = !version || version.includes(':unavailable');
-      const recovered = item.activeReaderVersion && (offline ? isDxfGroupRecoveryVersion(item.activeReaderVersion)
-        : item.activeReaderVersion === dxfGroupRecoveryVersion(version));
+      const recovered = item.activeReaderVersion && (offline ? isDxfRecoveryVersion(item.activeReaderVersion)
+        : [dxfGroupRecoveryVersion(version), dxfEncodingRecoveryVersion(version)].includes(item.activeReaderVersion));
       const pinnedVersion = offline || recovered ? item.activeReaderVersion ?? version : version;
       if (recovered) version = pinnedVersion;
       if (pinnedVersion) {
@@ -33,6 +34,8 @@ export async function packagePreparationInput(tx: PoolClient, target: Receipt, r
         }
       }
     }
+    const rasterRecovery = largeJpegRecoveryVersion(version,item.media,item.label);
+    if (rasterRecovery && item.activeRequestedVersion===rasterRecovery && !item.activeReaderVersion) version = rasterRecovery;
     expectedReaderVersions[item.versionId] = version;
   }
   return { ...target, expectedReaderVersions, verifiedDerivatives };

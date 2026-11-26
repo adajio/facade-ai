@@ -11,32 +11,34 @@ import { convert, converterFor, withDwgDerivative } from "./conversion.js";
 import type { Converter, Legacy } from "./conversion.js";
 import { buildDwgIndex, dwgReaderProfile, openDwgIndex } from "./dwg-index.js";
 import type { DwgIndex } from "./dwg-index.js";
-import { dxfFramingRevision, dwgVersionPin } from "./dwg-profile.js";
+import { dxfEncodingRevision, dxfFramingRevision, dwgVersionPin } from "./dwg-profile.js";
 import { FormatHold, originalOnly, parseText, readInput, readerVersion } from "./model.js";
 import type { Locator, Parsed, Row, Unit } from "./model.js";
 import { cellAddress, parseDocx, parseWordPackage, parseXlsx } from "./office.js";
 import { stampPhysicalInventory } from "./physical-inventory.js";
 import { createRasterAdapter } from "./raster.js";
 import { createSignatureAdapter } from "./cms-signature.js";
+import { cadLock, companionFormat, desktopIni } from './companion-files.js';
 import { isThumbsDbName, parseThumbsDb, thumbsDbFormat } from "./windows-thumbnail-cache.js";
 import { parseDxf, parseIfc } from "./spatial.js";
 
-const formats = ["docx", "xlsx", "txt", "csv", "tsv", "dxf", "ifc", "doc", "xls", "dwg", "rvt", "image", "sig", thumbsDbFormat, "unknown"] as const;
+const formats = ["docx", "xlsx", "txt", "csv", "tsv", "dxf", "ifc", "doc", "xls", "dwg", "rvt", "image", "sig", thumbsDbFormat, "desktopini", "dwl", "dwl2", "unknown"] as const;
 type Format = typeof formats[number];
 const supports = new Set<string>(formats);
 const converterFormats = ["doc", "xls", "dwg"] as const;
 const rasterExtensions = new Set(["png", "jpg", "jpeg", "webp", "bmp", "gif", "tiff", "tif", "avif", "heic"]);
 const native = new Map<Format, (input: Buffer, checkInventory: boolean) => Parsed | Promise<Parsed>>([
   ["docx", parseDocx], ["xlsx", parseXlsx], ["txt", parseText], ["csv", parseText], ["tsv", parseText],
-  ["dxf", parseDxf], ["ifc", parseIfc], [thumbsDbFormat, parseThumbsDb],
+  ["dxf", parseDxf], ["ifc", parseIfc], [thumbsDbFormat, parseThumbsDb], ["desktopini", desktopIni], ["dwl", bytes => cadLock(bytes,false)], ["dwl2", bytes => cadLock(bytes,true)],
 ]);
 
 export function resolveFormat(name: string): Format | "pdf" {
   if (isThumbsDbName(name)) return thumbsDbFormat;
+  const companion=companionFormat(name);if(companion)return companion;
   const extension = /\.([a-z0-9]+)$/i.exec(name)?.[1].toLowerCase();
   if (extension === "pdf") return "pdf";
   if (extension && rasterExtensions.has(extension)) return "image";
-  return extension && extension !== thumbsDbFormat && supports.has(extension) ? extension as Format : "unknown";
+  return extension && extension !== thumbsDbFormat && extension !== "desktopini" && supports.has(extension) ? extension as Format : "unknown";
 }
 
 function isLegacy(format: Format): format is Legacy {
@@ -270,6 +272,8 @@ function adapter(format: Format): ReaderAdapter {
       units = originalOnly(error.code, "held").units.map(mapUnit);
       if (error.code === "dxf_group_invalid") {
         units[0].locator = { ...units[0].locator, dxfFraming: dxfFramingRevision };
+      } else if (error.code === "text_encoding_unconfirmed") {
+        units[0].locator = { ...units[0].locator, dxfEncoding: dxfEncodingRevision };
       }
     }
     return stampPhysicalInventory(units, { units: [], inventory: { limitation: "dwg_original_inventory_unverified" } },

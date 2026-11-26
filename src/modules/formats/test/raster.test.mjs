@@ -237,4 +237,54 @@ test('a prior failed JPG is rebuilt through preparation, serves PNG/OCR in harne
   assert.equal(reply.headers.etag, `"sha256-${sha256}"`);
   assert.deepEqual(reply.rawPayload, overview.bytes);
   assert.ok(originalOpens >= 5);
+
+  const supportedBefore = await db.query(`SELECT m.fingerprint,pm.reader_version,pm.next_ordinal FROM harness_package_maps m
+    JOIN project_memory_versions pm ON pm.project_id=m.project_id AND pm.version_id=m.version_id
+    WHERE m.version_id=$1 AND m.active`,[source.versionId]);
+  const readerVersion = await reader.readerVersion('image');
+  const retryVersion = await addDimensionFailure();
+  const visited=[];
+  const selectOnlyFailed = {readerVersion:reader.readerVersion,formatFor:reader.formatFor,
+    map:async input => { visited.push(input.versionId); return reader.map(input); }};
+  assert.equal(await preparePackageMap(db,queue,selectOnlyFailed,[]),true);
+  assert.equal(await preparePackageMap(db,queue,selectOnlyFailed,[]),false);
+  assert.deepEqual(visited,[retryVersion]);
+  const recovered=await db.query('SELECT active,refusal,reader_version,requested_reader_version FROM harness_package_maps WHERE version_id=$1',[retryVersion]);
+  assert.ok(recovered.rows.some(map=>map.active && map.reader_version===readerVersion && map.requested_reader_version===readerVersion));
+  assert.ok(recovered.rows.some(map=>!map.active && map.refusal==='raster_dimension_limit'));
+  const supportedAfter = await db.query(`SELECT m.fingerprint,pm.reader_version,pm.next_ordinal FROM harness_package_maps m
+    JOIN project_memory_versions pm ON pm.project_id=m.project_id AND pm.version_id=m.version_id
+    WHERE m.version_id=$1 AND m.active`,[source.versionId]);
+  assert.deepEqual(supportedAfter.rows,supportedBefore.rows);
+
+  const {ReaderError} = await fromBuild('pdf/types.js');
+  const stillTooLarge=await addDimensionFailure();
+  let rejectedCalls=0;
+  const reject = {readerVersion:reader.readerVersion,formatFor:reader.formatFor,map:async input=>{
+    assert.equal(input.versionId,stillTooLarge);
+    rejectedCalls++;
+    throw new ReaderError('raster_dimension_limit','outside the synthetic JPEG profile',422);
+  }};
+  assert.equal(await preparePackageMap(db,queue,reject,[]),true);
+  assert.equal(await preparePackageMap(db,queue,reject,[]),false);
+  assert.equal(rejectedCalls,1);
+  const {rows:[held]}=await db.query('SELECT refusal,requested_reader_version FROM harness_package_maps WHERE version_id=$1 AND active',[stillTooLarge]);
+  assert.deepEqual(held,{refusal:'raster_dimension_limit',requested_reader_version:readerVersion+':large-jpeg-v1'});
+
+  async function addDimensionFailure() {
+    const {rows:[data]}=await db.query(`WITH receipt AS (INSERT INTO intake_receipts(project_id,source,created_by,sealed_at)
+      SELECT project_id,'upload',created_by,now() FROM intake_receipts WHERE id=$1 RETURNING id,project_id),
+      doc AS (INSERT INTO intake_documents(project_id) SELECT project_id FROM receipt RETURNING id,project_id),
+      version AS (INSERT INTO intake_document_versions(project_id,document_id,original_id,media_type)
+        SELECT doc.project_id,doc.id,old.original_id,'image/jpeg' FROM doc,intake_document_versions old WHERE old.id=$2 RETURNING *),
+      occ AS (INSERT INTO intake_occurrences(project_id,receipt_id,relative_path,declared_media_type,version_id,state)
+        SELECT receipt.project_id,receipt.id,'large.JPG','image/jpeg',version.id,'accepted' FROM receipt,version RETURNING id),
+      job AS (INSERT INTO intake_reader_jobs(project_id,receipt_id,document_id,version_id,original_id)
+        SELECT receipt.project_id,receipt.id,version.document_id,version.id,version.original_id FROM receipt,version,occ RETURNING *)
+      SELECT version_id FROM job`,[source.receiptId,source.versionId]);
+    await db.query(`INSERT INTO harness_package_maps(project_id,version_id,fingerprint,requested_reader_version,format,refusal,physical_limitation)
+      VALUES($1,$2,$3,$4,'image/jpeg','raster_dimension_limit','raster_dimension_limit')`,
+    [source.projectId,data.version_id,hash(data.version_id),readerVersion]);
+    return data.version_id;
+  }
 });

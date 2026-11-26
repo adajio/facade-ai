@@ -53,6 +53,7 @@ async function fixture(page: Page, editable: boolean, comparable = false) {
   };
   let published = false;
   let reviewRequests = 0;
+  let chainUpdated = false;
   await page.route('**/api/**', async (route) => {
     const request = route.request();
     const url = new URL(request.url());
@@ -65,6 +66,22 @@ async function fixture(page: Page, editable: boolean, comparable = false) {
     if (path.endsWith('/preliminary-package-reviews')) {
       reviewRequests += 1;
       return route.fulfill({ json: { items: comparable ? published ? [detailed, { ...baseline, isCurrent: false }] : [baseline] : [review], nextCursor: null } });
+    }
+    if (path.endsWith('/evidence-chain')) {
+      const historical = published && url.searchParams.get('reviewId') === 'review';
+      return route.fulfill({ json: {
+        receiptId, receiptNumber: 17, reviewId: url.searchParams.get('reviewId'), historical,
+        cutoff: historical ? review.createdAt : null, inventoryOpen: false, preparationId: 'prepared',
+        latest: historical ? null : { stage: 'revision', status: chainUpdated ? 'unknown' : 'sending',
+          reason: chainUpdated ? 'held_legacy_attempt' : null, at: review.createdAt },
+        request: { status: 'published', requestBytes: 1200, selectedFiles: 1, totalFiles: 2, coveredFiles: 1, selectedLines: 2, totalLines: 5 },
+        items: [{ versionId, documentId, label: 'Синтетический.pdf', mediaType: 'application/pdf', mapUnits: 2,
+          index: null, preparation: null, windows: null,
+          openings: { units:2, rendered:1, ocr:1, latestId:'ocr-proof', latestRenderId:'raster-proof', latestOcrId:'ocr-proof', latestOcrInputId:'ocr-proof' },
+          pixels: historical ? null : { confirmedImages: 1, partialImages: 0, latest: { id: 'raster-proof', partsDelivered: 1, partsExpected: 1 } },
+          citations: { count: 1, examples: [{ key:'key-0', title:'Требование 1', anchor:'Стр. 3–4' }] } }],
+        nextCursor: null,
+      } });
     }
     if (path.endsWith('/reading-progress')) return route.fulfill({ json: { totalWindows: 3, mappedVersions: 1, acceptedVersions: 1,
       completed: published ? 2 : 0, covered: 0, partial: published ? 1 : undefined, noMatch: published ? 1 : 0, refused: 0, held: 0, reading: 1 } });
@@ -80,7 +97,7 @@ async function fixture(page: Page, editable: boolean, comparable = false) {
     }
     return route.fulfill({ status: 404, json: { code: 'not_found' } });
   });
-  return { submissions, publishDetailed: () => { published = true; }, reviewRequests: () => reviewRequests };
+  return { submissions, changeChain: () => { chainUpdated = true; }, publishDetailed: () => { published = true; }, reviewRequests: () => reviewRequests };
 }
 
 test('Комплектность показывает цвета и путь инженера до технических блоков, решение сохраняется и открывается снова', async ({ page }) => {
@@ -215,4 +232,33 @@ test('Историческая версия остаётся только для
   await page.getByRole('link', { name: 'Посмотреть основания · Требование 1', exact: true }).click();
   await expect(page.getByRole('form', { name: 'Решение инженера по требованию' })).toHaveCount(0);
   expect(submissions).toEqual([]);
+});
+
+test('Цепочка файла сохраняет фокус и прокрутку на обновлении и открывает сведения выбранной редакции', async ({ page }) => {
+  const { changeChain, publishDetailed } = await fixture(page, false, true);
+  await page.goto(base);
+  const chain = page.getByRole('region', { name: 'Как обработаны файлы' });
+  await expect(chain).toContainText('Идёт запрос. Ответ ещё не получен');
+  await expect(chain).toContainText('Индексных строк 2 из 5');
+  await chain.getByText('Состояние по файлам').click();
+  const origin = chain.getByRole('link', { name: 'Синтетический.pdf', exact: true });
+  await origin.focus();
+  const position = await origin.evaluate(element => element.getBoundingClientRect().top);
+  await expect(chain.getByRole('link', { name: 'Вход OCR' })).toHaveAttribute('href', '/api/v1/evidence/ocr-proof/ocr-input');
+  await expect(chain.getByRole('link', { name: /Требование 1/ })).toHaveAttribute('href',
+    `/api/documents/${documentId}/versions/${versionId}/content#page=3`);
+  await expect(chain.getByRole('link', { name: /Исходный рендер для последней передачи/ })).toHaveAttribute('href',
+    '/api/v1/evidence/raster-proof/content');
+  changeChain();
+  await page.evaluate(() => document.dispatchEvent(new Event('visibilitychange')));
+  await expect(chain).toContainText('Требуется сверка сохранённой попытки');
+  await expect(origin).toBeFocused();
+  expect(Math.abs(await origin.evaluate(element => element.getBoundingClientRect().top) - position)).toBeLessThan(3);
+  publishDetailed();
+  const selector = page.getByRole('region', { name: 'Предварительный разбор пакета' }).getByRole('combobox');
+  await expect(selector).toHaveValue('detailed');
+  await selector.selectOption('review');
+  await chain.getByText('Состояние по файлам').click();
+  await expect(chain).toContainText('История поступления №17');
+  await expect(chain.getByText('Передача не подтверждена')).toBeVisible();
 });

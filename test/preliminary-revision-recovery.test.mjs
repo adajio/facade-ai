@@ -4,7 +4,8 @@ import {mkdtemp, readFile, readdir, rm, writeFile} from 'node:fs/promises';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import test from 'node:test';
-import {applyRevision, reviseReceipt, revisionRequest} from '../infra/local-terra/revise.mjs';
+import {applyRevision, reviseReceipt, revisionRequest, prepareRevisionSnapshot} from '../infra/local-terra/revise.mjs';
+import {maxInputTokens, maxRequestBytes, ModelTransportError, measureRequest} from '../infra/local-terra/request-budget.mjs';
 
 const read = async (path) => JSON.parse(await readFile(path,'utf8'));
 const hash = 'a'.repeat(64);
@@ -76,15 +77,49 @@ async function fixture(t) {
   return {r,fact,state,run,pendingPath,dir,resultPaths,reopen};
 }
 
+test('revision budgets the full prompt and keeps the strongest late observation with its exact address', async t => {
+  const {r,fact} = await fixture(t);
+  const bulk=Array.from({length:95},()=>({...fact,id:randomUUID(),quote:'Однотипная строка '.repeat(180)}));
+  const decisive={...fact,id:randomUUID(),versionId:randomUUID(),quote:'Крепления, ведомость: узел 17'};
+  const {snapshot,request} = prepareRevisionSnapshot(r,[...bulk,decisive],101);
+  const {budget} = snapshot;
+  assert.equal(budget.requestBytes,measureRequest(request).requestBytes);
+  assert.ok(budget.requestBytes<=maxRequestBytes && budget.estimatedInputTokens<=maxInputTokens);
+  assert.equal(budget.remainingFacts,101-snapshot.facts.length);
+  assert.ok(budget.selectedFacts<96);
+  assert.equal(budget.coveredFiles,2);
+  assert.equal(snapshot.facts[0].id,decisive.id);
+  assert.deepEqual(JSON.parse(request.messages[1].content).facts[0].address,decisive.address);
+});
+
+test('known provider rejection preserves exact pending batch across restart', async t => {
+  const {run,pendingPath,state} = await fixture(t);
+  const events=[];
+  const recordActivity=async (_db,event)=>events.push(event);
+  assert.equal(await run({recordActivity,modelCall:async ()=>{
+    throw new ModelTransportError('rejected','provider_context_limit');
+  }}),'revision_rejected:provider_context_limit');
+  assert.equal(await run({recordActivity}),'revision_rejected:provider_context_limit');
+  assert.equal(state.modelCalls,0);
+  assert.deepEqual(events.map(({status})=>status),['sending','rejected','rejected']);
+  const pending=await read(pendingPath);
+  assert.equal(pending.snapshot.facts[0].id,state.facts[0].id);
+  assert.equal(pending.state,'rejected');
+});
+
 test('known invalid answer is retained with its reason and releases the next batch', async (t) => {
   const {state,run,resultPaths,pendingPath,reopen,fact} = await fixture(t);
   const bad = {model:'gpt-6.1-terra'};
   assert.equal(await run({modelCall:async ()=>bad,publish:()=>assert.fail('invalid answer')}),'revision_rejected:invalid_revision_response');
   const [path] = await resultPaths();
-  assert.deepEqual(await read(path), {
-    state:'rejected',reportId:state.r.reportId,observationIds:[fact.id],reason:'invalid_revision_response',
-    pending:{state:'responded',snapshot:{...state.r,facts:[fact],wireVersion:2,key:path.split('/').at(-1).split('.')[0]},response:bad},
-  });
+  const {activityFields,pending,...result} = await read(path);
+  assert.deepEqual(result, {state:'rejected',reportId:state.r.reportId,observationIds:[fact.id],reason:'invalid_revision_response'});
+  const {budget,requestSha256,...snapshot} = pending.snapshot;
+  assert.deepEqual(snapshot,{...state.r,facts:[fact],wireVersion:2,key:path.split('/').at(-1).split('.')[0]});
+  assert.match(requestSha256,/^[a-f0-9]{64}$/);
+  assert.equal(budget.selectedFacts,1);
+  assert.equal(activityFields.estimatedInputTokens,budget.estimatedInputTokens);
+  assert.deepEqual(pending.response,bad);
   await assert.rejects(read(pendingPath),{code:'ENOENT'});
   await reopen();
   const next = {...fact,id:randomUUID(),quote:'Ведомость 2'};
