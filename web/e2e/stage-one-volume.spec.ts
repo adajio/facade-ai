@@ -202,6 +202,7 @@ test('Стадия 1: 23 прямых PDF, 25 PDF в ZIP, опись, карты
   await rows.filter({ hasText: /^Раздел АР$/ }).click();
   await expect(page.getByRole('heading', { name: 'Раздел АР', exact: true })).toBeFocused();
   await expect(page.getByText('Критерий достаточности', { exact: true })).toBeVisible();
+  await page.getByText('Форматы по каталогу', { exact: true }).click();
   await expect(page.getByText(/Допустимая замена: DXF/)).toBeVisible();
   await evidence(info, 'requirement-ids', { catalogVersionId, before: initialQuestions, opened: browserIds });
 

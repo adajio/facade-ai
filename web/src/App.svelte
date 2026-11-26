@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onMount } from 'svelte';
+  import { onMount, tick } from 'svelte';
   import AuthForm from './lib/AuthForm.svelte';
   import Notice from './lib/Notice.svelte';
   import { Api, denied, describe, id, interrupted } from './lib/http';
@@ -212,14 +212,22 @@
     }
   }
 
-  function navigate(path: string) {
+  function navigate(path: string, rowAnchor?: {element: HTMLElement; top: number}) {
     if (path === window.location.pathname + window.location.search) return true;
     if (!window.dispatchEvent(new CustomEvent('facade:navigate', {
-      cancelable: true, detail: { proceed: () => navigate(path) },
+      cancelable: true, detail: { proceed: () => navigate(path, rowAnchor) },
     }))) return false;
     history.pushState(null, '', path);
     routeChanged();
-    window.scrollTo(0, 0);
+    if (rowAnchor) {
+      void tick().then(() => {
+        if (!rowAnchor.element.isConnected) return;
+        const delta = rowAnchor.element.getBoundingClientRect().top - rowAnchor.top;
+        const pane = rowAnchor.element.closest<HTMLElement>('.with-evidence .section-content');
+        if (pane && pane.scrollHeight > pane.clientHeight && /auto|scroll/.test(getComputedStyle(pane).overflowY)) pane.scrollTop += delta;
+        else window.scrollBy(0, delta);
+      });
+    } else window.scrollTo(0, 0);
     return true;
   }
 
@@ -230,7 +238,10 @@
     const url = new URL(target.href);
     if (url.origin !== window.location.origin || url.pathname.startsWith('/api/') || url.hash) return;
     event.preventDefault();
-    navigate(url.pathname + url.search);
+    const key = target.dataset.inlineRequirement;
+    const row = key ? document.getElementById('matrix-row-' + key) : null;
+    const top = row?.getBoundingClientRect().top ?? 0;
+    navigate(url.pathname + url.search, row ? {element:row, top:top >= 0 && top < innerHeight ? top : 80} : undefined);
   }
 
   onMount(() => {

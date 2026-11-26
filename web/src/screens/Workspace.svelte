@@ -306,7 +306,11 @@
     history.replaceState(history.state, '', url);
   }
 
+  let sourcePosition: {element: HTMLElement; top: number} | undefined;
+
   function openEvidence(entries: Citation[], index: number, source: HTMLElement, options?: { actions?: EvidenceActions }) {
+    if (!evidenceOpen) sourcePosition = source.closest('.requirement-detail')
+      ? {element:source, top:source.getBoundingClientRect().top} : undefined;
     refs = entries;
     comparison = options;
     selected = index;
@@ -316,6 +320,12 @@
     void tick().then(() => {
       const pane = source.closest('.section-content');
       if (!pane || !matchMedia('(min-width: 851px)').matches) return;
+      if (sourcePosition?.element.isConnected) {
+        const bounds = pane.getBoundingClientRect();
+        const targetTop = Math.max(bounds.top + 4, Math.min(bounds.bottom - sourcePosition.element.offsetHeight - 4, sourcePosition.top));
+        pane.scrollTop += sourcePosition.element.getBoundingClientRect().top - targetTop;
+        return;
+      }
       window.scrollTo(0, 0);
       const row = pane.querySelector('[data-triage-row][aria-current="true"], [data-triage-row][aria-pressed="true"]') ?? source;
       pane.scrollTop += row.getBoundingClientRect().top - pane.getBoundingClientRect().top - 24;
@@ -331,7 +341,14 @@
     comparison = undefined;
     componentIndex = undefined;
     address();
-    void tick().then(() => (trigger?.isConnected ? trigger : document.getElementById('main'))?.focus());
+    const anchor = sourcePosition;
+    sourcePosition = undefined;
+    void tick().then(() => {
+      if (anchor?.element.isConnected) {
+        anchor.element.focus({preventScroll:true});
+        window.scrollBy(0, anchor.element.getBoundingClientRect().top - anchor.top);
+      } else (trigger?.isConnected ? trigger : document.getElementById('main'))?.focus();
+    });
   }
 
   async function addScope(event: SubmitEvent) {
@@ -452,14 +469,14 @@
           {:else if section === 'receipts'}
             <Receipts {api} {context} {projection} {renew} open={openEvidence} />
           {:else if section === 'completeness'}
-            {#if showPreliminary}
-              {#key project.id}<PreliminaryPackageReview {api} projectId={project.id} {refreshKey} mode="review" />{/key}
-            {/if}
             {#if project.intakeMode && (!scopeId || route.params.has('context')) && !project.scopeId}
               <FacadeAssessment {api} {context} {renew} {triage} {chooseTriage}
                 refreshProject={() => refresh()} open={openEvidence} />
             {:else}
               <Completeness {api} {context} {renew} {triage} {chooseTriage} open={openEvidence} />
+            {/if}
+            {#if showPreliminary}
+              {#key project.id}<PreliminaryPackageReview {api} projectId={project.id} {refreshKey} mode="review" />{/key}
             {/if}
           {:else if section === 'questions' || section === 'facts'}
             {#if project.intakeMode && (!scopeId || route.params.has('context')) && !project.scopeId}

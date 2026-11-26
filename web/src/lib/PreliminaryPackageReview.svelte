@@ -1,9 +1,10 @@
 <script lang="ts">
-  import { preliminarySourceUrl, preliminaryStatusLabels, type PreliminaryReview, type PreliminaryStatus } from './preliminary-review';
+  import { preliminarySourcePlace, preliminarySourceUrl, preliminaryStatusLabels, type PreliminaryReview, type PreliminaryStatus } from './preliminary-review';
   import { date } from './format';
   import { denied, describe, id, interrupted, type Api } from './http';
   import { projectV1 } from './workspace';
   import Notice from './Notice.svelte';
+  import PreliminaryStatusBadge from './PreliminaryStatusBadge.svelte';
 
   type ReadingProgress = { totalWindows: number; mappedVersions: number; acceptedVersions: number;
     completed: number; covered: number; noMatch: number; refused: number; held: number; reading: number };
@@ -97,9 +98,9 @@
   <section class="card"><h2>Предварительный разбор пакета</h2><Notice kind="error" message={'Не удалось загрузить предварительный разбор: ' + error + (selected ? '. Показан последний полученный результат.' : '')} /></section>
 {/if}
 {#if selected}
-  <section class="card preliminary-review" aria-label={mode === 'review' ? 'Предварительный разбор пакета' : 'Черновик письма по разбору Terra'}>
-    <h2>{mode === 'review' ? 'Предварительный разбор пакета' : 'Черновик письма по разбору Terra'}</h2>
-    <p class="notice">Выводы одного читателя. Ожидается проверка инженером.</p>
+  <section class="card preliminary-review" aria-label={mode === 'review' ? 'Предварительный разбор пакета' : 'Черновик письма по результатам проверки'}>
+    <h2>{mode === 'review' ? 'Предварительный разбор пакета' : 'Черновик письма по результатам проверки'}</h2>
+    <p class="notice">Предварительный результат. Решение инженера отображается в строке каждого требования.</p>
     {#if reviews.length > 1}
       <label>Поступление
         <select bind:value={selectedId} onchange={() => { manuallySelected = true; copied = ''; }}>
@@ -110,12 +111,12 @@
       </label>
     {/if}
     <p title={selected.receiptId}><strong>{selected.isCurrent ? 'Актуальный разбор' : 'Исторический разбор'}</strong> · {date(selected.createdAt)}</p>
-    <p class="meta" title={'Версия каталога: ' + selected.catalogVersionId}>{selected.stage} · модель {selected.model}</p>
+    <p class="meta" title={'Версия каталога: ' + selected.catalogVersionId}>{selected.stage}</p>
     {#if selected.scopeNote}<p>{selected.scopeNote}</p>{/if}
     {#if mode === 'review' && selected.isCurrent}
       {#if progressError}<p role="alert">Не удалось загрузить состояние постраничного чтения: {progressError}</p>{/if}
       {#if progress && !progressError}
-        <p role="status" class="meta">Постраничное чтение Terra:
+        <p role="status" class="meta">Постраничное чтение:
           {#if progress.mappedVersions < progress.acceptedVersions || progress.acceptedVersions === 0}
             строится карта файлов ({progress.mappedVersions} из {progress.acceptedVersions}).
             {#if progress.totalWindows > 0} Завершено {progress.completed} из {progress.totalWindows} участков.{/if}
@@ -131,19 +132,19 @@
     {/if}
     {#if mode === 'review'}
       <div class="actions" aria-label="Число позиций по состояниям">
-        {#each counts as item (item.status)}<span class="pill">{preliminaryStatusLabels[item.status]}: {item.count}</span>{/each}
+        {#each counts as item (item.status)}<PreliminaryStatusBadge status={item.status} count={item.count} />{/each}
       </div>
       <p class="meta">Всего позиций: {selected.rows.length}</p>
-      <details><summary>Все строки разбора Terra и источники</summary>
+      <details><summary>Все выводы и источники</summary>
       <div class="table-wrap"><table>
         <thead><tr><th>Позиция</th><th>Состояние</th><th>Предварительный разбор и источники</th></tr></thead>
         <tbody>
           {#each selected.rows as row (row.key)}
-            <tr><td>{row.title}</td><td>{preliminaryStatusLabels[row.status]}</td><td>
+            <tr><td>{row.title}</td><td><PreliminaryStatusBadge status={row.status} /></td><td>
               <p>{row.finding}</p>
               {#if row.sources.length}
                 <ul>{#each row.sources as source}
-                  <li><a href={preliminarySourceUrl(source)} target="_blank" rel="noopener noreferrer">{source.label}</a> · {source.anchor}</li>
+                  <li><a href={preliminarySourceUrl(source)} target="_blank" rel="noopener noreferrer">{source.label}</a> · {preliminarySourcePlace(source).label}</li>
                 {/each}</ul>
               {/if}
             </td></tr>

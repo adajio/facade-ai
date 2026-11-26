@@ -10,6 +10,7 @@
 </script>
 <script lang="ts">
   import { originalUrl, renderAddress } from './copilot';
+  import PreliminaryStatusBadge from './PreliminaryStatusBadge.svelte';
   import { count, date } from './format';
   import { scopedUrl } from './workspace';
   import type { WorkSlice } from './work-slice';
@@ -32,18 +33,18 @@
   <h2 id="terra-title">Комплектность поступления</h2>
   {#if error}<p role="alert">Не удалось обновить данные. {error}. Показаны последние полученные сведения.</p>{/if}
   {#if report}
-    <p class="lead">Terra оценила <strong>{count(evaluated)} из {count(total)}</strong> требований.</p>
-    <dl class="outcomes" aria-label="Результаты Terra по требованиям">
-      <div><dt>Представлено</dt><dd>{count(report.summary.present)}</dd></div>
-      <div><dt>Частично</dt><dd>{count(report.summary.partial)}</dd></div>
-      <div><dt>Не найдено</dt><dd>{count(report.summary.notFound)}</dd></div>
-      {#if report.summary.unassessed}<div><dt>Не оценено</dt><dd>{count(report.summary.unassessed)}</dd></div>{/if}
+    <p class="lead">Система оценила <strong>{count(evaluated)} из {count(total)}</strong> требований.</p>
+    <dl class="outcomes" aria-label="Результаты по требованиям">
+      <div><dt><PreliminaryStatusBadge status="present" /></dt><dd>{count(report.summary.present)}</dd></div>
+      <div><dt><PreliminaryStatusBadge status="partial" /></dt><dd>{count(report.summary.partial)}</dd></div>
+      <div><dt><PreliminaryStatusBadge status="not_found" /></dt><dd>{count(report.summary.notFound)}</dd></div>
+      {#if report.summary.unassessed}<div><dt><PreliminaryStatusBadge status="unassessed" /></dt><dd>{count(report.summary.unassessed)}</dd></div>{/if}
     </dl>
     <p>Инженеру нужно сверить основания по требованиям и решить, какие вопросы включить в письмо заказчику.</p>
     <div class="actions"><a class="button primary" href={scopedUrl(slice.projectId, 'completeness', { scope: slice.scopeId, context: slice.assessment?.contextId })}>Открыть требования и источники</a>{#if report.draftAvailable}<a class="button" href={scopedUrl(slice.projectId, 'letters', { scope: slice.scopeId })}>Открыть черновик письма</a>{/if}</div>
     <p class="meta">Предварительный разбор сохранён {date(report.createdAt)}.</p>
   {:else if receipt}
-    <p>Terra ещё не опубликовала разбор по требованиям.</p>
+    <p>Разбор по требованиям ещё не готов.</p>
     <a href={scopedUrl(slice.projectId, 'receipts', { scope: slice.scopeId }, receipt.receiptId)}>Открыть поступление</a>
   {:else}
     <p>Поступлений пока нет.</p>
@@ -52,10 +53,10 @@
 </section>
 {#if receipt}
   <section class="card terra" aria-labelledby="reading-title">
-    <h2 id="reading-title">Подробное чтение Terra</h2>
+    <h2 id="reading-title">Подробное чтение документов</h2>
     {#if progress && progress.totalWindows}
       <p data-reading-progress>Завершено участков чтения <strong>{count(progress.completed)} из {count(progress.totalWindows)}</strong>. Сохранено наблюдений <strong>{count(progress.observations)}</strong>.</p>
-      {#if progress.reading}<p>Сейчас Terra читает документ.</p>{:else if progress.queued || progress.unassigned}<p>Есть участки, ожидающие чтения.</p>{/if}
+      {#if progress.reading}<p>Система читает документ.</p>{:else if progress.queued || progress.unassigned}<p>Есть участки, ожидающие чтения.</p>{/if}
       {#if progress.held}<p>Приостановлено участков · {count(progress.held)}.</p>{/if}
       <a href={scopedUrl(slice.projectId, 'facts', { scope: slice.scopeId })}>Все найденные сведения</a>
       <!-- svelte-ignore a11y_no_noninteractive_tabindex: Keyboard users can scroll the bounded reading excerpt. -->
@@ -94,7 +95,7 @@
   .terra h3 { margin: 1rem 0 .3rem; font-size: 1rem; }
   .lead { font-size: 1.1rem; }
   .outcomes { display: flex; flex-wrap: wrap; gap: 1rem 2rem; margin: 1rem 0; }
-  .outcomes dt { color: var(--muted); font-size: .9rem; }
+  .outcomes dt { font-size: .9rem; }
   .outcomes dd { font-variant-numeric: tabular-nums; font-size: 1.75rem; font-weight: 650; line-height: 1.2; margin: .15rem 0 0; }
   .actions { margin: .8rem 0; }
   .terra details { margin-top: .9rem; }
