@@ -8,6 +8,19 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 
 
+NEXT_EVENTS = {
+    None: ("queued",),
+    "queued": ("started", "terminal"),
+    "started": ("checkpoint", "would_stop", "stop_requested", "terminal"),
+    "checkpoint": ("checkpoint", "would_stop", "stop_requested", "terminal"),
+    "would_stop": ("checkpoint", "stop_requested", "terminal"),
+    "stop_requested": ("terminal",),
+    "terminal": (),
+}
+LIMITS = ("attempt_ms", "stage_ms", "silence_ms")
+STOP_REASONS = ("operator_stop", "limit_reached", "executor_left_children")
+
+
 def utc_now():
     return datetime.now(timezone.utc).isoformat(timespec="milliseconds")
 
@@ -27,24 +40,91 @@ def append(stream, row):
     os.fsync(stream.fileno())
 
 
-def previous_result(stream, identity):
+def valid_terminal(row, last):
+    outcome, verified = row["outcome"], row.get("verified")
+    exit_code, cancellation = row.get("exit_code"), row.get("cancellation")
+    if exit_code is not None and type(exit_code) is not int:
+        return False
+    if outcome == "passed":
+        return (verified is True and exit_code == 0 and cancellation is None
+                and row.get("reason") is None and last["event"] != "stop_requested"
+                and last["groups"] > 0)
+    if outcome == "observer_lost":
+        return (verified is False and cancellation == "unconfirmed" and exit_code is None
+                and row.get("timing") == "last_observed")
+    if outcome in ("failed", *STOP_REASONS):
+        return verified is True
+    return outcome in ("launch_failed", "executor_lost", "result_unconfirmed", "cancel_unconfirmed") and verified is False
+
+
+def validate_row(row, identity, last, checkpoints):
+    if not isinstance(row, dict) or any(
+        key not in row or type(row[key]) is not type(value) or row[key] != value
+        for key, value in identity.items()
+    ):
+        raise ValueError("run ID already belongs to another input or policy")
+    event = row.get("event")
+    previous_event = last["event"] if last else None
+    if event not in NEXT_EVENTS[previous_event]:
+        raise ValueError("invalid report event sequence")
+    fields = ("queue_ms", "execution_ms", "groups", "examples")
+    if (any(type(row.get(key)) is not int or row[key] < 0 for key in fields)
+        or not isinstance(row.get("at"), str) or not row["at"]
+        or not {"process_group", "checkpoint", "limit", "outcome"} <= row.keys()
+        or row["limit"] not in (None, *LIMITS)):
+        raise ValueError("incomplete report event")
+
+    process_group = row["process_group"]
+    if event == "started":
+        if type(process_group) is not int or process_group <= 0:
+            raise ValueError("invalid process group")
+    else:
+        expected_group = last["process_group"] if last else None
+        if type(process_group) is not type(expected_group) or process_group != expected_group:
+            raise ValueError("inconsistent process group")
+
+    progress = row["checkpoint"], row["groups"], row["examples"]
+    previous_progress = (last["checkpoint"], last["groups"], last["examples"]) if last else (None, 0, 0)
+    if event == "checkpoint":
+        group, groups, examples = progress
+        if (not isinstance(group, str) or not group or group in checkpoints
+            or groups != last["groups"] + 1 or examples <= last["examples"]):
+            raise ValueError("invalid report checkpoint")
+        checkpoints.add(group)
+    elif progress != previous_progress:
+        raise ValueError("checkpoint does not match previous evidence")
+
+    if event == "terminal":
+        if not valid_terminal(row, last):
+            raise ValueError("invalid terminal result")
+    elif row["outcome"] is not None or (event == "stop_requested" and row.get("reason") not in STOP_REASONS):
+        raise ValueError("invalid nonterminal result")
+
+
+def previous_result(stream, identity, expected=None):
     """The lock is held. An abandoned attempt must never be dispatched again."""
     stream.seek(0)
     last = None
     offset = 0
+    checkpoints = set()
     for line in stream:
         if not line.endswith(b"\n"):
-            # Only an acknowledged complete line can be used as evidence.
+            # An acknowledged, validated prefix must establish ownership first.
+            if last is None:
+                raise ValueError("report has no complete event")
             stream.truncate(offset)
+            stream.flush()
+            os.fsync(stream.fileno())
             break
-        last = json.loads(line)
+        row = json.loads(line)
+        validate_row(row, identity, last, checkpoints)
+        if row["outcome"] == "passed" and expected is not None and checkpoints != expected:
+            raise ValueError("incomplete coverage in saved result")
+        last = row
         offset += len(line)
     if last is None:
         # Dispatch only happens after a durable queued event.
         return None
-    for key in ("schema", "run_id", "stage", "sha", "policy", "input_sha256", "environment"):
-        if last[key] != identity[key]:
-            raise ValueError("run ID already belongs to another input or policy")
     if last["event"] != "terminal":
         last = {**last, "event": "terminal", "outcome": "observer_lost",
                 "cancellation": "unconfirmed", "verified": False, "at": utc_now(),
