@@ -180,7 +180,7 @@
         preliminaryError = '';
       } catch (error) {
         if (controller.signal.aborted || interrupted(error)) return;
-        preliminary = undefined;
+        if (denied(error)) preliminary = undefined;
         preliminaryError = describe(error);
       }
       if (!controller.signal.aborted) timer = setTimeout(loadPreliminary, 30_000);
@@ -610,7 +610,7 @@
       {/if}
     </details>
 
-    {#if preliminaryError}<Notice kind="error" message={'Предварительный разбор Terra · ' + preliminaryError} />{/if}
+    {#if preliminaryError}<Notice kind="error" message={'Предварительный разбор Terra · ' + preliminaryError + (preliminary ? '. Показан последний полученный результат.' : '')} />{/if}
     {#if preliminary && preliminaryProject === context.project.id && preliminary.catalogVersionId !== summary.catalogVersionId}<p class="notice">Предварительный разбор относится к другой версии каталога и не сопоставлен с этими требованиями.</p>{/if}
     {#if showTerra && view.kind !== 'common'}<p class="notice">Terra оценила поступление целиком. Сверьте, какие источники относятся к выбранной области.</p>{/if}
     {#snippet filters()}

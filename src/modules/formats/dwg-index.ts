@@ -133,11 +133,12 @@ export async function buildDwgIndex(
   file: FileHandle, sha: string, converter: string, pin?: Pin, fonts = dwgFontAssets(),
 ): Promise<DwgIndex> {
   let path = pin && location(pin, fonts);
+  if (pin && !path) throw new ReaderError("dwg_storage_unavailable", "Не настроено постоянное хранилище DWG", 503);
   let root = path ? join(path, "..") : tmpdir();
   try {
     await mkdir(root, { recursive: true, mode: 0o700 });
   } catch (error) {
-    if (!path || !cacheUnavailable(error)) return indexError(error);
+    if (pin || !path || !cacheUnavailable(error)) return indexError(error);
     path = undefined;
     root = tmpdir();
   }
@@ -148,14 +149,7 @@ export async function buildDwgIndex(
   try {
     tmp = await mkdtemp(join(root, ".dwg-"));
   } catch (error) {
-    if (!path || !cacheUnavailable(error)) return indexError(error);
-    path = undefined;
-    const temporary = await statfs(tmpdir(), { bigint: true });
-    capacity = temporary.bavail * temporary.bsize - BigInt(pin?.reserve ?? 0);
-    if (capacity < 1024n * 1024n) {
-      throw new ReaderError("dwg_index_scratch_unavailable", "Недостаточно места для временного индекса DWG", 503);
-    }
-    tmp = await mkdtemp(join(tmpdir(), ".dwg-"));
+    return indexError(error);
   }
   const clean = () => rm(tmp, { recursive: true, force: true });
   let records: DatabaseSync | undefined;

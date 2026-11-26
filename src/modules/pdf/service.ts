@@ -1,3 +1,4 @@
+import { verifyStoredDwgDerivative } from './dwg-derivative.js';
 import { createHash, randomUUID } from 'node:crypto';
 import { createWriteStream } from 'node:fs';
 import { mkdir, mkdtemp, rm, statfs } from 'node:fs/promises';
@@ -5,6 +6,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { pipeline } from 'node:stream/promises';
 import type { Pool, PoolClient } from 'pg';
+import { transaction } from '../access/commands.js';
 import { blockId, fingerprint, memoryVersion } from '../project-memory/contracts.js';
 import { groundComponents } from './components.js';
 import { verifiedNativeLineCrops, type NativeLineCrop, type VerifiedNativeDeliveryLine } from './native-line.js';
@@ -362,22 +364,41 @@ export function createReaderService(db: Pool, deps: ReaderDependencies, adapters
     if (new Set(units.map(({ id }) => id)).size !== units.length || units.some(({ id }) => !id || id.length > 200)) {
       throw new ReaderError('reader_inventory_invalid', 'Reader вернул недопустимую карту физических единиц', 422);
     }
-    await db.query(
-      `INSERT INTO reader_maps
-       (project_id, document_id, version_id, reader_version, receipt_id, original_sha256, format, units)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8) ON CONFLICT (version_id, reader_version) DO NOTHING`,
-      [source.projectId, source.documentId, source.versionId, version, original.receiptId, source.sha256,
-        adapter.format, JSON.stringify(units)],
-    );
-    const stored = await lookupMap(source, version);
-    if (!stored) mismatch();
-    return stored;
+    const durable = await adapter.durableInfo?.(source,units,version);
+    return transaction(db, async tx => {
+      const old = adapter.format === 'dwg' ? await lookupMap(source, version, tx) : undefined;
+      const oldHash = old?.units.find(unit => typeof unit.locator?.derivativeSha256 === 'string')?.locator?.derivativeSha256;
+      const newHash = units.find(unit => typeof unit.locator?.derivativeSha256 === 'string')?.locator?.derivativeSha256;
+      if (oldHash && oldHash !== newHash) throw new ReaderError('dwg_index_identity_changed', 'Повторная производная DWG отличается от закреплённой', 409);
+      await tx.query(
+        `INSERT INTO reader_maps
+         (project_id, document_id, version_id, reader_version, receipt_id, original_sha256, format, units)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8) ON CONFLICT (version_id, reader_version) DO NOTHING`,
+        [source.projectId, source.documentId, source.versionId, version, original.receiptId, source.sha256,
+          adapter.format, JSON.stringify(units)],
+      );
+      const stored = await lookupMap(source, version, tx);
+      if (!stored) mismatch();
+      const storedHash = stored.units.find(unit => typeof unit.locator?.derivativeSha256 === 'string')?.locator?.derivativeSha256;
+      if (durable && storedHash !== durable.sha256) throw new ReaderError('dwg_index_identity_changed','Карта DWG закреплена за другой производной',409);
+      if (durable) {
+        const result = await tx.query(`INSERT INTO dwg_derivatives(project_id,document_id,version_id,original_sha256,reader_version,converter_identity,derivative_sha256,byte_size,format,storage_key)
+          VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) ON CONFLICT DO NOTHING RETURNING version_id`,
+          [source.projectId,source.documentId,source.versionId,source.sha256,version,durable.converter,durable.sha256,durable.size,durable.format,durable.storageKey]);
+        if (!result.rowCount) {
+          const existing = await verifyStoredDwgDerivative(tx,source,version);
+          if (!existing || existing.derivativeSha256 !== durable.sha256 || existing.byteSize !== durable.size)
+            throw new ReaderError('dwg_derivative_invalid','Закреплённая производная DWG отличается',424);
+        }
+      }
+      return stored;
+    });
   }
 
-  async function readMapped(source: SourceRef, original: Original, adapter: ReaderAdapter, request: ReadRequest, unit: ReaderUnit) {
+  async function readMapped(source: SourceRef, original: Original, adapter: ReaderAdapter, request: ReadRequest, unit: ReaderUnit, readerVersion?: string) {
     if (original.check && adapter.readCached) {
       await original.check();
-      const cached = await adapter.readCached(source, request, unit);
+      const cached = await adapter.readCached(source, request, unit, readerVersion);
       if (cached) return cached;
     }
     return withOriginal(original, deps, path => adapter.read(path, request, unit, undefined, source));
@@ -385,25 +406,27 @@ export function createReaderService(db: Pool, deps: ReaderDependencies, adapters
 
   async function previewDwg(document: DocumentKey, input: ReadRequest) {
     const request = checkedRead(input);
-    const map = await latestMap(document);
+    const { rows: [stored] } = await db.query<MapRow>(`SELECT * FROM reader_maps WHERE project_id=$1 AND document_id=$2 AND version_id=$3 AND reader_version=$4`,
+      [document.projectId,document.documentId,document.versionId,request.readerVersion]);
+    const map = stored && mapFromRow(stored);
     if (!map || map.format !== 'dwg') throw new ReaderError('reader_map_unavailable', 'Карта DWG ещё недоступна', 404);
-    const { original, adapter, version } = await describe(map.source);
-    if (map.readerVersion !== version || request.readerVersion !== version) {
+    const { original, adapter } = await describe(map.source);
+    if (request.readerVersion !== map.readerVersion) {
       throw new ReaderError('reader_profile_changed', 'Требуется текущая карта DWG', 409);
     }
     const unit = map.units.find(({ id }) => id === request.address.unitId);
     if (!unit) throw new ReaderError('reader_address_invalid', 'Часть DWG отсутствует в карте', 422);
-    return readMapped(map.source, original, adapter, request, unit);
+    return readMapped(map.source, original, adapter, request, unit, map.readerVersion);
   }
 
   async function materializeNative(sourceRef: SourceRef, readerVersion: string, start: number, count: number,
     publish: (block: NativeBlock) => Promise<void>): Promise<void> {
     const source = checkedSource(sourceRef);
     const { original, adapter, version } = await describe(source);
-    if (readerVersion !== version) {
+    if (readerVersion !== version && adapter.format !== 'dwg') {
       throw new ReaderError('reader_profile_changed', 'Требуется исходный профиль reader', 409);
     }
-    const map = await lookupMap(source, version);
+    const map = await lookupMap(source, readerVersion);
     if (!map || !Number.isSafeInteger(start) || start < 0 || start >= map.units.length
       || !Number.isSafeInteger(count) || count < 1 || count > 16) {
       throw new ReaderError('reader_address_invalid', 'Пакет нативных окон отсутствует в карте', 422);
@@ -441,7 +464,7 @@ export function createReaderService(db: Pool, deps: ReaderDependencies, adapters
     }
     if (original.check && adapter.readCachedNativeUnits) {
       await original.check();
-      const cached = await adapter.readCachedNativeUnits(source, selected);
+      const cached = await adapter.readCachedNativeUnits(source, selected, readerVersion);
       if (cached) return consume(cached);
     }
     await withOriginal(original, deps, path => consume(adapter.readNativeUnits?.(path, selected, source) ?? readUnits(path)));
@@ -492,7 +515,9 @@ export function createReaderService(db: Pool, deps: ReaderDependencies, adapters
     const previous = await replay<Evidence>(db, 'reader_evidence', source.projectId, scope, requestHash);
     if (previous) return { evidence: previous, bytes: await content(previous) };
 
-    const { original, adapter, version } = await describe(source);
+    const described = await describe(source);
+    const { original, adapter } = described;
+    const version = adapter.format === 'dwg' && request.readerVersion ? request.readerVersion : described.version;
     if (request.readerVersion !== undefined && request.readerVersion !== version) {
       throw new ReaderError('reader_profile_changed', 'Требуется исходный профиль reader', 409);
     }
@@ -506,7 +531,7 @@ export function createReaderService(db: Pool, deps: ReaderDependencies, adapters
     }
     if (!output) {
       const map = await lookupMap(source, version);
-      output = map ? await readMapped(source, original, adapter, request, selected(map))
+      output = map ? await readMapped(source, original, adapter, request, selected(map), map.readerVersion)
         : await withOriginal(original, deps, async path => {
           const fresh = await insertMap(source, original, version, adapter, path);
           return adapter.read(path, request, selected(fresh), undefined, source);
@@ -728,7 +753,17 @@ export function createReaderService(db: Pool, deps: ReaderDependencies, adapters
        ORDER BY created_at DESC, reader_version DESC LIMIT 1`,
       [document.projectId, document.documentId, document.versionId],
     );
-    if (rows[0]) return mapFromRow(rows[0]);
+    if (!rows[0]) return;
+    const latest = mapFromRow(rows[0]);
+    if (latest.format === 'dwg' && latest.units.every(unit => ['held','original_only'].includes(String(unit.locator?.coverage)))) {
+      const { rows: candidates } = await db.query<MapRow>(`SELECT r.* FROM reader_maps r JOIN dwg_derivatives d
+        ON d.project_id=r.project_id AND d.document_id=r.document_id AND d.version_id=r.version_id AND d.reader_version=r.reader_version
+        WHERE r.project_id=$1 AND r.document_id=$2 AND r.version_id=$3 AND r.format='dwg'
+        ORDER BY r.created_at DESC,r.reader_version DESC LIMIT 1`, [document.projectId,document.documentId,document.versionId]);
+      const prior = candidates[0] && mapFromRow(candidates[0]);
+      if (prior && await verifyStoredDwgDerivative(db,document,prior.readerVersion)) return prior;
+    }
+    return latest;
   }
 
   return {
@@ -736,8 +771,31 @@ export function createReaderService(db: Pool, deps: ReaderDependencies, adapters
     async map(sourceRef: SourceRef): Promise<PageMap> {
       const source = checkedSource(sourceRef);
       const { original, adapter, version } = await describe(source);
-      return await lookupMap(source, version)
-        ?? await withOriginal(original, deps, (path) => insertMap(source, original, version, adapter, path));
+      if (adapter.format === 'dwg') {
+        const current = await lookupMap(source, version);
+        if (current && await verifyStoredDwgDerivative(db, source, version)) { await original.check?.(); return current; }
+        if (version.includes(':dwg:unavailable:')) {
+          const { rows: candidates } = await db.query<MapRow>(`SELECT r.* FROM reader_maps r JOIN dwg_derivatives d
+            ON d.project_id=r.project_id AND d.document_id=r.document_id AND d.version_id=r.version_id AND d.reader_version=r.reader_version
+            WHERE r.project_id=$1 AND r.document_id=$2 AND r.version_id=$3 AND r.format='dwg'
+            ORDER BY r.created_at DESC,r.reader_version DESC LIMIT 1`, [source.projectId,source.documentId,source.versionId]);
+          const prior = candidates[0] && mapFromRow(candidates[0]);
+          if (prior && sameSource(prior.source,source) && await verifyStoredDwgDerivative(db,source,prior.readerVersion)) {
+            await original.check?.(); return prior;
+          }
+          throw new ReaderError('dwg_converter_unavailable','Нет проверенной сохранённой производной и конвертер недоступен',503);
+        }
+      } else {
+        const current = await lookupMap(source, version);
+        if (current) return current;
+      }
+      return await withOriginal(original, deps, (path) => insertMap(source, original, version, adapter, path));
+    },
+    async checkDocumentOriginal(document: DocumentKey) {
+      const original = await deps.resolveOriginal(document);
+      if (!original) mismatch();
+      await original.check?.();
+      return original.relativePath;
     },
     latestMap, previewDwg,
     open, pin, findEvidence, content, readPdfFragment, previewPdfPage, materializeNative, readMaterializedNative, verifyNativeDeliveryLine,

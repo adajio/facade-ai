@@ -112,8 +112,8 @@ async function remainingProject(tx: PoolClient, projectId: string, data: Project
   const args = [projectId, JSON.stringify(data.versions), data.version];
   const { rows: [{ count }] } = await tx.query<{ count: number }>(`
     WITH versions AS (${selectManifest})
-    SELECT count(*)::int AS count FROM versions v JOIN project_memory_blocks b
-      ON b.project_id=$1 AND b.version_id=v.version_id AND b.contract=$3 AND b.ordinal<v.indexed
+    SELECT count(*)::int AS count FROM versions v JOIN project_memory_blocks_all b
+      ON b.project_id=$1 AND b.version_id=v.version_id AND b.contract=$3 AND b.reader_version=v.reader_version AND b.ordinal<v.indexed
      WHERE cardinality(b.remaining)>0`, args);
   const queued = data.versions.reduce((sum, version) => sum + (version.total ?? 0) - version.indexed, 0);
   const limitations = [...new Set(data.versions.flatMap(({ total, limitation }) =>
@@ -122,8 +122,8 @@ async function remainingProject(tx: PoolClient, projectId: string, data: Project
   if (count) {
     const { rows } = await tx.query<StoredBlock>(`
       WITH versions AS (${selectManifest})
-      SELECT ${selectBlock} FROM versions v JOIN project_memory_blocks b
-        ON b.project_id=$1 AND b.version_id=v.version_id AND b.contract=$3 AND b.ordinal<v.indexed
+      SELECT ${selectBlock} FROM versions v JOIN project_memory_blocks_all b
+        ON b.project_id=$1 AND b.version_id=v.version_id AND b.contract=$3 AND b.reader_version=v.reader_version AND b.ordinal<v.indexed
        WHERE cardinality(b.remaining)>0
        ORDER BY b.version_id,b.ordinal LIMIT ${maximumRemainder}`, args);
     remaining.push(...rows.map((row) => fromBlock(row, versions.get(row.versionId)!)));
@@ -217,8 +217,8 @@ export async function searchProjectMemory(db: Pool, session: SessionAccount, inp
     const { rows: hits } = await tx.query<MemoryHit>(`
       WITH versions AS (${selectManifest})
       SELECT b.id AS "blockId",l.line_id AS "lineId",l.literal AS text,l.address,b.version_id AS "versionId"
-        FROM versions v JOIN project_memory_blocks b
-          ON b.project_id=$1 AND b.version_id=v.version_id AND b.contract=$3 AND b.ordinal<v.indexed
+        FROM versions v JOIN project_memory_blocks_all b
+          ON b.project_id=$1 AND b.version_id=v.version_id AND b.contract=$3 AND b.reader_version=v.reader_version AND b.ordinal<v.indexed
         JOIN project_memory_lines l ON l.block_id=b.id
        WHERE strpos(l.folded,$4)>0 ORDER BY b.version_id,b.ordinal,l.ordinal LIMIT $5`,
     [target.projectId, JSON.stringify(data.versions), data.version, query, limit + 1]);
@@ -248,8 +248,8 @@ export async function readProjectMemory(
     const data = await projectManifest(tx, target.projectId, input);
     const { rows: [stored] } = await tx.query<StoredBlock>(`
       WITH versions AS (${selectManifest})
-      SELECT ${selectBlock} FROM versions v JOIN project_memory_blocks b
-        ON b.project_id=$1 AND b.version_id=v.version_id AND b.contract=$3 AND b.ordinal<v.indexed
+      SELECT ${selectBlock} FROM versions v JOIN project_memory_blocks_all b
+        ON b.project_id=$1 AND b.version_id=v.version_id AND b.contract=$3 AND b.reader_version=v.reader_version AND b.ordinal<v.indexed
        WHERE b.id=$4`, [target.projectId, JSON.stringify(data.versions), data.version, input.blockId]);
     if (!stored) {
       const state = await remainingProject(tx, target.projectId, data);

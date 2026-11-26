@@ -5,6 +5,7 @@
   import { projectV1, scopedUrl, type Assessment, type OpenEvidence, type Projection, type WorkspaceProps } from '../lib/workspace';
   import { chooseWorkArea, currentOperation, requirementsUrl, workReceiptFilters, workSliceApi, type WorkReceiptFilter, type WorkSlice } from '../lib/work-slice';
   import Notice from '../lib/Notice.svelte';
+  import PackagePreparation from '../lib/PackagePreparation.svelte';
   import WorkProgress from '../lib/WorkProgress.svelte';
   import TerraReadingProgress, { type TerraReading } from '../lib/TerraReadingProgress.svelte';
 
@@ -12,6 +13,9 @@
     api: Api; context: WorkspaceProps; projection?: Projection; open: OpenEvidence; renew: () => void;
   } = $props();
   const facadeMode = $derived(context.project.intakeMode && !context.scopeId && !context.project.scopeId);
+  const projectId = $derived(context.project.id);
+  const currentScope = $derived(context.scopeId);
+  const accessScope = $derived(context.project.scopeId);
   let workSlice = $state<WorkSlice>();
   let error = $state('');
   let accessDenied = $state(false);
@@ -22,11 +26,11 @@
   let terraUpdated = $state<number>();
 
   $effect(() => {
-    const projectId = context.project.id;
-    const scopeId = facadeMode ? undefined : context.scopeId;
+    const currentProjectId = projectId;
+    const scopeId = facadeMode ? undefined : currentScope;
     const cancel = new AbortController();
     const { signal } = cancel;
-    const accessScope = context.project.scopeId;
+    const restrictedScope = accessScope;
     let timer: ReturnType<typeof setTimeout>;
     let loading = false;
     let refreshPending = false;
@@ -46,12 +50,12 @@
       const request = { signal: AbortSignal.any([signal, deadline]) };
       clearTimeout(timer);
       try {
-        if (accessScope) {
+        if (restrictedScope) {
           scopedAssessment = await api.json<Assessment>(
-            query(projectV1(projectId) + '/assessments/current', { scopeId: accessScope }), request);
+            query(projectV1(currentProjectId) + '/assessments/current', { scopeId: restrictedScope }), request);
         } else {
-          const slicePromise = api.json<WorkSlice>(query(workSliceApi(projectId), { scopeId }), request);
-          const terraPromise = facadeMode ? api.json<TerraReading>(projectV1(projectId) + '/terra-reading', request) : undefined;
+          const slicePromise = api.json<WorkSlice>(query(workSliceApi(currentProjectId), { scopeId }), request);
+          const terraPromise = facadeMode ? api.json<TerraReading>(projectV1(currentProjectId) + '/terra-reading', request) : undefined;
           if (terraPromise) {
             const [sliceResult, terraResult] = await Promise.allSettled([slicePromise, terraPromise]);
             if (sliceResult.status === 'rejected') throw sliceResult.reason;
@@ -113,6 +117,7 @@
 
 {#if workSlice && facadeMode && terra?.enabled}
   <TerraReadingProgress data={terra} slice={workSlice} updatedAt={terraUpdated} error={terraError} canEdit={context.canEdit} />
+  {#if terra.receipt}<PackagePreparation {api} projectId={context.project.id} receiptId={terra.receipt.receiptId} refreshKey={context.refreshKey} compact />{/if}
 {:else if workSlice && facadeMode && !terra && terraError}
   <section class="card"><h2>Состояние разбора</h2><Notice kind="error" message={'Не удалось загрузить состояние чтения: ' + terraError} /><button onclick={refreshSlice}>Повторить</button></section>
 {:else if workSlice}

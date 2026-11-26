@@ -2,7 +2,7 @@
   import type { SourceAddress } from './copilot';
   export type TerraReading = {
     enabled: boolean;
-    receipt: { receiptId: string; receiptNumber: number; inventoryOpen: boolean; acceptedVersions: number; rootFiles: number; rootArchives: number; directChildren: number; deeperChildren: number } | null;
+    receipt: { receiptId: string; receiptNumber: number; inventoryOpen: boolean; acceptedVersions: number; rootFiles: number; rootArchives: number; directChildren: number; deeperChildren: number; officeParts: number } | null;
     report: { id: string; createdAt: string; summary: { present: number; partial: number; notFound: number; unassessed: number }; draftAvailable: boolean } | null;
     progress: { totalWindows: number; mappedVersions: number; completed: number; covered: number; noMatch: number; refused: number; held: number; reading: number; queued: number; unassigned: number; heldReasons: { reason: string; count: number }[]; observations: number } | null;
     activity: { kind: string; documentId: string; versionId: string; label: string; anchor: SourceAddress | null; text: string | null; quote: string | null; value: string | null; unit: string | null; limitation: string | null; createdAt: string }[];
@@ -58,14 +58,17 @@
       {#if progress.reading}<p>Сейчас Terra читает документ.</p>{:else if progress.queued || progress.unassigned}<p>Есть участки, ожидающие чтения.</p>{/if}
       {#if progress.held}<p>Приостановлено участков · {count(progress.held)}.</p>{/if}
       <a href={scopedUrl(slice.projectId, 'facts', { scope: slice.scopeId })}>Все найденные сведения</a>
-      {#if data.activity.length}
-        {@const item = data.activity[0]}
+      <!-- svelte-ignore a11y_no_noninteractive_tabindex: Keyboard users can scroll the bounded reading excerpt. -->
+      <div class="latest-reading" role="region" tabindex="0" aria-label="Последняя запись чтения">
         <h3>Последняя запись</h3>
+        {#if data.activity.length}
+        {@const item = data.activity[0]}
         {#if item.quote || item.text}<blockquote>{item.quote || item.text}</blockquote>{/if}
         {#if item.value}<p>{item.value}{item.unit ? ' ' + item.unit : ''}</p>{/if}
         {#if item.limitation}<p>{item.limitation}</p>{/if}
         <a href={originalUrl(item.documentId, item.versionId, item.anchor?.locator?.page)} target="_blank" rel="noopener">{item.label}{item.anchor ? ' · ' + renderAddress(item.anchor) : ''}</a>
-      {/if}
+        {:else}<p>Записей чтения пока нет.</p>{/if}
+      </div>
       <details>
         <summary>Ход чтения по участкам</summary>
         <p>С находками · {count(progress.covered)}. Без совпадений · {count(progress.noMatch)}. Чтение завершилось отказом · {count(progress.refused)}.</p>
@@ -79,6 +82,7 @@
     <summary>Что принято и подготовлено к чтению</summary>
     <p>Поступление №{count(receipt.receiptNumber)}. {receipt.inventoryOpen ? 'Опись открыта.' : 'Опись закрыта.'}</p>
     <p>На верхнем уровне архивов · {count(receipt.rootArchives)}, отдельных файлов · {count(receipt.rootFiles)}. Вложений первого уровня · {count(receipt.directChildren)}, более глубоких вложений · {count(receipt.deeperChildren)}.</p>
+    {#if receipt.officeParts}<p>При распаковке документа Word в опись попали его служебные части · {count(receipt.officeParts)}. Они входят в общее число принятых версий.</p>{/if}
     {#if slice.files}<p>Файлов проекта с картой страниц, листов или других адресуемых частей · {count(slice.files.prepared)} из {count(slice.files.accepted)} принятых версий.</p>{/if}
     <a href={scopedUrl(slice.projectId, 'receipts', { scope: slice.scopeId }, receipt.receiptId)}>Открыть опись поступления</a>
   </details>
@@ -94,5 +98,6 @@
   .outcomes dd { font-variant-numeric: tabular-nums; font-size: 1.75rem; font-weight: 650; line-height: 1.2; margin: .15rem 0 0; }
   .actions { margin: .8rem 0; }
   .terra details { margin-top: .9rem; }
+  .latest-reading { height: 10rem; overflow: auto; overscroll-behavior: contain; }
   blockquote { margin: .4rem 0; padding-left: .8rem; border-left: 3px solid var(--line); }
 </style>

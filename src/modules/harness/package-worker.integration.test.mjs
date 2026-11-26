@@ -733,14 +733,20 @@ test('ordinary intake publishes independent package evidence before questions an
       WHERE project_id=$1 ORDER BY state`, [existing.id])).rows;
     assert.deepEqual(before.map(({ state }) => state), ['paid', 'unknown']);
     const readerVersion = complete.windows[0].readerVersion;
+    async function fixtureMap(source, version) {
+      const count = source.projectId === existing.id ? 2625 : 3;
+      const units = Array.from({ length: count }, (_, index) => ({
+        id: String(index + 1), width: 600, height: 400, locator: { page: index + 1 },
+      }));
+      await app.db.query(`INSERT INTO reader_maps(project_id,document_id,version_id,reader_version,receipt_id,original_sha256,format,units)
+        SELECT project_id,document_id,version_id,$2,receipt_id,$3,'pdf',$4::jsonb FROM intake_reader_jobs
+        WHERE version_id=$1 ON CONFLICT(version_id,reader_version) DO NOTHING`,
+        [source.versionId,version,source.sha256,JSON.stringify(units)]);
+      return { format: 'pdf', source, readerVersion: version, units };
+    }
     const map = {
       formatFor: () => 'pdf', readerVersion: async () => readerVersion,
-      async map(source) {
-        const count = source.projectId === existing.id ? 2625 : 3;
-        return { format: 'pdf', source, readerVersion, units: Array.from({ length: count }, (_, index) => ({
-          id: String(index + 1), width: 600, height: 400, locator: { page: index + 1 },
-        })) };
-      },
+      async map(source) { return fixtureMap(source, readerVersion); },
     };
     await activatePackageProjects(app.db, gateway, [existing.id]);
     const target = (await app.db.query('SELECT generation_id FROM harness_package_projects WHERE project_id=$1', [existing.id])).rows[0];
@@ -751,7 +757,7 @@ test('ordinary intake publishes independent package evidence before questions an
     assert.equal(await preparePackageMap(app.db, gateway, map, [existing.id]), false);
 
     const profile = managedProfile();
-    for (let index = 0; index < 12; index++) if (!await dispatchPackagePair(app.db, gateway, profile)) break;
+    for (let index = 0; index < 12; index++) if (!await dispatchPackagePair(app.db, gateway, profile, undefined, map)) break;
     const large = await readPackageAnalysis(app.db, existing.id);
     const competing = await readPackageAnalysis(app.db, small.id);
     assert.equal(large.windows.length, 2625);
@@ -772,7 +778,7 @@ test('ordinary intake publishes independent package evidence before questions an
       WHERE project_id=$1 ORDER BY state`, [existing.id])).rows, before);
     const nextReaderVersion = readerVersion + ';fixture-profile=v2';
     const switched = { ...map, readerVersion: async () => nextReaderVersion,
-      async map(source) { return { ...await map.map(source), readerVersion: nextReaderVersion }; } };
+      async map(source) { return fixtureMap(source, nextReaderVersion); } };
     // The same source and frames are read under a new derived-map contract.
     const { rows: [{ mappedOriginals }] }=await app.db.query(`SELECT count(*)::int AS "mappedOriginals"
       FROM harness_package_maps WHERE active`);
@@ -780,7 +786,7 @@ test('ordinary intake publishes independent package evidence before questions an
       assert.equal(await preparePackageMap(app.db, gateway, switched, [existing.id]), true);
     }
     assert.equal(await preparePackageMap(app.db, gateway, switched, [existing.id]), false);
-    for (let index = 0; index < 12; index++) if (!await dispatchPackagePair(app.db, gateway, profile)) break;
+    for (let index = 0; index < 12; index++) if (!await dispatchPackagePair(app.db, gateway, profile, undefined, switched)) break;
     const changed = await readPackageAnalysis(app.db, existing.id);
     assert.notEqual(changed.windows[0].id, large.windows[0].id);
     assert.deepEqual(changed.windows[0].place, large.windows[0].place);

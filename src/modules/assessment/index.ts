@@ -1,3 +1,6 @@
+import { readPackagePreparation } from "../intake/package-preparation.js";
+import { packagePreparationInput } from "../harness/package-preparation.js";
+import { createRuntimePdfService } from "../pdf/index.js";
 import { readTerraReading } from "./terra-reading.js";
 import { readPreliminaryPackageReviews, readPreliminaryReadingProgress } from "./preliminary-package-review.js";
 export { publishPreliminaryPackageReview, type PreliminaryPackageReviewInput } from "./preliminary-package-review.js";
@@ -69,13 +72,34 @@ export async function register(app: FastifyInstance): Promise<void> {
       checkCsrf(request, cookie);
     }
   });
+  let preparationReader: ReturnType<typeof createRuntimePdfService> | undefined;
+  const reader = () => preparationReader ??= createRuntimePdfService(app.db, app.config);
+  app.addHook("onClose", async () => preparationReader?.close());
   for (const prefix of ["/api/v1", "/api"]) {
-    registerRoutes(app, prefix);
+    registerRoutes(app, prefix, reader);
   }
 }
 
-function registerRoutes(app: FastifyInstance, prefix: string) {
+function registerRoutes(app: FastifyInstance, prefix: string, reader: () => ReturnType<typeof createRuntimePdfService>) {
   const db = app.db;
+  app.get<{ Params: Project & { receiptId: string } }>(`${prefix}/projects/:projectId/receipts/:receiptId/preparation`, async (request, reply) => {
+    const projectId = identifier(request.params.projectId);
+    const receiptId = identifier(request.params.receiptId);
+    return transaction(db, async (tx) => {
+      const session = await readSession(tx, request);
+      await authorize(tx, session, { action: "project:read", projectId });
+      const receipt = await tx.query("SELECT 1 FROM intake_receipts WHERE project_id=$1 AND id=$2", [projectId, receiptId]);
+      if (!receipt.rowCount) return reply.code(404).send({ error: "receipt_not_found" });
+      const input = await packagePreparationInput(tx, { projectId, receiptId }, reader());
+      const preparation = await readPackagePreparation(tx, input);
+      await touchSession(tx, session);
+      const items = preparation.items.map(({occurrenceId,documentId,versionId,label,state,kind,reason,derivativeAvailable,format,readerVersion}) =>
+        ({occurrenceId,documentId,versionId,label,state,kind,reason,derivativeAvailable,format,readerVersion}));
+      return { projectId, receiptId, state: preparation.state, manifestId: preparation.manifestId,
+        revision: preparation.revision, counts: preparation.counts, reasons: preparation.reasons,
+        restrictions: preparation.restrictions.map(({label,reason,sourceId}) => ({label,reason,sourceId})), items };
+    });
+  });
   app.get<{ Params: Project; Querystring: { after?: string } }>(`${prefix}/projects/:projectId/preliminary-package-reviews`, async (request) => {
     const projectId = identifier(request.params.projectId);
     const after = request.query.after === undefined ? undefined : identifier(request.query.after);

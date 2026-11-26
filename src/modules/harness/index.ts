@@ -1,3 +1,4 @@
+import { packagePreparationSweep } from './package-preparation.js';
 import { createCopilotMemory, createCopilotResearch, copilotKind, copilotModelAdmission, processNextCopilot } from '../copilot/index.js';
 import type { CopilotRoute } from '../copilot/worker.js';
 import { indexNextProjectMemory } from '../project-memory/index.js';
@@ -70,8 +71,8 @@ function configuredCopilot(): CopilotRoute | null {
   } catch {return null;}
 }
 
-function modelGateway(context: WorkerContext, external: ReturnType<typeof journalFromEnv>, profile: ResearchProfile, packageEnabled: boolean, packageProjects: readonly string[], test?: ManagedTestOptions) {
-  const packageAdmission=packageModelAdmission(packageEnabled,packageProjects,process.env.FACADE_HARNESS_PACKAGE_EFFECTS==='enabled');
+function modelGateway(context: WorkerContext, external: ReturnType<typeof journalFromEnv>, profile: ResearchProfile, packageEnabled: boolean, packageProjects: readonly string[], reader: () => ReturnType<typeof createRuntimePdfService> | undefined, test?: ManagedTestOptions) {
+  const packageAdmission=packageModelAdmission(packageEnabled,packageProjects,process.env.FACADE_HARNESS_PACKAGE_EFFECTS==='enabled',reader);
   const copilotAdmission=copilotModelAdmission();
   const reviewAdmission:typeof reviewPairAdmission=async (tx,work)=>work.kind===copilotKind?'early':reviewPairAdmission(tx,work);
   const policyOptions = {
@@ -217,7 +218,8 @@ export async function startWorker(context: WorkerContext, test?: ManagedTestOpti
   }
 
   try {
-    const { gateway, admit, hasTransport, mode, copilotRoute, defaultCustomerGrants } = modelGateway(context, external, profile, packageEnabled, packageProjects, test);
+    let runtimeReader: ReturnType<typeof createRuntimePdfService> | undefined;
+    const { gateway, admit, hasTransport, mode, copilotRoute, defaultCustomerGrants } = modelGateway(context, external, profile, packageEnabled, packageProjects, () => runtimeReader, test);
     const allowProfileScans=packageEnabled&&hasTransport&&process.env.FACADE_HARNESS_PACKAGE_EFFECTS==='enabled'&&
       process.env.FACADE_HARNESS_REPLAY_ONLY!=='1';
     if (test) {
@@ -231,6 +233,7 @@ export async function startWorker(context: WorkerContext, test?: ManagedTestOpti
       ...(test && { replayOnly: process.env.FACADE_HARNESS_REPLAY_ONLY === '1', qualifiesProduction: false }) });
     if (packageEnabled) await activatePackageProjects(db, gateway, packageProjects);
     const base = createRuntimePdfService(db, config, { storage, adapters: createFormatAdapters() });
+    runtimeReader = base;
     const service = {
       ...base,
       map: (...args: Parameters<typeof base.map>) => withReaderSlot(db, () => base.map(...args)),
@@ -244,6 +247,7 @@ export async function startWorker(context: WorkerContext, test?: ManagedTestOpti
       ()=>indexNextProjectMemory(db,base,signal),
       ...(packageEnabled?[
         ()=>preparePackageMap(db,gateway,service,packageProjects),
+        packagePreparationSweep(db,service),
         ()=>scanPackageStructure(db,service),
         ()=>reconcileNextFacadeDiscovery(db),
       ]:[]),
@@ -281,7 +285,7 @@ export async function startWorker(context: WorkerContext, test?: ManagedTestOpti
       }));
     }
     if (packageEnabled) lanes.push(
-      poll('package primary scheduler', () => dispatchPackagePair(db, gateway, profile, newWalkJobs)),
+      poll('package primary scheduler', () => dispatchPackagePair(db, gateway, profile, newWalkJobs, service)),
       poll('package review scheduler', () => schedulePackageReview(db, gateway, profile)),
     );
     if (hasTransport && external) {

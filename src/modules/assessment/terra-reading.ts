@@ -4,6 +4,16 @@ import { loadResearchProfile } from '../harness/profile.js';
 
 const model = 'gpt-6.1-terra';
 const route = 'codex-subscription-terra';
+// Count admitted windows and already assigned work; an absent snapshot never
+// implies that unassigned windows are ready for a new analysis.
+const visibleReadingWindow = `(EXISTS (SELECT 1 FROM intake_package_preparation_current cur
+  JOIN intake_package_preparation_windows pi ON pi.manifest_id=cur.manifest_id AND pi.project_id=cur.project_id
+  WHERE cur.project_id=w.project_id AND cur.receipt_id=$2 AND pi.window_id=w.id)
+
+ OR EXISTS (SELECT 1 FROM harness_package_branches old JOIN gateway_jobs job ON job.id=old.job_id
+   JOIN gateway_generations generation ON generation.generation_id=job.generation_id AND generation.current
+   WHERE old.window_id=w.id AND old.active AND old.branch='A' AND old.settings->>'model'=$3
+     AND old.settings->>'routeId'=$4 AND job.project_id=w.project_id AND job.purpose='primary_a'))`;
 /** The overview is a bounded, read-only view of the newest intake. */
 export async function readTerraReading(tx: PoolClient, projectId: string) {
   const profile = loadResearchProfile();
@@ -68,6 +78,8 @@ export async function readTerraReading(tx: PoolClient, projectId: string) {
      LEFT JOIN LATERAL jsonb_array_elements(r.rows) item ON true
      WHERE r.project_id=$1 AND r.receipt_id=$2 AND r.model=$3 AND r.catalog_version_id=p.catalog_version_id
        AND r.stage=p.project_stage AND r.input_generation=coalesce(g.generation,0)
+       AND (r.preparation_id IS NULL OR EXISTS (SELECT 1 FROM intake_package_preparation_current cur
+         WHERE cur.project_id=r.project_id AND cur.receipt_id=r.receipt_id AND cur.manifest_id=r.preparation_id))
      GROUP BY r.id ORDER BY r.created_at DESC,r.id DESC LIMIT 1`, [projectId, receipt.receiptId, model]);
   const { rows: [progress] } = await tx.query<{
     totalWindows: number; mappedVersions: number; completed: number; covered: number; noMatch: number;
@@ -76,7 +88,7 @@ export async function readTerraReading(tx: PoolClient, projectId: string) {
        WHERE project_id=$1 AND receipt_id=$2 AND state='accepted'), maps AS (
        SELECT m.version_id,m.fingerprint FROM harness_package_maps m JOIN accepted a ON a.version_id=m.version_id
        WHERE m.project_id=$1 AND m.active), windows AS (
-       SELECT w.id,w.version_id FROM maps m JOIN harness_package_windows w ON w.version_id=m.version_id AND w.map_fingerprint=m.fingerprint WHERE w.project_id=$1
+       SELECT w.id,w.version_id FROM maps m JOIN harness_package_windows w ON w.version_id=m.version_id AND w.map_fingerprint=m.fingerprint WHERE w.project_id=$1 AND ${visibleReadingWindow}
      ), jobs AS (
        SELECT w.id,w.version_id,j.id AS job_id,j.state,j.result,j.reason FROM windows w JOIN harness_package_branches b
          ON b.window_id=w.id AND b.active AND b.branch='A' AND b.settings->>'model'=$3 AND b.settings->>'routeId'=$4
@@ -112,7 +124,7 @@ export async function readTerraReading(tx: PoolClient, projectId: string) {
      JOIN reader_observations o ON o.project_id=$1 AND o.version_id=a.version_id AND o.branch='A'
        AND (o.run_id=j.id OR EXISTS (SELECT 1 FROM harness_package_followups f
          WHERE f.root_job_id=j.id AND f.job_id=o.run_id AND f.window_id=w.id AND f.branch='A'))
-     WHERE (nullif(o.payload->>'quote','') IS NOT NULL OR nullif(o.payload->>'value','') IS NOT NULL OR nullif(o.payload->>'limitation','') IS NOT NULL)
+     WHERE ${visibleReadingWindow} AND (nullif(o.payload->>'quote','') IS NOT NULL OR nullif(o.payload->>'value','') IS NOT NULL OR nullif(o.payload->>'limitation','') IS NOT NULL)
      ORDER BY o.created_at DESC,o.id DESC LIMIT 20`, [projectId, receipt.receiptId, model, route]);
   return { enabled: true, receipt, report: report ?? null, progress, activity };
 }

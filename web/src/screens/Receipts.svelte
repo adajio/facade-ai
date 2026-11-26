@@ -12,6 +12,7 @@
   import { workReceiptFilters, workSliceApi, type WorkReceiptFilter, type WorkSlice } from '../lib/work-slice';
   import WorkProgress from '../lib/WorkProgress.svelte';
   import Notice from '../lib/Notice.svelte';
+  import PackagePreparation from '../lib/PackagePreparation.svelte';
   import Document from './Document.svelte';
   import IntakeHolds from './IntakeHolds.svelte';
 
@@ -1018,6 +1019,10 @@
       {/each}</ul>
     {/if}
   </section>
+
+  {#if !activeDocument && context.project.intakeMode && !context.project.scopeId && !detailWorkSlice}
+    {#key inventory.receiptId}<PackagePreparation {api} projectId={context.project.id} receiptId={inventory.receiptId} refreshKey={context.refreshKey} />{/key}
+  {/if}
 
   {#if !activeDocument}
   <section class="card table-card">

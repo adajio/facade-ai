@@ -5,7 +5,7 @@ import { ReaderError, type NativeBlock, type PageMap, type ReaderAddress, type S
 import { blockId, folded, memoryVersion, type MemoryRemainder } from './contracts.js';
 
 type MemoryIndexer = Pick<ReturnType<typeof createRuntimePdfService>, 'map' | 'materializeNative'>;
-type Candidate = SourceRef & { readerVersion: string | null; format: string | null; ordinal: number };
+type Candidate = SourceRef & { readerVersion: string | null; targetReaderVersion: string | null; format: string | null; ordinal: number };
 const slot = "hashtextextended('facade/heavy-local-slot',0)";
 const valueLimits = new Set(['format_zero_text_candidates', 'xlsx_formula_cache_unverified',
   'xlsx_formula_value_missing', 'xlsx_cell_error', 'cad_entity_handle_unconfirmed']);
@@ -13,10 +13,17 @@ const valueLimits = new Set(['format_zero_text_candidates', 'xlsx_formula_cache_
 async function dequeue(db: Pool | PoolClient) {
   const { rows: [row] } = await db.query<Candidate>(`
     SELECT j.project_id AS "projectId", j.document_id AS "documentId", j.version_id AS "versionId", o.sha256,
-           m.reader_version AS "readerVersion", m.format, coalesce(m.next_ordinal,0) AS ordinal
+           m.reader_version AS "readerVersion", target.reader_version AS "targetReaderVersion", m.format, coalesce(m.next_ordinal,0) AS ordinal
       FROM intake_reader_jobs j JOIN intake_originals o ON o.project_id=j.project_id AND o.id=j.original_id
       LEFT JOIN project_memory_versions m ON m.project_id=j.project_id AND m.version_id=j.version_id AND m.contract=$1
-     WHERE (m.total IS NULL OR m.next_ordinal<m.total)
+      LEFT JOIN LATERAL (
+        SELECT r.reader_version FROM reader_maps r
+        LEFT JOIN harness_package_maps p ON p.project_id=r.project_id AND p.version_id=r.version_id
+          AND p.reader_version=r.reader_version AND p.active
+        WHERE r.project_id=j.project_id AND r.version_id=j.version_id AND r.document_id=j.document_id AND r.original_sha256=o.sha256
+        ORDER BY (p.version_id IS NOT NULL) DESC,r.created_at DESC,r.reader_version DESC LIMIT 1
+      ) target ON true
+     WHERE (m.total IS NULL OR m.next_ordinal<m.total OR (target.reader_version IS NOT NULL AND target.reader_version IS DISTINCT FROM m.reader_version))
        AND (m.retry_at IS NULL OR m.retry_at<=clock_timestamp())
        AND EXISTS (SELECT 1 FROM intake_occurrences c WHERE c.project_id=j.project_id
                    AND c.version_id=j.version_id AND c.state='accepted')
@@ -32,16 +39,35 @@ function physicalLimitation(map: PageMap) {
 }
 
 async function writeMap(db: PoolClient, map: PageMap) {
-  await db.query(`
-    INSERT INTO project_memory_versions
-      (project_id,version_id,contract,reader_version,format,total,physical_limitation)
-    VALUES ($1,$2,$3,$4,$5,$6,$7)
-    ON CONFLICT (version_id,contract) DO UPDATE SET reader_version=EXCLUDED.reader_version,format=EXCLUDED.format,
-      total=EXCLUDED.total,physical_limitation=EXCLUDED.physical_limitation,last_error=NULL,retry_at=NULL,
-      updated_at=clock_timestamp()
-    WHERE project_memory_versions.reader_version IS NULL AND project_memory_versions.total IS NULL`,
-  [map.source.projectId, map.source.versionId, memoryVersion, map.readerVersion, map.format,
-    map.units.length, physicalLimitation(map)]);
+  await db.query('BEGIN');
+  try {
+    // Preserve the cursor of the departing generation, including legacy rows written before this migration.
+    await db.query(`INSERT INTO project_memory_generations(project_id,version_id,contract,reader_version,format,total,next_ordinal,physical_limitation)
+      SELECT project_id,version_id,contract,reader_version,format,total,next_ordinal,physical_limitation
+      FROM project_memory_versions WHERE project_id=$1 AND version_id=$2 AND contract=$3 AND reader_version IS NOT NULL AND total IS NOT NULL
+      ON CONFLICT(version_id,contract,reader_version) DO UPDATE SET next_ordinal=EXCLUDED.next_ordinal`,
+      [map.source.projectId,map.source.versionId,memoryVersion]);
+    await db.query(`INSERT INTO project_memory_generations(project_id,version_id,contract,reader_version,format,total,physical_limitation)
+      VALUES($1,$2,$3,$4,$5,$6,$7) ON CONFLICT(version_id,contract,reader_version) DO NOTHING`,
+      [map.source.projectId,map.source.versionId,memoryVersion,map.readerVersion,map.format,map.units.length,physicalLimitation(map)]);
+    await db.query(`INSERT INTO project_memory_versions(project_id,version_id,contract,reader_version,format,total,next_ordinal,physical_limitation)
+      SELECT project_id,version_id,contract,reader_version,format,total,next_ordinal,physical_limitation FROM project_memory_generations
+      WHERE project_id=$1 AND version_id=$2 AND contract=$3 AND reader_version=$4
+      ON CONFLICT(version_id,contract) DO UPDATE SET reader_version=EXCLUDED.reader_version,format=EXCLUDED.format,
+        total=EXCLUDED.total,next_ordinal=EXCLUDED.next_ordinal,physical_limitation=EXCLUDED.physical_limitation,
+        last_error=NULL,retry_at=NULL,updated_at=clock_timestamp()`,
+      [map.source.projectId,map.source.versionId,memoryVersion,map.readerVersion]);
+    await db.query('COMMIT');
+  } catch (error) { await db.query('ROLLBACK'); throw error; }
+}
+
+async function targetMap(db: PoolClient, job: Candidate): Promise<PageMap> {
+  const { rows: [row] } = await db.query<{ readerVersion: string; format: string; units: PageMap['units']; receiptId: string }>(`
+    SELECT reader_version AS "readerVersion",format,units,receipt_id AS "receiptId" FROM reader_maps
+    WHERE project_id=$1 AND document_id=$2 AND version_id=$3 AND original_sha256=$4 AND reader_version=$5`,
+    [job.projectId,job.documentId,job.versionId,job.sha256,job.targetReaderVersion]);
+  if (!row) throw new Error('Target reader map is unavailable');
+  return { source: {projectId:job.projectId,documentId:job.documentId,versionId:job.versionId,sha256:job.sha256}, ...row };
 }
 
 function unavailable(job: Candidate, error: unknown) {
@@ -91,11 +117,12 @@ async function writeBlock(db: PoolClient, job: Candidate, block: NativeBlock) {
     [job.projectId, job.versionId, memoryVersion, job.readerVersion, block.ordinal]);
     if (!result.rowCount) throw new Error('Project memory cursor changed');
     await db.query(`
-      INSERT INTO project_memory_blocks
-        (id,project_id,version_id,contract,ordinal,unit_id,address,artifact_sha256,artifact_size,limitations,remaining)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`,
+      INSERT INTO project_memory_blocks_all
+        (id,project_id,version_id,contract,ordinal,unit_id,address,artifact_sha256,artifact_size,limitations,remaining,reader_version)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
     [id, job.projectId, job.versionId, memoryVersion, block.ordinal, block.unit.id, address,
-      block.artifact?.sha256 ?? null, block.artifact?.size ?? null, [...limitations], [...remaining]]);
+      block.artifact?.sha256 ?? null, block.artifact?.size ?? null, [...limitations], [...remaining], job.readerVersion]);
+
     if (lines.length) await db.query(`
       INSERT INTO project_memory_lines (block_id,ordinal,line_id,literal,folded,address)
       SELECT $1,x.ordinal,x.id,x.literal,x.folded,x.address
@@ -120,8 +147,8 @@ export async function indexNextProjectMemory(db: Pool, reader: MemoryIndexer, si
     const job = await dequeue(conn);
     if (!job) return false;
     try {
-      if (!job.readerVersion) {
-        const map = await reader.map(job);
+      if (!job.readerVersion || (job.targetReaderVersion && job.targetReaderVersion !== job.readerVersion)) {
+        const map = job.targetReaderVersion ? await targetMap(conn,job) : await reader.map(job);
         await writeMap(conn, map);
       } else {
         await reader.materializeNative(job, job.readerVersion, job.ordinal, job.format === 'pdf' ? 1 : 8, async (block) => {

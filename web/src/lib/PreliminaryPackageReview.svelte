@@ -1,7 +1,7 @@
 <script lang="ts">
   import { preliminarySourceUrl, preliminaryStatusLabels, type PreliminaryReview, type PreliminaryStatus } from './preliminary-review';
   import { date } from './format';
-  import { describe, id, interrupted, type Api } from './http';
+  import { denied, describe, id, interrupted, type Api } from './http';
   import { projectV1 } from './workspace';
   import Notice from './Notice.svelte';
 
@@ -17,6 +17,7 @@
   let progressError = $state('');
   let textArea = $state<HTMLTextAreaElement>();
   let selected = $derived(reviews.find((item) => item.id === selectedId));
+  let progressReviewId = $derived(mode === 'review' && selected?.isCurrent ? selected.id : undefined);
   let counts = $derived(selected ? (Object.keys(preliminaryStatusLabels) as PreliminaryStatus[]).map((status) => ({
     status, count: selected!.rows.filter((row) => row.status === status).length,
   })) : []);
@@ -45,8 +46,7 @@
     }
     void load().catch((failure) => {
       if (!controller.signal.aborted && !interrupted(failure)) {
-        reviews = [];
-        selectedId = '';
+        if (denied(failure)) { reviews = []; selectedId = ''; }
         error = describe(failure);
       }
     });
@@ -54,7 +54,7 @@
   });
 
   $effect(() => {
-    const reviewId = mode === 'review' && selected?.isCurrent ? selected.id : undefined;
+    const reviewId = progressReviewId;
     const project = projectId;
     progress = undefined;
     progressError = '';
@@ -94,8 +94,9 @@
 </script>
 
 {#if error}
-  <section class="card"><h2>Предварительный разбор пакета</h2><Notice kind="error" message={'Не удалось загрузить предварительный разбор: ' + error} /></section>
-{:else if selected}
+  <section class="card"><h2>Предварительный разбор пакета</h2><Notice kind="error" message={'Не удалось загрузить предварительный разбор: ' + error + (selected ? '. Показан последний полученный результат.' : '')} /></section>
+{/if}
+{#if selected}
   <section class="card preliminary-review" aria-label={mode === 'review' ? 'Предварительный разбор пакета' : 'Черновик письма по разбору Terra'}>
     <h2>{mode === 'review' ? 'Предварительный разбор пакета' : 'Черновик письма по разбору Terra'}</h2>
     <p class="notice">Выводы одного читателя. Ожидается проверка инженером.</p>

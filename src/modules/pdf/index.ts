@@ -1,3 +1,6 @@
+import { findStoredDwgDerivative } from './dwg-derivative.js';
+export { verifyStoredDwgDerivative } from './dwg-derivative.js';
+import { openVerifiedDwgFile } from '../formats/dwg-durable.js';
 import { join } from 'node:path';
 import { Readable } from 'node:stream';
 import type { FastifyInstance, FastifyRequest } from 'fastify';
@@ -170,6 +173,28 @@ export async function register(
     return document;
   }
 
+  for (const prefix of ['/api/v1', '/api']) {
+    app.get<UnitsRoute>(`${prefix}/documents/:documentId/versions/:versionId/dwg-derivative`, async (request, reply) => {
+      const document = await authorizedDocument(request);
+      const originalPath = await reader().checkDocumentOriginal(document);
+      const saved = await findStoredDwgDerivative(app.db, document);
+      if (!saved) throw new ReaderError('dwg_derivative_not_found', 'Сохранённая производная DWG отсутствует', 404);
+      await authorize(app.db, await readSession(app.db, request), { action:'project:read', projectId:document.projectId });
+      const ext = saved.format === 'dxf' ? 'dxf' : 'json';
+      const base = (originalPath?.split(/[\\/]/u).pop() ?? 'drawing').replace(/\.dwg$/iu,'').replace(/[\x00-\x1f\x7f]/gu,'').slice(0,150) || 'drawing';
+      const filename = encodeURIComponent(`${base}.${ext}`).replace(/[!'()*]/gu, c => `%${c.charCodeAt(0).toString(16).toUpperCase()}`);
+      reply.header('X-Content-Type-Options','nosniff').header('ETag', `"sha256-${saved.derivativeSha256}"`)
+        .header('Content-Disposition', `attachment; filename="drawing.${ext}"; filename*=UTF-8''${filename}`)
+        .header('Content-Length', saved.byteSize).type(saved.format === 'dxf' ? 'application/dxf' : 'application/json');
+      if (request.method === 'HEAD') {
+        reply.hijack();
+        for (const [name,value] of Object.entries(reply.getHeaders())) if (value !== undefined) reply.raw.setHeader(name,value);
+        reply.raw.statusCode = 200; reply.raw.end(); return;
+      }
+      const file = await openVerifiedDwgFile(saved.path,saved.derivativeSha256,saved.byteSize);
+      return reply.send(file.createReadStream({start:0,autoClose:true}));
+    });
+  }
   const documentReader = '/api/v1/documents/:documentId/versions/:versionId/reader';
   app.get<UnitsRoute>(documentReader + '/units', async (request) => {
     const document = await authorizedDocument(request);

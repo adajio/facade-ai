@@ -1,7 +1,9 @@
 import { createHash } from "node:crypto";
+import { open } from "node:fs/promises";
 import type { FastifyInstance } from "fastify";
 import { ReaderError } from "../pdf/types.js";
 import type { ReaderAdapter, ReaderOutput, ReaderUnit, ReadRequest, SourceRef } from "../pdf/types.js";
+import { persistDwgFile, verifyDwgFile } from "./dwg-durable.js";
 import { dwgFontAssets } from "./cad-font-assets.js";
 import type { CadFontAssets } from "./cad-font-assets.js";
 import { cadFrame, renderCad } from "./cad-render.js";
@@ -201,22 +203,46 @@ function adapter(format: Format): ReaderAdapter {
     }
   }
 
-  async function index(path?: string, source?: SourceRef, expected?: string | number) {
+  async function index(path?: string, source?: SourceRef, expected?: string | number, readerVersion?: string) {
+    const match = readerVersion?.match(/^formats-1\.1\.8:dwg:(sha256:[0-9a-f]{64}):fonts:sha256:([0-9a-f]{64})$/);
+    if (match && fonts?.identity !== match[2]) throw new ReaderError("dwg_index_identity_changed", "Шрифты сохранённого DWG изменились", 409);
+    const pinnedConverter = match?.[1];
+    const cachedPin = source && pinnedConverter && { source, converter: pinnedConverter, reserve: 0 };
+    if (cachedPin) {
+      const cached = await openDwgIndex(cachedPin, fonts);
+      if (cached && (!expected || expected === cached.identity.derivative)) return cached;
+      if (cached) { await cached.close(); throw new ReaderError("dwg_index_identity_changed", "Производная DWG изменилась", 409); }
+      if (source && typeof expected === "string") {
+        const saved = await verifyDwgFile(source, expected);
+        if (saved) {
+          const file = await open(saved.path, "r");
+          try { return await buildDwgIndex(file, expected, pinnedConverter!, cachedPin, fonts); }
+          finally { await file.close(); }
+        }
+      }
+    }
     const converter = await resolve();
-    if (converter?.format !== "dwg") throw new FormatHold("dwg_converter_unavailable");
+    if (converter?.format !== "dwg" || (pinnedConverter && pinnedConverter !== converter.identity)) throw new FormatHold("dwg_converter_unavailable");
     const pin = source && { source, converter: converter.identity, reserve: converter.reserve };
     const cached = pin && await openDwgIndex(pin, fonts);
-    if (cached || !path) return cached;
-    return withDwgDerivative(path, converter, (file, sha) => {
-      if (expected !== undefined && expected !== sha) {
-        throw new ReaderError("dwg_index_identity_changed", "Повторная конвертация вернула другую производную DWG", 409);
-      }
-      return buildDwgIndex(file, sha, converter.identity, pin, fonts);
+    if (cached) {
+      if (expected !== undefined && expected !== cached.identity.derivative) { await cached.close(); throw new ReaderError("dwg_index_identity_changed", "Производная DWG изменилась", 409); }
+      if (!path || !source || await verifyDwgFile(source, cached.identity.derivative)) return cached;
+      expected = cached.identity.derivative;
+      await cached.close();
+    }
+    if (!path) return;
+    return withDwgDerivative(path, converter, async (file, sha) => {
+      if (expected !== undefined && expected !== sha) throw new ReaderError("dwg_index_identity_changed", "Повторная конвертация вернула другую производную DWG", 409);
+      const built = await buildDwgIndex(file, sha, converter.identity, pin, fonts);
+      try { if (source) await persistDwgFile(source, file, sha); }
+      catch (error) { await built.close(); throw error; }
+      return built;
     });
   }
 
   function pinned(index: DwgIndex, unit: Unit, digest: string): Unit {
-    return { ...unit, locator: { ...unit.locator, derivativeSha256: index.identity.derivative, partSha256: digest } };
+    return { ...unit, locator: { ...unit.locator, derivativeSha256: index.identity.derivative, derivativeFormat: index.identity.kind, converterIdentity: index.identity.converter, partSha256: digest } };
   }
 
   function output(index: DwgIndex, request: ReadRequest, selected: ReaderUnit) {
@@ -243,9 +269,9 @@ function adapter(format: Format): ReaderAdapter {
       format, await version());
   }
 
-  async function readDwg(path: string | undefined, request: ReadRequest, unit: ReaderUnit, source?: SourceRef) {
+  async function readDwg(path: string | undefined, request: ReadRequest, unit: ReaderUnit, source?: SourceRef, readerVersion?: string) {
     try {
-      const stored = await index(path, source, unit.locator?.derivativeSha256);
+      const stored = await index(path, source, unit.locator?.derivativeSha256, readerVersion);
       if (!stored) return;
       try {
         return output(stored, request, unit);
@@ -273,16 +299,24 @@ function adapter(format: Format): ReaderAdapter {
   return {
     format,
     version,
+    ...(format === "dwg" ? { async durableInfo(source: SourceRef, units: readonly ReaderUnit[], readerVersion: string) {
+      const sha = units[0]?.locator?.derivativeSha256;
+      const kind = units[0]?.locator?.derivativeFormat;
+      const converter = units[0]?.locator?.converterIdentity;
+      if (typeof sha !== "string" || (kind !== "dxf" && kind !== "dwg-json") || typeof converter !== "string" || !readerVersion.includes(converter)) return;
+      const stored = await verifyDwgFile(source, sha);
+      return stored && { storageKey: stored.storageKey, sha256: sha, size: stored.size, format: kind, converter };
+    } } : {}),
     async inspect(path, source) {
       if (format === "dwg") return inspectDwg(path, source);
       const parsed = await parse(path, true);
       return stampPhysicalInventory(parsed.units.map(mapUnit), parsed, format, await version());
     },
     ...(format === "dwg" ? {
-      readCached: (source: SourceRef, request: ReadRequest, unit: ReaderUnit) => readDwg(undefined, request, unit, source),
-      async readCachedNativeUnits(source: SourceRef, units: readonly ReaderUnit[]) {
+      readCached: (source: SourceRef, request: ReadRequest, unit: ReaderUnit, readerVersion?: string) => readDwg(undefined, request, unit, source, readerVersion),
+      async readCachedNativeUnits(source: SourceRef, units: readonly ReaderUnit[], readerVersion?: string) {
         try {
-          const stored = await index(undefined, source);
+          const stored = await index(undefined, source, units[0]?.locator?.derivativeSha256, readerVersion);
           return stored && nativeDwg(stored, units);
         } catch (error) {
           if (!(error instanceof FormatHold)) throw error;

@@ -88,9 +88,10 @@ export interface ReaderAdapter {
   format: string;
   version(): Promise<string>;
   inspect(path: string, source?: SourceRef): Promise<ReaderUnit[]>;
+  durableInfo?(source: SourceRef, units: readonly ReaderUnit[], readerVersion: string): Promise<{ storageKey: string; sha256: string; size: number; format: 'dxf' | 'dwg-json'; converter: string } | undefined>;
   read(path: string, request: ReadRequest, unit: ReaderUnit, containedWords?: boolean, source?: SourceRef): Promise<ReaderOutput>;
-  readCached?(source: SourceRef, request: ReadRequest, unit: ReaderUnit): Promise<ReaderOutput | undefined>;
-  readCachedNativeUnits?(source: SourceRef, units: readonly ReaderUnit[]): Promise<AsyncIterable<ReaderOutput | ReaderError> | undefined>;
+  readCached?(source: SourceRef, request: ReadRequest, unit: ReaderUnit, readerVersion?: string): Promise<ReaderOutput | undefined>;
+  readCachedNativeUnits?(source: SourceRef, units: readonly ReaderUnit[], readerVersion?: string): Promise<AsyncIterable<ReaderOutput | ReaderError> | undefined>;
   readNativeUnits?(path: string, units: readonly ReaderUnit[], source?: SourceRef): AsyncIterable<ReaderOutput | ReaderError>;
 }
 

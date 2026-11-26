@@ -12,6 +12,7 @@ type Status = "present" | "partial" | "not_found" | "unassessed";
 export type PreliminaryPackageReviewInput = {
   projectId: string; receiptId: string; catalogVersionId: string; model: "gpt-6.1-terra";
   inventory: Original[];
+  preparationId?: string;
   scopeNote: string;
   rows: { key: string; status: Status; finding: string; sources: (Original & { anchor: string })[] }[];
   draftText: string;
@@ -61,14 +62,19 @@ export async function publishPreliminaryPackageReview(db: Pool, input: Prelimina
       return { key: requirement.key, title: requirement.part, status: row.status, finding: row.finding, sources };
     });
     const inventory = originals.map(({ versionId, originalSha256 }) => ({ versionId, originalSha256 }));
-    const payload = { projectId: input.projectId, receiptId: input.receiptId, catalogVersionId: input.catalogVersionId,
+    if (input.preparationId) {
+      const current = await tx.query('SELECT 1 FROM intake_package_preparation_current WHERE project_id=$1 AND receipt_id=$2 AND manifest_id=$3',
+        [input.projectId,input.receiptId,input.preparationId]);
+      if (!current.rowCount) invalidInput("Состав подготовленного поступления изменился.");
+    }
+    const payload = { ...(input.preparationId ? {preparationId:input.preparationId} : {}), projectId: input.projectId, receiptId: input.receiptId, catalogVersionId: input.catalogVersionId,
       model: input.model, stage: project.project_stage, inventory, scopeNote: input.scopeNote, rows, draftText: input.draftText };
     const hash = createHash("sha256").update(canonicalJson(payload)).digest("hex");
     const { rows: [saved] } = await tx.query<{ id: string }>(
-      `INSERT INTO preliminary_package_reviews(project_id,receipt_id,catalog_version_id,model,stage,input_generation,inventory,scope_note,rows,draft_text,content_hash)
-       VALUES($1,$2,$3,$4,$5,$6,$7::jsonb,$8,$9::jsonb,$10,$11)
+      `INSERT INTO preliminary_package_reviews(project_id,receipt_id,catalog_version_id,model,stage,input_generation,inventory,scope_note,rows,draft_text,content_hash,preparation_id)
+       VALUES($1,$2,$3,$4,$5,$6,$7::jsonb,$8,$9::jsonb,$10,$11,$12)
        ON CONFLICT(project_id,content_hash) DO NOTHING RETURNING id`,
-      [input.projectId,input.receiptId,input.catalogVersionId,input.model,project.project_stage,project.generation,JSON.stringify(inventory),input.scopeNote,JSON.stringify(rows),input.draftText,hash]);
+      [input.projectId,input.receiptId,input.catalogVersionId,input.model,project.project_stage,project.generation,JSON.stringify(inventory),input.scopeNote,JSON.stringify(rows),input.draftText,hash,input.preparationId ?? null]);
     if (saved) {
       await publishProjectEvent(tx, input.projectId, { type: "package-analysis.changed", payload: {} });
       return { id: saved.id };
@@ -83,6 +89,8 @@ export async function readPreliminaryPackageReviews(tx: PoolClient, projectId: s
     `SELECT r.id,r.receipt_id AS "receiptId",r.catalog_version_id AS "catalogVersionId",r.model,r.created_at AS "createdAt",
        r.stage,r.scope_note AS "scopeNote",r.rows,r.draft_text AS "draftText",
        (r.catalog_version_id=p.catalog_version_id AND r.stage=p.project_stage AND r.input_generation=coalesce(g.generation,0)
+        AND (r.preparation_id IS NULL OR EXISTS (SELECT 1 FROM intake_package_preparation_current cur
+          WHERE cur.project_id=r.project_id AND cur.receipt_id=r.receipt_id AND cur.manifest_id=r.preparation_id))
         AND NOT EXISTS (SELECT 1 FROM intake_receipts later JOIN intake_receipts origin ON origin.id=r.receipt_id
           WHERE later.project_id=r.project_id AND later.number>origin.number)
         AND NOT EXISTS (SELECT 1 FROM preliminary_package_reviews newer WHERE newer.project_id=r.project_id
@@ -94,6 +102,13 @@ export async function readPreliminaryPackageReviews(tx: PoolClient, projectId: s
        (SELECT created_at,id FROM preliminary_package_reviews WHERE project_id=$1 AND id=$2))
      ORDER BY r.created_at DESC,r.id DESC LIMIT 101`, [projectId, after ?? null]);
   return { items: rows.slice(0,100), nextCursor: rows.length > 100 ? rows[99].id : null };
+}
+
+/** Older runs predate manifests. Once prepared, count only windows actually admitted for this receipt. */
+export function admittedReceiptReadingWindow(receiptId: '$2' | 't.receipt_id') {
+  return `(NOT EXISTS (SELECT 1 FROM intake_package_preparation_current cur WHERE cur.project_id=w.project_id AND cur.receipt_id=${receiptId})
+    OR EXISTS (SELECT 1 FROM intake_package_preparation_current cur JOIN intake_package_preparation_windows pi ON pi.manifest_id=cur.manifest_id
+      WHERE cur.project_id=w.project_id AND cur.receipt_id=${receiptId} AND pi.window_id=w.id))`;
 }
 
 /** A read-only count of primary A reading for the report's own receipt and model. */
@@ -112,7 +127,7 @@ export async function readPreliminaryReadingProgress(tx: PoolClient, projectId: 
        JOIN target t ON t.project_id=m.project_id
      ), windows AS (
        SELECT w.id FROM maps m JOIN harness_package_windows w ON w.version_id=m.version_id AND w.map_fingerprint=m.fingerprint
-       JOIN target t ON t.project_id=w.project_id
+       JOIN target t ON t.project_id=w.project_id WHERE ${admittedReceiptReadingWindow('t.receipt_id')}
      ), jobs AS (
        SELECT w.id,j.state,j.result FROM windows w JOIN harness_package_branches b
          ON b.window_id=w.id AND b.active AND b.branch='A'

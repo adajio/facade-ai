@@ -78,6 +78,7 @@ export const jobSchema = z.discriminatedUnion('mode', [
     observationProtocol: z.literal(2).optional(),
     packageWindow: z.strictObject({ id, readerVersion: text, routeRevision: text,
       packageReadingVersion: z.literal(2).optional(),
+      preparationId: id.optional(),
       profileInspection: z.strictObject({ lineIds: z.array(text).max(8) }).optional(),
       walkProtocol: z.literal(1).optional(), followup: z.strictObject({ rootJobId: id,
         blocks: z.array(z.string().min(1).max(60)).min(1).max(4096),

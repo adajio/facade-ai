@@ -31,6 +31,8 @@
   let readerError = $state('');
   let workError = $state('');
   let originalError = $state('');
+  let derivativeState = $state<{ versionId: string; available: boolean }>();
+  let derivativeError = $state('');
   let ready = $state(false);
   let heading: HTMLHeadingElement;
   let viewer = $state<HTMLHeadingElement>();
@@ -152,6 +154,30 @@
   });
 
   $effect(() => {
+    const version = versionId;
+    const url = V1 + path.slice(4) + '/dwg-derivative';
+    const isDwg = /\.dwg$/iu.test(occurrence.relativePath) || Boolean(cadVersion);
+    derivativeState = undefined;
+    derivativeError = '';
+    if (!isDwg || context.masked) return;
+    const controller = new AbortController();
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    async function checkDerivative() {
+      try {
+        await api.response(url, { method: 'HEAD', signal: controller.signal });
+        if (!controller.signal.aborted) { derivativeState = { versionId: version, available: true }; derivativeError = ''; }
+      } catch (error) {
+        if (controller.signal.aborted || interrupted(error)) return;
+        derivativeState = { versionId: version, available: false };
+        derivativeError = error instanceof ApiError && error.status === 404 ? '' : describe(error);
+        timer = setTimeout(checkDerivative, 30_000);
+      }
+    }
+    void checkDerivative();
+    return () => { controller.abort(); if (timer) clearTimeout(timer); };
+  });
+
+  $effect(() => {
     const url = path + '/work';
     void snapshotRevision;
     void refreshWork;
@@ -219,10 +245,14 @@
           {/if}
         {/if}
         <a class="button" href={original} download={occurrence.relativePath.split('/').at(-1)}>Скачать оригинал</a>
+        {#if derivativeState?.versionId === versionId && derivativeState.available}
+          <a class="button" href={V1 + path.slice(4) + '/dwg-derivative'}>Скачать машиночитаемую версию DWG</a>
+        {/if}
       </div>
     {/if}
   </div>
   <Notice kind="error" message={originalError} />
+  {#if derivativeError}<Notice kind="error" message={'Машиночитаемая версия DWG · ' + derivativeError} />{/if}
   {#if !ready && !originalError && !workError}<p role="status">Проверяем доступ к оригиналу…</p>{/if}
   {#if selectedPage !== undefined && ready && isPdf && !context.masked}
     <section class="original" aria-labelledby="document-viewer">
