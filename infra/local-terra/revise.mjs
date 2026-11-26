@@ -1,4 +1,4 @@
-import { admitRecordedClaim } from './review-admission.mjs';
+import { admitRecordedClaim, preDispatchReviewRejection } from './review-admission.mjs';
 import { createHash } from 'node:crypto';
 import { mkdir, open, readFile, unlink } from 'node:fs/promises';
 import { join } from 'node:path';
@@ -444,12 +444,22 @@ async function nextFacts(db, r, seen) {
     JOIN intake_originals orig ON orig.id=d.original_id AND orig.project_id=d.project_id
     JOIN LATERAL (SELECT relative_path FROM intake_occurrences occ WHERE occ.project_id=$1 AND occ.receipt_id=$2 AND occ.version_id=o.version_id
       AND occ.state='accepted' ORDER BY relative_path,id LIMIT 1) v ON true
-    WHERE pw.project_id=$1 AND pw.manifest_id=$3 AND (j.state='done' OR (j.state='held' AND j.reason='turn_limit_final'))
+    WHERE pw.project_id=$1 AND pw.manifest_id=$3
+      -- A held visual job may have saved facts before an image was delivered to Terra.
+      AND (j.state='done' OR (j.state='held' AND (
+        (j.kind<>'local_terra_production_research' AND j.reason='turn_limit_final') OR
+        (j.kind='local_terra_production_research' AND j.reason IN ('turn_limit_final','repeated_rejected_action')
+          AND j.payload#>'{packageWindow,productionReview,requiresVisual}'='false'::jsonb
+          AND m.format NOT IN ('pdf','sig','dwg','dxf','image')))))
+      AND (j.kind<>'local_terra_production_research' OR (
+        j.payload#>>'{packageWindow,preparationId}'=$3::uuid::text
+        AND j.payload#>>'{packageWindow,productionReview,catalogVersionId}'=$6
+        AND j.payload#>>'{packageWindow,productionReview,stage}'=$7))
       AND f.revision_status<>'superseded' AND o.payload#>>'{source,sha256}'=orig.sha256
       AND (o.payload#>>'{address,unitId}')=w.place->>'unitId'
       AND (nullif(btrim(o.payload->>'quote'),'') IS NOT NULL OR nullif(btrim(o.payload->>'limitation'),'') IS NOT NULL)
       AND NOT (o.id=ANY($4::uuid[]))
-    ORDER BY o.created_at,o.id LIMIT $5`, [r.projectId,r.receiptId,r.preparationId,seen,batchSize]);
+    ORDER BY o.created_at,o.id LIMIT $5`, [r.projectId,r.receiptId,r.preparationId,seen,batchSize,r.catalogVersionId,r.stage]);
   return {facts:rows.map(({totalFacts,...fact})=>fact),totalFacts:Number(rows[0]?.totalFacts ?? rows.length)};
 }
 
@@ -489,7 +499,7 @@ export async function reviseReceipt({db,receiptId,stateDir,admitClaim,modelCall,
   const pendingPath = join(dir, 'pending.json');
   const cursor = await read(cursorPath) ?? {seen:[],at:0};
   let pending = await read(pendingPath);
-  if (!pending) {
+  if (!pending || preDispatchReviewRejection(pending)) {
     if (Date.now() - cursor.at < settleMs) return 'published';
     const {facts,totalFacts} = await nextFacts(db, r, cursor.seen);
     if (!facts.length) return 'published';
@@ -504,7 +514,7 @@ export async function reviseReceipt({db,receiptId,stateDir,admitClaim,modelCall,
     const admission = await admitRecordedClaim(admitClaim,stateDir,snapshot, async () => {
       await syncDirectory(stateDir);
       await syncDirectory(revisions);
-      return claim(pendingPath, {...snapshot,startedAt});
+      return claim(pendingPath, {...snapshot,startedAt},pending);
     });
     if (admission !== 'claimed') {
       if (admission==='waiting') await notify(snapshot,'waiting',snapshot.key,snapshot.budget,'prepared_input_changed');
@@ -517,8 +527,11 @@ export async function reviseReceipt({db,receiptId,stateDir,admitClaim,modelCall,
     catch (error) {
       const {state,reason}=modelFailure(error);
       const transport={providerElapsedMs:Date.now()-providerStarted};
-      await atomicWrite(pendingPath,{state,snapshot,startedAt,transport,error:reason});
-      await notify(snapshot,state,snapshot.key,{...snapshot.budget,...transport,...duration(startedAt)},reason);
+      const record = {state,snapshot,startedAt,transport,error:reason};
+      await atomicWrite(pendingPath,record);
+      const status = preDispatchReviewRejection(record) ? 'waiting' : state;
+      await notify(snapshot,status,snapshot.key,{...snapshot.budget,...transport,...duration(startedAt)},reason);
+      if (status === 'waiting') return status;
       return state==='rejected' ? `revision_rejected:${reason}` : 'revision_outcome_unknown';
     }
     pending = {state:'responded',snapshot,response,startedAt,

@@ -1,4 +1,4 @@
-import { admitRecordedClaim } from './review-admission.mjs';
+import { admitRecordedClaim, preDispatchReviewRejection } from './review-admission.mjs';
 import { createHash, randomUUID } from 'node:crypto';
 import { mkdir, open, readFile, readdir, link, unlink } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
@@ -172,10 +172,11 @@ export async function runReassessment(run,scope,reason) {
     return 'published';
   }
   const replayValidation=saved?.state==='rejected' && Boolean(saved.response) && saved.validationVersion!==3;
-  if (saved && saved.state!=='responded' && !replayValidation) {
+  const waitingForMac=preDispatchReviewRejection(saved);
+  if (saved && saved.state!=='responded' && !replayValidation && !waitingForMac) {
     return saved.state==='sending' ? 'unknown' : saved.state;
   }
-  if (!saved) {
+  if (!saved || waitingForMac) {
     if (reason==='index_complete' && !await indexComplete(db,scope)) return 'waiting';
     const report=await loadReport(db,scope.receiptId);
     if (!report || report.preparationId!==scope.preparationId || report.catalogVersionId!==scope.catalogVersionId || report.stage!==scope.stage) return 'waiting';
@@ -198,7 +199,7 @@ export async function runReassessment(run,scope,reason) {
       await notify('rejected',snapshot,snapshot.budget,'primary_request_limit');
       return 'rejected';
     }
-    const admission=await admitRecordedClaim(admitClaim,stateDir,snapshot,()=>claim(path,{...snapshot,startedAt,parentId:report.reportId}));
+    const admission=await admitRecordedClaim(admitClaim,stateDir,snapshot,()=>claim(path,{...snapshot,startedAt,parentId:report.reportId},saved));
     if (admission!=='claimed') return admission;
     await notify('sending',snapshot,snapshot.budget);
     let response;
@@ -206,8 +207,9 @@ export async function runReassessment(run,scope,reason) {
     catch (error) {
       const failure=modelFailure(error);
       await atomicWrite(path,{...failure,snapshot,startedAt});
-      await notify(failure.state,snapshot,{...snapshot.budget,...duration(startedAt)},failure.reason);
-      return failure.state;
+      const status=preDispatchReviewRejection(failure) ? 'waiting' : failure.state;
+      await notify(status,snapshot,{...snapshot.budget,...duration(startedAt)},failure.reason);
+      return status;
     }
     const transport={...responseUsage(response),providerElapsedMs:Date.now()-startedAt};
     saved={state:'responded',snapshot,response,parentId:report.reportId,startedAt,transport};

@@ -1,6 +1,6 @@
 import { attachReadingSkills, inspectionSchema, inspectSheetsInstruction } from './sheet-review.mjs';
 import { applyFactApplicability, factApplicabilityInstruction } from './fact-applicability.mjs';
-import { admitRecordedClaim } from './review-admission.mjs';
+import { admitRecordedClaim, preDispatchReviewRejection } from './review-admission.mjs';
 import { productionTerra } from './transport/production.mjs';
 import { queueReassessment,queuedReasons,runReassessment } from './reassessment.mjs';
 import { validatedPartial } from './partial-result.mjs';
@@ -35,7 +35,14 @@ export async function atomicWrite(path, value) {
   const dir = await open(path.slice(0, path.lastIndexOf('/')), 'r');
   try { await dir.sync(); } finally { await dir.close(); }
 }
-export async function claim(path, snapshot) {
+export async function claim(path, snapshot, previous) {
+  if (preDispatchReviewRejection(previous)) {
+    // Retry transitions use the same project intake lock as the first claim.
+    const current = await readState(path);
+    if (json(current) !== json(previous)) return false;
+    await atomicWrite(path,{state:'sending',snapshot});
+    return true;
+  }
   try {
     const f = await open(path, 'wx', 0o600);
     try { await f.writeFile(json({ state:'sending', snapshot })); await f.sync(); } finally { await f.close(); }
@@ -469,14 +476,16 @@ export async function processReceipt({db,receiptId,stateDir,modelCall,publish,ad
   const fingerprint=primaryKey(source);
   const statePath=join(stateDir,`${receiptId}-${fingerprint}.json`);
   let saved=await readState(statePath);
-  if (!saved) {
+  const waitingForMac = preDispatchReviewRejection(saved);
+  if (!saved || waitingForMac) {
     // Older producer revisions used a single receipt file. Never bypass an uncertain legacy request.
     const legacy=await readState(join(stateDir,`${receiptId}.json`));
     if (['sending','unknown','responded'].includes(legacy?.state)) {
       await notify(source,'unknown',fingerprint,{},'held_legacy_attempt');
       return 'held_legacy_attempt';
     }
-    const snapshot=preparePromptSnapshot({...(withSkills ? await withSkills(source) : source),reviewContract});
+    const snapshot=waitingForMac && saved.snapshot?.promptData
+      ? {...saved.snapshot} : preparePromptSnapshot({...(withSkills ? await withSkills(source) : source),reviewContract});
     const request=makeRequest(snapshot);
     snapshot.requestSha256=sha(json(request));
     // A changed preparation may reuse the same originals. An operator may authorize one
@@ -498,7 +507,7 @@ export async function processReceipt({db,receiptId,stateDir,modelCall,publish,ad
       return 'primary_request_limit';
     }
     const startedAt=Date.now();
-    const reserve = () => claim(statePath,{...snapshot,startedAt});
+    const reserve = () => claim(statePath,{...snapshot,startedAt},saved);
     const admission = await admitRecordedClaim(admitClaim,stateDir,snapshot,reserve);
     if (admission !== 'claimed') {
       if (admission==='waiting') await notify(snapshot,'waiting',fingerprint,snapshot.budget,'prepared_input_changed');
@@ -519,8 +528,11 @@ export async function processReceipt({db,receiptId,stateDir,modelCall,publish,ad
     }
     if (failure) {
       const {state,reason}=failure;
-      await atomicWrite(statePath,{state,snapshot,startedAt,transport,error:reason});
-      await notify(snapshot,state,fingerprint,{...snapshot.budget,...transport,...duration(startedAt)},reason);
+      const record = {state,snapshot,startedAt,transport,error:reason};
+      await atomicWrite(statePath,record);
+      const status = preDispatchReviewRejection(record) ? 'waiting' : state;
+      await notify(snapshot,status,fingerprint,{...snapshot.budget,...transport,...duration(startedAt)},reason);
+      if (status === 'waiting') return status;
       return state==='rejected' ? `primary_rejected:${reason}` : state;
     }
     saved={state:'responded',snapshot,result,startedAt,transport};

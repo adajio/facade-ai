@@ -18,6 +18,7 @@ export type DirectedReading = {
 // Estimate the next useful addresses for automatic reading. These bounds affect scheduling only.
 const targetsPerRequirement = 2;
 const targetsPerReceipt = 24;
+export const productionDeepReading = { kind:'local_terra_production_research', targetsPerReceipt:4, turnsPerWindow:8 } as const;
 const maxTermsPerProperty = 12;
 const ignoredWords = '^(проект|документ|материал|налич|предостав|получ|необходим|указан|информац|данн|требован|провер|подтверж|сведени|файл|действующ|применим|текущ|долж|между|после|перед|для|содерж|соответ|drawing|document|source|provided|current|evidence|value|presence|exact|existing|project|required|verify|cannot|include|with|from|when|must)';
 
@@ -47,7 +48,7 @@ function directedReadingScopeSql(project: string) {
     ORDER BY review.created_at DESC,review.id DESC LIMIT 1
   ), documents AS MATERIALIZED (
     SELECT DISTINCT ON (pin.version_id) pin.version_id,pin.project_id,m.reader_version,pin.map_fingerprint AS fingerprint,
-      item->>'label' AS label,pm.total,pm.next_ordinal
+      item->>'label' AS label,m.format,pm.total,pm.next_ordinal
     FROM intake i CROSS JOIN LATERAL jsonb_array_elements(i.manifest->'items') item
     JOIN intake_package_preparation_items pin ON pin.project_id=i.project_id AND pin.manifest_id=i.manifest_id
       AND pin.version_id::text=item->>'versionId'
@@ -74,7 +75,7 @@ const scopeStamp = `md5(jsonb_build_array((SELECT manifest_id FROM intake),(SELE
   (SELECT jsonb_agg(jsonb_build_array(version_id,reader_version,fingerprint,total,next_ordinal) ORDER BY version_id)
    FROM documents))::text)`;
 
-export function directedReadingPlanSql(project: string) {
+export function directedReadingPlanSql(project: string, research = false) {
   return String.raw`${directedReadingScopeSql(project)}, open AS MATERIALIZED (
     SELECT req->>'key' AS requirement,coalesce(property->>'key','') AS property_key,req,
       property->>'label' AS property_label,coalesce(property->'sources',review->'sources') AS sources
@@ -120,7 +121,9 @@ export function directedReadingPlanSql(project: string) {
     GROUP BY b.id
   ), place_index AS MATERIALIZED (
     SELECT w.id,w.version_id,w.ordinal,w.place->>'unitId' AS unit,b.id AS block,
-      coalesce(b.remaining && ARRAY['graphics','ocr']::text[],false) AS visual
+      coalesce(b.remaining && ARRAY['graphics','ocr']::text[],false) AS visual,
+      (d.format IN ('pdf','sig','dwg','dxf','png','jpg','jpeg','tiff','tif','bmp','webp','svg','image')
+        AND coalesce(w.place#>>'{locator,coverage}','addressable')<>'native_only') AS can_open_image
     FROM intake i CROSS JOIN report rp CROSS JOIN documents d
     JOIN intake_package_preparation_windows pin ON pin.project_id=d.project_id AND pin.manifest_id=i.manifest_id
     JOIN harness_package_windows w ON w.id=pin.window_id AND w.project_id=d.project_id AND w.version_id=d.version_id AND w.map_fingerprint=d.fingerprint
@@ -162,9 +165,29 @@ export function directedReadingPlanSql(project: string) {
     SELECT shortlist.id,shortlist.rank,shortlist.score,(array_agg(requirement ORDER BY requirement))[1:${targetsPerReceipt}] AS keys
     FROM shortlist JOIN per_requirement ON per_requirement.id=shortlist.id
     WHERE per_requirement.rank<=${targetsPerRequirement} GROUP BY shortlist.id,shortlist.rank,shortlist.score
+  ), ordered AS (
+    SELECT id,rank,score,keys,1 AS lane FROM goals
+    ${research ? `UNION ALL
+      SELECT choice.id,0,0,keys.value,0 FROM LATERAL (
+        SELECT p.id FROM place_index p
+        LEFT JOIN goals matched ON matched.id=p.id
+        WHERE EXISTS (SELECT 1 FROM open)
+          AND NOT EXISTS (SELECT 1 FROM harness_package_branches branch WHERE branch.window_id=p.id AND branch.branch='A' AND branch.active)
+          AND NOT EXISTS (SELECT 1 FROM intake i JOIN intake_package_preparations pin ON pin.project_id=i.project_id AND pin.receipt_id=i.id
+            JOIN gateway_jobs job ON job.project_id=i.project_id AND job.payload#>>'{packageWindow,preparationId}'=pin.id::text
+            WHERE job.kind='${productionDeepReading.kind}')
+          AND (p.can_open_image OR NOT EXISTS (SELECT 1 FROM goals))
+        ORDER BY p.can_open_image DESC NULLS LAST,matched.score DESC NULLS LAST,
+          p.ordinal,p.version_id,p.id LIMIT 1
+      ) choice CROSS JOIN LATERAL (
+        SELECT coalesce((SELECT keys FROM goals WHERE id=choice.id),ARRAY(
+          SELECT DISTINCT requirement FROM open ORDER BY requirement LIMIT 4)) AS value
+      ) keys` : ''}
+  ), distinct_ordered AS (
+    SELECT DISTINCT ON (id) id,rank,score,keys,lane FROM ordered ORDER BY id,lane
   ), planned AS (
-    SELECT coalesce(array_agg(id ORDER BY rank,score DESC,id),'{}'::uuid[]) AS ids,
-      coalesce(jsonb_object_agg(id,keys),'{}'::jsonb) AS requirements FROM goals
+    SELECT coalesce(array_agg(id ORDER BY lane,rank,score DESC,id),'{}'::uuid[]) AS ids,
+      coalesce(jsonb_object_agg(id,keys),'{}'::jsonb) AS requirements FROM distinct_ordered
   )
   SELECT ${scopeStamp} AS stamp,CASE WHEN NOT EXISTS (SELECT 1 FROM report) THEN CASE WHEN EXISTS (
       SELECT 1 FROM preliminary_package_reviews saved WHERE saved.project_id=${project} AND saved.model='gpt-6.1-terra'
@@ -182,7 +205,7 @@ export function directedReadingPlanSql(project: string) {
 type DirectedState = { stamp: string; report: string | null; receiptId: string | null; earlierReview: boolean;
   indexPendingVersions: number; indexCompleteVersions: number; indexPendingUnits: number; indexUnknownVersions: number };
 
-const cache = new Map<string, { stamp: string; plan: DirectedReading }>();
+const cache = new Map<string, { stamp: string; plan: DirectedReading; expires?: number }>();
 const planning = new Set<string>();
 const scopeStateSql = `${directedReadingScopeSql('$1::uuid')}
   SELECT (SELECT id FROM intake) AS "receiptId",(SELECT id FROM report) AS report,
@@ -194,11 +217,21 @@ const scopeStateSql = `${directedReadingScopeSql('$1::uuid')}
 
 /** Cache the calculation only for exactly the same report, reader versions and indexed prefixes. */
 export async function readDirectedReadingPlan(tx: PoolClient, projectId: string, background?: Pool): Promise<DirectedReading> {
+  return readPlan(tx,projectId,false,background);
+}
+
+export async function readProductionDirectedReadingPlan(tx: PoolClient, projectId: string): Promise<DirectedReading> {
+  return readPlan(tx,projectId,true);
+}
+
+async function readPlan(tx: PoolClient, projectId: string, research: boolean, background?: Pool): Promise<DirectedReading> {
   const { rows: [{ stamp, report, earlierReview, ...state }] } = await tx.query<DirectedState>(scopeStateSql, [projectId]);
   if (!report) return { ...state, mode: earlierReview ? 'waiting_report' : 'ordinary',
     windowIds:[], requirementsByWindow:{}, preparationId:null, openRequirements:0 };
-  const saved = cache.get(projectId);
-  if (saved?.stamp===stamp) return availableTargets(tx,projectId,saved.plan);
+  const cacheKey = research ? projectId + ':production' : projectId;
+  // A competing branch can become active independently of the index.
+  const saved = cache.get(cacheKey);
+  if (saved?.stamp===stamp && (saved.expires === undefined || saved.expires > Date.now())) return availableTargets(tx,projectId,saved.plan);
   if (background) {
     if (!planning.has(projectId) && planning.size<2) {
       planning.add(projectId);
@@ -209,9 +242,9 @@ export async function readDirectedReadingPlan(tx: PoolClient, projectId: string,
   // This analytical query is rerun only for changed input. JIT compilation is slower than the query itself.
   await tx.query('SET LOCAL jit=off');
   const { rows: [{stamp: computed, ...plan}] } = await tx.query<DirectedReading & {stamp: string}>(
-    directedReadingPlanSql('$1::uuid'), [projectId]);
+    directedReadingPlanSql('$1::uuid',research), [projectId]);
   if (cache.size>=64 && !saved) cache.delete(cache.keys().next().value!);
-  cache.set(projectId,{stamp:computed,plan});
+  cache.set(cacheKey,{stamp:computed,plan,...(research && {expires:Date.now()+10_000})});
   return availableTargets(tx,projectId,plan);
 }
 

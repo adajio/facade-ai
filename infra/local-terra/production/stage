@@ -17,7 +17,7 @@ git archive "$sha" -- infra/local-terra | tar -xf - -C "$root"
 from="$root/infra/local-terra"
 mkdir -p "$root/release/producer/transport"
 cp "$from/"*.mjs "$root/release/producer/"
-cp "$from/transport/production.mjs" "$root/release/producer/transport/"
+cp "$from/transport/"{production,worker,deep-reading,codex-client}.mjs "$root/release/producer/transport/"
 cp "$from/production/"{compose.yaml,status.mjs} "$root/release/"
 printf '%s\n' "$sha" > "$root/release/revision"
 (

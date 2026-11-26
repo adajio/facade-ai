@@ -319,6 +319,15 @@ function isAddressedRead(reply: ToolReply) {
   return deliveredLines(content ?? null).some(({ text }) => text.trim().length > 0);
 }
 
+function assignedPhysicalReads(state: State, place: Place) {
+  return [...state.delivered].flatMap((id) => {
+    const reply = state.replies.get(id);
+    if (!reply?.evidence || !reply.readKind || !physicalReadKinds.has(reply.readKind) ||
+        !samePlace(reply.evidence.place, place) || (place.box && (!reply.evidence.place.box || !contains(place.box, reply.evidence.place.box)))) return [];
+    return [{ id, reply }];
+  });
+}
+
 const failedTool = (code: string, nextAction?: string): ToolReply => ({ body: { ok: false, code, nextAction } });
 
 function argumentCorrection(name: string, code: unknown): string | undefined {
@@ -694,18 +703,15 @@ async function executeTool(
       if (task.job.mode !== 'primary') throw new Error('Reading outcome from a non-primary job');
       const evidenceIds = [...state.delivered].filter((id) => state.replies.get(id)?.readKind !== 'open_context');
       const delivered = evidenceIds.map((id) => state.replies.get(id));
-      if (task.job.place.page && !delivered.some((reply) => reply?.readKind === 'survey' && reply.image)) {
+      const visual = delivered.some((reply) => reply?.readKind === 'survey' && reply.image);
+      if (task.job.place.page && !visual ||
+          task.job.packageWindow?.productionReview?.requiresVisual && !visual &&
+          !delivered.some((reply) => reply?.readKind === 'zoom' && reply.image)) {
         return { reply: failedTool('survey_required', 'Откройте и рассмотрите физическое окно.') };
       }
       if (input.status === 'partial') {
         const { place } = task.job;
-        const addressed = [...state.delivered].flatMap((id) => {
-          const reply = state.replies.get(id);
-          return reply?.evidence && reply.readKind && physicalReadKinds.has(reply.readKind)
-            && samePlace(reply.evidence.place, place)
-            && (!place.box || reply.evidence.place.box && contains(place.box, reply.evidence.place.box))
-            ? [{ id, reply }] : [];
-        });
+        const addressed = assignedPhysicalReads(state,place);
         const assignedEvidenceIds = new Set(addressed.map(({ id }) => id));
         const limitationIds = [...state.limitations].flatMap(([id, evidenceId]) => assignedEvidenceIds.has(evidenceId) ? [id] : []);
         if (!addressed.some(({ reply }) => isAddressedRead(reply)) || !limitationIds.length) {
@@ -840,7 +846,20 @@ export async function advance(task: ResearchTask, ports: SessionPorts): Promise<
   const extension=state.limitStop && await ports.continued?.(state.limitStop.id)?Math.min(4,baseLimit):0;
   if(state.latestModel>=baseLimit+extension) {
     if(!walkJob(task.job)) return outcomeAfterLimit(task);
-    if(state.limitStop || (task.job.mode==='primary'&&task.job.packageWindow?.followup)) return {
+    if (task.job.mode === 'primary' && task.job.packageWindow?.productionReview) {
+      const delivered = assignedPhysicalReads(state,task.job.place);
+      const evidenceIds = delivered.map(({id}) => id);
+      const observationIds = [...new Set(state.observations.filter(({qualified}) => qualified).map(({id}) => id))];
+      const limitationIds = [...state.limitations].flatMap(([id, evidenceId]) => evidenceIds.includes(evidenceId) ? [id] : []);
+      const visuallyOpened = delivered.some(({reply}) => (reply.readKind === 'survey' || reply.readKind === 'zoom') && reply.image);
+      if ((!task.job.packageWindow.productionReview.requiresVisual || visuallyOpened) &&
+          (limitationIds.length || observationIds.length) &&
+          (visuallyOpened || delivered.some(({reply}) => isAddressedRead(reply)))) return { status:'done', outcome:{
+        kind:'partial', reason:'Достигнут предел автоматического чтения, оставшиеся участки не проверены.',
+        evidenceIds, observationIds, limitationIds,
+      } };
+    }
+    if(state.limitStop || (task.job.mode==='primary'&&(task.job.packageWindow?.followup || task.job.packageWindow?.productionReview))) return {
       status:'suspended',hold:{reason:'turn_limit_final',nextAction:'Предел продолжения достигнут. Непроверенные блоки сохранены.'},
     };
     const last=events.findLast((event)=>event.kind==='model');

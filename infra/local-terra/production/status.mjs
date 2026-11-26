@@ -47,7 +47,9 @@ try {
       const {rows:[{timeout}]} = await db.query('SELECT coalesce(max(timeout_ms),0)::int AS timeout FROM gateway_routes WHERE enabled');
       const {rows:[{installed}]} = await db.query("SELECT to_regclass('preliminary_package_reviews') IS NOT NULL AS installed");
       const {rows:attempts} = await db.query('SELECT state,count(*)::int AS count FROM gateway_attempts WHERE state=ANY($1) GROUP BY state ORDER BY state',[held]);
-      return {preliminaryMigration:installed,workerGraceSeconds:Math.max(60,Math.ceil(timeout/1000)+45),attempts};
+      const {rows:[ledger]} = await db.query("SELECT to_regclass('local_terra_calls') IS NOT NULL AS present");
+      const deepSending = ledger.present ? (await db.query("SELECT count(*)::int AS n FROM local_terra_calls WHERE state='sending'")).rows[0].n : 0;
+      return {deepSending,preliminaryMigration:installed,workerGraceSeconds:Math.max(60,Math.ceil(timeout/1000)+45),attempts};
     });
     const journal = await inspect(process.env.FACADE_GATEWAY_JOURNAL_URL,async db=>{
       const {rows} = await db.query('SELECT state,count(*)::int AS count FROM gateway_external_attempts WHERE state=ANY($1) GROUP BY state ORDER BY state',[held]);
@@ -56,7 +58,7 @@ try {
     if (process.argv.includes('--worker-grace')) console.log(result.workerGraceSeconds);
     else console.log(JSON.stringify({...result,journal}));
     if (process.argv.includes('--require-no-active') &&
-        [...result.attempts,...journal].some(row=>row.state !== 'unknown')) process.exitCode=3;
+        (result.deepSending || [...result.attempts,...journal].some(row=>row.state !== 'unknown'))) process.exitCode=3;
     if (process.argv.includes('--require-preliminary-schema') && !result.preliminaryMigration) process.exitCode=4;
   }
 } catch (error) {

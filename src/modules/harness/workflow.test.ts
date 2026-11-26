@@ -953,6 +953,56 @@ test('package turn exhaustion records the last request and permits exactly one b
   assert.deepEqual(attempts,[`${task.jobId}:model:1`,`${task.jobId}:model:2`]);
 });
 
+test('production directed reading sends actual PNG, resumes a pre-start busy turn, and saves a partial at the turn limit', async () => {
+  const { task, ports, overviewId, textId, observationId, recorded } = setup();
+  assert.ok(task.job.mode === 'primary');
+  task.scopeId = null;
+  task.job.packageWindow = { id: randomUUID(), readerVersion: 'test', routeRevision: 'production', walkProtocol: 1,
+    packageReadingVersion:2, directedRequirements:['R1'],
+    productionReview:{catalogVersionId:randomUUID(),stage:'Стадия 1',requiresVisual:true} };
+  task.job.observationProtocol = 2;
+  task.job.settings = {...task.job.settings,maxTurns:3};
+  const pixel = new PNG({width:1,height:1});
+  pixel.data.set([250,100,10,255]);
+  const originalRead = ports.reader.read;
+  ports.reader.read = async (context,input) => {
+    const result = await originalRead(context,input);
+    if (input.kind !== 'survey') return result;
+    const bytes = PNG.sync.write(pixel);
+    return {...result,bytes,sha256:hashBytes(bytes)};
+  };
+  const effects: string[] = [];
+  let turn = 0;
+  ports.call = async ({effectKey,request: wire}) => {
+    effects.push(effectKey);
+    switch (++turn) {
+      case 1: return receipt('survey',{});
+      case 2: return {status:'held',code:'mac_terra_busy',nextAction:'Повторить с сохранённого места',retryAt:new Date()};
+      case 3: {
+        const image = wire.messages.flatMap(({content})=>Array.isArray(content)?content:[])
+          .find(({type})=>type==='image_url');
+        assert.ok(image && image.type==='image_url');
+        const png = PNG.sync.read(Buffer.from(image.image_url.url.split(',')[1],'base64'));
+        assert.deepEqual([...png.data],[250,100,10,255]);
+        return receipt('extract',{});
+      }
+      case 4: return receipt('save_observation',{evidenceId:textId,quote:'Толщина 2 мм',value:'2',unit:'мм'});
+      default: return assert.fail('Unexpected model dispatch');
+    }
+  };
+  const signal = new AbortController().signal;
+  const busy = await runResearchWorkflow(task,ports,signal);
+  assert.equal(busy.status==='suspended' && busy.hold.reason,'mac_terra_busy');
+  const result = await runResearchWorkflow(task,ports,signal);
+  assert.equal(effects[1],effects[2]);
+  assert.equal(recorded.length,1);
+  assert.deepEqual(result,{status:'done',outcome:{kind:'partial',
+    reason:'Достигнут предел автоматического чтения, оставшиеся участки не проверены.',
+    evidenceIds:[overviewId,textId],observationIds:[observationId],limitationIds:[]}});
+  assert.deepEqual(await runResearchWorkflow(task,ports,signal),result);
+  assert.equal(turn,4);
+});
+
 test('partial reading preserves accepted sources and limitations across a historical refusal and replay', async () => {
   const { task, ports, events, overviewId, textId } = setup();
   assert.ok(task.job.mode === 'primary');

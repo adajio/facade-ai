@@ -4,7 +4,7 @@ import { lstat, open, readFile } from 'node:fs/promises';
 import { createServer } from 'node:http';
 import { dirname, isAbsolute, join } from 'node:path';
 import { pathToFileURL } from 'node:url';
-import { allowedTerraRequest, terraModel, terraRejection, terraRequestBytes, terraResponseBytes } from './production.mjs';
+import { terraRequestKind, terraModel, terraRejection, terraRequestBytes, terraResponseBytes } from './production.mjs';
 
 const uuid = /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/u;
 const knownCode = (error = '') => terraRejection(error.trim().split('\n').at(-1));
@@ -89,18 +89,25 @@ export function createMacTerraBridge({pauseFile,limitFile,ledgerDir,run}) {
   const server = createServer({requestTimeout:60000,headersTimeout:10000}, async (incoming,response)=>{
     let reserved = false;
     try {
-      if (incoming.method === 'GET' && incoming.url === '/health') {
+      if (incoming.method === 'GET' && (incoming.url === '/health' || incoming.url === '/health/research')) {
         const {gate} = await availability();
         return json(response,200,{ready:Boolean(gate) && !busy,busy});
       }
-      if (incoming.method !== 'POST' || incoming.url !== '/v1/review') return json(response,404,{},'request');
+      const path = incoming.url;
+      if (incoming.method !== 'POST' || (path !== '/v1/review' && path !== '/v1/research')) return json(response,404,{},'request');
       const declared = Number(incoming.headers['content-length']);
       if (incoming.headers['content-type'] !== 'application/json' || !Number.isSafeInteger(declared)
           || declared < 1 || declared > terraRequestBytes) return json(response,400,{},'request');
-      if (busy) return json(response,409,{},'busy');
+      async function rejectBeforeDispatch(status,error) {
+        // Finish the bounded upload before closing: otherwise a large request can
+        // fail with EPIPE before the caller reads the pre-dispatch rejection.
+        for await (const _ of incoming) { /* discard */ }
+        return json(response,status,{},error);
+      }
+      if (busy) return await rejectBeforeDispatch(409,'busy');
       busy = reserved = true;
       const {gate,error} = await availability();
-      if (!gate) return json(response,503,{},error);
+      if (!gate) return await rejectBeforeDispatch(503,error);
       let size = 0;
       const chunks = [];
       for await (const chunk of incoming) {
@@ -112,7 +119,9 @@ export function createMacTerraBridge({pauseFile,limitFile,ledgerDir,run}) {
       const body = Buffer.concat(chunks);
       let input;
       try { input = JSON.parse(body.toString('utf8')); } catch { return json(response,400,{},'request'); }
-      if (!allowedTerraRequest(input)) return json(response,400,{},'request');
+      const kind = terraRequestKind(input);
+      if (!kind || path !== `/v1/${kind}`) return json(response,400,{},'request');
+      if (response.destroyed) return;
       if (!same(gate,await currentGate())) return json(response,503,{},'paused');
       const handle = await open(gate.ledger,'a',0o600);
       try {
@@ -120,6 +129,7 @@ export function createMacTerraBridge({pauseFile,limitFile,ledgerDir,run}) {
         await handle.sync();
       } finally { await handle.close(); }
       if (!same(gate,await currentGate())) return json(response,503,{},'paused');
+      if (response.destroyed) return;
       const result = await run(body);
       if (result.error) return json(response,502,{},result.error);
       response.writeHead(200,{'content-type':'application/json','cache-control':'no-store','content-length':result.body.length});

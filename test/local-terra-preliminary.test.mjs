@@ -5,7 +5,8 @@ import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { validate, claim, processReceipt, readSnapshot, makeRequest, parseModelResponse, preparePromptSnapshot } from '../infra/local-terra/producer.mjs';
-import {measureRequest, maxInputTokens, maxRequestBytes} from '../infra/local-terra/request-budget.mjs';
+import {measureRequest, maxInputTokens, maxRequestBytes, ModelTransportError} from '../infra/local-terra/request-budget.mjs';
+import {queueReassessment, runReassessment} from '../infra/local-terra/reassessment.mjs';
 const hash='b'.repeat(64);
 function fakeDb({published=false,service=false,requirements=[{key:'1',part:'Чертёж'}]}={}) {
   const client={release(){},async query(sql){
@@ -62,6 +63,62 @@ test('uncertain request survives restart for same fingerprint',async()=>{
     assert.equal(await processReceipt({db,receiptId:'r',stateDir:dir,admitClaim,modelCall:()=>{called=true;}}),'unknown');
     assert.equal(called,false); assert.equal(JSON.parse(await readFile(path)).state,'sending');
   } finally { await rm(dir,{recursive:true,force:true}); }
+});
+test('preliminary review resumes after verified Mac rejections and keeps late uncertainty held',async t=>{
+  const stateDir=await mkdtemp(join(tmpdir(),'prelim-mac-'));
+  t.after(()=>rm(stateDir,{recursive:true,force:true}));
+  const db=fakeDb(), events=[], requests=[];
+  const snapshot=await readSnapshot(db,'r');
+  const path=statePath(stateDir,snapshot);
+  const run=options=>processReceipt({db,receiptId:'r',stateDir,admitClaim,publish:assert.fail,
+    recordActivity:async (_db,event)=>events.push(event),...options});
+  const rejection=async (state,reason)=>run({modelCall:async request=>{
+    assert.equal(JSON.parse(await readFile(path)).state,'sending');
+    requests.push(request);
+    throw new ModelTransportError(state,reason);
+  }});
+  for (const reason of ['mac_terra_busy','mac_terra_paused','mac_terra_budget_exhausted','mac_terra_not_started']) {
+    assert.equal(await rejection('rejected',reason),'waiting');
+    const saved=JSON.parse(await readFile(path));
+    assert.equal(saved.state,'rejected');
+    assert.equal(saved.error,reason);
+    assert.deepEqual(events.at(-1).reason,reason);
+    assert.equal(events.at(-1).status,'waiting');
+    assert.equal(await run({admitClaim:async()=> 'held_terra_mac_unavailable',modelCall:assert.fail}),'held_terra_mac_unavailable');
+  }
+  assert.equal(await rejection('unknown','mac_terra_busy'),'unknown');
+  assert.equal(await run({modelCall:assert.fail}),'unknown');
+  assert.equal(requests.length,5);
+  requests.forEach(request=>assert.deepEqual(request,requests[0]));
+});
+
+test('addressed review retries a confirmed pre-dispatch halt through its queued ticket',async t=>{
+  const stateDir=await mkdtemp(join(tmpdir(),'addressed-mac-'));
+  t.after(()=>rm(stateDir,{recursive:true,force:true}));
+  const db=fakeDb(), scope=await readSnapshot(db,'r');
+  const report={...scope,reportId:'original',rows:[{key:'1',status:'unassessed',finding:'Нет решения',sources:[]}],draftText:''};
+  db.query=async sql=>sql.includes('ORDER BY r.created_at DESC') ? {rows:[report]} : {rowCount:0};
+  const key=await queueReassessment(stateDir,scope,'operator');
+  const path=join(stateDir,'addressed','r',key+'.json');
+  const events=[], requests=[];
+  const run={db,stateDir,admitClaim,publish:async()=>({id:'revised'}),recordActivity:async (_db,event)=>events.push(event),
+    modelCall:async request=>{
+      assert.equal(JSON.parse(await readFile(path)).state,'sending');
+      requests.push(request);
+      if (requests.length===1) throw new ModelTransportError('rejected','mac_terra_paused');
+      return {rows:[{key:'1',status:'partial',finding:'37 мм',citations:[{id:'L1',quote:'37 мм'}],analysis:{
+        applicability:{kind:'undetermined',reason:'Нужна сверка',citations:[]},properties:[],tensions:[],
+      }}]};
+    }};
+  assert.equal(await runReassessment(run,scope,'operator'),'waiting');
+  assert.equal(JSON.parse(await readFile(path)).reason,'mac_terra_paused');
+  assert.equal(await runReassessment(run,scope,'operator'),'published');
+  assert.equal(JSON.parse(await readFile(path)).reviewId,'revised');
+  assert.deepEqual(events.map(({status,reason})=>[status,reason]),[
+    ['sending',undefined],['waiting','mac_terra_paused'],['sending',undefined],['published',undefined],
+  ]);
+  assert.equal(requests.length,2);
+  assert.deepEqual(requests[0],requests[1]);
 });
 test('response replay after failed publish does not call model',async()=>{
   const dir=await mkdtemp(join(tmpdir(),'prelim-')); const db=fakeDb(); const snapshot=await readSnapshot(db,'r');

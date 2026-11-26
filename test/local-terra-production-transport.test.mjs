@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { once } from 'node:events';
+import { request as httpRequest } from 'node:http';
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -17,6 +18,35 @@ const validRequest = {
 };
 const answer = effort => ({body:Buffer.from(JSON.stringify({model:'gpt-6.1-terra',local_effort:effort,choices:[]}))});
 const code = (state,message) => error => error.state === state && error.message === message;
+
+async function nativeWalk(toolChoice = 'required') {
+  const native = await import('../dist/src/modules/harness/openrouter.js');
+  const job = {mode:'primary',branch:'A',place:{source:{projectId:randomUUID(),versionId:randomUUID(),
+    documentId:randomUUID(),sha256:'a'.repeat(64)},unitId:'1',page:1},
+  settings:{routeId:'codex-subscription-terra',model:'gpt-6.1-terra',dataClass:'customer',maxTokens:2048,
+    maxTurns:32,maxKnownRejections:1,toolChoice},observationProtocol:2,
+  packageWindow:{id:randomUUID(),readerVersion:'fixture',routeRevision:'fixture',walkProtocol:1,packageReadingVersion:2}};
+  const messages = native.initialMessages(job);
+  return {...native,job,messages,next:()=>native.request(job,messages)};
+}
+
+function completion(message,finish_reason = 'tool_calls') {
+  return {body:Buffer.from(JSON.stringify({id:randomUUID(),model:'gpt-6.1-terra',local_effort:'high',choices:[{message,finish_reason}]}))};
+}
+
+function postMac(socket,path,value) {
+  const body = Buffer.from(JSON.stringify(value));
+  return new Promise((resolve,reject)=>{
+    const req = httpRequest({socketPath:socket,method:'POST',path,agent:false,
+      headers:{'content-type':'application/json','content-length':body.length}},res=>{
+      res.resume();
+      res.on('end',()=>resolve({status:res.statusCode,error:res.headers['x-facade-terra-error']}));
+      res.on('error',reject);
+    });
+    req.on('error',reject);
+    req.end(body);
+  });
+}
 
 async function fixture(t, run = async () => answer('high')) {
   const root = await mkdtemp(join('/tmp','fttera-'));
@@ -186,6 +216,109 @@ test('production bridge carries the real structured producer request and accepts
   const input = validate(snapshot,parseModelResponse(raw));
   assert.equal(input.rows[0].analysis.properties[0].scope.sources[0].anchor,source.anchor);
   assert.match(input.rows[0].finding,/Кирпич 60 мм/);
+});
+
+test('the native multi-turn request carries original scope, tool history, a verbatim quote and its PNG', async t=>{
+  const native = await nativeWalk('auto');
+  const quote = 'Ось Б. Облицовка 60 мм, зона Ф-1.';
+  const evidenceId = randomUUID(), lineId = randomUUID();
+  const data = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/nfoAAAAASUVORK5CYII=';
+  const sha256 = native.hashBytes(Buffer.from(data,'base64'));
+  const turn = (name,args) => ({role:'assistant',content:null,tool_calls:[{id:randomUUID(),type:'function',
+    function:{name,arguments:JSON.stringify(args)}}]});
+  const actions = [turn('extract',{}),turn('save_observation',{evidenceId,lineId,quote}),
+    {role:'assistant',content:'Сведения о зоне Ф-1 сохранены.'}];
+  let count = 0;
+  const {transport,arm,ledger} = await fixture(t,async body=>{
+    assert.deepEqual(JSON.parse(body),native.next());
+    const action = actions[count++];
+    return completion(action,action.tool_calls ? 'tool_calls' : 'stop');
+  });
+  await arm(actions.length);
+  const call = async () => native.decodeCompletion(await transport.call(native.next())).message;
+  const first = await call();
+  native.messages.push(first,native.toolMessage(first.tool_calls[0],{body:{evidenceId,scope:native.job.place,
+    lines:[{id:lineId,text:quote}]}}),...native.imageMessage({evidence:{evidenceId,sha256},image:{mediaType:'image/png',data}}));
+  const second = await call();
+  native.messages.push(second,native.toolMessage(second.tool_calls[0],{body:{saved:true,evidenceId,lineId}}));
+  assert.deepEqual(JSON.parse(second.tool_calls[0].function.arguments),{evidenceId,lineId,quote});
+  assert.deepEqual(await call(),actions[2]);
+  assert.equal(count,3);
+  const entries = (await readFile(ledger,'utf8')).trim().split('\n').map(JSON.parse);
+  assert.equal(entries.length,3);
+  entries.forEach(entry=>assert.deepEqual(Object.keys(entry).sort(),['at','requestSha256']));
+});
+
+test('both endpoints enforce the native request boundary before counting or executing a dispatch', async t=>{
+  const {next} = await nativeWalk();
+  const {transport,socket,arm,ledger} = await fixture(t,async()=>assert.fail('denied input reached adapter'));
+  await arm();
+  const wrongReply = {role:'tool',tool_call_id:'unmatched',content:'{}'};
+  const set = [
+    {...next(),model:'qwen'},
+    {...next(),parallel_tool_calls:true},
+    {...next(),stream:true},
+    {...next(),reasoning_effort:'medium'},
+    {...next(),tools:next().tools.slice(0,-1)},
+    {...next(),tools:[...next().tools.slice(0,-1),next().tools[0]]},
+    {...next(),tools:[...next().tools.slice(0,-1),{type:'web_search'}]},
+    {...next(),tools:[...next().tools.slice(0,-1),{type:'function',function:{name:'shell',description:'shell',parameters:{}}}]},
+    {...next(),messages:[...next().messages,wrongReply]},
+    {...next(),messages:[...next().messages,{role:'assistant',content:null,tool_calls:[{id:'call',type:'function',
+      function:{name:'extract',arguments:'{}'}}]},wrongReply]},
+    {...next(),messages:[...next().messages,{role:'tool',tool_call_id:'call',content:[{type:'image_url',image_url:{url:'file:///tmp/source.png'}}]}]},
+    {...next(),messages:[...next().messages,{role:'user',content:[{type:'image_url',image_url:{url:'https://fixture.invalid/source.png'}}]}]},
+    {...next(),messages:[...next().messages,{role:'user',content:[{type:'image_url',image_url:{url:'data:image/png;base64,YWJj'}}]}]},
+  ];
+  for (const value of set) {
+    await assert.rejects(transport.call(value),code('rejected','invalid_mac_terra_request'));
+    assert.deepEqual(await postMac(socket,'/v1/research',value),{status:400,error:'request'});
+  }
+  assert.deepEqual(await postMac(socket,'/v1/review',next()),{status:400,error:'request'});
+  assert.deepEqual(await postMac(socket,'/v1/research',validRequest),{status:400,error:'request'});
+  await assert.rejects(readFile(ledger),{code:'ENOENT'});
+});
+
+test('research shares the same Mac slot and rejects unexpected model output as an unknown effect', async t=>{
+  const {next} = await nativeWalk();
+  let finish, started;
+  const released = new Promise(resolve=>{finish=resolve;});
+  const reached = new Promise(resolve=>{started=resolve;});
+  const {stateDir,snapshot,transport,arm} = await fixture(t,async()=>{
+    started();
+    await released;
+    return completion({role:'assistant',content:'unpermitted plain answer'},'stop');
+  });
+  await transport.activate({query:async()=>({rows:[{time:cutoffTime}]})},stateDir,{research:true});
+  await arm(2);
+  const inFlight = assert.rejects(transport.call(next()),code('unknown','mac_terra_outcome_unknown'));
+  await reached;
+  try {
+    const tx = {query:async()=>({rows:[{held:false,automatic:true}]})};
+    assert.equal(await transport.hold(tx,snapshot,{research:true}),'held_terra_mac_busy');
+    await assert.rejects(transport.call(validRequest),code('rejected','mac_terra_busy'));
+    await assert.rejects(transport.call(next()),code('rejected','mac_terra_busy'));
+  } finally { finish(); }
+  await inFlight;
+});
+
+test('deep admission has its own lasting cutoff and does not inherit old review grants', async t=>{
+  const {root,config,transport,stateDir,snapshot,allow} = await fixture(t);
+  const researchTime = '2026-11-26T12:15:00.654321Z';
+  await allow();
+  await transport.activate({query:async()=>({rows:[{time:researchTime}]})},stateDir,{research:true});
+  const restart = productionTerra(config);
+  assert.equal(await restart.activate({query:assert.fail},stateDir,{research:true}),researchTime);
+  assert.deepEqual(await restart.admissions({research:true}),{activatedAt:researchTime,grants:[]});
+  const tx = {query:async(sql,params)=>{
+    assert.deepEqual(params,[snapshot.projectId,snapshot.receiptId,researchTime]);
+    assert.match(sql,/sealed_at IS NOT NULL AND created_at > \$3::timestamptz/);
+    return {rows:[{held:false,automatic:false}]};
+  }};
+  assert.equal(await restart.hold(tx,snapshot,{research:true}),'held_terra_production_admission');
+  await writeFile(join(root,'paused'),'');
+  assert.equal(await restart.admissions({research:true}),null);
+  assert.equal(await restart.hold({query:assert.fail},snapshot,{research:true}),'held_terra_production_paused');
 });
 
 test('the launchd relay reconnects after SSH exits without opening public ports', async t=>{

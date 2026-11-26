@@ -51,7 +51,11 @@ function primaryResult(task: ScheduledResearchTask, outcome: ResearchOutcome): P
   if (task.job.mode !== 'primary') return undefined;
   if (outcome.kind === 'covered') return { state: 'completed', evidenceRef: outcome.observationIds[0] };
   if (outcome.kind === 'reviewed_no_match') return { state: 'completed', evidenceRef: outcome.evidenceIds[0] };
-  if (outcome.kind === 'partial') return { state: 'partial', evidenceRef: outcome.limitationIds[0] };
+  if (outcome.kind === 'partial') {
+    const evidenceRef = outcome.limitationIds[0] ?? (task.job.packageWindow?.productionReview ? outcome.observationIds[0] : undefined);
+    if (!evidenceRef) throw new Error('Partial reading has no source evidence');
+    return { state: 'partial', evidenceRef };
+  }
   if (outcome.kind === 'final_refusal') return {
     state: 'final_refusal', evidenceRef: outcome.evidenceIds[0] ?? `harness:${task.jobId}:refusal`,
   };
