@@ -143,6 +143,15 @@ test('held package jobs retain their effects while independent windows and suppl
     const overview = await readTerraReading(db,first);
     assert.equal(overview.progress.totalWindows,1);
     assert.equal(overview.progress.unassigned,0);
+    const { rows: [duplicate] } = await db.query(`WITH r AS (INSERT INTO intake_receipts(project_id,source,created_by,sealed_at)
+      VALUES($1,'upload',$2,now()) RETURNING id), o AS (INSERT INTO intake_occurrences(project_id,receipt_id,relative_path,declared_media_type,version_id,state)
+      SELECT $1,r.id,'duplicate.pdf','application/pdf',$3,'accepted' FROM r RETURNING id,receipt_id)
+      SELECT id,receipt_id FROM o`,[first,user,original]);
+    try { assert.equal((await readTerraReading(db,first)).progress.totalWindows,0); }
+    finally {
+      await db.query('DELETE FROM intake_occurrences WHERE id=$1',[duplicate.id]);
+      await db.query('DELETE FROM intake_receipts WHERE id=$1',[duplicate.receipt_id]);
+    }
   } finally {
     await db.query(`UPDATE harness_package_branches SET settings=$3 WHERE window_id=$1 AND branch='A' AND profile_hash=$2`,
       [legacyBranch.window_id,legacyBranch.profile_hash,JSON.stringify(legacyBranch.settings)]);

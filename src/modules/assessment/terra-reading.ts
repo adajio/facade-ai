@@ -13,7 +13,11 @@ const visibleReadingWindow = `(EXISTS (SELECT 1 FROM intake_package_preparation_
  OR EXISTS (SELECT 1 FROM harness_package_branches old JOIN gateway_jobs job ON job.id=old.job_id
    JOIN gateway_generations generation ON generation.generation_id=job.generation_id AND generation.current
    WHERE old.window_id=w.id AND old.active AND old.branch='A' AND old.settings->>'model'=$3
-     AND old.settings->>'routeId'=$4 AND job.project_id=w.project_id AND job.purpose='primary_a'))`;
+     AND old.settings->>'routeId'=$4 AND job.project_id=w.project_id AND job.purpose='primary_a'
+     AND (EXISTS (SELECT 1 FROM intake_package_preparations pin WHERE pin.project_id=w.project_id AND pin.receipt_id=$2
+           AND pin.id::text=job.payload#>>'{packageWindow,preparationId}')
+       OR (job.payload#>>'{packageWindow,preparationId}' IS NULL AND EXISTS (
+         SELECT 1 FROM intake_reader_jobs ij WHERE ij.project_id=w.project_id AND ij.version_id=w.version_id AND ij.receipt_id=$2)))))`;
 /** The overview is a bounded, read-only view of the newest intake. */
 export async function readTerraReading(tx: PoolClient, projectId: string) {
   const profile = loadResearchProfile();
