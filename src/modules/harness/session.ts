@@ -75,8 +75,27 @@ function outcomeAfterLimit(task: ResearchTask): FlowState {
 
 type State = ReturnType<typeof restore>;
 
+type NativeCopy = { content: string; toolCallId: string; evidenceId: string };
+
+function nativeToolMessage(call: FunctionCall, reply: ToolReply, copies?: Map<string, NativeCopy>) {
+  const { body, evidence } = reply;
+  if (copies && evidence && !reply.image && body && typeof body === 'object' && 'content' in body &&
+    typeof body.content === 'string' && body.content.length >= 2048) {
+    const key = canonicalJson([evidence.place, evidence.readerVersion, evidence.sha256, reply.readKind ?? null, reply.support ?? null]);
+    const previous = copies.get(key);
+    if (previous?.content === body.content) {
+      return toolMessage(call, {body: {...body, content: undefined,
+        contentReference: {toolCallId: previous.toolCallId, evidenceId: previous.evidenceId}}});
+    }
+    copies.set(key, {content: body.content, toolCallId: call.id, evidenceId: evidence.evidenceId});
+  }
+  return toolMessage(call, reply);
+}
+
 function restore(task: ResearchTask, events: ResearchEvent[]) {
   const messages = initialMessages(task.job);
+  const nativeCopies = task.job.mode === 'primary' && task.job.packageWindow?.packageReadingVersion === 2
+    ? new Map<string, NativeCopy>() : undefined;
   const corrections = new Map<number, ReturnType<typeof toolMessage>>();
   const legacyCorrections = new Map<number, ReturnType<typeof toolMessage>>();
   const emptyTruncations = new Set<number>();
@@ -164,7 +183,7 @@ function restore(task: ResearchTask, events: ResearchEvent[]) {
                 ?? (!('nextAction' in body) && typeof body.code === 'string' ? readerCorrections[body.code] : undefined);
               if (nextAction) corrections.set(messages.length, toolMessage(call, { body: { ...body, nextAction } }));
             }
-            messages.push(toolMessage(call, reply));
+            messages.push(nativeToolMessage(call, reply, nativeCopies));
           });
           results.forEach((result) => messages.push(...imageMessage(result.reply)));
           if (model.finishReason === 'length') {

@@ -144,7 +144,7 @@ export async function dispatchPackagePair(db: Pool, queue: WorkQueue, profile: R
     // Serialize the slot decision. Reader and sender locks always follow the project lock.
     await lockPackagePrimarySlots(tx);
     const { rows: routes } = await tx.query<{ id: string; revision: string }>(
-      'SELECT id,revision FROM gateway_routes WHERE enabled AND id=ANY($1::text[])',
+      'SELECT id,revision FROM gateway_routes WHERE id=ANY($1::text[])',
       [[profile.A!.routeId, profile.B!.routeId]]);
     if (routes.length !== 2) return false;
     const pinned = branches.map((branch) => {
@@ -165,55 +165,107 @@ export async function dispatchPackagePair(db: Pool, queue: WorkQueue, profile: R
     const { rows: [{ count }] } = await tx.query<{ count: number }>(
       `SELECT count(*)::int AS count FROM ${runnablePackagePrimary}`);
     if (count >= packagePrimaryGlobalLimit) return false;
-    const { rows: [waiting] } = await tx.query<{ id: string; project_id: string; reason: string | null }>(
-      `SELECT target.id,target.project_id,target.reason FROM (
-         SELECT j.id,j.project_id,j.reason,j.created_at FROM ${currentPackagePrimary} AND j.state='held'
-         AND EXISTS(SELECT 1 FROM gateway_outbox e WHERE e.job_id=j.id AND e.lease_epoch=j.lease_epoch AND e.event_type=$1)
+    const { rows: [waiting] } = await tx.query<{ id: string; projectId: string; reason: string | null; lastTurn: string; requestCursor: string }>(
+      `SELECT target.id,target.project_id AS "projectId",target.reason,p.last_turn AS "lastTurn",
+         target.request_cursor AS "requestCursor" FROM (
+         SELECT j.id,j.project_id,j.reason,
+           (SELECT e.cursor FROM gateway_outbox e WHERE e.job_id=j.id AND e.lease_epoch=j.lease_epoch AND e.event_type=$1) AS request_cursor
+         FROM ${currentPackagePrimary} AND j.state='held'
+         AND EXISTS(SELECT 1 FROM gateway_grants gr JOIN gateway_routes r ON r.id=gr.route_id AND r.revision=gr.revision AND r.enabled
+           WHERE gr.project_id=j.project_id AND gr.allowed AND gr.purpose=j.purpose AND gr.route_id=j.payload#>>'{settings,routeId}'
+             AND gr.data_class=j.payload#>>'{settings,dataClass}' AND gr.revision=j.payload#>>'{packageWindow,routeRevision}')
          AND NOT EXISTS(SELECT 1 FROM gateway_attempts a WHERE a.job_id=j.id AND a.state IN ('sending','unknown'))
-       ) target WHERE (SELECT count(*) FROM ${runnablePackagePrimary} AND w.project_id=target.project_id)<$2
-       ORDER BY (SELECT last_turn FROM harness_package_projects p WHERE p.project_id=target.project_id),target.created_at,target.id LIMIT 1`,
+       ) target JOIN harness_package_projects p ON p.project_id=target.project_id
+       WHERE target.request_cursor IS NOT NULL
+         AND (SELECT count(*) FROM ${runnablePackagePrimary} AND w.project_id=target.project_id)<$2
+       ORDER BY p.last_turn,p.project_id,target.request_cursor,target.id LIMIT 1`,
       [packageResumeWaitingSlot, packagePrimaryProjectLimit]);
-    if (waiting && await queue.resume(waiting.id, waiting.reason ? [waiting.reason] : undefined, tx)) {
-      await tx.query("UPDATE harness_package_projects SET last_turn=nextval('harness_package_turn') WHERE project_id=$1", [waiting.project_id]);
-      return true;
-    }
-    if (count > packagePrimaryGlobalLimit - 2) return false;
     const { rows: [next] } = await tx.query<{
       projectId: string; generationId: string; windowId: string; place: Place; readerVersion: string; walkDefault: boolean;
-      firstLook: boolean; inspectionLines: string[];
+      lastTurn: string; firstAssignment: boolean; firstLook: Branch[]; available: Branch[]; inspectionLines: string[];
     }>(
-      `SELECT p.project_id AS "projectId",p.generation_id AS "generationId",candidate.*,
+      `SELECT p.project_id AS "projectId",p.generation_id AS "generationId",p.last_turn AS "lastTurn",candidate.*,
         (project.intake_mode AND project.package_walk_default) AS "walkDefault"
        FROM harness_package_projects p
        JOIN projects project ON project.id=p.project_id
+       JOIN gateway_generations generation ON generation.generation_id=p.generation_id AND generation.current
        JOIN LATERAL (
-         SELECT w.id AS "windowId",w.place,m.reader_version AS "readerVersion",
-           config.walk AND NOT observed.visited AS "firstLook",coalesce(hints.line_ids,'{}'::text[]) AS "inspectionLines"
-         FROM ${selectedWindows}
-         CROSS JOIN LATERAL (SELECT coalesce($6::boolean,project.intake_mode AND project.package_walk_default) AS walk) config
-         CROSS JOIN LATERAL (SELECT EXISTS (SELECT 1 FROM harness_package_windows earlier
-           JOIN harness_package_branches assigned ON assigned.window_id=earlier.id AND assigned.active AND assigned.job_id IS NOT NULL
-           WHERE earlier.project_id=w.project_id AND earlier.version_id=w.version_id AND earlier.map_fingerprint=w.map_fingerprint) AS visited) observed
-         LEFT JOIN LATERAL (SELECT ARRAY(${profileHintLines('w.project_id','w.version_id','m.reader_version',"w.place->>'unitId'",7)}) AS line_ids)
-           hints ON config.walk AND NOT observed.visited
-         CROSS JOIN LATERAL (SELECT min(o.created_at) AS accepted_at FROM intake_occurrences o
-           WHERE o.project_id=w.project_id AND o.version_id=w.version_id AND o.state='accepted') original
-         WHERE w.project_id=p.project_id AND m.refusal IS NULL AND ${currentSource}
-           AND (SELECT count(*) FROM harness_package_branches b WHERE b.window_id=w.id AND b.active
-             AND (b.job_id IS NOT NULL OR EXISTS (SELECT 1 FROM gateway_attempts a WHERE a.job_id=b.blocker_job_id
-                   AND a.state IN ('reserved','prepared','sending','unknown','paid'))))<2
-         ORDER BY (config.walk AND NOT observed.visited) DESC,
-           (coalesce(cardinality(hints.line_ids),0)>0) DESC,
-           CASE WHEN config.walk AND NOT observed.visited THEN original.accepted_at END,w.version_id,w.ordinal LIMIT 1
+         SELECT ARRAY(
+           SELECT profile.branch FROM jsonb_to_recordset($3::jsonb) AS profile(branch text,route text,class text,revision text)
+           JOIN gateway_grants gr ON gr.project_id=p.project_id AND gr.route_id=profile.route AND gr.data_class=profile.class
+             AND gr.purpose=CASE profile.branch WHEN 'A' THEN 'primary_a' ELSE 'primary_b' END
+             AND gr.revision=profile.revision AND gr.allowed
+           JOIN gateway_routes r ON r.id=gr.route_id AND r.revision=gr.revision AND r.enabled
+         ) AS branches,
+         least($2::int,$1::int-(SELECT count(*) FROM ${runnablePackagePrimary} AND w.project_id=p.project_id)) AS slots
+       ) admission ON admission.slots>0 AND cardinality(admission.branches)>0
+       JOIN LATERAL (
+         WITH progress AS (
+           SELECT prior.version_id,prior.map_fingerprint,b.branch,bool_or(read_receipt.opened IS TRUE) AS opened
+           FROM harness_package_windows prior
+           JOIN harness_package_maps map ON map.version_id=prior.version_id AND map.fingerprint=prior.map_fingerprint AND map.active
+           JOIN harness_package_branches b ON b.window_id=prior.id AND b.active
+           JOIN gateway_jobs root ON root.id=b.job_id AND root.generation_id=p.generation_id
+           LEFT JOIN LATERAL (
+             SELECT true AS opened FROM reader_evidence e
+             WHERE e.project_id=prior.project_id AND e.version_id=prior.version_id AND e.reader_version=map.reader_version
+               AND e.run_id=root.id AND e.branch=b.branch LIMIT 1
+           ) read_receipt ON true
+           WHERE prior.project_id=p.project_id AND b.branch=ANY(admission.branches)
+             AND coalesce($4::boolean,project.intake_mode AND project.package_walk_default)
+           GROUP BY prior.version_id,prior.map_fingerprint,b.branch
+         ), pending AS (
+           SELECT w.id,w.project_id,w.version_id,w.ordinal,w.place,m.reader_version,
+             array_agg(requested.branch ORDER BY status.fresh DESC,requested.branch) AS available,
+             coalesce(array_agg(requested.branch) FILTER(WHERE status.unopened),'{}'::text[]) AS unopened,
+             bool_or(status.fresh) AS fresh
+           FROM ${selectedWindows}
+           CROSS JOIN LATERAL unnest(admission.branches) AS requested(branch)
+           LEFT JOIN progress ON progress.version_id=w.version_id AND progress.map_fingerprint=w.map_fingerprint
+             AND progress.branch=requested.branch
+           CROSS JOIN LATERAL (SELECT coalesce($4::boolean,project.intake_mode AND project.package_walk_default) AS walk) config
+           CROSS JOIN LATERAL (SELECT config.walk AND NOT coalesce(progress.opened,false) AS unopened,
+             config.walk AND progress.branch IS NULL AS fresh) status
+           WHERE w.project_id=p.project_id AND m.refusal IS NULL AND ${currentSource}
+             AND NOT EXISTS (
+               SELECT 1 FROM harness_package_branches b WHERE b.window_id=w.id AND b.branch=requested.branch AND b.active
+                 AND (b.job_id IS NOT NULL OR EXISTS (SELECT 1 FROM gateway_attempts a WHERE a.job_id=b.blocker_job_id
+                     AND a.state IN ('reserved','prepared','sending','unknown','paid')))
+             )
+           GROUP BY w.id,m.reader_version
+         )
+         SELECT pending.id AS "windowId",pending.place,pending.reader_version AS "readerVersion",
+           pending.available[1:admission.slots::int] AS available,pending.unopened AS "firstLook",pending.fresh AS "firstAssignment",
+           coalesce(hints.line_ids,'{}'::text[]) AS "inspectionLines"
+         FROM pending
+         LEFT JOIN LATERAL (SELECT ARRAY(${profileHintLines('pending.project_id','pending.version_id','pending.reader_version',
+           "pending.place->>'unitId'",5)}) AS line_ids) hints ON cardinality(pending.unopened)>0
+         JOIN (SELECT o.version_id,min(o.created_at) AS accepted_at FROM intake_occurrences o
+           WHERE o.project_id=p.project_id AND o.state='accepted' GROUP BY o.version_id) original
+           ON original.version_id=pending.version_id
+         ORDER BY pending.fresh DESC,(coalesce(cardinality(hints.line_ids),0)>0) DESC,
+           CASE WHEN pending.fresh THEN original.accepted_at END,pending.version_id,pending.ordinal LIMIT 1
        ) candidate ON true
-       WHERE (SELECT count(*) FROM ${runnablePackagePrimary} AND w.project_id=p.project_id)<=$1-2
-         AND (SELECT count(*) FROM gateway_grants g JOIN gateway_routes r ON r.id=g.route_id AND r.revision=g.revision AND r.enabled
-              WHERE g.project_id=p.project_id AND g.allowed AND
-              ((g.route_id=$2 AND g.data_class=$3 AND g.purpose='primary_a') OR
-               (g.route_id=$4 AND g.data_class=$5 AND g.purpose='primary_b')))=2
        ORDER BY p.last_turn,p.project_id LIMIT 1`,
-      [packagePrimaryProjectLimit, profile.A!.routeId, profile.A!.dataClass, profile.B!.routeId, profile.B!.dataClass,
-        walkOverride??null,memoryVersion,...profileHintPatterns]);
+      [packagePrimaryProjectLimit, packagePrimaryGlobalLimit-count, JSON.stringify(pinned.map(({branch,settings,revision})=>({
+        branch,route:settings.routeId,class:settings.dataClass,revision,
+      }))), walkOverride??null,memoryVersion,...profileHintPatterns]);
+    const sameProject = waiting && next && waiting.projectId === next.projectId;
+    // A first assignment can take one slot ahead of a waiting continuation.
+    // Persist the alternation via queue events, including across worker restarts.
+    const lastTurnWasFirstLook = sameProject && next.firstAssignment && (await tx.query<{ first: boolean }>(
+      `SELECT e.event_type='queued' AND j.priority>0 AS first
+       FROM harness_package_branches b JOIN gateway_jobs j ON j.id=b.job_id
+       JOIN gateway_outbox e ON e.job_id=j.id AND e.event_type IN ('queued','resumed')
+       WHERE j.project_id=$1 AND e.cursor>$2 ORDER BY e.cursor DESC LIMIT 1`,
+      [waiting.projectId,waiting.requestCursor])).rows[0]?.first;
+    const resumeFirst = waiting && (!next || BigInt(waiting.lastTurn)<BigInt(next.lastTurn) ||
+      (waiting.lastTurn===next.lastTurn && (waiting.projectId<next.projectId ||
+        sameProject && (!next.firstAssignment || lastTurnWasFirstLook))));
+    if (resumeFirst && await queue.resume(waiting.id, waiting.reason ? [waiting.reason] : undefined, tx)) {
+      await tx.query("UPDATE harness_package_projects SET last_turn=nextval('harness_package_turn') WHERE project_id=$1", [waiting.projectId]);
+      return true;
+    }
     if (!next) return false;
     await lockIntakeProject(tx, next.projectId);
     // A blocked sibling can be issued later, after a worker's option changes.
@@ -224,7 +276,8 @@ export async function dispatchPackagePair(db: Pool, queue: WorkQueue, profile: R
       [next.windowId]);
     const walk = walkPinned ?? walkOverride ?? next.walkDefault;
     const ref = { projectId: next.projectId, scopeId: null, generationId: next.generationId };
-    for (const { branch, revision, profileHash: branchHash, settings } of pinned) {
+    const selected = pinned.filter(({branch})=>next.available.includes(branch));
+    for (const { branch, revision, profileHash: branchHash, settings } of selected) {
       // An assigned branch belongs to this window even when the default has since changed.
       const { rows: [active] } = await tx.query<{ profile_hash: string; occupied: boolean }>(
         `SELECT b.profile_hash,(b.job_id IS NOT NULL OR EXISTS (
@@ -233,6 +286,11 @@ export async function dispatchPackagePair(db: Pool, queue: WorkQueue, profile: R
          )) AS occupied FROM harness_package_branches b WHERE b.window_id=$1 AND b.branch=$2 AND b.active`,
         [next.windowId, branch]);
       if (active?.occupied) continue;
+      const grant = await tx.query(
+        `SELECT 1 FROM gateway_grants gr JOIN gateway_routes r ON r.id=gr.route_id AND r.revision=gr.revision AND r.enabled
+         WHERE gr.project_id=$1 AND gr.route_id=$2 AND gr.data_class=$3 AND gr.purpose=$4 AND gr.revision=$5 AND gr.allowed`,
+        [next.projectId,settings.routeId,settings.dataClass,branch==='A'?'primary_a':'primary_b',revision]);
+      if (!grant.rowCount) continue;
       if (active && active.profile_hash !== branchHash) {
         await tx.query(`UPDATE harness_package_branches SET active=false
           WHERE window_id=$1 AND branch=$2 AND profile_hash=$3 AND job_id IS NULL`, [next.windowId, branch, active.profile_hash]);
@@ -246,10 +304,10 @@ export async function dispatchPackagePair(db: Pool, queue: WorkQueue, profile: R
         const key = hash([next.windowId, branchHash]);
         await queue.declarePrimary(ref, { id: key + ':' + branch, branch, place: key }, tx);
         const payload: PrimaryJob = { mode: 'primary', branch, settings, place: next.place, observationProtocol: 2,
-          packageWindow: { id: next.windowId, readerVersion: next.readerVersion, routeRevision: revision,
+          packageWindow: { id: next.windowId, readerVersion: next.readerVersion, routeRevision: revision, packageReadingVersion: 2,
             ...(walk ? { walkProtocol: 1 as const,profileInspection:{lineIds:next.inspectionLines} } : {}) } };
         jobId = await queue.enqueue({ ...ref, key: 'package:' + key + ':' + branch, kind: researchKind,
-          ...(walk&&next.firstLook?{priority:next.inspectionLines.length?2:1}:{}),
+          ...(walk&&next.firstAssignment&&next.firstLook.includes(branch)?{priority:next.inspectionLines.length?2:1}:{}),
           subjectId: next.place.source.versionId, obligationId: key + ':' + branch,
           purpose: branch === 'A' ? 'primary_a' : 'primary_b', payload }, tx);
       }

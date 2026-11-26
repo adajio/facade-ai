@@ -147,6 +147,7 @@ export function registerLetterRoutes(app: FastifyInstance, deps: LetterDependenc
     const grounds = await selectedGrounds(tx, { ...letter, recipient, selections });
     // Verify the saved revision against the template used when it was issued.
     const matchesText = renderText(recipient, layout, items) === text
+      || renderText(recipient, layout, items, 'before-stage-prefix-normalization') === text
       || renderText(recipient, layout, items, 'before-clarification-label') === text
       || renderText(recipient, layout, items, 'before-stage') === text;
     if (grounds.length !== revision.items.length

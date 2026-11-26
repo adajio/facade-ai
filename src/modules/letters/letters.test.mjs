@@ -61,6 +61,19 @@ test('Оба оформления сохраняют произвольную с
   }
 });
 
+test('Номер стадии появляется в тексте и обоих форматах без повторения названия', async () => {
+  const { renderText, renderDocument } = await load('letters/content.js');
+  const item = { basis: { scope: { stage: 'Стадия 1' } }, wording: 'Проверенный запрос.', editedWording: null };
+  for (const layout of ['formal', 'brief']) {
+    const text = renderText('Заказчик', layout, [item]);
+    assert.equal(text.split('\n\n')[2], 'Стадия 1');
+    assert.equal((await renderDocument('txt', text)).toString('utf8'), text);
+    assert.equal(extractDocx(await renderDocument('docx', text)), text);
+    assert.equal(renderText('Заказчик', layout, [item], 'before-stage-prefix-normalization').split('\n\n')[2],
+      'Стадия Стадия 1');
+  }
+});
+
 test('Название запроса D8 входит в пункт TXT и DOCX и не меняет текст прежних редакций', async () => {
   const { renderText, renderDocument } = await load('letters/content.js');
   const body = 'В проверенном комплекте по описи №12 сведения о «Крепление» найти не удалось. Просим направить документ или указать, где приведены данные.';

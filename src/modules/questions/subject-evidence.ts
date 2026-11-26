@@ -54,6 +54,33 @@ export function hasAddressedSubject(
   return names.some((name) => bindsAttribute([...new Set(words(name))], observation, valueLine, lines));
 }
 
+/** A categorical value must be the whole addressed field or the content of a labelled cell. */
+export function hasAddressedCategoricalSubject(
+  subject: string,
+  observation: Pick<Observation, "quote" | "value" | "unit" | "lineId" | "grounding">,
+  lines: readonly ReaderLine[],
+): boolean {
+  const value = observation.value?.trim();
+  const { quote, lineId, grounding } = observation;
+  if (!value || observation.unit || !/\p{L}/u.test(value) || grounding !== "text" || !quote?.includes(value) || !lineId ||
+      /^(?:n\/?a|н\/?д|нет данных|не указан[ао]?|не определ[её]н[ао]?)\.?$/iu.test(value)) return false;
+  const addressed = lines.filter(({ id }) => id === lineId);
+  if (addressed.length !== 1 || !addressed[0].text.includes(quote)) return false;
+  const [line] = addressed;
+  const name = normalize(subject);
+  const fields = line.text.split(/[|;·\n]/u)
+    .map((field) => field.split(/\s*[:=]\s*|\s+[–—-]\s+/u))
+    .filter(([label]) => normalize(label) === name);
+  if (fields.length) {
+    const [[, literal, ...rest]] = fields;
+    return fields.length === 1 && !rest.length && literal?.trim().replace(/\.$/u, "") === value.replace(/\.$/u, "");
+  }
+  const { row, column } = line.locator ?? {};
+  return typeof row === "number" && row > 1 && typeof column === "number" && line.text.trim() === value &&
+    lines.some((heading) => sameTable(heading, line) && heading.locator?.row === 1 && heading.locator.column === column &&
+      normalize(heading.text.replace(/:\s*$/u, "")) === name);
+}
+
 function engineeringWords(text: string): string[] {
   const named = text.replace(/\bAnchorSpacing\b/giu, "шаг креплений")
     .replace(/\bhinge\s+bracket\b/giu, "шарнирный кронштейн")

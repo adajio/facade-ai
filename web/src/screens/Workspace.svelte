@@ -45,6 +45,7 @@
   let evidenceId = $derived(route.params.get('evidence'));
   let observationId = $derived(route.params.get('observation') ?? undefined);
   let evidenceComponent = $derived(route.params.get('component'));
+  let evidenceLine = $derived(route.params.get('line'));
   let projection = $state<Projection>();
   let copilotBudget = $state<CopilotBudget>();
   let synchronizedAt = $state<number>();
@@ -270,10 +271,11 @@
     void scopeId;
     void objectId;
     const evidence = isolatedSection || missingScope ? null : evidenceId;
-    const observation = observationId;
+    const lineId = evidenceLine || undefined;
+    const observation = lineId ? undefined : observationId;
     const component = evidenceComponent;
     untrack(() => {
-      refs = evidence ? [{ evidenceId: evidence, observationId: observation }] : [];
+      refs = evidence ? [{ evidenceId: evidence, observationId: observation, lineId }] : [];
       comparison = undefined;
       selected = 0;
       componentIndex = component && /^\d{1,2}$/u.test(component) ? Number(component) : undefined;
@@ -286,12 +288,15 @@
     const ref = index === undefined ? undefined : refs[index];
     if (ref) {
       url.searchParams.set('evidence', ref.evidenceId);
+      if (ref.lineId) url.searchParams.set('line', ref.lineId);
+      else url.searchParams.delete('line');
       if (ref.observationId) url.searchParams.set('observation', ref.observationId);
       else url.searchParams.delete('observation');
       if (ref.observationId && componentIndex !== undefined) url.searchParams.set('component', String(componentIndex));
       else url.searchParams.delete('component');
     } else {
       url.searchParams.delete('evidence');
+      url.searchParams.delete('line');
       url.searchParams.delete('observation');
       url.searchParams.delete('component');
     }
@@ -312,6 +317,10 @@
       const row = pane.querySelector('[data-triage-row][aria-current="true"], [data-triage-row][aria-pressed="true"]') ?? source;
       pane.scrollTop += row.getBoundingClientRect().top - pane.getBoundingClientRect().top - 24;
     });
+  }
+
+  function openEvidenceLine(ref: Citation, source: HTMLElement) {
+    openEvidence([ref], 0, trigger ?? source);
   }
 
   function closeEvidence() {
@@ -478,11 +487,11 @@
             </button>
           {/if}
           {#if comparison}
-            <DualEvidenceViewer {api} projectId={project.id} {refs} close={closeEvidence} verify={() => refresh()} actions={comparison.actions} />
+            <DualEvidenceViewer {api} projectId={project.id} {refs} close={closeEvidence} verify={() => refresh()} openLine={openEvidenceLine} actions={comparison.actions} />
           {:else}
             <EvidenceViewer {api} projectId={project.id} {refs} index={selected} {componentIndex} close={closeEvidence} verify={() => refresh()}
               select={(index) => { selected = index; componentIndex = undefined; address(index); }}
-              selectComponent={(index) => { componentIndex = index; address(selected); }} />
+              selectComponent={(index) => { componentIndex = index; address(selected); }} openLine={openEvidenceLine} />
           {/if}
         </div>
       {/if}

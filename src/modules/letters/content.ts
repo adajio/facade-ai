@@ -68,15 +68,16 @@ export function externalLine(value: string) {
 
 export function renderText(
   recipient: string, layout: Layout, items: readonly LetterItem[],
-  edition: 'current' | 'before-clarification-label' | 'before-stage' = 'current',
+  edition: 'current' | 'before-stage-prefix-normalization' | 'before-clarification-label' | 'before-stage' = 'current',
 ): string {
   const contents = items.map((item, index) => {
-    const label = edition === 'current' && item.kind === 'clarification' ? 'Запрос на уточнение. ' : '';
+    const label = item.kind === 'clarification' && (edition === 'current' || edition === 'before-stage-prefix-normalization')
+      ? 'Запрос на уточнение. ' : '';
     return `${index + 1}. ${label}${item.editedWording ?? item.wording}`;
   });
   const title = layout === 'formal' ? 'Запрос исходных данных' : 'Запрос';
   const stage = edition !== 'before-stage' ? externalLine(items[0]?.basis?.scope?.stage ?? '') : '';
-  const stageLine = stage ? [`Стадия ${stage}`] : [];
+  const stageLine = !stage ? [] : [edition === 'current' && /^стадия(?:\s|$)/iu.test(stage) ? stage : `Стадия ${stage}`];
   return [title, `Кому: ${recipient}`, ...stageLine, ...contents].join('\n\n');
 }
 

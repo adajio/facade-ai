@@ -3,7 +3,7 @@ import type { CatalogRequirement } from "../access/input.js";
 import { allowsCatalogPair, comparisonSource } from "../access/catalog-comparison.js";
 import { initialProjectStage } from "../access/project-state.js";
 import {
-  canonicalJson, isInventoryRole, matchesRequirementSubject, pairProofVersion, requirementSubjectKey,
+  canonicalJson, isInventoryRole, matchesRequirementSubject, pairProofVersion, requirementSubjectKey, requiresDocumentApproval,
   type Finding, type Requirement, type Review, type VerifiedPairEvidence,
 } from "./domain.js";
 import { approvedEvidenceSubjects, facadeEvidenceGroups, proveFacadeRule } from "./facade-rule.js";
@@ -23,6 +23,9 @@ export type FacadeFact = {
   membership: FacadeMembership;
   documentFacadeLink?: { version: number; basis: OriginalBasis; facadeId: string };
   property: string | null;
+  legacyPresence?: { subject: string; verified: boolean };
+  addressedPresence?: boolean;
+  documentApproval?: NonNullable<Finding["citation"]["documentApproval"]>;
   materials?: string[];
   variant: string | null;
   printedRevision: string | null;
@@ -68,7 +71,7 @@ export function nonDeliveryFromOriginal(quote: string, originalLine: string | un
 }
 
 export function requirementsFor(rows: CatalogRequirement[], context: FacadeContext, stage: string | null) {
-  return rows.flatMap((row) => {
+  const requirements = rows.flatMap((row) => {
     if (row.level !== context.kind) return [];
     const rule = normalize(row.applicability);
     const expectedStage = rule.startsWith("stage:") ? rule.slice("stage:".length).trim() : null;
@@ -79,12 +82,45 @@ export function requirementsFor(rows: CatalogRequirement[], context: FacadeConte
     const applies = stage && (unconditional || expectedStage) && (!row.facadeKinds?.length || confirmedKind);
     return [catalogRequirement(row, applies ? "applicable" : "unknown")];
   });
+  const canonical = new Set(requirements.map(({ subject }) => requirementSubjectKey(subject)));
+  const aliases = new Map<string, Set<string>>();
+  for (const requirement of requirements) {
+    for (const alias of requirement.aliases ?? []) {
+      const key = requirementSubjectKey(alias);
+      const positions = aliases.get(key) ?? new Set<string>();
+      positions.add(requirement.positionId);
+      aliases.set(key, positions);
+    }
+  }
+  for (const requirement of requirements) {
+    if (!requirement.aliases) continue;
+    const unique = requirement.aliases.filter((alias) => {
+      const key = requirementSubjectKey(alias);
+      return !canonical.has(key) && aliases.get(key)?.size === 1;
+    });
+    if (unique.length) requirement.aliases = unique;
+    else delete requirement.aliases;
+  }
+  return requirements;
 }
 
 export function inFacadeContext(fact: FacadeFact, context: FacadeContext) {
   const { membership } = fact;
   return context.kind === "common" ? membership.kind === "common" :
     membership.kind === "facades" && membership.facadeIds.includes(context.facadeId!);
+}
+
+export function unambiguousCatalogSubjects(requirements: Requirement[]) {
+  const positions = new Map<string, Set<string>>();
+  for (const requirement of requirements) {
+    for (const subject of [requirement.part, ...requirement.aliases ?? [], ...approvedEvidenceSubjects(requirement)]) {
+      const key = requirementSubjectKey(subject);
+      const owners = positions.get(key) ?? new Set<string>();
+      owners.add(requirement.positionId);
+      positions.set(key, owners);
+    }
+  }
+  return new Set([...positions].filter(([, owners]) => owners.size === 1).map(([key]) => key));
 }
 
 export function facadeReview(options: {
@@ -98,6 +134,7 @@ export function facadeReview(options: {
   versionIds: string[];
   supplementReceiptIds: string[];
   knownSubjectKeys?: ReadonlySet<string>;
+  legacyPresenceSubjects?: ReadonlySet<string>;
   semanticBasisIds?: readonly string[];
   clarification?: Review["clarification"];
 }): Review {
@@ -105,10 +142,17 @@ export function facadeReview(options: {
   const firstIntake = stage === initialProjectStage;
   const sourceApplies = (sourceStage: string | null) =>
     firstIntake || Boolean(stage && sourceStage && normalize(stage) === normalize(sourceStage));
-  const sameStage = facts.filter((fact) => !stage || !fact.stage || sourceApplies(fact.stage));
   const approvedSubjects = new Set(approvedEvidenceSubjects(requirement).map(requirementSubjectKey));
   const related = (subject: string) =>
     matchesRequirementSubject(requirement, subject) || approvedSubjects.has(requirementSubjectKey(subject));
+  const sameStage = facts.filter((fact) => !stage || !fact.stage || sourceApplies(fact.stage)).map((fact) => {
+    const heading = fact.legacyPresence;
+    if (!heading || !related(heading.subject) || !options.legacyPresenceSubjects?.has(requirementSubjectKey(heading.subject))) return fact;
+    const projected = { ...fact, property: heading.subject };
+    if (!heading.verified || !inFacadeContext(fact, context) || fact.finding.applicability === "superseded") return projected;
+    const active = { ...fact.finding, format: normalizeFormat(fact.finding.format), applicability: "active" as const };
+    return facadeEvidenceGroups(requirement, projected, active).length ? { ...projected, finding: active } : projected;
+  });
   const relevant = sameStage.filter((fact) =>
     (fact.property && related(fact.property)) ||
       fact.materials?.some(related) ||
@@ -116,6 +160,10 @@ export function facadeReview(options: {
   const scoped = relevant.filter((fact) => inFacadeContext(fact, context) &&
     (fact.finding.sourceRole === "unknown" || requirement.sourceRoles.includes(fact.finding.sourceRole) ||
       isInventoryRole(fact.finding.sourceRole) && Boolean(fact.finding.citation.deliveryStatement)));
+  const requireApproval = requiresDocumentApproval(requirement);
+  const approvalCandidate = requireApproval && scoped.some(({ addressedPresence, finding }) =>
+    addressedPresence && finding.applicability !== "superseded" &&
+    requirement.sourceRoles.includes(finding.sourceRole) && requirement.formats.includes(normalizeFormat(finding.format)));
   const comparisonKey = (property: string | null, variant: string | null, valueRole: Finding["valueRole"]) => canonicalJson([context.id, requirement.positionId,
     variant && normalize(variant), property && matchesRequirementSubject(requirement, property) ? requirementSubjectKey(requirement.part) :
       requirementSubjectKey(property ?? ""), ...(valueRole ? [valueRole] : [])]);
@@ -124,9 +172,12 @@ export function facadeReview(options: {
       sourceApplies(sourceStage) ? [deliveryLocation] : []));
   const resolvedCrop = (fact: FacadeFact) => fact.deliveryLocation && reverified.has(fact.deliveryLocation) &&
     fact.finding.citation.deliveryUncertainty === "original_statement_unverified" && inFacadeContext(fact, context);
-  let findings: Finding[] = scoped.filter((fact) => !resolvedCrop(fact)).map(({ finding, variant, stage: sourceStage, property, documentFacadeLink }) => ({
+  let findings: Finding[] = scoped.filter((fact) => !resolvedCrop(fact)).map(({ finding, variant, stage: sourceStage, property, documentFacadeLink, documentApproval }) => ({
     ...finding,
-    ...(documentFacadeLink ? { citation: { ...finding.citation, documentFacadeLink } } : {}),
+    ...(documentFacadeLink || requireApproval && documentApproval ? { citation: { ...finding.citation,
+      ...(documentFacadeLink ? { documentFacadeLink } : {}),
+      ...(requireApproval && documentApproval ? { documentApproval } : {}),
+    } } : {}),
     ...(finding.nonDelivery ? { nonDelivery: { ...finding.nonDelivery, questionId } } : {}),
     format: normalizeFormat(finding.format),
     comparisonKey: comparisonKey(property, variant, finding.valueRole),
@@ -135,6 +186,7 @@ export function facadeReview(options: {
   }));
   if (supplementReceiptIds.length) {
     return { findings, completenessChecked: false, remaining: ["supplement_review_required"],
+      ...(approvalCandidate ? { approvalCandidate: true } : {}),
       requireVerifiedPairs: true, supplementReceiptIds };
   }
 
@@ -242,5 +294,6 @@ export function facadeReview(options: {
     confirmedPairs,
     requireVerifiedPairs: true,
     packageCoverageIds,
+    ...(!localChecked && approvalCandidate ? { approvalCandidate: true } : {}),
   };
 }

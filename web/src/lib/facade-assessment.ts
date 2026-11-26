@@ -141,6 +141,7 @@ export const assessmentReasons: Record<string, string> = {
   no_applicable_requirements: 'Применимых требований пока нет',
   engineer_fact_review_required: 'Инженер изменил или исключил опору. Проверьте зависимый вывод.',
   requirement_not_proven: 'Доказательства по требованию неполны',
+  review_incomplete: 'Нужно завершить сверку применимости и содержания по оригиналам',
   required_evidence_incomplete: 'Комплект обязательных доказательств по требованию неполон',
   alternatives_unverified: 'Проверка возможных альтернатив не завершена',
   pair_verification_required: 'Для подтверждения противоречия нужна сверка пары опор',

@@ -3,6 +3,7 @@
   import { Commands } from './commands';
   import { describe, query, type Api } from './http';
   import Notice from './Notice.svelte';
+  import { evidenceFilters, type EvidenceFilter } from './triage';
   import { bytes, count, label } from './format';
   import { chooseWorkArea, readingStatus, requirementsUrl, type ResearchContinuation, type WorkSlice } from './work-slice';
 
@@ -79,7 +80,19 @@
       {:else}
         <p>{slice?.catalogAssigned === false ? 'Для оценки требований нужен применимый каталог.' : 'Проверка требований ещё не началась.'}</p>
       {/if}
-      {#if slice && assessment?.total && (!assessment.contexts || assessment.contexts.length <= 1 || assessment.contextId)}<a href={requirementsUrl(slice)}>Посмотреть все {assessment.total} требований</a>{/if}
+      {#if slice && assessment?.total && (!assessment.contexts || assessment.contexts.length <= 1 || assessment.contextId)}
+        <a href={requirementsUrl(slice)}>Посмотреть все {assessment.total} требований</a>
+        {#if assessment.evidence}
+          <ul class="plain-list evidence-counts" aria-label="Итоги проверки требований">
+            {#each Object.entries(evidenceFilters) as [filter, title] (filter)}
+              <li><a href={requirementsUrl(slice, filter)}>{title} · {count(assessment.evidence[filter as EvidenceFilter])}</a></li>
+            {/each}
+          </ul>
+        {/if}
+        {#if assessment.letter}
+          <p><a href={scopedUrl(slice.projectId, 'letters', { scope: slice.scopeId, context: assessment.contextId })}>Подтверждено к запросу · {count(assessment.letter)}</a></p>
+        {/if}
+      {/if}
     </div>
   </div>
   {#if slice}
@@ -136,4 +149,5 @@
   h2 { margin-bottom: 4px; }
   progress { height: .65rem; }
   p { margin-bottom: 8px; }
+  .evidence-counts { display: flex; flex-wrap: wrap; gap: 4px 12px; margin-top: 6px; }
 </style>

@@ -438,6 +438,7 @@ test('ordinary intake publishes independent package evidence before questions an
     const bytes=pdf([...Array.from({length:72},(_,row)=>'Record '+(row+1)),'Material Graphite | project facade ID: K-88'],
       {size:4,leading:6,top:475,height:500});
     walkOriginal=sha(bytes);
+    const callsBeforePassive = calls.length;
     run();
     try {
       await upload('walk.pdf',bytes,target);
@@ -448,7 +449,7 @@ test('ordinary intake publishes independent package evidence before questions an
       const { rows: protocols }=await app.db.query(`SELECT payload#>>'{packageWindow,walkProtocol}' AS protocol
         FROM gateway_jobs WHERE id=ANY($1::uuid[])`,[roots]);
       assert.deepEqual(protocols.map(({protocol})=>protocol),['1','1']);
-      assert.equal(calls.length,0);
+      assert.equal(calls.length,callsBeforePassive);
       driver.abort();
       await worker;
       process.env.FACADE_HARNESS_PACKAGE_WALK='0';

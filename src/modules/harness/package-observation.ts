@@ -6,8 +6,8 @@ import { deliveredLines } from '../questions/attribute-aliases.js';
 import type { Observation } from '../pdf/types.js';
 import type { VerifiedNativeDeliveryLine } from '../pdf/native-line.js';
 import { supportsFacadeHeader, type ObservationInput, type ReaderContext } from './contracts.js';
-import { packageRoles, type PackageBinding, type PackageFact, type PackageSourceRole } from './package-analysis.js';
-import { hasPrintedRevision } from './pair-evidence.js';
+import { originalPackageRoles, packageRoles, type PackageBinding, type PackageFact, type PackageSourceRole } from './package-analysis.js';
+import { hasPrintedRevision, hasInactiveRevision } from './pair-evidence.js';
 import { adjacentFacadeTypeHeader } from './facade-type-evidence.js';
 
 const literal = z.string().trim().min(1).max(500).refine((value) => !value.includes('\0'));
@@ -33,6 +33,10 @@ export const packageDetails = z.strictObject({
     commonQuote: literal.optional() }).optional(),
 });
 
+export const originalPackageDetails = packageDetails.extend({
+  role: z.strictObject({ value: z.enum(originalPackageRoles), quote: literal }).optional(),
+});
+export const originalProfileScanDetails = originalPackageDetails.extend({ facadeHeaderLineId: literal.optional() });
 export const profileScanDetails=packageDetails.extend({facadeHeaderLineId:literal.optional()});
 export type PackageDetails = z.infer<typeof profileScanDetails>;
 
@@ -93,17 +97,38 @@ export function packageCommonGrounded(quote: string) {
 }
 const entireRegister = /(?:\b(?:complete|full|exhaustive)\s+(?:list|schedule|register)\s+of\s+facades?\b|(?:полн\p{L}*|исчерпывающ\p{L}*)\s+(?:перечень|список|ведомость)\s+фасад)/iu;
 const current = /(?:\b(?:current|effective)\b|действующ\p{L}*|актуальн\p{L}*)/iu;
-const inactive = /(?:\b(?:superseded|obsolete|withdrawn|draft|not[ -]+current)\b|замен[её]н\p{L}*|архивн\p{L}*|не\s+действующ\p{L}*|недействующ\p{L}*|неактуальн\p{L}*|отмен[её]н\p{L}*|черновик)/iu;
+const catalogRoleTitles = {
+  brief: /^(?:техническое задание|(?:тз|задание) на проектирование|(?:подписанное )?тз нвф|проектное задание|задание заказчика|design brief|terms of reference)(?![\p{L}\p{N}])/iu,
+  certificate: /^(?:техническ(?:ое свидетельство|ие свидетельства)|тс на облицовку|сертификат|technical (?:approval|certificate)|certificate)(?![\p{L}\p{N}])/iu,
+  test_report: /^(?:(?:акты?|протоколы?) (?:испытаний|на вырыв)|(?:(?:anchor|pull[ -]out) )?test report)(?![\p{L}\p{N}])/iu,
+  design: /^(?:проектная документация|проектн(?:ое решение|ые решения)|раздел (?:по )?энергоэффективности|цветовое решение (?:фасад(?:а|ов)|по фасадам)|колористика фасадов|design (?:document(?:ation)?|solution))(?![\p{L}\p{N}])/iu,
+} satisfies Partial<Record<PackageSourceRole, RegExp>>;
 const roleWords: Partial<Record<PackageSourceRole, RegExp>> = {
+  ...catalogRoleTitles,
   drawing: /drawing|черт[её]ж|схема/iu, detail: /detail|узел|деталь/iu, schedule: /schedule|ведомость|таблица/iu,
   specification: /specification|спецификация/iu, calculation: /calculation|расч[её]т/iu,
   inventory: /inventory|transmittal|опись|сопроводительн\p{L}*\s+письмо/iu,
   correspondence: /correspondence|letter|переписка|письмо/iu, model: /model|модель/iu,
   other: /commercial offer|quotation|reference material|коммерческ\p{L}*\s+предложен|справочн\p{L}*\s+материал/iu,
 };
-const roleSegments = (line: string) => line.split(/[|;·]/u).map((segment) => segment.trim().replace(
-  /^(?:document(?: type| role)?|type|title|тип документа|вид документа|документ)\s*:\s*/iu, ''));
+const roleLabel = /^(?:document(?: type| role)?|type|title|тип документа|вид документа|документ)\s*:\s*/iu;
+const roleSegments = (line: string) => line.split(/[|;·]/u).map((segment) => segment.trim().replace(roleLabel, ''));
 const inventoryRolePrefix = /^(?:inventory|transmittal|опись|сопроводительн\p{L}*\s+письмо)(?![\p{L}\p{N}_])/iu;
+function matchesPrintedRole(line: string, role: NonNullable<PackageDetails['role']>) {
+  const pattern = roleWords[role.value];
+  if (!pattern) return false;
+  const segments = roleSegments(line);
+  if (!Object.hasOwn(catalogRoleTitles, role.value)) {
+    return segments.some(segment => segment.includes(role.quote) && pattern.exec(segment)?.index === 0);
+  }
+  // An entry in a transmittal or reference list does not establish the type of the original.
+  if (!pattern.test(role.quote) || segments.some(segment => inventoryRolePrefix.test(segment))) return false;
+  const fields = line.split(/[|;·]/u).map(part => part.trim());
+  const missing = /не (?:передан|предоставлен|приложен)|отсутствует|not (?:provided|supplied|delivered)|missing/iu;
+  return segments.some((segment, index) => (index === 0 || roleLabel.test(fields[index])) &&
+    segment.startsWith(role.quote) && !missing.test(segment));
+}
+
 const normalized = (value: string) => value.normalize('NFC').trim();
 function hasLiteral(quote: string, value: string) {
   const escaped = value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -167,7 +192,7 @@ export async function publishPackageObservation(
   const references=details.references??{};
   const fields=referenceFields;
   const supportIds=[...new Set([observation.evidenceId,...(observation.components??[]).map(({evidenceId})=>evidenceId)])];
-  const {rows:issued}=grounding==='text'&&(details.role||details.binding||details.facadeHeaderLineId||Object.keys(references).length)
+  const {rows:issued}=grounding==='text'&&(details.role||details.revision||details.binding||details.facadeHeaderLineId||Object.keys(references).length)
     ? await tx.query<{ id:string;content:string|null;readKind?:string;box?:Observation['address']['box'] }>(
       `SELECT DISTINCT ON(event#>>'{reply,evidence,evidenceId}') event#>>'{reply,evidence,evidenceId}' AS id,
         event#>>'{reply,body,content}' AS content,event#>>'{reply,readKind}' AS "readKind",
@@ -183,7 +208,7 @@ export async function publishPackageObservation(
   const headerLine=supportsFacadeHeader(task.job)&&details.facadeHeaderLineId&&anchor.lineId&&anchor.quote&&
     opened?.readKind==='extract'&&!opened.box&&details.binding?.state==='identified'&&details.binding.labels.length===1
     ? adjacentFacadeTypeHeader(deliveredLines(opened.content),anchor.lineId,details.facadeHeaderLineId,anchor.quote) : undefined;
-  const header=headerLine&&!inactive.test(headerLine.text)?{...anchor,lineId:headerLine.id,quote:headerLine.text,
+  const header=headerLine&&!hasInactiveRevision(headerLine.text)?{...anchor,lineId:headerLine.id,quote:headerLine.text,
     address:{unitId:observation.address.unitId,locator:headerLine.locator,box:headerLine.box}}:undefined;
   const headerFields=new Set<ReferenceField>(['role','stage','revision','binding']);
   const citations=Object.fromEntries(fields.map((field)=>{
@@ -207,14 +232,18 @@ export async function publishPackageObservation(
   const isCommercial = Boolean(segments?.some((segment) => roleWords.other!.exec(segment)?.index === 0));
   const confirmedRole = verified && roleCrop ? { value: 'inventory' as const, quote: verified.role.quote }
     : role && rolePart?.quote?.includes(role.quote) && (!isCommercial || role.value === 'other') &&
-      segments?.some((segment) => segment.includes(role.quote) && roleWords[role.value]?.exec(segment)?.index === 0) ? role : undefined;
+      fullRole && matchesPrintedRole(fullRole, role) ? role : undefined;
   const stage = details.stage && citations.stage?.quote?.includes(details.stage.quote) && hasLiteral(details.stage.quote, details.stage.value)
     ? details.stage : undefined;
   const revision = details.revision && citations.revision?.quote?.includes(details.revision.quote) &&
     hasPrintedRevision(details.revision.quote, details.revision.value)
     ? details.revision : undefined;
-  const revisionStatus = revision?.status === 'current' && current.test(revision.quote) && !inactive.test(revision.quote)
-    ? 'current' : revision?.status === 'superseded' && inactive.test(revision.quote) ? 'superseded' : 'unknown';
+  const revisionPart = citations.revision;
+  const revisionLine = revisionPart && fullLine(revisionPart.evidenceId, revisionPart.lineId);
+  const inactiveSource = hasInactiveRevision(revisionLine ?? revisionPart?.quote ?? '') ||
+    Boolean(confirmedRole && fullRole && hasInactiveRevision(fullRole));
+  const revisionStatus = revision?.status === 'current' && current.test(revision.quote) && !inactiveSource
+    ? 'current' : revision?.status === 'superseded' && hasInactiveRevision(revision.quote) ? 'superseded' : 'unknown';
   const bindingPart=citations.binding;
   const bindingAnchor=bindingPart?{...observation,lineId:bindingPart.lineId,address:bindingPart.address}:observation;
   const binding=bindingFor(bindingAnchor,details,bindingPart&&fullLine(bindingPart.evidenceId,bindingPart.lineId),bindingPart?.quote??'');

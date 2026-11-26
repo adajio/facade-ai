@@ -29,9 +29,11 @@ export type SemanticRemainder = {
 };
 
 export function facadeVerdict(coverage: FacadeCoverage, limitations: readonly string[],
-  questions: { machine: Pick<Machine, "outcome">; semanticRemainder: Pick<SemanticRemainder, "state"> }[]) {
+  questions: { machine: Pick<Machine, "outcome"> & Partial<Pick<Machine, "limitations">>;
+    semanticRemainder: Pick<SemanticRemainder, "state"> }[]) {
   const unresolved = !questions.length || limitations.length > 0 || Object.values(coverage).some(({ complete }) => !complete) ||
-    questions.some(({ machine, semanticRemainder }) => machine.outcome === "needs_review" || semanticRemainder.state !== "complete");
+    questions.some(({ machine, semanticRemainder }) => machine.outcome === "needs_review" || semanticRemainder.state !== "complete" ||
+      machine.outcome === "covered" && Boolean(machine.limitations?.length));
   const known = questions.some(({ machine }) => machine.outcome === "covered");
   const problem = questions.some(({ machine }) => machine.outcome === "confirmed_missing" || machine.outcome === "confirmed_conflict");
   return unresolved ? known || problem ? "mixed" : "needs_review" : problem ? "confirmed_problems" : "sufficient";

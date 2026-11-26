@@ -4,9 +4,9 @@
   import type { Citation, EvidenceActions } from './workspace';
   import EvidenceViewer from './EvidenceViewer.svelte';
 
-  let { api, projectId, refs, close, verify, actions }: {
+  let { api, projectId, refs, close, verify, openLine, actions }: {
     api: Api; projectId: string; refs: Citation[]; close: () => void;
-    verify: () => void; actions?: EvidenceActions;
+    verify: () => void; openLine: (ref: Citation, trigger: HTMLElement) => void; actions?: EvidenceActions;
   } = $props();
   let full = $state(false);
   let sideBySide = $state(false);
@@ -91,7 +91,7 @@
     {#each refs as ref, index (ref.evidenceId)}
       <EvidenceViewer {api} {projectId} refs={[ref]} index={0} componentIndex={components[index]}
         select={() => {}} selectComponent={(value) => components[index] = value}
-        {close} {verify} embedded slotLabel={labels[index]} />
+        {close} {verify} {openLine} embedded slotLabel={labels[index]} />
     {/each}
   </div>
   {#if actions?.confirm || actions?.dismiss}

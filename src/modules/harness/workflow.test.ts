@@ -73,6 +73,42 @@ function setup() {
   return { events, task, ports, pixels, overviewId, textId, observationId, reads, recorded };
 }
 
+test('repeated large native reads keep their evidence addresses and a single full copy in a new package session', async () => {
+  for (const current of [true, false]) {
+    const { task, ports, events } = setup();
+    assert.ok(task.job.mode === 'primary');
+    task.job.packageWindow = {id: randomUUID(), readerVersion: 'v1', routeRevision: 'r1',
+      walkProtocol: 1, ...(current ? {packageReadingVersion: 2 as const} : {})};
+    const place = task.job.place;
+    const content = 'Точная строка ведомости '.repeat(600);
+    const evidenceIds: string[] = [];
+    for (const [index, unitId] of ['sheet-1', 'sheet-1', 'sheet-2'].entries()) {
+      const evidence = { evidenceId: randomUUID(), readerVersion: 'v1', sha256: hashBytes(content), place: { ...place, unitId } };
+      evidenceIds.push(evidence.evidenceId);
+      events.push({ kind: 'model', turn: index+1, attemptId: randomUUID(), requestHash: 'fixture', finishReason: 'tool_calls',
+        inputRefs: evidenceIds.slice(0,-1), message: {role: 'assistant', content: null,
+          tool_calls: [{id: 'open-'+index, type:'function', function: {name:'extract', arguments:'{}'}}]} });
+      events.push({kind:'tool', turn:index+1, index:0, reply:{readKind:'extract', evidence,
+        body:{ok:true, content, evidence, limitations:[]}}});
+    }
+    ports.call = async ({request: wire, inputRefs}) => {
+      assert.deepEqual(inputRefs, evidenceIds);
+      const results = wire.messages.flatMap(m => m.role === 'tool' ? [JSON.parse(m.content)] : []);
+      assert.deepEqual(results.map(r => r.evidence.evidenceId), evidenceIds);
+      assert.equal(results[0].content, content);
+      assert.equal(results[2].content, content);
+      if (current) {
+        assert.equal(results[1].content, undefined);
+        assert.deepEqual(results[1].contentReference, {toolCallId:'open-0', evidenceId:evidenceIds[0]});
+      } else assert.equal(results[1].content, content);
+      return receipt('inventory', {});
+    };
+    assert.deepEqual(await advance(task, ports), {status:'continue'});
+    assert.equal(events.filter(e => e.kind === 'tool' && e.reply.body && typeof e.reply.body === 'object' &&
+      'content' in e.reply.body && e.reply.body.content === content).length, 3);
+  }
+});
+
 test('visual turns keep seen images as references and deliver every addressed tile losslessly', async () => {
   const { task, ports, events, overviewId } = setup();
   const png = new PNG({ width: 8, height: 4 });

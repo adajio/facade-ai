@@ -108,6 +108,7 @@ export function describe(error: unknown): string {
     if (error.code === 'scope_held') return 'Актуальная выдача удержана до разбора поступивших материалов.';
     if (error.code === 'hold_material_pending') return 'Материалы ещё не приняты или состав импорта продолжает формироваться.';
     if (error.code === 'letter_unconfirmed') return 'Редакция ещё не подтверждена.';
+    if (error.code === 'letter_basis_stale') return 'Основание письма изменилось.';
     if (error.code === 'snapshot_required') return copy.snapshotRequired;
     if (error.status === 409) return 'Команда конфликтует с текущим состоянием. Сверьте сохранённые данные.';
     if (error.status === 412) return 'Сервер уже сохранил другую версию. Ваш ввод сохранён.';

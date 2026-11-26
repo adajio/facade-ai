@@ -8,6 +8,8 @@ import { researchContinuation, waitingForResearchSlot } from '../harness/stops.j
 import { readProjectionPosition } from '../supplements/events.js';
 import { SupplementError } from '../supplements/errors.js';
 
+import { evidenceCounts, localFinding, requirementChecked, requirementDone, type RequirementProgress } from './progress.js';
+
 export const filters = ['all', 'open', 'processing'] as const;
 export type Filter = typeof filters[number];
 export type ReceiptRow = {
@@ -31,6 +33,7 @@ type AreaCounts = {
   letter: number;
   actionable: number;
   concluded: boolean;
+  evidence?: ReturnType<typeof evidenceCounts>;
   previousConclusion?: { assessmentVersion: number; reason: string };
 };
 type AssessmentStatus = AreaCounts & {
@@ -53,17 +56,25 @@ function includes(row: Pick<ReceiptRow, 'inventoryOpen' | 'processing'>, filter:
   return filter === 'all' || (filter === 'open' ? row.inventoryOpen : row.processing);
 }
 
-export function countRequirements(questions: { outcome: string; letterEligible?: boolean; machine: { outcome: string; citations?: unknown[] } }[]) {
-  const ready = questions.filter(({ outcome }) => outcome === 'covered' || outcome === 'excluded').length;
-  const letter = questions.filter(({ letterEligible }) => letterEligible).length;
+export function countRequirements(questions: (RequirementProgress & {
+  letterEligible?: boolean;
+  semanticRemainder?: { state: string; items?: readonly { reason: string }[] };
+  machine: NonNullable<RequirementProgress['machine']> & { citations?: readonly unknown[] };
+})[]) {
+  const done = questions.filter(requirementDone);
+  const review = questions.filter((row) => !row.letterEligible && !requirementDone(row));
   return {
-    ready, letter, review: questions.filter((q) => !q.letterEligible && q.outcome !== 'covered' && q.outcome !== 'excluded').length,
-    actionable: questions.filter((q) => !q.letterEligible && q.outcome !== 'covered' && q.outcome !== 'excluded' &&
-      (q.outcome !== 'needs_review' || Boolean(q.machine.citations?.length))).length,
+    ready: done.length,
+    letter: questions.filter(({ letterEligible }) => letterEligible).length,
+    review: review.length,
+    actionable: review.filter((row) => requirementChecked(row) || Boolean(row.machine.citations?.length) ||
+      Boolean(localFinding(row)) || row.semanticRemainder?.items?.some(({ reason }) =>
+        reason === 'semantic_check_missing' || reason === 'semantic_independence_unproven')).length,
     covered: questions.filter(({ outcome }) => outcome === 'covered').length,
-    checked: questions.filter(({ outcome }) => outcome !== 'needs_review').length,
+    checked: questions.filter(requirementChecked).length,
     conflicts: questions.filter(({ machine }) => machine.outcome === 'confirmed_conflict').length,
     total: questions.length,
+    ...(questions.some(({ semanticRemainder }) => semanticRemainder) && { evidence: evidenceCounts(questions) }),
   };
 }
 

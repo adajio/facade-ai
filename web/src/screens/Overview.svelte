@@ -116,17 +116,17 @@
       {#if context.canEdit}<a class="button" class:primary={!accepted} href={scopedUrl(context.project.id, 'receipts', { upload: 1 })}>{workSlice.totals.all ? 'Добавить поступление' : 'Загрузить первый комплект'}</a>{/if}
       <a href={receiptUrl('all')}>К поступлениям</a>
     </details>
-    <details open={current === 2} class:active-step={current === 2}>
-      <summary aria-current={current === 2 ? 'step' : undefined}>{#if current === 2}<span class="step-label">Текущий шаг</span>{/if}2. Подготовка и чтение · {workSlice.files ? 'Карт ' + workSlice.files.prepared + ' из ' + workSlice.files.accepted : 'Состав уточняется'}</summary>
-      <WorkProgress slice={selected} {api} canEdit={context.canEdit} refresh={() => refreshSlice?.()} />
+    <section class="reading-step" class:active-step={current === 2} aria-labelledby="reading-step-heading">
+      <h3 id="reading-step-heading" aria-current={current === 2 ? 'step' : undefined}>{#if current === 2}<span class="step-label">Текущий шаг</span>{/if}2. Подготовка и чтение</h3>
+      <WorkProgress slice={chooseArea ? workSlice : selected} {api} canEdit={context.canEdit} refresh={() => refreshSlice?.()} />
       {#if receipt}<a class="button" href={receiptUrl('all', receipt.receiptId)}>Открыть опись поступления №{receipt.number}</a>{/if}
-    </details>
+    </section>
     <details open={current === 3} class:active-step={current === 3}>
       <summary aria-current={current === 3 ? 'step' : undefined}>{#if current === 3}<span class="step-label">Текущий шаг</span>{/if}3. Проверка требований · {accepted && assessment ? (assessment.checked ?? assessment.covered) + ' из ' + assessment.total : 'Ожидает материалов и правил'}</summary>
       {#if context.project.catalog}<p>{context.project.catalog.name} · версия {context.project.catalog.revision}</p>{/if}
       {#if assessment}
         <a class="button" href={requirementsUrl(selected)}>Все требования · {assessment.total}</a>
-        {#if assessment.checked !== undefined}<a href={requirementsUrl(selected, 'checked')}>Проверено · {assessment.checked}</a>{/if}
+        {#if assessment.checked !== undefined && !assessment.evidence}<a href={requirementsUrl(selected, 'checked')}>Проверено · {assessment.checked}</a>{/if}
         {#if assessment.ready !== undefined}<a href={requirementsUrl(selected, 'done')}>Готово · {assessment.ready}</a>{/if}
         {#if assessment.review !== undefined}<a href={requirementsUrl(selected, 'review')}>Требуют проверки · {assessment.review}</a>{/if}
       {:else if !chooseArea}<a href={scopedUrl(context.project.id, 'settings', {})}>Посмотреть правила проверки</a>{/if}
@@ -166,9 +166,12 @@
 {#if error}<Notice message={'Состояние проекта · ' + error} /><button onclick={refreshSlice}>Обновить обзор</button>{/if}
 
 <style>
-  .stage-flow > details { margin-block: .5rem; padding: .25rem .8rem; border: 1px solid var(--line); border-radius: .4rem; }
+  .reading-step { padding: .7rem .8rem .85rem; }
+  .reading-step h3 { font-size: 1rem; margin-block: 0 .35rem; }
+  .stage-flow > details, .reading-step { margin-block: .5rem; border: 1px solid var(--line); border-radius: .4rem; }
+  .stage-flow > details { padding: .25rem .8rem; }
   .stage-flow > details[open] { padding-bottom: .85rem; }
-  .stage-flow > details.active-step { border-inline-start: .3rem solid var(--accent); }
+  .stage-flow > .active-step { border-inline-start: .3rem solid var(--accent); }
   .stage-flow > details > summary { padding-block: .65rem; min-height: 40px; cursor: pointer; font-weight: 600; }
   .stage-flow > details > a { display: inline-flex; align-items: center; min-height: 40px; margin-inline-end: .6rem; }
   .step-label { color: var(--accent-text); margin-inline-end: .6rem; font-size: .87em; }

@@ -3,7 +3,7 @@
   import { Commands } from '../lib/commands';
   import { tick } from 'svelte';
   import TriageBar from '../lib/TriageBar.svelte';
-  import { matchesSelection, requirementTitle, triageCounts, type Triage } from '../lib/triage';
+  import { evidenceCounts, hasRemainder, localFinding, matchesSelection, requirementChecked, requirementTitle, triageCounts, type Triage } from '../lib/triage';
   import { conflictMessage, conflictVersion } from '../lib/conflict';
   import { date, label } from '../lib/format';
   import { ApiError, denied, describe, id, interrupted, type Api } from '../lib/http';
@@ -34,9 +34,10 @@
   let contextId = $derived(context.params.get('context') || (summary?.contexts.length === 1 ? summary.contexts[0].assessmentContextId : ''));
   let view = $derived(summary?.contexts.find((item) => item.assessmentContextId === contextId));
   let counts = $derived(triageCounts(view?.questions ?? summary?.contexts.flatMap((item) => item.questions) ?? []));
-  let current = $derived((mode === 'questions' ? 'review' : context.filter || triage || 'all') as Triage);
+  let evidence = $derived(view?.questions.some((item) => item.semanticRemainder) ? evidenceCounts(view.questions) : undefined);
+  let current = $derived((context.filter || (mode === 'questions' ? 'review' : triage || 'all')) as Triage);
   let questions = $derived(view?.questions.filter((item) => matchesSelection(item, current)) ?? []);
-  let active = $derived(questions.find((item) => item.id === context.objectId));
+  let active = $derived(view?.questions.find((item) => item.id === context.objectId));
   let inquiryRequirement = $derived(view?.questions.find((item) => item.id === context.params.get('requirement')));
   let heading = $state<HTMLHeadingElement>();
   let lastOpened: string | undefined;
@@ -139,7 +140,8 @@
 
   function url(ctx?: FacadeContext, question?: AssessmentQuestion, filter?: string) {
     return scopedUrl(context.project.id, mode === 'questions' ? 'questions' : 'completeness', {
-      context: ctx?.assessmentContextId, filter, revision: historicalVersion || (ctx ? overviewVersion : undefined), slice: context.params.get('slice'),
+      context: ctx?.assessmentContextId, filter, revision: historicalVersion || (ctx ? overviewVersion : undefined),
+      seen: historicalVersion || overviewVersion ? undefined : context.params.get('seen'), slice: context.params.get('slice'),
     }, question?.id);
   }
 
@@ -170,6 +172,14 @@
       evidence: citation.observationId ? citation.evidenceId : component?.evidenceId,
       observation: citation.observationId, component: citation.observationId ? index : undefined,
     }, active?.id);
+  }
+
+  function machineResult(question: AssessmentQuestion) {
+    if (localFinding(question) === 'partial') {
+      return question.machine.outcome === 'covered' ? 'Найдено частично' : 'Есть читаемые опоры, нужна сверка';
+    }
+    if (question.machine.outcome === 'covered' && question.semanticRemainder?.state === 'complete') return 'Доказана достаточность';
+    return label(question.machine.outcome === 'needs_review' ? 'internal_review' : question.machine.outcome);
   }
 
   function reason(value: string) {
@@ -415,7 +425,7 @@
     {#if !summary.contexts.some(({ kind }) => kind === 'facade')}<p class="meta">Фасады пока не выявлены.</p>{/if}
     <div class="table-wrap">
       <table>
-        <thead><tr><th>Контекст</th><th>Тип фасада</th><th>Проверено</th><th>Нехватка</th><th>Противоречия</th><th>Требуется сверка</th><th>Заключение инженера</th></tr></thead>
+        <thead><tr><th>Контекст</th><th>Тип фасада</th><th>Проверено</th><th>Нехватка</th><th>Противоречия</th><th>Остаток проверки</th><th>Заключение инженера</th></tr></thead>
         <tbody>
           {#each summary.contexts as item (item.assessmentContextId)}
             <tr>
@@ -431,10 +441,10 @@
                   {#if item.facadeType?.state === 'stale'}<br /><span class="meta">Опора требует сверки</span>{/if}
                 {:else}—{/if}
               </td>
-              <td><a href={url(item, undefined, 'checked')} aria-label={'Проверенные требования · ' + item.name}>{item.questions.filter((q) => q.outcome !== 'needs_review').length}</a></td>
+              <td><a href={url(item, undefined, 'checked')} aria-label={'Проверенные требования · ' + item.name}>{item.questions.filter(requirementChecked).length}</a></td>
               <td><a href={url(item, undefined, 'confirmed_missing')} aria-label={'Подтверждённая нехватка · ' + item.name}>{item.counts.confirmed_missing}</a></td>
               <td><a href={url(item, undefined, 'confirmed_conflict')} aria-label={'Подтверждённые противоречия · ' + item.name}>{item.counts.confirmed_conflict}</a></td>
-              <td><a href={url(item, undefined, 'needs_review')} aria-label={'Требуют сверки · ' + item.name}>{item.counts.needs_review}</a></td>
+              <td><a href={url(item, undefined, 'remainder')} aria-label={'Остаток проверки · ' + item.name}>{item.questions.filter(hasRemainder).length}</a></td>
               <td>{item.conclusion ? label(item.conclusion.startWork) : 'Ожидает решения'}</td>
             </tr>
           {/each}
@@ -520,11 +530,11 @@
     </details>
 
     {#if chooseTriage}
-      <TriageBar value={current} {counts} checked={view.questions.filter((item) => item.outcome !== 'needs_review').length} choose={chooseTriage}
+      <TriageBar value={current} {counts} {evidence} checked={view.questions.filter(requirementChecked).length} choose={chooseTriage}
         letterUrl={scopedUrl(context.project.id, 'letters', { context: view.assessmentContextId, scope: context.scopeId })} />
     {/if}
     <section class="card table-card">
-      <div class="card-header"><h2>{mode === 'questions' ? 'Внутренние вопросы' : 'Требования'} · {view.kind === 'common' ? 'Весь комплект' : view.name}</h2></div>
+      <div class="card-header"><h2>{mode === 'questions' ? 'Требования для внутренней сверки' : 'Требования'} · {view.kind === 'common' ? 'Весь комплект' : view.name}</h2></div>
       {#if questions.length}
         <div class="table-wrap"><table>
           <thead><tr><th>Требование</th><th>Машинный вывод</th><th>Проверка содержания</th><th>Решение инженера</th></tr></thead>
@@ -532,10 +542,11 @@
             {#each questions as question (question.id)}
               <tr>
                 <td><a id={'requirement-' + question.id} data-triage-row href={url(view, question, context.filter)} aria-current={active?.id === question.id ? 'true' : undefined}>{requirementTitle(question.requirement)}</a></td>
-                <td>{question.machine.outcome === 'needs_review' ? 'Требует проверки' : label(question.machine.outcome)}</td>
+                <td>{machineResult(question)}</td>
                 <td>{question.semanticRemainder
                   ? question.semanticRemainder.verifiedWindows + ' из ' + question.semanticRemainder.totalWindows +
-                    (question.semanticRemainder.state === 'open' ? ' · есть остаток' : '')
+                    (question.semanticRemainder.state === 'open' ? ' · есть остаток' :
+                      question.machine.outcome === 'covered' && question.machine.limitations?.length ? ' · есть ограничения' : '')
                   : 'Данные отсутствуют в этой ревизии'}</td>
                 <td>{label(question.decision?.action === 'request_clarification' ? 'clarification' : question.decision?.outcome,
                   'Ожидает решения')}</td>
@@ -544,7 +555,7 @@
           </tbody>
         </table></div>
       {:else}
-        <p class="empty">{context.filter ? 'В этом состоянии нет требований.' : 'Для этого контекста пока нет применимых требований.'}</p>
+        <p class="empty">{mode === 'questions' ? 'Требований для внутренней сверки сейчас нет.' : context.filter ? 'В этом состоянии нет требований.' : 'Для этой области пока нет применимых требований.'}</p>
       {/if}
     </section>
 
@@ -559,7 +570,10 @@
         {/if}
         {#if active.requirement.completeness}<p><strong>Критерий достаточности</strong> · {active.requirement.completeness}</p>{/if}
         <p>Формат по каталогу · {(active.requirement.requiredFormats ?? active.requirement.formats?.filter((format) => !active.requirement.equivalentFormats?.includes(format)))?.join(', ').toUpperCase() || 'Не указан'}{active.requirement.equivalentFormats?.length ? ' · Допустимая замена: ' + active.requirement.equivalentFormats.join(', ').toUpperCase() : ''}</p>
-        <p>Машинный вывод · {active.machine.outcome === 'needs_review' ? 'Требует проверки' : label(active.machine.outcome)}</p>
+        <p>Машинный вывод · {machineResult(active)}</p>
+        {#if active.machine.outcome === 'covered' && active.semanticRemainder?.state === 'open'}
+          <p>По открытым источникам есть адресные опоры. Для вывода по всему требованию проверьте оставшиеся места и допустимые замены.</p>
+        {/if}
         {#if active.requirement.applicability === 'unknown'}
           <p>Применимость требования требует подтверждения.</p>
         {/if}
@@ -577,7 +591,7 @@
         {#if active.semanticRemainder}
           {@const remainder = active.semanticRemainder}
           <h3>Проверка содержания</h3>
-          <p>{remainder.verifiedWindows} из {remainder.totalWindows} окон · {remainder.state === 'open' ? 'Есть остаток' : 'Проверка завершена'}</p>
+          <p>{remainder.verifiedWindows} из {remainder.totalWindows} окон · {remainder.state === 'open' ? 'Есть остаток' : 'Проверка окон завершена'}</p>
           {#if remainder.alternativesVerified !== undefined}
             <p>Альтернативы · {remainder.alternativesVerified ? 'Проверены' : 'Требуют сверки'}</p>
           {/if}
@@ -658,7 +672,11 @@
             <div class="actions"><button class="primary" disabled={busy || staleView || !decisionReason.trim() || decisionVersion !== undefined && decisionVersion !== active.version}>Сохранить решение по требованию</button></div>
           </form>
         {/if}
-        <a class="button" href={scopedUrl(context.project.id, 'letters', { context: view.assessmentContextId })}>К письмам по этой области</a>
+        {#if active.letterEligible}
+          <a class="button primary" href={scopedUrl(context.project.id, 'letters', { context: view.assessmentContextId })}>Подготовить письмо по подтверждённым пунктам</a>
+        {:else if mode === 'questions'}
+          <a class="button" href={scopedUrl(context.project.id, 'completeness', { context: view.assessmentContextId, revision: historicalVersion }, active.id)}>Открыть требование в комплектности</a>
+        {/if}
       </section>
     {/if}
   {:else if !overview && contextId}

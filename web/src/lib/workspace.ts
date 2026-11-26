@@ -18,12 +18,14 @@ export function scopedUrl(projectId: string, section: Section, params: Record<st
 
 export type Citation = {
   evidenceId: string;
+  lineId?: string;
   observationId?: string;
   documentId?: string;
   versionId?: string;
   sha256?: string;
   label?: string;
   documentRevision?: { label: string; evidenceId?: string };
+  documentApproval?: { evidenceId: string; lineId: string; address: RecordData; quote: string };
   sourceLabel?: string;
   sourceRole?: string;
   quote?: string;
@@ -35,6 +37,13 @@ export type Citation = {
   address?: RecordData;
   components?: CitationComponent[];
 };
+
+export function approvalEvidence(citation?: Citation): Citation | undefined {
+  const approval = citation?.documentApproval;
+  if (!approval || !citation) return;
+  const { documentId, versionId, sha256, branch } = citation;
+  return { ...approval, documentId, versionId, sha256, branch };
+}
 
 export type CitationComponent = {
   role: 'value' | 'unit' | 'variant' | 'revision' | 'identifier' | 'relationship';

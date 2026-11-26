@@ -50,6 +50,7 @@
   let linked = $state<Supplement[]>([]);
   let preview = $state('');
   let previewError = $state('');
+  let previewStale = $state(false);
   let checked = $state<string[]>([]);
   let recipient = $state('');
   let draftRecipient = $state('');
@@ -101,6 +102,14 @@
   let current = $derived(letter?.id === activeId ? letter : undefined);
   let currentRevision = $derived(revision && current && revision.id === (context.revision ?? current.revisionId) ? revision : undefined);
   let choices = $derived((eligible?.items ?? []).filter((item) => !recipient || item.recipient === recipient));
+  let chosenGrounds = $derived(choices.filter((item) => checked.includes(selectionKey(item))));
+  let selectionsChanged = $derived(Boolean(eligible && checked.length > chosenGrounds.length));
+  let selectionTarget = $derived(JSON.stringify([context.project.id, target.scopeId, target.assessmentContextId]));
+  $effect(() => {
+    void selectionTarget;
+    checked = [];
+    recipient = '';
+  });
   let reviewItems = $derived(currentRevision?.items.flatMap((item) => {
     const ground = currentGround(item);
     if (!ground || !item.editedWording || managedWording(item.editedWording, ground.wording, ground.alternativeWording)) return [];
@@ -127,6 +136,10 @@
   function asSelection(item: Ground): Selection {
     return { questionId: item.questionId, questionVersion: item.questionVersion, decisionId: item.decisionId };
   }
+  function selectionKey(item: Ground) {
+    return [item.questionId, item.questionVersion, item.decisionId].join('/');
+  }
+
   function currentGround(item: Ground) {
     return eligible?.items.find((ground) => ground.questionId === item.questionId && ground.recipient === draftRecipient);
   }
@@ -166,24 +179,26 @@
     void context.refreshKey;
     const stop = new AbortController();
     listError = '';
+    eligibleError = '';
+    assessmentOutcome = '';
     api.json<Page<Summary>>(query(listPath, selection), { signal: stop.signal }).then((page) => {
+      if (stop.signal.aborted) return;
       letters = page.items;
       cursor = page.nextCursor ?? null;
-    }).catch((error) => { if (!interrupted(error)) listError = describe(error); });
+    }).catch((error) => { if (!stop.signal.aborted && !interrupted(error)) listError = describe(error); });
     eligible = undefined;
     if (selection.scopeId || selection.assessmentContextId) {
-      eligibleError = '';
       api.json<Eligible>(query(listPath + '/eligible', selection), { signal: stop.signal })
         .then(async (result) => {
+          if (stop.signal.aborted) return;
           eligible = result;
-          assessmentOutcome = '';
           if (result.items.length || result.holds.length || selection.assessmentContextId) return;
           const outcome = await api.json<Assessment>(query(listPath.replace(/\/letters$/, '/assessments/current'), { scopeId }), {
             signal: stop.signal,
           }).catch(() => undefined);
           if (!stop.signal.aborted && outcome) assessmentOutcome = outcome.outcome;
         })
-        .catch((error) => { if (!interrupted(error)) { eligible = undefined; eligibleError = describe(error); } });
+        .catch((error) => { if (!stop.signal.aborted && !interrupted(error)) eligibleError = describe(error); });
     }
     return () => stop.abort();
   });
@@ -212,6 +227,7 @@
     const selected = path(letterId);
     preview = '';
     previewError = '';
+    previewStale = false;
     detailError = '';
     async function load() {
       try {
@@ -227,7 +243,10 @@
           try {
             preview = (await currentText(item, signal)).text;
           } catch (error) {
-            if (!interrupted(error)) previewError = describe(error);
+            if (!signal.aborted && !interrupted(error)) {
+              previewError = describe(error);
+              previewStale = error instanceof ApiError && error.code === 'letter_basis_stale';
+            }
           }
         }
       } catch (error) {
@@ -308,7 +327,10 @@
         const subject = currentRevision?.items.find((item) => item.questionId === error.details.questionId)?.subject;
         problem = [error.message, subject, field].filter(Boolean).join(' · ');
       }
-      if (error instanceof ApiError && [409, 412, 422].includes(error.status)) preview = '';
+      if (error instanceof ApiError && [409, 412, 422].includes(error.status)) {
+        preview = '';
+        if (error.code === 'letter_basis_stale') previewStale = true;
+      }
       return false;
     } finally {
       busy = false;
@@ -318,7 +340,7 @@
 
   function create(event: SubmitEvent) {
     event.preventDefault();
-    const selected = choices.filter((item) => checked.includes(item.questionId));
+    const selected = chosenGrounds;
     if (!selected.length) return;
     void run(async () => {
       const result = await commands.send<Summary>(base, 'POST', {
@@ -489,9 +511,10 @@
         : interfaceCopy.noLetterItems}</p>
       <a href={assessmentUrl()}>Проверить комплектность</a>
     {:else if eligible?.items.length}
-      <p>Доступно для запроса · {eligible.items.length}</p>
+      <p>Подтверждено инженером к запросу · {eligible.items.length}</p>
       {#if context.canEdit}
         <form onsubmit={create}>
+          {#if selectionsChanged}<p role="status">Основания части выбранных пунктов изменились. Сверьте их и отметьте снова.</p>{/if}
           <label>Адресат<select bind:value={recipient} required onchange={() => checked = []}>
             <option value="">Выберите адресата</option>
             {#each [...new Set(eligible.items.map((item) => item.recipient))] as option (option)}
@@ -501,14 +524,15 @@
           <ul class="plain-list">
             {#each choices as item (item.questionId)}
               <li>
-                <label><input type="checkbox" bind:group={checked} value={item.questionId} disabled={!recipient} /> {item.subject} · {label(item.kind)}</label>
+                <label><input type="checkbox" bind:group={checked} value={selectionKey(item)} disabled={!recipient} /> {item.subject} · {label(item.kind)}</label>
                 <p>{item.wording}</p>
+                <a href={assessmentUrl(undefined, item.questionId)}>Открыть требование и решение</a>
                 <EvidenceButtons citations={supports(item)} {open} />
               </li>
             {/each}
           </ul>
-          <p class="meta">Выбрано пунктов · {checked.length}. При создании письмо получит номер.</p>
-          <div class="actions"><button class="primary" disabled={busy || !recipient || !checked.length}>Создать письмо из выбранных пунктов</button></div>
+          <p class="meta">Выбрано пунктов · {chosenGrounds.length}. При создании письмо получит номер.</p>
+          <div class="actions"><button class="primary" disabled={busy || !recipient || !chosenGrounds.length}>Создать письмо из выбранных пунктов</button></div>
         </form>
       {:else}
         <ul class="plain-list">{#each eligible.items as item (item.questionId)}
@@ -579,6 +603,7 @@
             {:else if current.status === 'confirmed'}
               <h3>Предпросмотр актуального текста</h3>
               <Notice message={previewError} />
+              {#if previewStale}<a href={url()}>Сверить актуальные пункты для письма</a>{/if}
               {#if preview}
                 <pre data-testid="current-letter-text">{preview}</pre>
                 <div class="actions">

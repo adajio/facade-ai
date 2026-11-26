@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto';
 import { z } from 'zod';
 import { boxSchema, branchSchema, packagePairChecksSchema, pairChecksSchema, supportsFacadeHeader, type EvidenceRef, type ResearchJob } from './contracts.js';
-import { packageDetails, profileScanDetails } from './package-observation.js';
+import { packageDetails, profileScanDetails, originalPackageDetails, originalProfileScanDetails } from './package-observation.js';
 import { componentLinks, componentRoles } from '../pdf/types.js';
 
 const shortText = z.string().trim().min(1).max(500);
@@ -55,19 +55,29 @@ const deliveryForm = z.strictObject({ ...observationAddress, ...quoted, sourceRo
 const valueOrLimitation = z.union(observationForms);
 const withDelivery = z.union([...observationForms, deliveryForm]);
 const metadata = { package: packageDetails.optional() };
-const packageObservation = z.union([
-  z.strictObject({ ...observationAddress, ...quoted, value: argumentText.optional(), ...metadata }),
-  ...observationForms.map((form) => form.extend(metadata)),
-  deliveryForm.extend(metadata),
-]);
-const scanMetadata={package:profileScanDetails.optional()};
-const packageObservationWire = (job: ResearchJob) =>
-  statementObservation.extend(supportsFacadeHeader(job) ? scanMetadata : metadata);
-const profileScanObservation = z.union([
-  z.strictObject({ ...observationAddress, ...quoted, value: argumentText.optional(), ...scanMetadata }),
-  ...observationForms.map((form) => form.extend(scanMetadata)),
-  deliveryForm.extend(scanMetadata),
-]);
+const scanMetadata = { package: profileScanDetails.optional() };
+const originalMetadata = { package: originalPackageDetails.optional() };
+const originalScanMetadata = { package: originalProfileScanDetails.optional() };
+
+function packageForms<T extends { package: z.ZodType }>(fields: T) {
+  return z.union([
+    z.strictObject({ ...observationAddress, ...quoted, value: argumentText.optional(), ...fields }),
+    ...observationForms.map((form) => form.extend(fields)),
+    deliveryForm.extend(fields),
+  ]);
+}
+const packageObservation = packageForms(metadata);
+const profileScanObservation = packageForms(scanMetadata);
+const originalPackageObservation = packageForms(originalMetadata);
+const originalProfileScanObservation = packageForms(originalScanMetadata);
+
+function usesOriginalRoles(job: ResearchJob) {
+  return job.mode === 'primary' && job.packageWindow !== undefined && !job.packageWindow.packageReadingVersion;
+}
+function packageObservationWire(job: ResearchJob) {
+  if (usesOriginalRoles(job)) return statementObservation.extend(supportsFacadeHeader(job) ? originalScanMetadata : originalMetadata);
+  return statementObservation.extend(supportsFacadeHeader(job) ? scanMetadata : metadata);
+}
 
 function profileScan(job: ResearchJob) {
   const discovery=job.mode==='primary'?job.packageWindow?.followup?.discovery:undefined;
@@ -120,7 +130,8 @@ export const commands = {
 const walkOpenContext = commands.open_context.extend({
   representation:z.enum(['native','ocr','render']).optional(),box:boxSchema.optional(),
 });
-const walkCompound = commands.save_compound_observation.extend({package:packageDetails.optional()});
+const walkCompound = commands.save_compound_observation.extend(metadata);
+const originalWalkCompound = commands.save_compound_observation.extend(originalMetadata);
 export function walkJob(job: ResearchJob) { return job.mode==='primary' && job.packageWindow?.walkProtocol===1; }
 export function compoundArguments(job:ResearchJob) {
   return walkJob(job)?walkCompound:commands.save_compound_observation;
@@ -340,7 +351,7 @@ export function request(job: ResearchJob, messages: Message[], wire: ToolWire = 
       let description = toolDescriptions[name];
       if (walkJob(job)) {
         if(name==='open_context'){ schema=walkOpenContext;description='Open an addressed neighboring window from context_inventory, as text, OCR or render. An optional box stays inside that window. Cite its returned evidenceId and lineId.'; }
-        if(name==='save_compound_observation'){ schema=walkCompound;description+=' Supply package metadata on the same compound observation. Reference addressed source fragments instead of joining them into a quote.'; }
+        if(name==='save_compound_observation'){ schema=usesOriginalRoles(job) ? originalWalkCompound : walkCompound;description+=' Supply package metadata on the same compound observation. Reference addressed source fragments instead of joining them into a quote.'; }
       }
       if (earlyPair && isPairCommand(name)) {
         schema = reviewCommands(job)[name];
@@ -378,7 +389,9 @@ export function request(job: ResearchJob, messages: Message[], wire: ToolWire = 
       const parameters = z.toJSONSchema(schema, { io: 'input' });
       if (hasObservationForms) {
         if (name === 'save_observation' && !compactPackage) {
-          const forms = z.toJSONSchema(observationArguments(job), { io: 'input' });
+          const schema = usesOriginalRoles(job)
+            ? (supportsFacadeHeader(job) ? originalProfileScanObservation : originalPackageObservation) : observationArguments(job);
+          const forms = z.toJSONSchema(schema, { io: 'input' });
           Object.assign(parameters, { anyOf: forms.anyOf });
         }
         if (name === 'verify_resolution' && !earlyPair) {

@@ -9,8 +9,9 @@ import { printedPairVariant } from './pair-evidence.js';
 import { currentFacadeScopes } from './package-walk.js';
 import { buildFacadeProfiles, facadeDiscoveryVersion, type FacadeMention, type FacadeProfile } from './facade-discovery.js';
 
-export const packageRoles = ['drawing', 'detail', 'schedule', 'specification', 'calculation', 'inventory',
+export const originalPackageRoles = ['drawing', 'detail', 'schedule', 'specification', 'calculation', 'inventory',
   'correspondence', 'model', 'other', 'unknown'] as const;
+export const packageRoles = [...originalPackageRoles, 'brief', 'certificate', 'test_report', 'design'] as const;
 export type PackageSourceRole = typeof packageRoles[number];
 
 export interface PackageBinding {
@@ -417,7 +418,7 @@ export async function readPackageAnalysis(db: Pool | PoolClient, projectId: stri
        closed.id AS "completedFollowupId",scan.blocks AS "profileBlocks"
      FROM harness_package_branches b LEFT JOIN harness_package_structures s ON s.window_id=b.window_id
      LEFT JOIN LATERAL (
-       SELECT j.id,j.state,j.reason FROM harness_package_followups f JOIN gateway_jobs j ON j.id=f.job_id
+       SELECT j.id,j.state,coalesce(j.reason,j.result->>'reason') AS reason FROM harness_package_followups f JOIN gateway_jobs j ON j.id=f.job_id
        WHERE f.root_job_id=b.job_id ORDER BY j.created_at DESC,j.id LIMIT 1
      ) child ON true
      LEFT JOIN LATERAL (

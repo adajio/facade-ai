@@ -262,12 +262,24 @@ export async function saveSemanticCheck(tx: PoolClient, context: ReaderContext,
   await publishProjectEvent(tx,task.projectId,{ type:'package-analysis.changed',payload:{} });
 }
 
+const pinnedFollowupRoute = `EXISTS (
+  SELECT 1 FROM gateway_grants grant_row
+  JOIN gateway_routes route ON route.id=grant_row.route_id AND route.revision=grant_row.revision AND route.enabled
+  WHERE grant_row.project_id=j.project_id AND grant_row.purpose=j.purpose AND grant_row.allowed
+    AND grant_row.route_id=j.payload#>>'{settings,routeId}' AND grant_row.data_class=j.payload#>>'{settings,dataClass}'
+    AND grant_row.revision=j.payload#>>'{packageWindow,routeRevision}')`;
+
+const unsettledFollowupRoot = `EXISTS (
+  SELECT 1 FROM gateway_attempts a WHERE a.generation_id=j.generation_id AND a.purpose=j.purpose
+    AND a.state IN ('reserved','prepared','sending','unknown')
+    AND (a.job_id=j.id OR EXISTS (SELECT 1 FROM harness_package_followups f WHERE f.root_job_id=j.id AND f.job_id=a.job_id)))`;
+
 export async function dispatchPackageFollowup(db: Pool,queue: WorkQueue,allowProfileScans=true) {
   return transaction(db,async (tx)=>{
     await tx.query("SELECT pg_advisory_xact_lock(hashtextextended('facade/package-followup',0))");
     if (await dispatchComparisonFollowup(tx, queue)) return true;
     if(allowProfileScans&&await dispatchUnseededFacadeScan(tx,queue))return true;
-    const {rows:[row]}=await tx.query<{ rootId:string;windowId:string;projectId:string;generationId:string;payload:unknown;blocks:string[];round:number }>(
+    const {rows}=await tx.query<FollowupTarget&{round:number}>(
       `SELECT j.id AS "rootId",w.id AS "windowId",w.project_id AS "projectId",j.generation_id AS "generationId",j.payload,missing.ids AS blocks,coalesce(history.round,0)+1 AS round
        FROM ${activeWindows}
        JOIN harness_package_structures s ON s.window_id=w.id
@@ -291,22 +303,20 @@ export async function dispatchPackageFollowup(db: Pool,queue: WorkQueue,allowPro
          SELECT ARRAY(SELECT item->>'id' FROM jsonb_array_elements(s.blocks) item
            WHERE NOT EXISTS (SELECT 1 FROM harness_package_block_checks c WHERE c.block_id=item->>'id' AND c.reviewed
              AND (c.job_id=j.id OR EXISTS(SELECT 1 FROM harness_package_followups f WHERE f.root_job_id=j.id AND f.job_id=c.job_id)))
-             OR (history.round IS NULL AND (SELECT count(*) FROM harness_package_branches siblings JOIN gateway_jobs root ON root.id=siblings.job_id
-                 WHERE siblings.window_id=w.id AND siblings.active AND root.result->>'kind'='reviewed_no_match')=2)
          ) AS ids
        ) missing ON cardinality(missing.ids)>0
        WHERE ${activeSource} AND j.payload#>>'{packageWindow,walkProtocol}'='1'
          AND (history.round IS NULL OR history.progressed AND
            (history.state='done' OR history.state='held' AND history.reason='turn_limit_final'))
-         AND 2=(SELECT count(*) FROM harness_package_branches peer JOIN gateway_jobs p ON p.id=peer.job_id
-           WHERE peer.window_id=w.id AND peer.active AND (p.state='done' OR p.state='held' AND p.reason='turn_limit_final') AND p.payload#>>'{packageWindow,walkProtocol}'='1'
-             AND NOT EXISTS(SELECT 1 FROM gateway_attempts a WHERE a.job_id=p.id AND a.state IN ('reserved','prepared','sending','unknown')))
+         AND ${pinnedFollowupRoute} AND NOT ${unsettledFollowupRoot}
          AND NOT EXISTS (SELECT 1 FROM harness_package_followups f JOIN gateway_jobs x ON x.id=f.job_id
            WHERE x.project_id=w.project_id AND x.state IN ('ready','leased'))
          AND 4>(SELECT count(*) FROM harness_package_followups f JOIN gateway_jobs x ON x.id=f.job_id WHERE x.state IN ('ready','leased'))
-       ORDER BY j.created_at,j.project_id,b.branch LIMIT 1`);
-    if (!row) return await dispatchFacadeFollowup(tx,queue) || dispatchCatalogFollowup(tx,queue);
-    return putFollowup(tx,queue,row,`blocks:${row.round}`);
+       ORDER BY j.created_at,j.project_id,b.branch,j.id LIMIT 8`);
+    for(const row of rows) {
+      if(await putFollowup(tx,queue,row,`blocks:${row.round}`))return true;
+    }
+    return await dispatchFacadeFollowup(tx,queue) || dispatchCatalogFollowup(tx,queue);
   });
 }
 
@@ -338,7 +348,7 @@ async function putFollowup(tx:PoolClient,queue:WorkQueue,row:FollowupTarget,plan
   const jobId=await queue.enqueue({...ref,kind:packageFollowupKind,key,priority:-100,
     purpose:root.branch==='A'?'primary_a':'primary_b',subjectId:root.place.source.versionId,obligationId:key,
     payload:{...root,settings:{...root.settings,maxTurns:Math.min(root.settings.maxTurns,8)},
-      packageWindow:{...root.packageWindow,followup:{rootJobId:row.rootId,blocks:row.blocks,
+      packageWindow:{...root.packageWindow,packageReadingVersion:2,followup:{rootJobId:row.rootId,blocks:row.blocks,
         ...(semantic?{semantic}:{}),...(discovery?{discovery}:{}),...(comparison?{comparison}:{})}}},
   },tx);
   await tx.query(`INSERT INTO harness_package_followups(root_job_id,job_id,window_id,branch,blocks,plan_key)
@@ -418,10 +428,11 @@ export async function blockedComparisonReads(tx: PoolClient, projectId: string, 
 const profileScanPlan='facade-profile-scan';
 
 async function dispatchUnseededFacadeScan(tx:PoolClient,queue:WorkQueue) {
+  // Applicability by stage is evaluated after discovery. A published fact
+  // already inspected its own line, even if it belongs to a different stage.
   const {rows}=await tx.query<FollowupTarget&{round:number;candidateBlocks:string[]}>(`SELECT j.id AS "rootId",w.id AS "windowId",w.project_id AS "projectId",
       j.generation_id AS "generationId",j.payload,targets.blocks,targets.candidates AS "candidateBlocks",coalesce(history.round,0)+1 AS round
     FROM ${activeWindows}
-    JOIN projects project ON project.id=w.project_id
     JOIN harness_package_structures s ON s.window_id=w.id
     JOIN harness_package_branches b ON b.window_id=w.id AND b.active
     JOIN gateway_jobs j ON j.id=b.job_id AND (j.state='done' OR j.state='held' AND j.reason='turn_limit_final')
@@ -461,7 +472,6 @@ async function dispatchUnseededFacadeScan(tx:PoolClient,queue:WorkQueue) {
                 WHERE stale.project_id=w.project_id AND stale.facade_id::text=item->>'id'))
               AND (
                 cue.is_type AND f.revision_status='current' AND f.revision IS NOT NULL AND f.source_role<>'unknown' AND f.basis?'role'
-                  AND (project.project_stage IS NULL OR f.design_stage IS NULL OR lower(f.design_stage)=lower(project.project_stage))
                   AND jsonb_array_length(binding.candidates)=1 AND lower(coalesce(o.payload->>'quote',''))~$2
                   AND (o.payload->>'lineId'=l.line_id OR o.payload->>'quote'=l.literal)
                 OR NOT cue.is_type AND EXISTS(SELECT 1 FROM jsonb_array_elements(d.mentions) mark
@@ -472,20 +482,14 @@ async function dispatchUnseededFacadeScan(tx:PoolClient,queue:WorkQueue) {
         ) hints
       ) selected
     ) targets ON targets.blocks IS NOT NULL
-    WHERE ${activeSource} AND m.refusal IS NULL AND j.payload#>>'{packageWindow,walkProtocol}'='1'
-      AND EXISTS(SELECT 1 FROM gateway_grants grant_row JOIN gateway_routes route
-        ON route.id=grant_row.route_id AND route.revision=grant_row.revision AND route.enabled
-        WHERE grant_row.project_id=w.project_id AND grant_row.allowed AND grant_row.purpose=j.purpose
-          AND route.id=j.payload#>>'{settings,routeId}' AND route.revision=j.payload#>>'{packageWindow,routeRevision}'
-          AND grant_row.data_class=j.payload#>>'{settings,dataClass}')
+    WHERE ${activeSource} AND m.refusal IS NULL AND j.payload#>>'{packageWindow,walkProtocol}'='1' AND ${pinnedFollowupRoute}
       AND NOT EXISTS(SELECT 1 FROM harness_package_facts f LEFT JOIN harness_facade_discovery d ON d.fact_id=f.id
         WHERE f.project_id=w.project_id AND f.window_id=w.id AND f.job_id=j.id
           AND NOT coalesce(d.resolved AND d.discovery_version=${facadeDiscoveryVersion},false))
       AND (history.job_id IS NULL OR (history.state='done' AND history.result->>'kind' IN ('covered','reviewed_no_match')
           OR history.state='held' AND history.reason='turn_limit_final') AND EXISTS (
           SELECT 1 FROM harness_package_block_checks c WHERE c.job_id=history.job_id AND c.reviewed AND history.blocks?c.block_id))
-      AND NOT EXISTS(SELECT 1 FROM gateway_attempts a WHERE a.state IN ('reserved','prepared','sending','unknown')
-        AND (a.job_id=j.id OR EXISTS(SELECT 1 FROM harness_package_followups child WHERE child.root_job_id=j.id AND child.job_id=a.job_id)))
+      AND NOT ${unsettledFollowupRoot}
       AND NOT EXISTS(SELECT 1 FROM harness_package_followups f JOIN gateway_jobs x ON x.id=f.job_id
         WHERE x.project_id=w.project_id AND x.state IN ('ready','leased'))
       AND 4>(SELECT count(*) FROM harness_package_followups f JOIN gateway_jobs x ON x.id=f.job_id WHERE x.state IN ('ready','leased'))
@@ -497,6 +501,7 @@ async function dispatchUnseededFacadeScan(tx:PoolClient,queue:WorkQueue) {
 }
 
 async function dispatchFacadeFollowup(tx:PoolClient,queue:WorkQueue) {
+  // Discovery labels come from the reader's own evidence. Pair review has its own assignment.
   const {rows}=await tx.query<FollowupTarget&{label:string;key:string}>(`WITH demand AS (
       SELECT DISTINCT fact.project_id,w.version_id,coalesce(mark->>'lookupToken',translate(lower(trim(mark->>'label')),'‐‑‒–—','-----')) AS key,
         mark->>'lookupToken' AS direction,mark->>'label' AS label,
@@ -513,12 +518,12 @@ async function dispatchFacadeFollowup(tx:PoolClient,queue:WorkQueue) {
     JOIN harness_package_branches b ON b.window_id=w.id AND b.active
     JOIN gateway_jobs j ON j.id=b.job_id AND j.state='done'
     JOIN gateway_generations g ON g.generation_id=j.generation_id AND g.current
-    JOIN demand ON demand.project_id=w.project_id AND (demand.branch=b.branch OR demand.mention_kind IN ('context','registry'))
+    JOIN demand ON demand.project_id=w.project_id AND demand.branch=b.branch
       AND (demand.version_id=w.version_id OR demand.mention_kind='reference')
     JOIN project_memory_versions v ON v.version_id=w.version_id AND v.project_id=w.project_id AND v.contract=$1 AND v.reader_version=m.reader_version
     JOIN project_memory_blocks mb ON mb.project_id=v.project_id AND mb.version_id=v.version_id AND mb.contract=v.contract
       AND mb.unit_id=w.place->>'unitId' AND mb.ordinal<v.next_ordinal AND mb.artifact_sha256 IS NOT NULL AND NOT ('native'=ANY(mb.remaining))
-    WHERE ${activeSource} AND j.payload#>>'{packageWindow,walkProtocol}'='1'
+    WHERE ${activeSource} AND j.payload#>>'{packageWindow,walkProtocol}'='1' AND ${pinnedFollowupRoute}
       AND EXISTS (SELECT 1 FROM project_memory_lines l
         CROSS JOIN LATERAL regexp_split_to_table(l.folded,'[|;·]') field
         WHERE l.block_id=mb.id AND (
@@ -541,7 +546,7 @@ async function dispatchFacadeFollowup(tx:PoolClient,queue:WorkQueue) {
       AND NOT EXISTS(SELECT 1 FROM harness_package_facts f LEFT JOIN harness_facade_discovery proof ON proof.fact_id=f.id
         WHERE f.project_id=w.project_id AND f.window_id=w.id AND f.job_id=j.id
           AND NOT coalesce(proof.resolved AND proof.discovery_version=${facadeDiscoveryVersion},false))
-      AND NOT EXISTS(SELECT 1 FROM gateway_attempts a WHERE a.job_id=j.id AND a.state IN ('reserved','prepared','sending','unknown'))
+      AND NOT ${unsettledFollowupRoot}
       AND NOT EXISTS(SELECT 1 FROM harness_package_followups f JOIN gateway_jobs x ON x.id=f.job_id
         WHERE x.project_id=w.project_id AND x.state IN ('ready','leased'))
       AND 4>(SELECT count(*) FROM harness_package_followups f JOIN gateway_jobs x ON x.id=f.job_id WHERE x.state IN ('ready','leased'))
@@ -553,6 +558,8 @@ async function dispatchFacadeFollowup(tx:PoolClient,queue:WorkQueue) {
 }
 
 async function dispatchCatalogFollowup(tx:PoolClient,queue:WorkQueue) {
+  // Terminal refusals without evidence get one retry per position in the same scope.
+  // A held assignment carries its original continuation and cannot create a sibling retry.
   const {rows:targets}=await tx.query<FollowupTarget&SemanticPlan&{scopeKey:string}>(
     `SELECT j.id AS "rootId",w.id AS "windowId",w.project_id AS "projectId",j.generation_id AS "generationId",j.payload,
       ARRAY(SELECT item->>'id' FROM jsonb_array_elements(s.blocks) item) AS blocks,
@@ -568,8 +575,9 @@ async function dispatchCatalogFollowup(tx:PoolClient,queue:WorkQueue) {
      LEFT JOIN harness_semantic_epochs epoch ON epoch.project_id=p.id
      JOIN LATERAL (
        SELECT jsonb_agg(jsonb_build_object('facadeId',next.facade_id,'positionId',next.position_id,'scopeEpoch',next.scope_epoch::text)
-         ORDER BY next.facade_id,next.position_id) AS positions FROM (
-       SELECT DISTINCT scopes.id AS facade_id,requirement->>'key' AS position_id,coalesce(scope_epoch.epoch,0) AS scope_epoch
+         ORDER BY next.facade_id,next.position_id) AS positions,bool_or(next.attempts>0) AS retry FROM (
+       SELECT DISTINCT scopes.id AS facade_id,requirement->>'key' AS position_id,coalesce(scope_epoch.epoch,0) AS scope_epoch,
+         history.attempts
        FROM jsonb_array_elements(c.requirements) requirement
        JOIN LATERAL (
          SELECT NULL::uuid AS id,'common' AS level,NULL::text AS kind
@@ -578,6 +586,16 @@ async function dispatchCatalogFollowup(tx:PoolClient,queue:WorkQueue) {
        ) scopes ON scopes.level=requirement->>'level'
        LEFT JOIN harness_semantic_scope_epochs scope_epoch ON scope_epoch.project_id=p.id
          AND scope_epoch.scope_key=coalesce(scopes.id::text,'common')
+       CROSS JOIN LATERAL (
+         SELECT count(*) AS attempts,bool_and(prior.state='done' AND prior.result->>'kind'='final_refusal'
+           AND prior.result->'evidenceIds'='[]'::jsonb) AS refused_without_evidence
+         FROM harness_package_followups assigned JOIN gateway_jobs prior ON prior.id=assigned.job_id
+         WHERE assigned.root_job_id=j.id AND assigned.plan_key LIKE 'catalog:%'
+           AND prior.payload#>'{packageWindow,followup,semantic}' @> jsonb_build_object(
+             'catalogVersionId',c.id,'stage',p.project_stage,'epoch',coalesce(epoch.epoch,0)::text,
+             'positions',jsonb_build_array(jsonb_build_object('facadeId',scopes.id,
+               'positionId',requirement->>'key','scopeEpoch',coalesce(scope_epoch.epoch,0)::text)))
+       ) history
        WHERE (lower(trim(requirement->>'applicability')) IN ('all','applicable','*','все','для всех','все фасады')
          OR lower(regexp_replace(requirement->>'applicability','^stage:[[:space:]]*','stage:'))='stage:'||lower(p.project_stage))
          AND (coalesce(jsonb_array_length(requirement->'facadeKinds'),0)=0 OR requirement->'facadeKinds'?scopes.kind)
@@ -590,23 +608,16 @@ async function dispatchCatalogFollowup(tx:PoolClient,queue:WorkQueue) {
              AND check_row.position_id=requirement->>'key' AND check_row.facade_id IS NOT DISTINCT FROM scopes.id
              AND check_row.subject IS NULL
          )
-         AND NOT EXISTS (
-           SELECT 1 FROM harness_package_followups assigned JOIN gateway_jobs prior ON prior.id=assigned.job_id
-           WHERE assigned.root_job_id=j.id AND assigned.plan_key LIKE 'catalog:%'
-             AND prior.payload#>'{packageWindow,followup,semantic}' @> jsonb_build_object(
-               'catalogVersionId',c.id,'stage',p.project_stage,'epoch',coalesce(epoch.epoch,0)::text,
-               'positions',jsonb_build_array(jsonb_build_object('facadeId',scopes.id,
-                 'positionId',requirement->>'key','scopeEpoch',coalesce(scope_epoch.epoch,0)::text)))
-         )
-       ORDER BY facade_id,position_id LIMIT 3
+         AND (history.attempts=0 OR history.attempts=1 AND history.refused_without_evidence)
+       ORDER BY history.attempts,facade_id,position_id LIMIT 3
        ) next
      ) missing ON missing.positions IS NOT NULL
-     JOIN LATERAL(SELECT md5(missing.positions::text) AS "scopeKey") plan ON true
-     WHERE ${activeSource} AND j.payload#>>'{packageWindow,walkProtocol}'='1'
+     JOIN LATERAL(SELECT md5(missing.positions::text)||CASE WHEN missing.retry THEN ':retry' ELSE '' END AS "scopeKey") plan ON true
+     WHERE ${activeSource} AND j.payload#>>'{packageWindow,walkProtocol}'='1' AND ${pinnedFollowupRoute}
        AND (NOT p.intake_mode OR c.default_stage=p.project_stage AND c.default_facade_kinds=p.confirmed_facade_kinds)
        AND NOT EXISTS(SELECT 1 FROM harness_package_followups f WHERE f.root_job_id=j.id AND
          f.plan_key='catalog:'||c.id::text||':'||p.project_stage||':'||coalesce(epoch.epoch,0)::text||':'||plan."scopeKey")
-       AND NOT EXISTS(SELECT 1 FROM gateway_attempts a WHERE a.job_id=j.id AND a.state IN ('reserved','prepared','sending','unknown'))
+       AND NOT ${unsettledFollowupRoot}
        AND NOT EXISTS (SELECT 1 FROM harness_package_followups f JOIN gateway_jobs x ON x.id=f.job_id
          WHERE x.project_id=w.project_id AND x.state IN ('ready','leased'))
        AND 4>(SELECT count(*) FROM harness_package_followups f JOIN gateway_jobs x ON x.id=f.job_id WHERE x.state IN ('ready','leased'))
