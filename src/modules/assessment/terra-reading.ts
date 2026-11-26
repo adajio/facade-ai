@@ -1,5 +1,6 @@
-import type { PoolClient } from 'pg';
+import type { Pool, PoolClient } from 'pg';
 import { inventoryOpen } from '../intake/receipts.js';
+import { readDirectedReadingPlan, type DirectedReading } from '../harness/directed-reading.js';
 import { loadResearchProfile } from '../harness/profile.js';
 
 const model = 'gpt-6.1-terra';
@@ -19,7 +20,7 @@ const visibleReadingWindow = `(EXISTS (SELECT 1 FROM intake_package_preparation_
        OR (job.payload#>>'{packageWindow,preparationId}' IS NULL AND EXISTS (
          SELECT 1 FROM intake_reader_jobs ij WHERE ij.project_id=w.project_id AND ij.version_id=w.version_id AND ij.receipt_id=$2)))))`;
 /** The overview is a bounded, read-only view of the newest intake. */
-export async function readTerraReading(tx: PoolClient, projectId: string) {
+export async function readTerraReading(tx: PoolClient, projectId: string, planBackground?: Pool) {
   const profile = loadResearchProfile();
   let configured: { B?: unknown; lead?: unknown } | null = null;
   try { configured = JSON.parse(process.env.FACADE_HARNESS_PROFILE ?? 'null'); } catch { /* disabled */ }
@@ -85,9 +86,12 @@ export async function readTerraReading(tx: PoolClient, projectId: string) {
        AND (r.preparation_id IS NULL OR EXISTS (SELECT 1 FROM intake_package_preparation_current cur
          WHERE cur.project_id=r.project_id AND cur.receipt_id=r.receipt_id AND cur.manifest_id=r.preparation_id))
      GROUP BY r.id ORDER BY r.created_at DESC,r.id DESC LIMIT 1`, [projectId, receipt.receiptId, model]);
+  const {windowIds: directedWindows,receiptId: planReceiptId,preparationId:_preparation,requirementsByWindow:_goals,...directed} = await readDirectedReadingPlan(tx,projectId,planBackground);
+  const applicableWindows = planReceiptId===receipt.receiptId ? directedWindows : [];
   const { rows: [progress] } = await tx.query<{
     totalWindows: number; mappedVersions: number; completed: number; covered: number; partial: number; noMatch: number;
     refused: number; held: number; reading: number; queued: number; unassigned: number; heldReasons: unknown; observations: number;
+    directed: Omit<DirectedReading, 'windowIds' | 'receiptId' | 'preparationId' | 'requirementsByWindow'> & { pendingTargets: number };
   }>(`WITH accepted AS (SELECT DISTINCT version_id FROM intake_occurrences
        WHERE project_id=$1 AND receipt_id=$2 AND state='accepted'), maps AS (
        SELECT m.version_id,m.fingerprint FROM harness_package_maps m JOIN accepted a ON a.version_id=m.version_id
@@ -113,7 +117,11 @@ export async function readTerraReading(tx: PoolClient, projectId: string) {
        count(*) FILTER (WHERE state='ready')::int AS queued,
        ((SELECT count(*) FROM windows) - count(*))::int AS unassigned,
        coalesce((SELECT jsonb_agg(jsonb_build_object('reason',reason,'count',count)) FROM reasons),'[]'::jsonb) AS "heldReasons",
-       (SELECT count FROM observations) AS observations FROM jobs`, [projectId, receipt.receiptId, model, route]);
+       (SELECT count FROM observations) AS observations,
+       $5::jsonb || jsonb_build_object('pendingTargets',(
+          SELECT count(*)::int FROM windows w WHERE w.id=ANY($6::uuid[])
+            AND NOT EXISTS (SELECT 1 FROM jobs assigned WHERE assigned.id=w.id)
+       )) AS directed FROM jobs`, [projectId, receipt.receiptId, model, route, JSON.stringify(directed),applicableWindows]);
   const { rows: activity } = await tx.query(`WITH accepted AS (
        SELECT DISTINCT ON (o.version_id) o.version_id,v.document_id,o.relative_path AS label
        FROM intake_occurrences o JOIN intake_document_versions v ON v.id=o.version_id AND v.project_id=o.project_id

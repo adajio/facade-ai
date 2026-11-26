@@ -8,6 +8,7 @@ import { currentPackagePrimary, currentPackageSource as currentSource, currentPa
 import { hash, transaction } from '../gateway/types.js';
 import type { ResearchAdmission } from '../gateway/gateway.js';
 import { lockIntakeProject } from '../intake/gate.js';
+import { dwgPredecessor, pinnedDwgPredecessorSql } from '../intake/dwg-predecessor.js';
 import type { Branch, Place, PrimaryJob } from './contracts.js';
 import { buildMap, jobFields, originalJoins, type IntakeJob } from './dispatch.js';
 import type { ResearchProfile } from './profile.js';
@@ -19,6 +20,7 @@ import { researchKind } from './runner.js';
 import { memoryVersion } from '../project-memory/contracts.js';
 import { profileHintLines,profileHintPatterns } from './facade-profile-hints.js';
 import { dxfEncodingRecoveryVersion, dxfGroupRecoveryVersion, dxfRecoveryVersionPatterns, legacyDxfEncodingHold, legacyDxfGroupHold } from '../formats/dwg-profile.js';
+import { readDirectedReadingPlans, currentDirectedWindow } from './directed-reading.js';
 import { largeJpegRecoveryVersion, rasterDimensionLimit } from '../formats/raster-profile.js';
 
 const branches = ['A', 'B'] as const;
@@ -61,14 +63,16 @@ export async function preparePackageMap(
      WHERE ${enabledProject('$1')}`, [[...packageProjects]]);
   const versions = await Promise.all(formats.map(async (input) => {
     const version = await service.readerVersion(service.formatFor(input.media, input.extension ?? ''));
+    const predecessor = dwgPredecessor(version);
     return { ...input, version, recovery: dxfGroupRecoveryVersion(version),
-      encoding_recovery: dxfEncodingRecoveryVersion(version),
+      encoding_recovery: dxfEncodingRecoveryVersion(version),predecessor_versions:predecessor.versions,predecessor_before:predecessor.before,
       raster_recovery: largeJpegRecoveryVersion(version,input.media,input.extension ?? '') };
   }));
   const { rows: [job] } = await db.query<IntakeJob & { requested: string | null; baseVersion: string | null; rasterRecovery: string | null }>(
     `SELECT ${jobFields}, effective.version AS requested,expected.version AS "baseVersion",expected.raster_recovery AS "rasterRecovery"
        FROM intake_reader_jobs j ${originalJoins} ${packageSources}
-     JOIN jsonb_to_recordset($1::jsonb) AS expected(media text,extension text,version text,recovery text,encoding_recovery text,raster_recovery text)
+     JOIN jsonb_to_recordset($1::jsonb) AS expected(media text,extension text,version text,recovery text,encoding_recovery text,
+       raster_recovery text,predecessor_versions text[],predecessor_before timestamptz)
        ON expected.media=v.media_type AND expected.extension IS NOT DISTINCT FROM source.extension
      LEFT JOIN harness_package_maps m ON m.version_id=j.version_id AND m.active
      LEFT JOIN reader_maps old_dwg ON old_dwg.project_id=j.project_id AND old_dwg.document_id=j.document_id
@@ -89,6 +93,7 @@ export async function preparePackageMap(
          AND old_dwg.units#>'{0,locator,dxfEncoding}' IS NULL THEN expected.encoding_recovery
        ELSE expected.version END AS version) effective
      WHERE ${enabledProject('$2')}
+       AND NOT COALESCE(${pinnedDwgPredecessorSql('m','expected.predecessor_versions','expected.predecessor_before')},false)
        AND (m.version_id IS NULL OR m.requested_reader_version IS DISTINCT FROM effective.version
          OR m.physical_basis_id IS NULL AND m.physical_limitation IS NULL)
        AND NOT EXISTS (SELECT 1 FROM harness_package_map_retries r WHERE r.version_id=j.version_id AND r.retry_at>clock_timestamp())
@@ -187,6 +192,7 @@ export async function dispatchPackagePair(db: Pool, queue: WorkQueue, profile: R
       return { branch, settings, revision, profileHash: hash([readingContract, settings, revision]) };
     });
     const profileHash = hash(pinned.map((entry) => entry.profileHash));
+    const requiresOverview = pinned.some(({settings})=>settings.model==='gpt-6.1-terra');
     const outdated = await tx.query<{ project_id: string }>(
       'SELECT project_id FROM harness_package_projects WHERE profile_hash IS DISTINCT FROM $1 ORDER BY project_id LIMIT 1',
       [profileHash]);
@@ -215,15 +221,19 @@ export async function dispatchPackagePair(db: Pool, queue: WorkQueue, profile: R
          AND (SELECT count(*) FROM ${runnablePackagePrimary} AND w.project_id=target.project_id)<$2
        ORDER BY p.last_turn,p.project_id,target.request_cursor,target.id LIMIT 1`,
       [packageResumeWaitingSlot, packagePrimaryProjectLimit]);
+    const directedPlans = await readDirectedReadingPlans(tx,requiresOverview,db);
     const { rows: [next] } = await tx.query<{
       projectId: string; generationId: string; windowId: string; place: Place; readerVersion: string; walkDefault: boolean;
-      lastTurn: string; firstAssignment: boolean; firstLook: Branch[]; available: Branch[]; inspectionLines: string[];
+      lastTurn: string; directedReceiptId: string | null; firstAssignment: boolean; firstLook: Branch[]; available: Branch[]; inspectionLines: string[];
     }>(
       `SELECT p.project_id AS "projectId",p.generation_id AS "generationId",p.last_turn AS "lastTurn",candidate.*,
-        (project.intake_mode AND project.package_walk_default) AS "walkDefault"
+        (project.intake_mode AND project.package_walk_default) AS "walkDefault",
+        CASE WHEN directed.mode<>'ordinary' THEN directed."receiptId" END AS "directedReceiptId"
        FROM harness_package_projects p
        JOIN projects project ON project.id=p.project_id
        JOIN gateway_generations generation ON generation.generation_id=p.generation_id AND generation.current
+       LEFT JOIN jsonb_to_recordset($12::jsonb) AS directed("projectId" uuid,mode text,"receiptId" uuid,"windowIds" uuid[],"requirementsByWindow" jsonb)
+         ON directed."projectId"=p.project_id
        JOIN LATERAL (
          SELECT ARRAY(
            SELECT profile.branch FROM jsonb_to_recordset($3::jsonb) AS profile(branch text,route text,class text,revision text)
@@ -262,6 +272,7 @@ export async function dispatchPackagePair(db: Pool, queue: WorkQueue, profile: R
            CROSS JOIN LATERAL (SELECT config.walk AND NOT coalesce(progress.opened,false) AS unopened,
              config.walk AND progress.branch IS NULL AS fresh) status
            WHERE w.project_id=p.project_id AND (m.refusal IS NULL OR m.refusal='physical_inventory_unverified') AND ${currentSource} AND ${preparedPackageWindow}
+             AND ((coalesce(directed.mode,'ordinary')='ordinary' AND NOT $11::boolean) OR w.id=ANY(directed."windowIds"))
              AND NOT EXISTS (
                SELECT 1 FROM harness_package_branches b WHERE b.window_id=w.id AND b.branch=requested.branch AND b.active
                  AND (b.job_id IS NOT NULL OR EXISTS (SELECT 1 FROM gateway_attempts a WHERE a.job_id=b.blocker_job_id
@@ -278,13 +289,14 @@ export async function dispatchPackagePair(db: Pool, queue: WorkQueue, profile: R
          JOIN (SELECT o.version_id,min(o.created_at) AS accepted_at FROM intake_occurrences o
            WHERE o.project_id=p.project_id AND o.state='accepted' GROUP BY o.version_id) original
            ON original.version_id=pending.version_id
-         ORDER BY pending.fresh DESC,(coalesce(cardinality(hints.line_ids),0)>0) DESC,
+         ORDER BY array_position(directed."windowIds",pending.id) NULLS LAST,
+           pending.fresh DESC,(coalesce(cardinality(hints.line_ids),0)>0) DESC,
            CASE WHEN pending.fresh THEN original.accepted_at END,pending.version_id,pending.ordinal LIMIT 1
        ) candidate ON true
        ORDER BY p.last_turn,p.project_id LIMIT 1`,
       [packagePrimaryProjectLimit, packagePrimaryGlobalLimit-count, JSON.stringify(pinned.map(({branch,settings,revision})=>({
         branch,route:settings.routeId,class:settings.dataClass,revision,
-      }))), walkOverride??null,memoryVersion,...profileHintPatterns]);
+      }))), walkOverride??null,memoryVersion,...profileHintPatterns,requiresOverview,JSON.stringify(directedPlans)]);
     const sameProject = waiting && next && waiting.projectId === next.projectId;
     // A first assignment can take one slot ahead of a waiting continuation.
     // Persist the alternation via queue events, including across worker restarts.
@@ -300,12 +312,13 @@ export async function dispatchPackagePair(db: Pool, queue: WorkQueue, profile: R
     // Hashing and storage access happen before the global scheduling lock. Revalidate all
     // mutable admission facts after acquiring it.
     const preflight = next && reader ? await preflightPackageWindow(tx,reader,next.projectId,next.windowId) : [];
+    const applicablePreflight = next?.directedReceiptId ? preflight.filter(item=>item.receiptId===next.directedReceiptId) : preflight;
     await lockPackagePrimarySlots(tx);
     if (resumeFirst && await queue.resume(waiting.id, waiting.reason ? [waiting.reason] : undefined, tx)) {
       await tx.query("UPDATE harness_package_projects SET last_turn=nextval('harness_package_turn') WHERE project_id=$1", [waiting.projectId]);
       return true;
     }
-    if (!next || (reader && !preflight.length)) return false;
+    if (!next || (reader && !applicablePreflight.length)) return false;
     const { rows: [slots] } = await tx.query<{ total: number; project: number }>(
       `SELECT count(*)::int AS total,count(*) FILTER (WHERE w.project_id=$1)::int AS project FROM ${runnablePackagePrimary}`, [next.projectId]);
     const availableSlots = Math.min(packagePrimaryGlobalLimit-slots.total,packagePrimaryProjectLimit-slots.project);
@@ -316,7 +329,10 @@ export async function dispatchPackagePair(db: Pool, queue: WorkQueue, profile: R
       WHERE w.project_id=$1 AND w.id=$2 AND p.generation_id=$3 AND m.reader_version=$4 AND (m.refusal IS NULL OR m.refusal='physical_inventory_unverified') AND ${currentSource}`,
       [next.projectId,next.windowId,next.generationId,next.readerVersion]);
     if (!stillCurrent.rowCount) return false;
-    const preparationId = reader ? await preparedManifestForWindow(tx, next.projectId, next.windowId, preflight) : undefined;
+    const directed = await currentDirectedWindow(tx,next.projectId,next.windowId,requiresOverview,next.directedReceiptId,db);
+    if (!directed.allowed) return false;
+    const preparationId = reader ? await preparedManifestForWindow(tx, next.projectId, next.windowId, applicablePreflight) : directed.preparationId;
+    if (directed.preparationId && preparationId!==directed.preparationId) return false;
     if (reader && !preparationId) return false;
     // A blocked sibling can be issued later, after a worker's option changes.
     const { rows: [{ walkPinned }] } = await tx.query<{ walkPinned: boolean | null }>(
@@ -356,6 +372,7 @@ export async function dispatchPackagePair(db: Pool, queue: WorkQueue, profile: R
         const payload: PrimaryJob = { mode: 'primary', branch, settings, place: next.place, observationProtocol: 2,
           packageWindow: { id: next.windowId, readerVersion: next.readerVersion, routeRevision: revision, packageReadingVersion: 2,
             ...(preparationId ? {preparationId} : {}),
+            ...(directed.requirements?.length ? {directedRequirements:directed.requirements} : {}),
             ...(walk ? { walkProtocol: 1 as const,profileInspection:{lineIds:next.inspectionLines} } : {}) } };
         jobId = await queue.enqueue({ ...ref, key: 'package:' + key + ':' + branch, kind: researchKind,
           ...(walk&&next.firstAssignment&&next.firstLook.includes(branch)?{priority:next.inspectionLines.length?2:1}:{}),

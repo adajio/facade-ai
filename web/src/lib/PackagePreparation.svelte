@@ -7,6 +7,7 @@
   type Item = { occurrenceId: string | null; documentId: string | null; versionId: string | null; label: string;
     state: 'waiting' | 'available' | 'unavailable' | 'excluded'; reason: string | null;
     kind: 'document' | 'archive' | 'technical' | 'import_entry'; derivativeAvailable: boolean; limitations?: string[]; readableParts?: number;
+    drawingPdf?: { occurrenceId: string; documentId: string; versionId: string; label: string };
     relatedPdf?: { occurrenceId: string; documentId: string; versionId: string; label: string } };
   type Preparation = { projectId: string; receiptId: string; state: 'waiting' | 'ready'; manifestId: string | null; revision: number | null;
     counts: { total: number; available: number; unavailable: number; waiting: number; archives: number; technical: number; restrictions: number }; items: Item[];
@@ -93,6 +94,13 @@
           {#if item.documentId && item.versionId}
             · <a href={originalUrl(item.documentId, item.versionId)} target="_blank" rel="noopener noreferrer">Открыть оригинал</a>
             {#if item.occurrenceId} · <a href={card(item)}>Карточка документа</a>{/if}
+          {/if}
+          {#if item.drawingPdf}
+            <p>В той же папке доступен <a href={card(item.drawingPdf)}>PDF с тем же именем · {item.drawingPdf.label}</a>. По нему можно сверить видимые листы. Для проверки объектов и слоёв нужен читаемый чертёж.</p>
+          {:else if /\.bak$/iu.test(item.label)}
+            <p>Резервная копия сохранена. Для использования в проекте подтвердите актуальную редакцию и приложите её как исходный документ.</p>
+          {:else if item.kind === 'document' && /\.(?:dwg|dxf)$/iu.test(item.label)}
+            <p>Для сверки запросите повторный экспорт чертежа или PDF этой редакции.</p>
           {/if}
         </li>
       {/each}</ul>

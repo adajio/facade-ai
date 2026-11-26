@@ -94,8 +94,8 @@ function registerRoutes(app: FastifyInstance, prefix: string, reader: () => Retu
       const input = await packagePreparationInput(tx, { projectId, receiptId }, reader());
       const preparation = await readPackagePreparation(tx, input);
       await touchSession(tx, session);
-      const items = preparation.items.map(({occurrenceId,documentId,versionId,label,state,kind,reason,derivativeAvailable,format,readerVersion,limitations,windowIds,relatedPdf}) =>
-        ({occurrenceId,documentId,versionId,label,state,kind,reason,derivativeAvailable,format,readerVersion,limitations,relatedPdf,readableParts:windowIds?.length ?? 0}));
+      const items = preparation.items.map(({occurrenceId,documentId,versionId,label,state,kind,reason,derivativeAvailable,format,readerVersion,limitations,windowIds,relatedPdf,drawingPdf}) =>
+        ({occurrenceId,documentId,versionId,label,state,kind,reason,derivativeAvailable,format,readerVersion,limitations,relatedPdf,drawingPdf,readableParts:windowIds?.length ?? 0}));
       return { projectId, receiptId, state: preparation.state, manifestId: preparation.manifestId,
         revision: preparation.revision, counts: preparation.counts, reasons: preparation.reasons,
         restrictions: preparation.restrictions.map(({label,reason,sourceId}) => ({label,reason,sourceId})), items };
@@ -144,7 +144,7 @@ function registerRoutes(app: FastifyInstance, prefix: string, reader: () => Retu
     return transaction(db, async (tx) => {
       const session = await readSession(tx, request);
       await authorize(tx, session, { action: "project:read", projectId });
-      const result = await readTerraReading(tx, projectId);
+      const result = await readTerraReading(tx, projectId, db);
       await touchSession(tx, session);
       return result;
     });

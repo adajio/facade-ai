@@ -14,9 +14,9 @@ export function measureRequest(request) {
     estimatedInputTokens:promptBytes + profileOverheadTokens,maxInputTokens,maxRequestBytes};
 }
 
-export function remainingRequestBytes({requestBytes,estimatedInputTokens}) {
+export function remainingRequestBytes({requestBytes,estimatedInputTokens,maxRequestBytes:limit=maxRequestBytes}) {
   // More JSON inside the user message adds the same escaped UTF-8 bytes to stdin and the CLI prompt.
-  return Math.min(maxRequestBytes - requestBytes, maxInputTokens - estimatedInputTokens);
+  return Math.min(Math.min(limit,maxRequestBytes) - requestBytes, maxInputTokens - estimatedInputTokens);
 }
 
 export function messageEntryBytes(value) {
@@ -122,4 +122,37 @@ export function prioritizeEvidence(items, requirements, describe) {
     });
   }
   return [...selected];
+}
+
+// Keep the model-facing catalog legible while sharing repeated lists and repeated
+// subject/role alternatives. The persisted and validated catalog stays canonical.
+export function compactCatalog(requirements) {
+  const fields = ['aliases','formats','equivalents','sourceRoles'];
+  const lists = [];
+  const entries = requirements.map(requirement => {
+    const row = {...requirement};
+    for (const field of fields) {
+      if (!Array.isArray(row[field])) continue;
+      const list = row[field];
+      if (!list.length) { delete row[field]; continue; }
+      const index = lists.findIndex(entry=>JSON.stringify(entry)===JSON.stringify(list));
+      if (index === -1) row[field] = lists.push(list);
+      else row[field] = index+1;
+    }
+    if (Array.isArray(row.evidenceRule?.allOf) && Object.keys(row.evidenceRule).length===1 &&
+        row.evidenceRule.allOf.every(group=>Array.isArray(group?.anyOf) && Object.keys(group).length===1 &&
+          group.anyOf.every(option=>option && Object.keys(option).every(key=>['mode','subject','sourceRole'].includes(key))))) {
+      row.evidenceRule = row.evidenceRule.allOf.map(({anyOf}) => {
+        const options = new Map();
+        for (const {mode,subject,sourceRole} of anyOf) {
+          const key = JSON.stringify([mode,subject]);
+          if (!options.has(key)) options.set(key,[subject ?? null,mode,[]]);
+          options.get(key)[2].push(sourceRole);
+        }
+        return [...options.values()];
+      });
+    }
+    return row;
+  });
+  return {requirements:entries,catalogLists:lists};
 }

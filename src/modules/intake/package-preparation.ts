@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto';
 import type { PoolClient } from 'pg';
+import { deriveDrawingAlternatives } from './drawing-alternatives.js';
 import { archiveFormat } from '../imports/policy.js';
 import { isThumbsDbName, thumbnailCacheUnits, windowsThumbnailCache } from '../formats/windows-thumbnail-cache.js';
 import { lockIntakeProject } from './gate.js';
@@ -14,7 +15,7 @@ export type PreparationItem = { occurrenceId: string | null; documentId: string 
   kind: 'document' | 'archive' | 'technical' | 'import_entry'; derivativeAvailable: boolean;
   originalId?: string; originalSha256?: string; readerVersion?: string | null; requestedReaderVersion?: string | null;
   mapFingerprint?: string; windowIds?: string[]; format?: string; limitations?: string[]; derivative?: DerivativeProof & { format: string };
-  relatedPdf?: RelatedPdf };
+  relatedPdf?: RelatedPdf; drawingPdf?: RelatedPdf };
 export type PreparationCounts = { total: number; available: number; unavailable: number; waiting: number;
   archives: number; technical: number; restrictions: number };
 export type PreparationManifest = { projectId: string; receiptId: string; counts: PreparationCounts;
@@ -209,7 +210,7 @@ async function evaluate(tx: PoolClient, input: PreparationInput) {
   const manifest: PreparationManifest = { projectId, receiptId, counts, items, restrictions };
   const reasons = [...(receipt.open ? ['inventory_open'] : []), ...(counts.waiting ? ['documents_pending'] : [])];
   const hash = createHash('sha256').update(JSON.stringify(manifest)).digest('hex');
-  return { manifest, reasons, hash };
+  return { manifest, reasons, hash, parents: new Map(rows.map(row => [row.occurrenceId,row.parentId])) };
 }
 
 /** Read-only projection; no old manifest is advertised while current input differs. */
@@ -219,8 +220,15 @@ export async function readPackagePreparation(tx: PoolClient, input: PreparationI
     `SELECT p.id,p.revision,p.snapshot_hash AS hash FROM intake_package_preparation_current c
      JOIN intake_package_preparations p ON p.id=c.manifest_id WHERE c.project_id=$1 AND c.receipt_id=$2`, [input.projectId,input.receiptId]);
   const matches = !result.reasons.length && current?.hash === result.hash;
+  const byOccurrence = new Map(result.manifest.items.map(item => [item.occurrenceId,item]));
+  const alternative = new Map(deriveDrawingAlternatives(result.manifest.items,result.parents)
+    .map(pair => [pair.originalOccurrenceId,byOccurrence.get(pair.availableOccurrenceId)!]));
+  const items = result.manifest.items.map(item => {
+    const pdf = item.occurrenceId && alternative.get(item.occurrenceId);
+    return pdf ? {...item,drawingPdf:{occurrenceId:pdf.occurrenceId!,documentId:pdf.documentId!,versionId:pdf.versionId!,label:pdf.label}} : item;
+  });
   return { state: result.reasons.length ? 'waiting' : 'ready', manifestId: matches ? current.id : null,
-    revision: matches ? current.revision : null, ...result.manifest, reasons: result.reasons };
+    revision: matches ? current.revision : null, ...result.manifest, items, reasons: result.reasons };
 }
 
 /** Call inside a transaction and repeat immediately before new admissions under the same lock. */

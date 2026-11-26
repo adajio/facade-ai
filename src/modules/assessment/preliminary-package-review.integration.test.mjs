@@ -147,6 +147,45 @@ test('preliminary review publication and receipt-scoped reading progress', { ski
     assert.equal(delta.rows[0].addedSources[0].limitation,'Выноска обрезана');
     assert.deepEqual(delta.letter,{changed:true,added:['Уточните узел'],removed:['Черновик']});
     assert.equal(listing.items.find(r=>r.id===report.id).changes.baselineId,null);
+    const [nextReceipt,nextOriginal,nextDocument,nextVersion,nextOccurrence] = Array.from({length:5},randomUUID);
+    const nextHash = 'b'.repeat(64);
+    await db.query("INSERT INTO intake_receipts(id,project_id,source,created_by,sealed_at) VALUES($1,$2,'upload',$3,now())",
+      [nextReceipt,project,user]);
+    await db.query('INSERT INTO intake_originals(id,project_id,object_key,size,sha256) VALUES($1,$2,$3,1,$4)',
+      [nextOriginal,project,nextOriginal,nextHash]);
+    await db.query('INSERT INTO intake_documents(id,project_id) VALUES($1,$2)',[nextDocument,project]);
+    await db.query("INSERT INTO intake_document_versions(id,project_id,document_id,original_id,media_type) VALUES($1,$2,$3,$4,'application/pdf')",
+      [nextVersion,project,nextDocument,nextOriginal]);
+    await db.query("INSERT INTO intake_occurrences(id,project_id,receipt_id,relative_path,declared_media_type,version_id,state) VALUES($1,$2,$3,'reply.pdf','application/pdf',$4,'accepted')",
+      [nextOccurrence,project,nextReceipt,nextVersion]);
+    const nextCitation = {versionId:nextVersion,originalSha256:nextHash,anchor:'стр. 1',quote:'Ответ на запрос №7: цвет RAL 7035'};
+    const response = {state:'received',finding:'Адресный ответ заказчика получен.',sources:[nextCitation]};
+    const property = {key:'gloss',label:'Блеск покрытия',status:'not_mentioned',finding:'В ответе указан цвет.',
+      sources:[],response,letter:{kind:'ask',text:'Уточните блеск покрытия.'}};
+    const nextRow = {...input.rows[0],status:'partial',finding:'В ответе требуется уточнить свойство.',
+      sources:[nextCitation],analysis:{applicability:{kind:'included',reason:'Узел входит в запрос.',sources:[]},properties:[property],tensions:[]}};
+    const nextInput = {...input,receiptId:nextReceipt,inventory:[{versionId:nextVersion,originalSha256:nextHash}],
+      rows:[nextRow],draftText:'Этот переданный извне текст не используется.'};
+    await assert.rejects(publishPreliminaryPackageReview(db,{...nextInput,rows:[{...nextRow,
+      analysis:{...nextRow.analysis,properties:[{...property,response:{...response,sources:[]}}]}}]}));
+    const nextReport = await publishPreliminaryPackageReview(db,nextInput);
+    assert.deepEqual(await publishPreliminaryPackageReview(db,nextInput),nextReport);
+    const nextListing = await readPreliminaryPackageReviews(db,project);
+    const current = nextListing.items.find(row => row.id === nextReport.id);
+    assert.equal(current.isCurrent,true);
+    assert.equal(current.changes.baselineId,newer.id);
+    assert.equal(current.changes.baselineReceiptId,receipt);
+    assert.equal(current.changes.baselineScope,'previous_receipt');
+    assert.equal(current.changes.rows[0].analysisChanged,true);
+    assert.equal(current.changes.rows[0].removedSources[0].versionId,version);
+    assert.equal(current.rows[0].sources.length,1);
+    assert.equal(current.rows[0].sources[0].versionId,nextVersion);
+    assert.equal(current.rows[0].analysis.properties[0].response.sources[0].documentId,nextDocument);
+    assert.equal(current.draftText,'Document — Блеск покрытия. Уточните блеск покрытия.');
+    assert.equal(current.changes.letter.removed[0],revision.draftText);
+    await db.query('DELETE FROM preliminary_package_reviews WHERE id=$1',[nextReport.id]);
+    await db.query('DELETE FROM intake_occurrences WHERE id=$1',[nextOccurrence]);
+    await db.query('DELETE FROM intake_receipts WHERE id=$1',[nextReceipt]);
     await db.query('DELETE FROM preliminary_package_reviews WHERE id=$1',[newer.id]);
     const [zipVersion,docxVersion,xmlVersion,zipOcc,docxOcc,xmlOcc] = Array.from({length:6}, randomUUID);
     for (const id of [zipVersion,docxVersion,xmlVersion]) await db.query("INSERT INTO intake_document_versions(id,project_id,document_id,original_id,media_type) VALUES($1,$2,$3,$4,'application/octet-stream')", [id,project,document,original]);

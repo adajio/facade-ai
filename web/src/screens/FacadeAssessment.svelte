@@ -4,6 +4,7 @@
   import { tick, untrack } from 'svelte';
   import TriageBar from '../lib/TriageBar.svelte';
   import PreliminaryStatusBadge from '../lib/PreliminaryStatusBadge.svelte';
+  import PreliminaryRequirementAnalysis from '../lib/PreliminaryRequirementAnalysis.svelte';
   import PreliminaryRowChange from '../lib/PreliminaryRowChange.svelte';
   import PreliminarySources from '../lib/PreliminarySources.svelte';
   import type { PreliminaryStatus, PreliminaryReview } from '../lib/preliminary-review';
@@ -430,6 +431,7 @@
           {#if reportRow.sources.length}
             <PreliminarySources sources={reportRow.sources} label="Основания вывода" />
           {:else}<p>В разборе нет ссылки на конкретный лист. <a href={receiptLink(preliminary!.receiptId)}>Открыть опись поступления</a></p>{/if}
+          <PreliminaryRequirementAnalysis analysis={reportRow.analysis} retained={reportRow.retained} />
           <PreliminaryRowChange row={reportRow} changes={preliminary?.changes} />
         {:else}
           <p>{machineResult(active)}</p>

@@ -147,12 +147,12 @@ test("reader and package dispatcher recover only historical DXF framing and enco
   const bytes=Buffer.from(dxf("MTEXT","Прочитано","\r\n"));
   const derivative=sha(bytes);
   const usable=[{id:"part-1",label:"Part",locator:{derivativeSha256:derivative,coverage:"addressable"}}];
-  async function durable(source) {
+  async function durable(source, identity=converter) {
     const key=join("dwg-derivatives",source.projectId,source.documentId,source.versionId,derivative);
     const path=join(scratch,key);
     await mkdir(join(path,".."),{recursive:true});
     await writeFile(path,bytes);
-    return {storageKey:key,sha256:derivative,size:bytes.length,format:"dxf",converter};
+    return {storageKey:key,sha256:derivative,size:bytes.length,format:"dxf",converter:identity};
   }
   async function fixture(name, units, healthy=false) {
     const [original,documentId,versionId]=Array.from({length:3},randomUUID);
@@ -166,6 +166,7 @@ test("reader and package dispatcher recover only historical DXF framing and enco
     await db.query("INSERT INTO intake_document_versions(id,project_id,document_id,original_id,media_type) VALUES($1,$2,$3,$4,'application/acad')",[versionId,projectId,documentId,original]);
     await db.query("INSERT INTO intake_occurrences(project_id,receipt_id,relative_path,declared_media_type,version_id,state) VALUES($1,$2,$3,'application/acad',$4,'accepted')",[projectId,receiptId,relativePath,versionId]);
     await db.query("INSERT INTO intake_reader_jobs(project_id,receipt_id,document_id,version_id,original_id) VALUES($1,$2,$3,$4,$5)",[projectId,receiptId,documentId,versionId,original]);
+    if (!units) return source;
     await db.query(`INSERT INTO reader_maps(project_id,document_id,version_id,reader_version,receipt_id,original_sha256,format,units)
       VALUES($1,$2,$3,$4,$5,$6,'dwg',$7)`,[projectId,documentId,versionId,readerVersion,receiptId,originalSha,JSON.stringify(units)]);
     await db.query(`INSERT INTO harness_package_maps(project_id,version_id,fingerprint,reader_version,requested_reader_version,format,physical_limitation)
@@ -227,4 +228,53 @@ test("reader and package dispatcher recover only historical DXF framing and enco
   assert.equal(input.expectedReaderVersions[healthy.versionId],readerVersion);
   assert.equal(input.verifiedDerivatives[recoverable.versionId].derivativeSha256,derivative);
   assert.equal(input.verifiedDerivatives[repairEncoding.versionId].derivativeSha256,derivative);
+
+  await t.test("one admitted predecessor retains old successes and holds and sends new versions to the new converter",async()=>{
+    const [{capturePackagePreparation,readPackagePreparation},{transaction}]=await Promise.all([
+      load("intake/package-preparation.js"),load("gateway/types.js"),
+    ]);
+    const old=await transaction(db,tx=>capturePackagePreparation(tx,input));
+    assert.equal(old.state,"ready");
+    const backup=process.env.FACADE_DWG_PREDECESSOR_ID, backupTime=process.env.FACADE_DWG_PREDECESSOR_BEFORE;
+    try {
+      process.env.FACADE_DWG_PREDECESSOR_ID=converter;
+      process.env.FACADE_DWG_PREDECESSOR_BEFORE=(await db.query("SELECT clock_timestamp() AS ts")).rows[0].ts.toISOString();
+      const nextConverter=`sha256:${"d".repeat(64)}`;
+      const nextVersion=readerVersion.replace(converter,nextConverter);
+      const readCalls=[];
+      const nextService=createReaderService(db,deps,[{
+        format:"dwg",version:async()=>nextVersion,
+        async inspect(_path,source){ readCalls.push(source.versionId);return usable; },
+        async durableInfo(source){ return durable(source,nextConverter); },
+      }]);
+      const nextReader={...nextService,formatFor:()=>"dwg"};
+      const view=()=>transaction(db,async tx=>readPackagePreparation(tx,await packagePreparationInput(tx,{projectId,receiptId},nextReader)));
+      const archived=await view();
+      assert.equal(archived.manifestId,old.manifestId);
+      assert.equal(archived.items.find(item=>item.versionId===healthy.versionId).state,"available");
+      assert.equal(archived.items.find(item=>item.versionId===invalidEncoding.versionId).reason,"text_encoding_unconfirmed");
+      assert.equal((await nextService.map(healthy)).readerVersion,readerVersion);
+      assert.equal((await nextService.map(invalidEncoding)).readerVersion,encodingRetry);
+      assert.equal(await preparePackageMap(db,queue,nextReader,[projectId]),false);
+      assert.deepEqual(readCalls,[]);
+
+      const fresh=await fixture("after-cutover",undefined);
+      assert.equal(await preparePackageMap(db,queue,nextReader,[projectId]),true);
+      const freshMap=await nextService.map(fresh);
+      assert.equal(freshMap.readerVersion,nextVersion);
+      assert.deepEqual(readCalls,[fresh.versionId]);
+      assert.equal(await preparePackageMap(db,queue,nextReader,[projectId]),false);
+
+      await rm(join(scratch,"dwg-derivatives",healthy.projectId,healthy.documentId,healthy.versionId,derivative));
+      assert.equal((await view()).items.find(item=>item.versionId===healthy.versionId).reason,"derivative_unverified");
+      await assert.rejects(nextService.map(healthy),{code:"dwg_predecessor_derivative_unavailable"});
+      assert.equal(await preparePackageMap(db,queue,nextReader,[projectId]),false);
+      assert.deepEqual(readCalls,[fresh.versionId]);
+    } finally {
+      if (backup===undefined) delete process.env.FACADE_DWG_PREDECESSOR_ID;
+      else process.env.FACADE_DWG_PREDECESSOR_ID=backup;
+      if (backupTime===undefined) delete process.env.FACADE_DWG_PREDECESSOR_BEFORE;
+      else process.env.FACADE_DWG_PREDECESSOR_BEFORE=backupTime;
+    }
+  });
 });

@@ -31,22 +31,49 @@ def main():
         key = item["key"]
         citations = []
         for path, pattern in controls.get(key, ()):
-            for line_id, number, _locator, literal in prompt["lines"]:
+            for line_id, number, _locator, literal, *_ in prompt["lines"]:
                 if number == files.get(path) and (match := re.search(pattern, literal, re.IGNORECASE)):
                     citations.append({"id": line_id, "quote": match.group(0)})
                     break
         status = "partial" if citations else "unassessed"
         finding = "Есть адресная опора. Требуется сверить объём." if citations else "Требуется сверка инженером."
-        rows.append({"key": key, "status": status, "finding": finding, "citations": citations})
-    facades = next(row for row in rows if row["key"] == "doc.facades")
-    draft = "Адресный вопрос по входу контрольного обзора пока не установлен."
-    if len(facades["citations"]) == 2:
+        analysis = {
+            "applicability": {
+                "kind": "undetermined",
+                "reason": "Применимость к фасадной подсистеме требует сверки с описью.",
+                "citations": [],
+            },
+            "properties": [],
+            "tensions": [],
+        }
+        rows.append({"key": key, "status": status, "finding": finding, "citations": citations, "analysis": analysis})
+    facades = next((row for row in rows if row["key"] == "doc.facades"), None)
+    if facades and len(facades["citations"]) == 2:
         facades["finding"] = "Для FACADE RIB получены два разных размера. Требуется уточнить применимую редакцию."
-        draft = (
-            "Для детали FACADE RIB в mtext.dwg указан размер 67.25 mm, "
-            "на странице 1 north.jpg — 42 mm. Просим уточнить применимый размер для рабочей редакции."
-        )
-    result = {"rows": rows, "draftText": draft}
+        first, second = facades["citations"]
+        facades["analysis"] = {
+            "applicability": {
+                "kind": "included",
+                "reason": "Два источника называют одну фасадную деталь.",
+                "citations": [first, second],
+            },
+            "properties": [{
+                "key": "rib-size", "label": "Размер FACADE RIB", "status": "conflicting",
+                "finding": "Указаны 67.25 mm и 42 mm.", "citations": [], "response": None,
+                "letter": {
+                    "kind": "ask",
+                    "text": "Для детали FACADE RIB в mtext.dwg указан размер 67.25 mm, на странице 1 north.jpg — 42 mm. Просим уточнить применимый размер для рабочей редакции.",
+                },
+            }],
+            "tensions": [{
+                "key": "rib-values", "propertyKey": "rib-size", "status": "open",
+                "finding": "Для одной детали указаны разные размеры.",
+                "sides": [{"text": "67.25 mm в чертеже.", "citations": [first]},
+                          {"text": "42 mm на изображении.", "citations": [second]}],
+                "resolutionCitations": [],
+            }],
+        }
+    result = {"rows": rows}
     print(json.dumps({
         "model": model,
         "choices": [{"finish_reason": "tool_calls", "message": {"tool_calls": [{

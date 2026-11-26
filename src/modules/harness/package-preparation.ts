@@ -1,6 +1,7 @@
 import type { Pool, PoolClient } from 'pg';
 import { transaction } from '../gateway/types.js';
 import { capturePackagePreparation, listPackagePreparationVersions, type PreparationInput } from '../intake/package-preparation.js';
+import { listPinnedDwgPredecessors } from '../intake/dwg-predecessor.js';
 import { verifyStoredDwgDerivative } from '../pdf/index.js';
 import { dxfEncodingRecoveryVersion, dxfGroupRecoveryVersion, isDxfRecoveryVersion } from '../formats/dwg-profile.js';
 import { largeJpegRecoveryVersion } from '../formats/raster-profile.js';
@@ -13,17 +14,23 @@ export async function packagePreparationInput(tx: PoolClient, target: Receipt, r
   const expectedReaderVersions: PreparationInput['expectedReaderVersions'] = {};
   const verifiedDerivatives: NonNullable<PreparationInput['verifiedDerivatives']> = {};
   const profiles = new Map<string, string | null>();
-  for (const item of await listPackagePreparationVersions(tx, target)) {
-    const format = reader.formatFor(item.media, item.label);
+  const items = (await listPackagePreparationVersions(tx, target)).map(item => ({...item,format:reader.formatFor(item.media,item.label)}));
+  for (const {format} of items) {
     if (!profiles.has(format)) profiles.set(format, await reader.readerVersion(format));
+  }
+  const predecessors = await listPinnedDwgPredecessors(tx,target.projectId,
+    items.filter(item=>item.format==='dwg').map(item=>item.versionId), profiles.get('dwg') ?? null);
+  for (const item of items) {
+    const {format} = item;
     let version = profiles.get(format) ?? null;
     if (format === 'dwg') {
       const document = { projectId: target.projectId, documentId: item.documentId, versionId: item.versionId };
       const offline = !version || version.includes(':unavailable');
       const recovered = item.activeReaderVersion && (offline ? isDxfRecoveryVersion(item.activeReaderVersion)
         : [dxfGroupRecoveryVersion(version), dxfEncodingRecoveryVersion(version)].includes(item.activeReaderVersion));
-      const pinnedVersion = offline || recovered ? item.activeReaderVersion ?? version : version;
-      if (recovered) version = pinnedVersion;
+      const predecessor = predecessors.get(item.versionId);
+      const pinnedVersion = predecessor ?? (offline || recovered ? item.activeReaderVersion ?? version : version);
+      if (predecessor || recovered) version = pinnedVersion;
       if (pinnedVersion) {
         try {
           const stored = await verifyStoredDwgDerivative(tx, document, pinnedVersion);

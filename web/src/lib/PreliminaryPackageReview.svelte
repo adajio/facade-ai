@@ -1,9 +1,10 @@
 <script lang="ts">
-  import { preliminaryStatusLabels, type PreliminaryReview, type PreliminaryStatus } from './preliminary-review';
+  import { preliminaryQuestions, preliminaryStatusLabels, type PreliminaryReview, type PreliminaryStatus } from './preliminary-review';
   import { date } from './format';
   import { denied, describe, id, interrupted, type Api } from './http';
   import { projectV1 } from './workspace';
   import Notice from './Notice.svelte';
+  import PreliminaryRequirementAnalysis from './PreliminaryRequirementAnalysis.svelte';
   import PreliminaryRowChange from './PreliminaryRowChange.svelte';
   import PreliminarySources from './PreliminarySources.svelte';
   import PreliminaryStatusBadge from './PreliminaryStatusBadge.svelte';
@@ -22,6 +23,7 @@
   let textArea = $state<HTMLTextAreaElement>();
   let selected = $derived(reviews.find((item) => item.id === selectedId));
   let progressReviewId = $derived(mode === 'review' && selected?.isCurrent ? selected.id : undefined);
+  let questions = $derived(selected ? preliminaryQuestions(selected.rows) : []);
   let counts = $derived(selected ? (Object.keys(preliminaryStatusLabels) as PreliminaryStatus[]).map((status) => ({
     status, count: selected!.rows.filter((row) => row.status === status).length,
   })) : []);
@@ -151,6 +153,7 @@
             <tr><td>{row.title}</td><td><PreliminaryStatusBadge status={row.status} /></td><td>
               <p>{row.finding}</p>
               {#if row.sources.length}<PreliminarySources sources={row.sources} />{/if}
+              <PreliminaryRequirementAnalysis analysis={row.analysis} retained={row.retained} />
               <PreliminaryRowChange {row} changes={selected.changes} />
             </td></tr>
           {/each}
@@ -162,16 +165,19 @@
       {:else if selected.changes.baselineId === null}
         <p class="meta">Первоначальный проект письма.</p>
       {:else if !selected.changes.letter.changed}
-        <p class="meta">Проект письма с первоначального разбора без изменений.</p>
+        <p class="meta">{selected.changes.baselineScope === 'previous_receipt' ? 'Проект письма с предыдущего поступления без изменений.' : 'Проект письма с первоначального разбора без изменений.'}</p>
       {:else}
         {@const changes = selected.changes}
-        <p>Проект письма изменился после первоначального разбора{changes.baselineAt ? ' от ' + date(changes.baselineAt) : ''}.</p>
+        {@const earlierReceipt = changes.baselineScope === 'previous_receipt'}
+        <p title={changes.baselineReceiptId ?? undefined}>
+          {earlierReceipt ? 'Проект письма изменился после предыдущего поступления' : 'Проект письма изменился после первоначального разбора'}{changes.baselineAt ? ' от ' + date(changes.baselineAt) : ''}.
+        </p>
         {#if changes.letter.removed.length || changes.letter.added.length}
           <details class="letter-changes">
             <summary>Изменения проекта письма</summary>
             <div class="form-row">
               <div>
-                <h3>Первоначальный текст</h3>
+                <h3>{earlierReceipt ? 'Текст по предыдущему поступлению' : 'Первоначальный текст'}</h3>
                 {#each changes.letter.removed as text}<p>{text}</p>{:else}<p>Фрагменты не исключены.</p>{/each}
               </div>
               <div>
@@ -186,6 +192,20 @@
         <textarea bind:this={textArea} readonly rows="18" value={selected.draftText}></textarea>
       </label>
       <div class="actions"><button type="button" onclick={copyDraft}>Скопировать текст</button><span role="status">{copied}</span></div>
+      {#if questions.length}
+        <details class="letter-sources">
+          <summary>Основания вопросов письма</summary>
+          <ol>
+            {#each questions as question (question.key)}
+              <li>
+                <strong>{question.requirement} · {question.property}</strong>
+                <p>{question.text}</p>
+                <PreliminarySources sources={question.sources} label={'Основания вопроса по свойству «' + question.property + '»'} />
+              </li>
+            {/each}
+          </ol>
+        </details>
+      {/if}
     {/if}
   </section>
   {#if mode === 'review'}
@@ -197,6 +217,9 @@
 
 <style>
   textarea { width: 100%; min-height: 18em; field-sizing: content; }
+  .letter-sources { margin-block-start: .85rem; }
+  .letter-sources li + li { margin-block-start: .7rem; }
+  .letter-sources p { margin: .35rem 0; }
   .letter-changes { margin-block-end: .85rem; }
   .letter-changes .form-row { align-items: start; }
   .letter-changes .form-row > div { flex: 1 1 15rem; min-width: 0; margin-block-start: .5rem; }

@@ -1,5 +1,6 @@
 import { verifyStoredDwgDerivative } from './dwg-derivative.js';
 import { dxfEncodingRecoveryVersion, dxfEncodingRevision, dxfFramingRevision, dxfGroupRecoveryVersion, isDxfEncodingHold, isDxfGroupHold } from '../formats/dwg-profile.js';
+import { listPinnedDwgPredecessors } from '../intake/dwg-predecessor.js';
 import { createHash, randomUUID } from 'node:crypto';
 import { createWriteStream } from 'node:fs';
 import { mkdir, mkdtemp, rm, statfs } from 'node:fs/promises';
@@ -800,6 +801,19 @@ export function createReaderService(db: Pool, deps: ReaderDependencies, adapters
       const source = checkedSource(sourceRef);
       const { original, adapter, version } = await describe(source);
       if (adapter.format === 'dwg') {
+        const predecessor = (await listPinnedDwgPredecessors(db,source.projectId,[source.versionId],version)).get(source.versionId);
+        if (predecessor) {
+          const prior = await lookupMap(source,predecessor);
+          if (!prior) throw new ReaderError('dwg_predecessor_map_unavailable','Закреплённая карта DWG недоступна',424);
+          const readable = prior.units.filter(unit => !['held','original_only'].includes(String(unit.locator?.coverage)));
+          if (readable.length) {
+            const proof = await verifyStoredDwgDerivative(db,source,predecessor);
+            if (!proof || readable.some(unit=>unit.locator?.derivativeSha256!==proof.derivativeSha256))
+              throw new ReaderError('dwg_predecessor_derivative_unavailable','Недоступна закреплённая производная DWG прежнего профиля',424);
+          }
+          await original.check?.();
+          return prior;
+        }
         const current = await lookupMap(source, version);
         if (current && await verifyStoredDwgDerivative(db, source, version)) { await original.check?.(); return current; }
         const retryVersion = dxfGroupRecoveryVersion(version);

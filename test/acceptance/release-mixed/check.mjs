@@ -94,9 +94,10 @@ async function inspectPublic(upload) {
   const review = await waitFor('the saved preliminary review', async () => {
     const { json } = await client.call('GET', `${base}/preliminary-package-reviews`, 200);
     const items = json.items.filter((item) => item.receiptId === receiptId);
-    if (!items.some(({ isCurrent }) => isCurrent)) return;
-    assert.equal(items.length, 1, 'one preliminary publication');
-    return items[0];
+    const current = items.find(({ isCurrent }) => isCurrent);
+    if (!current?.scopeNote.includes('Текстовый индекс готов для всех доступных редакций')) return;
+    assert.ok(items.length <= 2, 'at most one reassessment when the index completes');
+    return current;
   }, phase === 'initial' ? 160_000 : 15_000);
   await write(`review-${phase}.json`, review);
   assert.equal(review.stage, catalog.defaultProfile.stage);
@@ -106,6 +107,12 @@ async function inspectPublic(upload) {
   assert.match(review.draftText, /north\.jpg[^.]*42 mm/iu);
   assert.match(review.draftText, /уточнить.*размер/iu);
   assert.equal(review.rows.length, 16);
+  assert.ok(review.rows.every(row => row.analysis?.applicability?.reason && Array.isArray(row.analysis.properties)));
+  const namedDetail = review.rows.find(row => row.key === 'doc.facades').analysis;
+  assert.equal(namedDetail.properties[0].status, 'conflicting');
+  assert.equal(namedDetail.properties[0].letter.kind, 'ask');
+  assert.deepEqual(namedDetail.tensions[0].sides.map(side => side.sources[0].label), ['mtext.dwg','north.jpg']);
+  assert.equal(review.rows.flatMap(row => row.analysis.properties).filter(property => property.letter.kind === 'ask').length, 1);
   assert.deepEqual(review.rows.map(({ key, title }) => ({ key, title })),
     catalog.requirements.map(({ key, part }) => ({ key, title: part })));
   for (const { key, status, sources } of review.rows) {
@@ -192,12 +199,27 @@ async function checkBrowser(upload, publicState) {
         assert.equal(actual.status(), 200);
         assert.equal(sha(await actual.body()), publicState.byName.get(control.label).sha256);
       }
+      if (row.key === 'doc.facades') {
+        const property = details.getByRole('region', { name: 'Размер FACADE RIB' });
+        await expect(property).toContainText('Есть противоречие');
+        await expect(property).toContainText('Вопрос для письма');
+        for (const control of required) {
+          await expect(property.getByRole('link', { name: control.label, exact: true }))
+            .toHaveAttribute('href', originalUrl(publicState.byName.get(control.label)));
+        }
+      }
       await details.getByRole('link', { name: 'Свернуть требование' }).click();
     }
     await page.goto(`${root}/letters`);
     const letter = page.getByRole('region', { name: 'Черновик письма по результатам проверки' });
     await expect(letter.getByLabel('Текст предварительного черновика')).toHaveValue(publicState.review.draftText);
     await expect(letter).toContainText(/Отсутствие не устанавливалось/iu);
+    await letter.getByText('Основания вопросов письма', { exact: true }).click();
+    const questionBasis = letter.getByRole('list', { name: 'Основания вопроса по свойству «Размер FACADE RIB»' });
+    for (const control of controls.get('doc.facades')) {
+      await expect(questionBasis.getByRole('link', { name: control.label, exact: true }))
+        .toHaveAttribute('href', originalUrl(publicState.byName.get(control.label)));
+    }
     await page.screenshot({ path: join(run, `letter-${phase}.png`) });
     if (phase === 'initial') {
       await page.goto(`${root}/receipts/${upload.receiptId}`);
@@ -243,8 +265,30 @@ try {
   await checkBrowser(upload, current);
   const attempts = (await readdir(join(run, 'state'))).filter((name) => name.endsWith('.json'));
   assert.equal(attempts.length, 1, 'expect one local synthetic answer for this receipt');
-  const journal = JSON.parse(await readFile(join(run, 'state', attempts[0]), 'utf8'));
-  assert.equal(journal.state, 'published');
+  const primaryJournal = JSON.parse(await readFile(join(run, 'state', attempts[0]), 'utf8'));
+  assert.equal(primaryJournal.state, 'published');
+  const addressed = join(run, 'state', 'addressed', upload.receiptId);
+  const reassessmentFiles = await readdir(addressed).catch(error => {
+    if (error.code !== 'ENOENT') throw error;
+    return [];
+  });
+  const complete = primaryJournal.snapshot.indexCoverage.pendingVersions === 0;
+  const responses = await Promise.all(reassessmentFiles.filter(name => name.endsWith('.json'))
+    .map(async name => JSON.parse(await readFile(join(addressed,name),'utf8'))));
+  assert.ok(responses.length <= 1, 'expect at most one index completion attempt');
+  const completedAttempt = complete ? primaryJournal : responses.find(item => item.state === 'published');
+  assert.ok(completedAttempt, 'expect a published result with complete index coverage');
+  assert.equal(primaryJournal.result.rows.length,16);
+  const journal = completedAttempt.snapshot ? completedAttempt : primaryJournal;
+  const result = journal.result ?? JSON.parse(journal.response.choices[0].message.tool_calls[0].function.arguments);
+  const responseChars = JSON.stringify(result).length;
+  assert.equal(result.rows.length,journal.snapshot.requirements.length);
+  assert.ok(JSON.stringify(primaryJournal.result).length < 55_000 && responseChars < 55_000);
+  await write(`review-transport-${phase}.json`, {
+    primaryResponseChars:JSON.stringify(primaryJournal.result).length, primaryRequestBytes:primaryJournal.snapshot.budget?.requestBytes,
+    primaryProviderElapsedMs:primaryJournal.transport?.providerElapsedMs, responseChars,requestBytes:journal.snapshot.budget?.requestBytes,
+    providerElapsedMs:journal.transport?.providerElapsedMs,
+  });
   for (const [path, reason] of [['scan.pdf', 'pdf_non_native_unreviewed'], ['colour-swatch.png', 'raster_ocr_empty'],
     ['unreadable.doc', 'doc_signature_invalid']]) {
     assert.ok(journal.snapshot.unread.some((entry) =>

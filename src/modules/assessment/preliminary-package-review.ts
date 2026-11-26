@@ -8,9 +8,8 @@ import { canonicalJson } from "./domain.js";
 import { AssessmentError, invalidInput } from "./store.js";
 
 import { preliminaryChanges, type ReviewRow } from "./preliminary-changes.js";
-
-type Original = { versionId: string; originalSha256: string };
-type Status = "present" | "partial" | "not_found" | "unassessed";
+import { enrichReviewAnalysis, renderPreliminaryQuestions, type Original, type RetainedReviewFinding, type ReviewAnalysis,
+  type ReviewSourceInput, type ReviewStatus } from "./preliminary-analysis.js";
 export type PreliminaryPackageReviewInput = {
   projectId: string; receiptId: string; catalogVersionId: string; model: "gpt-6.1-terra";
   inventory: Original[];
@@ -18,7 +17,8 @@ export type PreliminaryPackageReviewInput = {
   previousReportId?: string;
   revisionKey?: string;
   scopeNote: string;
-  rows: { key: string; status: Status; finding: string; sources: (Original & { anchor: string; quote?: string; limitation?:string })[] }[];
+  rows: { key: string; status: ReviewStatus; finding: string; sources: ReviewSourceInput[];
+    analysis?: ReviewAnalysis<ReviewSourceInput>; retained?: RetainedReviewFinding<ReviewSourceInput> }[];
   draftText: string;
 };
 
@@ -71,14 +71,30 @@ export async function publishPreliminaryPackageReview(db: Pool, input: Prelimina
       const row = byKey.get(requirement.key);
       if (!row || !["present", "partial", "not_found", "unassessed"].includes(row.status) || !text(row.finding, 20000) || !Array.isArray(row.sources) || row.sources.length > 100) invalidInput("Некорректная позиция разбора.");
       if ((row.status === "present" || row.status === "partial") && row.sources.length === 0) invalidInput("Для найденной позиции требуется источник.");
-      const sources = row.sources.map((source) => {
+      const enrichSource = (source: ReviewSourceInput) => {
+        if (!source || typeof source !== "object") invalidInput("Некорректное обоснование.");
         const original = byVersion.get(source.versionId);
         if (!original || original.originalSha256 !== source.originalSha256 || !text(source.anchor, 4000)) invalidInput("Источник не относится к исходным байтам поступления.");
         if (source.quote !== undefined && !text(source.quote,4000) || source.limitation !== undefined && !text(source.limitation,4000)) invalidInput("Некорректное обоснование.");
         return { ...(source.quote ? {quote:source.quote} : {}), ...(source.limitation ? {limitation:source.limitation} : {}), documentId: original.documentId, versionId: original.versionId, label: original.label, anchor: source.anchor, originalSha256: original.originalSha256 };
-      });
-      return { key: requirement.key, title: requirement.part, status: row.status, finding: row.finding, sources };
+      };
+      const sources = row.sources.map(enrichSource);
+      const analysis = row.analysis === undefined ? undefined : enrichReviewAnalysis(row.analysis,enrichSource);
+      let retained: RetainedReviewFinding | undefined;
+      if (row.retained !== undefined) {
+        const earlier = row.retained;
+        if (!analysis || !earlier || !["present","partial"].includes(earlier.status) || !text(earlier.finding,20000) ||
+            !Array.isArray(earlier.sources) || !earlier.sources.length || earlier.sources.length > 100)
+          invalidInput("Некорректный сохранённый вывод.");
+        retained = {status:earlier.status,finding:earlier.finding,sources:earlier.sources.map(enrichSource)};
+      }
+      return { key: requirement.key, title: requirement.part, status: row.status, finding: row.finding, sources,
+        ...(analysis && {analysis}), ...(retained && {retained}) };
     });
+    const structured = rows.some(row => row.analysis);
+    if (structured && !rows.every(row => row.analysis)) invalidInput("Свойства разбора нужны для каждой позиции.");
+    const draftText = structured ? renderPreliminaryQuestions(rows) : input.draftText;
+    if (!text(draftText,200000)) invalidInput("Некорректный черновик разбора.");
     const inventory = originals.map(({ versionId, originalSha256 }) => ({ versionId, originalSha256 }));
     if (input.preparationId) {
       const current = await tx.query('SELECT 1 FROM intake_package_preparation_current WHERE project_id=$1 AND receipt_id=$2 AND manifest_id=$3',
@@ -86,13 +102,13 @@ export async function publishPreliminaryPackageReview(db: Pool, input: Prelimina
       if (!current.rowCount) invalidInput("Состав подготовленного поступления изменился.");
     }
     const payload = { ...(input.revisionKey ? {revisionKey:input.revisionKey} : {}), ...(input.preparationId ? {preparationId:input.preparationId} : {}), projectId: input.projectId, receiptId: input.receiptId, catalogVersionId: input.catalogVersionId,
-      model: input.model, stage: project.project_stage, inventory, scopeNote: input.scopeNote, rows, draftText: input.draftText };
+      model: input.model, stage: project.project_stage, inventory, scopeNote: input.scopeNote, rows, draftText };
     const hash = createHash("sha256").update(canonicalJson(payload)).digest("hex");
     const { rows: [saved] } = await tx.query<{ id: string }>(
       `INSERT INTO preliminary_package_reviews(project_id,receipt_id,catalog_version_id,model,stage,input_generation,inventory,scope_note,rows,draft_text,content_hash,preparation_id,previous_report_id,revision_key)
        VALUES($1,$2,$3,$4,$5,$6,$7::jsonb,$8,$9::jsonb,$10,$11,$12,$13,$14)
        ON CONFLICT(project_id,content_hash) DO NOTHING RETURNING id`,
-      [input.projectId,input.receiptId,input.catalogVersionId,input.model,project.project_stage,project.generation,JSON.stringify(inventory),input.scopeNote,JSON.stringify(rows),input.draftText,hash,input.preparationId ?? null,input.previousReportId ?? null,input.revisionKey ?? null]);
+      [input.projectId,input.receiptId,input.catalogVersionId,input.model,project.project_stage,project.generation,JSON.stringify(inventory),input.scopeNote,JSON.stringify(rows),draftText,hash,input.preparationId ?? null,input.previousReportId ?? null,input.revisionKey ?? null]);
     if (saved) {
       await publishProjectEvent(tx, input.projectId, { type: "package-analysis.changed", payload: {} });
       return { id: saved.id };
@@ -103,9 +119,13 @@ export async function publishPreliminaryPackageReview(db: Pool, input: Prelimina
 }
 
 export async function readPreliminaryPackageReviews(tx: PoolClient, projectId: string, after?: string) {
-  const { rows } = await tx.query<{ id: string; receiptId: string; catalogVersionId: string; model: string; createdAt: Date; stage: string; scopeNote: string; rows: ReviewRow[]; draftText: string; isCurrent: boolean; baselineId:string; baselineAt:Date; baselineRows:ReviewRow[]; baselineDraft:string }>(
+  const { rows } = await tx.query<{ id: string; receiptId: string; catalogVersionId: string; model: string; createdAt: Date; stage: string; scopeNote: string; rows: ReviewRow[]; draftText: string; isCurrent: boolean; baselineId:string | null; baselineReceiptId:string | null; baselineAt:Date | null; baselineRows:ReviewRow[] | null; baselineDraft:string | null }>(
     `SELECT r.id,r.receipt_id AS "receiptId",r.catalog_version_id AS "catalogVersionId",r.model,r.created_at AS "createdAt",
-       first.id AS "baselineId",first.created_at AS "baselineAt",first.rows AS "baselineRows",first.draft_text AS "baselineDraft",
+       CASE WHEN first.id<>r.id THEN first.id ELSE previous.id END AS "baselineId",
+       CASE WHEN first.id<>r.id THEN r.receipt_id ELSE previous.receipt_id END AS "baselineReceiptId",
+       CASE WHEN first.id<>r.id THEN first.created_at ELSE previous.created_at END AS "baselineAt",
+       CASE WHEN first.id<>r.id THEN first.rows ELSE previous.rows END AS "baselineRows",
+       CASE WHEN first.id<>r.id THEN first.draft_text ELSE previous.draft_text END AS "baselineDraft",
        r.stage,r.scope_note AS "scopeNote",r.rows,r.draft_text AS "draftText",
        (r.catalog_version_id=p.catalog_version_id AND r.stage=p.project_stage AND r.input_generation=coalesce(g.generation,0)
         AND (r.preparation_id IS NULL OR EXISTS (SELECT 1 FROM intake_package_preparation_current cur
@@ -116,17 +136,26 @@ export async function readPreliminaryPackageReviews(tx: PoolClient, projectId: s
           AND newer.receipt_id=r.receipt_id AND newer.catalog_version_id=r.catalog_version_id
           AND (newer.created_at,newer.id)>(r.created_at,r.id))) AS "isCurrent"
      FROM preliminary_package_reviews r JOIN projects p ON p.id=r.project_id
+     JOIN intake_receipts intake ON intake.project_id=r.project_id AND intake.id=r.receipt_id
      CROSS JOIN LATERAL (SELECT f.id,f.created_at,f.rows,f.draft_text FROM preliminary_package_reviews f
        WHERE f.project_id=r.project_id AND f.receipt_id=r.receipt_id AND f.catalog_version_id=r.catalog_version_id
          AND f.stage=r.stage AND f.inventory=r.inventory AND (f.created_at,f.id)<=(r.created_at,r.id)
        ORDER BY f.created_at,f.id LIMIT 1) first
+     LEFT JOIN LATERAL (
+       SELECT f.id,f.receipt_id,f.created_at,f.rows,f.draft_text FROM preliminary_package_reviews f
+       JOIN intake_receipts earlier ON earlier.project_id=f.project_id AND earlier.id=f.receipt_id
+       WHERE first.id=r.id AND f.project_id=r.project_id AND f.catalog_version_id=r.catalog_version_id
+         AND f.stage=r.stage AND earlier.number<intake.number AND f.created_at<=r.created_at
+       ORDER BY earlier.number DESC,f.created_at DESC,f.id DESC LIMIT 1
+     ) previous ON true
      LEFT JOIN intake_project_generations g ON g.project_id=p.id
      WHERE r.project_id=$1 AND ($2::uuid IS NULL OR (r.created_at,r.id) <
        (SELECT created_at,id FROM preliminary_package_reviews WHERE project_id=$1 AND id=$2))
      ORDER BY r.created_at DESC,r.id DESC LIMIT 101`, [projectId, after ?? null]);
-  const items = rows.slice(0,100).map(({baselineId,baselineAt,baselineRows,baselineDraft,...item}) => ({
-    ...item, changes:preliminaryChanges(item, baselineId === item.id ? undefined : {
-      id:baselineId,createdAt:baselineAt,rows:baselineRows,draftText:baselineDraft})
+  const items = rows.slice(0,100).map(({baselineId,baselineReceiptId,baselineAt,baselineRows,baselineDraft,...item}) => ({
+    ...item, changes:preliminaryChanges(item, baselineId && baselineReceiptId && baselineAt && baselineRows && baselineDraft !== null ? {
+      id:baselineId,receiptId:baselineReceiptId,createdAt:baselineAt,rows:baselineRows,draftText:baselineDraft,
+    } : undefined),
   }));
   return { items, nextCursor: rows.length > 100 ? rows[99].id : null };
 }

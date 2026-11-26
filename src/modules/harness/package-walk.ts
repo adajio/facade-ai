@@ -149,7 +149,11 @@ export async function packageStructure(db: Pool | PoolClient, context: ReaderCon
   const project = await getProject(db,task.projectId);
   if(!project.stage||!project.catalogVersionId) return structure;
   const catalog=await getCatalog(db,project.organizationId,project.catalogVersionId);
-  if(project.intakeMode&&!matchesDefaultProfile(project,catalog)) return structure;
+  const directed = task.job.packageWindow.directedRequirements;
+  const focus = directed?.length ? catalog.requirements.filter(({key})=>directed.includes(key))
+    .map(({key,part,completenessCriterion})=>({key,part,criterion:completenessCriterion})) : [];
+  const scoped = focus.length ? {...structure,directedFocus:focus} : structure;
+  if(project.intakeMode&&!matchesDefaultProfile(project,catalog)) return scoped;
   const {rows:[own]}=await db.query<{facades:{id:string;label:string}[]}>(
     `SELECT coalesce(jsonb_agg(DISTINCT available.item),'[]') AS facades FROM (
        SELECT item FROM harness_package_facts f JOIN harness_package_bindings b
@@ -160,7 +164,7 @@ export async function packageStructure(db: Pool | PoolClient, context: ReaderCon
        WHERE kind IS NOT NULL OR id=ANY($4::uuid[])
      ) available`,[task.jobId,task.projectId,project.stage,followup?.semantic?.positions.flatMap(({facadeId})=>facadeId??[])??[]]);
   const assigned=followup?.semantic?.positions.map(({positionId})=>positionId);
-  return {...structure,catalog:{
+  return {...scoped,catalog:{
     catalogVersionId:catalog.id,stage:project.stage,facades:own.facades,
     positions:(assigned?catalog.requirements.filter(({key})=>assigned.includes(key)):catalog.requirements.slice(0,64))
       .map(({key,part,aliases,level,evidenceRule})=>({positionId:key,part,aliases,level,

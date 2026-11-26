@@ -14,8 +14,12 @@ function fakeDb({published=false,service=false,requirements=[{key:'1',part:'Че
       {kind:'document',state:'available',versionId:'v',originalSha256:hash,readerVersion:'pdf'},
       ...(service?[{kind:'technical',state:'excluded',versionId:'z',originalSha256:'a'.repeat(64)}]:[])],restrictions:[]}}]};
     if (/FROM intake_occurrences o JOIN intake_document_versions/.test(sql)) return {rows:[{versionId:'v',originalSha256:hash,path:'drawing.pdf',mediaType:'application/pdf',restricted:false,hasReaderJob:true},...(service?[{versionId:'z',originalSha256:'a'.repeat(64),path:'__MACOSX/._drawing',mediaType:'application/octet-stream',hasReaderJob:false}]:[])]};
-    if (/SELECT DISTINCT ON \(m.version_id\)/.test(sql)) return {rows:[{version_id:'v',reader_version:'pdf',total:1,next_ordinal:1}]};
-    if (/FROM project_memory_blocks b JOIN project_memory_lines/.test(sql)) return {rows:[{versionId:'v',unitId:'page-1',lineId:'line-1',text:'Высота 37 мм',address:{locator:{page:1}}}]};
+    if (/^SELECT id,parent_occurrence_id FROM intake_occurrences/.test(sql)) return {rows:[]};
+    if (/SELECT DISTINCT ON \(m.version_id\)/.test(sql)) return {rows:[{version_id:'v',reader_version:'pdf',contract:1,total:1,next_ordinal:1}]};
+    if (/^(DECLARE|CLOSE) preliminary_evidence/.test(sql)) return {rows:[]};
+    if (/FETCH FORWARD/.test(sql)) return {rows:[{versionId:'v',blockId:'block-1',ordinal:0,folded:'высота 37 мм'}]};
+    if (/pins AS/.test(sql)) return {rows:[{position:0,versionId:'v',readerVersion:'pdf',blockId:'block-1',blockOrdinal:0,
+      ordinal:0,unitId:'page-1',lineId:'line-1',text:'Высота 37 мм',address:{locator:{page:1}}}]};
     if (/WITH sequenced/.test(sql)) return {rows:[{version_id:'v',remaining:['graphics'],limitations:['drawing_unread'],first:2,last:4,first_unit:'p3',last_unit:'p5'}]};
     throw Error('unexpected query');
   }};
@@ -136,7 +140,7 @@ test('large preliminary prompt enforces a byte bound across files, restrictions 
   const noisy = {...s, lines:Array.from({length:5000}, (_, i) => ({...s.lines[0],id:'L'+(i+1),
     text:'Фасад '.repeat(25), anchor:JSON.stringify({unitId:'page-'+i,lineId:'x'.repeat(200)})})),
     unread:Array.from({length:1400},(_, i)=>({...s.unread[0],fromUnit:'p'+i,throughUnit:'p'+i})),
-    totalLines:5000,scopeNote:'Предварительный обзор'};
+    totalLines:5000,retrieval:undefined,scopeNote:'Предварительный обзор'};
   const prepared = preparePromptSnapshot(noisy);
   const request = makeRequest(prepared);
   const measured=measureRequest(request);
@@ -183,7 +187,7 @@ test('inventory compaction and source balance preserve evidence for a late crite
     ...files.slice(1).map((file,index) => source('E'+index,file.versionId,'Указание на листе.')),
     source('target',files.at(-1).versionId,'Узел примыкания: огнезащитный пояс 250 мм.'),
   ];
-  const snapshot = preparePromptSnapshot({...base,files,lines,requirements,totalLines:12_000});
+  const snapshot = preparePromptSnapshot({...base,files,lines,requirements,retrieval:undefined,totalLines:12_000});
   const {budget,promptData} = snapshot;
   assert.equal(budget.selectedFiles,306);
   assert.ok(budget.coveredFiles > 150);

@@ -1,6 +1,8 @@
 import assert from 'node:assert/strict';
 import { createHash, randomUUID } from 'node:crypto';
 import { join } from 'node:path';
+import { mkdtemp, open, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
 import { test } from 'node:test';
 import { pathToFileURL } from 'node:url';
 import pg from 'pg';
@@ -34,43 +36,70 @@ test('first overview gives independent branches the indexed register before repe
     await db.query(`INSERT INTO gateway_grants(project_id,route_id,data_class,purpose,revision,allowed)
       VALUES($1,$2,'synthetic',$3,'r1',true)`,[owner.project,route,branch==='A'?'primary_a':'primary_b']);
   }
-  const units=new Map();
+  const dataDir=await mkdtemp(join(tmpdir(),'facade-first-look-'));
+  const previousDataDir=process.env.FACADE_DATA_DIR;
+  process.env.FACADE_DATA_DIR=dataDir;
+  t.after(async()=>{
+    if (previousDataDir===undefined) delete process.env.FACADE_DATA_DIR;
+    else process.env.FACADE_DATA_DIR=previousDataDir;
+    await rm(dataDir,{recursive:true,force:true});
+  });
+  const { persistDwgFile }=await import(built('src/modules/formats/dwg-durable.js'));
+  const documents=new Map();
   async function accept(order,file,numberOfPages) {
     const versionId=`00000000-0000-4000-8000-${String(order).padStart(12,'0')}`;
+    const dwg=file.endsWith('.dwg');
+    const media=dwg?'application/octet-stream':'application/pdf';
     await db.query(`WITH receipt AS (INSERT INTO intake_receipts(project_id,source,created_by,sealed_at)
         VALUES($1,'upload',$2,now()) RETURNING id),
       original AS (INSERT INTO intake_originals(id,project_id,object_key,size,sha256)
         VALUES(gen_random_uuid(),$1,$3,1,$4) RETURNING id),
       document AS (INSERT INTO intake_documents(project_id) VALUES($1) RETURNING id),
       version AS (INSERT INTO intake_document_versions(id,project_id,document_id,original_id,media_type)
-        SELECT $5,$1,document.id,original.id,'application/pdf' FROM original,document RETURNING id,document_id,original_id),
+        SELECT $5,$1,document.id,original.id,$6 FROM original,document RETURNING id,document_id,original_id),
       occurrence AS (INSERT INTO intake_occurrences(project_id,receipt_id,relative_path,declared_media_type,version_id,state)
-        SELECT $1,receipt.id,$3,'application/pdf',version.id,'accepted' FROM receipt,version RETURNING id)
+        SELECT $1,receipt.id,$3,$6,version.id,'accepted' FROM receipt,version RETURNING id)
       INSERT INTO intake_reader_jobs(project_id,receipt_id,document_id,version_id,original_id)
       SELECT $1,receipt.id,version.document_id,version.id,version.original_id FROM receipt,version,occurrence`,
-    [owner.project,owner.actor,file,hash(file),versionId]);
-    units.set(versionId,Array.from({length:numberOfPages},(_,index)=>({id:String(index+1),width:400,height:400,locator:{page:index+1}})));
+    [owner.project,owner.actor,file,hash(file),versionId,media]);
+    documents.set(versionId,{format:dwg?'dwg':'pdf',
+      units:Array.from({length:numberOfPages},(_,index)=>({id:String(index+1),width:400,height:400,locator:{page:index+1}}))});
     return versionId;
   }
   const large=await accept(1,'large.pdf',5);
   const plain=await accept(2,'plain.pdf',1);
   const register=await accept(3,'register.pdf',1);
-  const formats=new Map();
-  const reader={formatFor:(_media,extension)=>extension==='dwg'?'dwg':'pdf',readerVersion:()=> 'first-look-v1',async map(source) {
-    return {source,format:formats.get(source.versionId)??'pdf',readerVersion:'first-look-v1',units:units.get(source.versionId)};
+  const readerVersion='first-look-v1';
+  const reader={formatFor:(_media,path)=>/(?:^|\.)dwg$/u.test(path)?'dwg':'pdf',readerVersion:()=>readerVersion,async map(source) {
+    const {format,units}=documents.get(source.versionId);
+    let mapped=units;
+    if (format==='dwg') {
+      const derivative='0\nSECTION\n2\nENTITIES\n0\nENDSEC\n0\nEOF\n';
+      const path=join(dataDir,'fixture.dxf');
+      await writeFile(path,derivative);
+      const file=await open(path,'r');
+      let durable;
+      try { durable=await persistDwgFile(source,file,hash(derivative)); } finally { await file.close(); }
+      await db.query(`INSERT INTO dwg_derivatives(project_id,document_id,version_id,original_sha256,reader_version,
+        converter_identity,derivative_sha256,byte_size,format,storage_key)
+        VALUES($1,$2,$3,$4,$5,'fixture',$6,$7,'dxf',$8) ON CONFLICT DO NOTHING`,
+      [source.projectId,source.documentId,source.versionId,source.sha256,readerVersion,hash(derivative),durable.size,durable.storageKey]);
+      mapped=units.map(unit=>({...unit,locator:{...unit.locator,derivativeSha256:hash(derivative)}}));
+    }
+    // The synthetic service persists the map it returns, like the runtime reader.
+    await db.query(`INSERT INTO reader_maps(project_id,document_id,version_id,reader_version,receipt_id,original_sha256,format,units)
+      SELECT project_id,document_id,version_id,$3,receipt_id,$4,$5,$6
+      FROM intake_reader_jobs WHERE project_id=$1 AND version_id=$2 ON CONFLICT DO NOTHING`,
+    [source.projectId,source.versionId,readerVersion,source.sha256,format,JSON.stringify(mapped)]);
+    return {source,format,readerVersion,units:mapped};
   }};
   while(await preparePackageMap(db,queue,reader,[])){}
-  async function readerMap(versionId,file) {
-    await db.query(`INSERT INTO reader_maps(project_id,document_id,version_id,reader_version,receipt_id,original_sha256,format,units)
-      SELECT project_id,document_id,version_id,'first-look-v1',receipt_id,$3,'pdf',$4
-      FROM intake_reader_jobs WHERE project_id=$1 AND version_id=$2 ON CONFLICT DO NOTHING`,
-      [owner.project,versionId,hash(file),JSON.stringify(units.get(versionId))]);
-  }
+  assert.equal((await db.query('SELECT count(*)::int AS n FROM intake_package_preparation_current')).rows[0].n,3);
+  const dispatch=()=>dispatchPackagePair(db,queue,profile,undefined,reader);
   async function indexHint(versionId,file,unit,ordinal,lineId) {
-    await readerMap(versionId,file);
     const blockId=hash('fixture index '+versionId);
     await db.query(`INSERT INTO project_memory_versions(project_id,version_id,contract,reader_version,format,total,next_ordinal)
-      VALUES($1,$2,1,'first-look-v1','pdf',$3,$4)`,[owner.project,versionId,units.get(versionId).length,ordinal+1]);
+      VALUES($1,$2,1,'first-look-v1','pdf',$3,$4)`,[owner.project,versionId,documents.get(versionId).units.length,ordinal+1]);
     await db.query(`INSERT INTO project_memory_blocks(id,project_id,version_id,contract,ordinal,unit_id,address,artifact_sha256,artifact_size,limitations,remaining)
       VALUES($1,$2,$3,1,$4,$5,jsonb_build_object('unitId',$5::text),$6,1,'{}','{}')`,
       [blockId,owner.project,versionId,ordinal,unit,hash(file+' index bytes')]);
@@ -82,20 +111,20 @@ test('first overview gives independent branches the indexed register before repe
   const blockId=await indexHint(register,'register.pdf','1',0,'shown-register');
   const jobs=async()=>(await db.query(`SELECT subject_id AS version,state,payload FROM gateway_jobs
     WHERE project_id=$1 AND kind='harness_research' ORDER BY created_at,id`,[owner.project])).rows;
-  while(!(await jobs()).length)assert.equal(await dispatchPackagePair(db,queue,profile),true);
+  while(!(await jobs()).length)assert.equal(await dispatch(),true);
   const first=await jobs();
   assert.deepEqual(first.map(({version})=>version),[register,register]);
   assert.deepEqual(first.map(({payload})=>payload.branch).sort(),['A','B']);
   assert.ok(first.every(({state,payload})=>state==='ready'&&payload.packageWindow.profileInspection.lineIds[0]==='shown-register'));
-  assert.equal(await dispatchPackagePair(db,queue,profile),true);
-  assert.equal(await dispatchPackagePair(db,queue,profile),true);
+  assert.equal(await dispatch(),true);
+  assert.equal(await dispatch(),true);
   const round=await jobs();
   assert.deepEqual(round.slice(2).map(({version})=>version),[large,large,plain,plain]);
   assert.ok(round.every(({state,payload})=>state==='ready'&&payload.place.unitId==='1'));
 
   await t.test('a queued assignment does not count as a physical opening',async()=>{
     await indexHint(large,'large.pdf','3',2,'newly-indexed-register');
-    assert.equal(await dispatchPackagePair(db,queue,profile),true);
+    assert.equal(await dispatch(),true);
     const next=(await jobs()).slice(6);
     assert.equal(next.length,2);
     assert.ok(next.every(({version,payload})=>version===large&&payload.place.unitId==='3'&&
@@ -178,7 +207,6 @@ test('first overview gives independent branches the indexed register before repe
   });
 
   await t.test('a disabled earlier route cannot delay another root or repeat its checked blocks',async()=>{
-    await readerMap(plain,'plain.pdf');
     let plainStructure=false;
     const parked=[];
     for(let job; (job=await claimPrimary());) {
@@ -246,10 +274,10 @@ test('first overview gives independent branches the indexed register before repe
   });
 
   await t.test('a newly mapped DWG gets one open slot before a deferred continuation with its sibling denied',async()=>{
-    while(await dispatchPackagePair(db,queue,profile)){}
+    while(await dispatch()){}
     const waiting=await claimPrimary();
     assert.equal(await queue.suspend(waiting.lease,{reason:'repeated_rejected_action',nextAction:'fixture'}),true);
-    assert.equal(await dispatchPackagePair(db,queue,profile),true,'existing work fills the just released slot');
+    assert.equal(await dispatch(),true,'existing work fills the just released slot');
     assert.equal(await queue.resume(waiting.lease.jobId),false);
     const deferred=async()=>(await db.query('SELECT state FROM gateway_jobs WHERE id=$1',[waiting.lease.jobId])).rows[0].state;
     assert.equal(await deferred(),'held');
@@ -257,20 +285,19 @@ test('first overview gives independent branches the indexed register before repe
     await db.query('UPDATE gateway_grants SET allowed=false WHERE project_id=$1 AND route_id=$2',
       [owner.project,profile[sibling].routeId]);
     const dwg=await accept(4,'late.dwg',2);
-    formats.set(dwg,'dwg');
     const nextOriginal=await accept(5,'behind-dwg.pdf',1);
     assert.equal(await preparePackageMap(db,queue,reader,[]),true);
     assert.equal(await preparePackageMap(db,queue,reader,[]),true);
     assert.equal(await refuse(await claimPrimary()),true);
-    assert.equal(await dispatchPackagePair(db,queue,profile),true);
+    assert.equal(await dispatch(),true);
     assert.deepEqual((await jobs()).filter(({version})=>version===dwg).map(({payload})=>payload.branch),[waiting.payload.branch]);
     assert.equal(await deferred(),'held');
     assert.equal(await refuse(await claimPrimary()),true);
-    assert.equal(await dispatchPackagePair(db,queue,profile),true);
+    assert.equal(await dispatch(),true);
     assert.equal(await deferred(),'ready','the deferred job gets the next free slot despite another untouched original');
     assert.equal((await jobs()).some(({version})=>version===nextOriginal),false);
     assert.equal(await refuse(await claimPrimary()),true);
-    assert.equal(await dispatchPackagePair(db,queue,profile),true);
+    assert.equal(await dispatch(),true);
     assert.deepEqual((await jobs()).filter(({version})=>version===nextOriginal).map(({payload})=>payload.branch),[waiting.payload.branch]);
     assert.equal((await db.query('SELECT count(*)::int AS n FROM gateway_attempts')).rows[0].n,0);
   });

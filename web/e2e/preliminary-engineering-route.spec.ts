@@ -9,7 +9,7 @@ const statuses = ['present', 'partial', 'not_found', 'unassessed'] as const;
 const labels = ['Представлено', 'Частично', 'Не найдено', 'Не оценено'];
 const base = `/projects/${projectId}/completeness`;
 
-async function fixture(page: Page, editable: boolean, comparable = false) {
+async function fixture(page: Page, editable: boolean, comparable = false, structured = false) {
   const project = { id: projectId, name: 'Синтетический комплект', version: 1, intakeMode: true, scopes: [],
     stage: 'Стадия 1', actions: editable ? ['project:read', 'project:engineer'] : ['project:read'] };
   const questions = Array.from({ length: 16 }, (_, index) => ({
@@ -51,6 +51,28 @@ async function fixture(page: Page, editable: boolean, comparable = false) {
       addedSources: index ? [] : [added], removedSources: [],
     })), letter: { changed: true, added: ['Обновлённый проект письма'], removed: [review.draftText] } },
   };
+  const waiting = { ...added,anchor:'Стр. 4',quote:'Ответ на запрос №7 не получен' };
+  const received = { ...added,anchor:'Стр. 5',quote:'Ответ на запрос №8: цвет RAL 7035' };
+  const excluded = { ...added,anchor:'Стр. 6',quote:'Крепление к стальной раме. КЖ в область заказа не входит.' };
+  const structuredReview = { ...review, id:'structured', draftText:'Требование 1 — Блеск покрытия. Уточните блеск покрытия.',
+    changes:{baselineReceiptId:'previous-receipt',baselineScope:'previous_receipt',baselineId:baseline.id,baselineAt:baseline.createdAt,
+      rows:baseline.rows.map(row=>({key:row.key,changed:true,previousStatus:row.status,previousFinding:row.finding,
+        addedSources:[],removedSources:[],analysisChanged:true})),
+      letter:{changed:true,added:['Уточните блеск покрытия.'],removed:[baseline.draftText]}},
+    rows:review.rows.map((row,index) => ({...row,analysis:index === 1 ? {
+      applicability:{kind:'excluded',reason:'КЖ исключён из области заказа.',sources:[excluded]},properties:[],tensions:[],
+    } : {
+      applicability:{kind:'included',reason:'Проверяемое свойство включено в задание.',sources:[]},
+      properties:index ? [] : [
+        {key:'coating',label:'Толщина покрытия',status:'unanswered',finding:'Результат по запросу №7 не поступил.',
+          sources:[waiting],response:{state:'not_received',finding:'В журнале отмечено неполучение.',sources:[waiting]},
+          letter:{kind:'omit',text:'Запрос №7 уже направлен.'}},
+        {key:'gloss',label:'Блеск покрытия',status:'not_mentioned',finding:'В ответе указан только цвет.',
+          sources:[],response:{state:'received',finding:'Получен ответ №8.',sources:[received]},
+          letter:{kind:'ask',text:'Уточните блеск покрытия.'}},
+      ],tensions:[],
+    }})),
+  };
   let published = false;
   let reviewRequests = 0;
   let chainUpdated = false;
@@ -65,7 +87,7 @@ async function fixture(page: Page, editable: boolean, comparable = false) {
       ? [{ cursor: '1', type: 'package-analysis.changed', payload: {} }] : [], cursor: published ? '1' : '0', hasMore: false } });
     if (path.endsWith('/preliminary-package-reviews')) {
       reviewRequests += 1;
-      return route.fulfill({ json: { items: comparable ? published ? [detailed, { ...baseline, isCurrent: false }] : [baseline] : [review], nextCursor: null } });
+      return route.fulfill({ json: { items: structured ? [structuredReview, {...baseline,isCurrent:false}] : comparable ? published ? [detailed, { ...baseline, isCurrent: false }] : [baseline] : [review], nextCursor: null } });
     }
     if (path.endsWith('/evidence-chain')) {
       const historical = published && url.searchParams.get('reviewId') === 'review';
@@ -261,4 +283,33 @@ test('Цепочка файла сохраняет фокус и прокрут�
   await chain.getByText('Состояние по файлам').click();
   await expect(chain).toContainText('История поступления №17');
   await expect(chain.getByText('Передача не подтверждена')).toBeVisible();
+});
+
+test('Свойства различают получение ответа, показывают исключение КЖ и сохраняют адрес вопроса', async ({ page }) => {
+  await fixture(page,true,false,true);
+  await page.goto(base);
+  const matrix = page.getByRole('region',{name:'Комплектность по требованиям'});
+  await matrix.getByRole('link',{name:'Сверить и решить · Требование 1',exact:true}).click();
+  const requirement = matrix.getByRole('region',{name:'Требование 1',exact:true});
+  await expect(requirement.getByRole('region',{name:'Толщина покрытия'})).toContainText('Ответ заказчика не получен');
+  const gloss = requirement.getByRole('region',{name:'Блеск покрытия'});
+  await expect(gloss).toContainText('Ответ получен, свойство в нём не упомянуто');
+  await expect(gloss).toContainText('Уточните блеск покрытия.');
+  await expect(gloss.getByRole('link',{name:'Синтетический.pdf'})).toHaveAttribute('href',
+    `/api/documents/${documentId}/versions/${versionId}/content#page=5`);
+  await expect(requirement).toContainText('Что изменилось после предыдущего поступления');
+  await matrix.getByRole('link',{name:'Свернуть требование',exact:true}).click();
+  await matrix.getByRole('link',{name:'Сверить и решить · Требование 2',exact:true}).click();
+  const outside = matrix.getByRole('region',{name:'Требование 2',exact:true});
+  await expect(outside).toContainText('КЖ исключён из области заказа.');
+  await expect(outside).toContainText('Запрос по этому требованию в письмо не включён.');
+  await expect(outside.getByRole('list',{name:'Основания применимости'})).toContainText('Крепление к стальной раме');
+  await page.goto(`/projects/${projectId}/letters`);
+  const letter = page.getByRole('region',{name:'Черновик письма по результатам проверки'});
+  await expect(letter).toContainText('Проект письма изменился после предыдущего поступления');
+  await letter.getByText('Основания вопросов письма',{exact:true}).click();
+  const basis = letter.getByRole('list',{name:'Основания вопроса по свойству «Блеск покрытия»'});
+  await expect(basis.getByRole('link',{name:'Синтетический.pdf'})).toHaveAttribute('href',
+    `/api/documents/${documentId}/versions/${versionId}/content#page=5`);
+  await expect(letter.getByLabel('Текст предварительного черновика')).not.toHaveValue(/КЖ|Толщина покрытия/);
 });

@@ -5,13 +5,33 @@ export type PreliminarySource = {
   documentId: string; versionId: string; label: string; anchor: string;
   originalSha256?: string; quote?: string; limitation?: string;
 };
-export type PreliminaryRow = { key: string; title: string; status: PreliminaryStatus; finding: string; sources: PreliminarySource[] };
+export type PreliminaryPropertyStatus = 'confirmed' | 'unanswered' | 'not_mentioned' | 'insufficient' | 'conflicting';
+export type PreliminaryAnalysis = {
+  applicability: { kind: 'included' | 'excluded' | 'undetermined'; reason: string; sources: PreliminarySource[] };
+  properties: {
+    key: string; label: string; status: PreliminaryPropertyStatus; finding: string; sources: PreliminarySource[];
+    letter: { kind: 'ask' | 'omit'; text: string };
+    response?: { state: 'received' | 'not_received'; finding: string; sources: PreliminarySource[] };
+  }[];
+  tensions: {
+    key: string; propertyKey: string; status: 'open' | 'resolved'; finding: string;
+    sides: { text: string; sources: PreliminarySource[] }[]; resolutionSources: PreliminarySource[];
+  }[];
+};
+export type PreliminaryRow = {
+  key: string; title: string; status: PreliminaryStatus; finding: string; sources: PreliminarySource[];
+  analysis?: PreliminaryAnalysis;
+  retained?: { status: 'present' | 'partial'; finding: string; sources: PreliminarySource[] };
+};
 export type PreliminaryChanges = {
   baselineId: string | null;
   baselineAt: string | null;
+  baselineReceiptId?: string | null;
+  baselineScope?: 'same_receipt' | 'previous_receipt' | null;
   rows: {
     key: string; changed: boolean; previousStatus: PreliminaryStatus | null; previousFinding: string | null;
     addedSources: PreliminarySource[]; removedSources: PreliminarySource[];
+    analysisChanged?: boolean; previousAnalysis?: PreliminaryAnalysis | null; retainedChanged?: boolean;
   }[];
   letter: { changed: boolean; added: string[]; removed: string[] };
 };
@@ -22,6 +42,20 @@ export type PreliminaryReview = {
 export const preliminaryStatusLabels: Record<PreliminaryStatus, string> = {
   present: 'Представлено', partial: 'Частично', not_found: 'Не найдено', unassessed: 'Не оценено',
 };
+export function preliminaryQuestions(rows: PreliminaryRow[]) {
+  const unique = (sources: PreliminarySource[]) => [...new Map(sources.map(source => [
+    JSON.stringify([source.versionId,source.anchor,source.quote,source.limitation]), source,
+  ])).values()];
+  return rows.flatMap(row => row.analysis?.properties.flatMap(property => property.letter.kind === 'ask' ? [{
+    key: `${row.key}/${property.key}`, requirement: row.title, property: property.label, text: property.letter.text,
+    sources: unique([
+      ...property.sources, ...(property.response?.sources ?? []),
+      ...(row.analysis?.tensions.filter(tension => tension.propertyKey === property.key)
+        .flatMap(tension => tension.sides.flatMap(side => side.sources)) ?? []),
+    ]),
+  }] : []) ?? []);
+}
+
 type ParsedPlace = {label: string; page?: number};
 
 export function preliminarySourcePlace(source: PreliminarySource): ParsedPlace {
