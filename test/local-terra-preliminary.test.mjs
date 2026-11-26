@@ -31,6 +31,24 @@ test('only exact supplied quote can become a source',async()=>{
   assert.throws(()=>validate(snap,{...result,rows:[{...result.rows[0],status:'not_found'}]}),/invalid_row/);
   assert.throws(()=>validate(snap,{...result,rows:[{...result.rows[0],citations:[]}]}),/missing_citation/);
 });
+test('legacy rejected tool result recovers literal line breaks only if the original line verifies the quote', async t=>{
+  const stateDir=await mkdtemp(join(tmpdir(),'terra-citation-'));
+  t.after(()=>rm(stateDir,{recursive:true,force:true}));
+  const db=fakeDb();
+  const snapshot=await readSnapshot(db,'r');
+  snapshot.lines[0].text='Первая строка\nВторая строка';
+  const withQuote = quote=>({...result,rows:[{...result.rows[0],citations:[{id:'L1',quote}]}]});
+  const raw=withQuote('строка\\nВторая');
+  await writeFile(statePath(stateDir,snapshot),JSON.stringify({state:'rejected',error:'invalid_citation',snapshot,result:raw}));
+  let savedQuote;
+  assert.equal(await processReceipt({db,receiptId:'r',stateDir,admitClaim,modelCall:assert.fail,
+    publish:async (_db,input)=>{savedQuote=input.rows[0].sources[0].quote;return {id:'old-response'};}}),'published');
+  assert.equal(savedQuote,'строка\nВторая');
+  assert.deepEqual(JSON.parse(await readFile(statePath(stateDir,snapshot),'utf8')).result,raw);
+  assert.throws(()=>validate(snapshot,withQuote('строка\\nДругая')),/invalid_citation/);
+  snapshot.lines[0].text='строка\\nВторая';
+  assert.equal(validate(snapshot,raw).rows[0].sources[0].quote,'строка\\nВторая');
+});
 test('published inventory prevents model invocation',async()=>{
   let called=false; assert.equal(await processReceipt({db:fakeDb({published:true}),receiptId:'r',stateDir:'/unused',modelCall:()=>{called=true;}}),'published'); assert.equal(called,false);
 });

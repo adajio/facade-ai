@@ -142,8 +142,11 @@ export function validate(snapshot, result) {
     assert(['present','partial','unassessed'].includes(row.status) && typeof row.finding === 'string' && row.finding.trim() && Array.isArray(row.citations), 'invalid_row');
     const sources = row.citations.map(c=>{
       const line = lines.get(c.id);
-      assert(line && typeof c.quote === 'string' && c.quote.trim().length >= 3 && line.text.includes(c.quote), 'invalid_citation');
-      return {versionId:line.versionId, originalSha256:line.originalSha256, anchor:line.anchor, quote:c.quote};
+      assert(line && typeof c.quote === 'string', 'invalid_citation');
+      // Some tool outputs quote the JSON spelling of a line break. Always store original source bytes.
+      const quote = line.text.includes(c.quote) ? c.quote : c.quote.replaceAll('\\r\\n','\r\n').replaceAll('\\n','\n');
+      assert(quote.trim().length >= 3 && line.text.includes(quote), 'invalid_citation');
+      return {versionId:line.versionId, originalSha256:line.originalSha256, anchor:line.anchor, quote};
     });
     assert(row.status === 'unassessed' || sources.length > 0, 'missing_citation');
     return {key:row.key,status:row.status,finding:row.finding,sources};
@@ -381,16 +384,18 @@ export async function processReceipt({db,receiptId,stateDir,modelCall,publish,ad
     await notify(saved.snapshot,'unknown',fingerprint,base,saved.error ?? 'model_outcome_unknown');
     return 'unknown';
   }
-  if (saved.state==='rejected') {
+  const recheckCitation = saved.state==='rejected' && saved.error==='invalid_citation'
+    && Boolean(saved.result) && saved.citationCheckVersion !== 2;
+  if (saved.state==='rejected' && !recheckCitation) {
     await notify(saved.snapshot,'rejected',fingerprint,base,saved.error);
     return `primary_rejected:${saved.error}`;
   }
-  assert(saved.state==='responded','invalid_state');
+  assert(saved.state==='responded' || recheckCitation,'invalid_state');
   await notify(saved.snapshot,'completed',fingerprint,base);
   let input;
   try { input=validate(saved.snapshot,saved.result); }
   catch (error) {
-    await atomicWrite(statePath,{...saved,state:'rejected',error:error.message});
+    await atomicWrite(statePath,{...saved,state:'rejected',error:error.message,citationCheckVersion:2});
     await notify(saved.snapshot,'rejected',fingerprint,base,error.message);
     return `primary_rejected:${error.message}`;
   }
