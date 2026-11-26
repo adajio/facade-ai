@@ -57,6 +57,10 @@ test('a native space joins adjacent words but cannot bridge columns, lines or a 
       [first,space,entity('C','решения',92.4,35,43.4)],[first,entity('B','\\P',89.3,20,223.2),last]]) {
     assert.equal(groupDrawingPhrases(lines,catalog).some(candidate=>candidate.catalogKeys.length),false);
   }
+  const titleWord=entity('D','Плитка',0,20,33), nextWord=entity('E','керамическая',37,20,69);
+  const marker=entity('F',' ',34.3,20,223.2);
+  const original=groupDrawingPhrases([titleWord,nextWord]);
+  assert.deepEqual(groupDrawingPhrases([titleWord,marker,nextWord]),original);
 });
 
 function syntheticDrawings({missingIndex=false,mismatch=false,stampTitle=false}={}) {
@@ -65,7 +69,7 @@ function syntheticDrawings({missingIndex=false,mismatch=false,stampTitle=false}=
   const source={projectId:uuid(1),receiptId:uuid(2),preparationId:uuid(3),catalogVersionId:uuid(4),stage:'Стадия 1',
     scopeNote:'Синтетический пакет',files,inventory:files.map(({versionId,originalSha256})=>({versionId,originalSha256})),lines:[],totalLines:22,
     requirements:[{key:'facades',part:'Фасады'},...(stampTitle ? [{key:'doc.architecture',part:'Раздел АР',
-      aliases:['Архитектурные решения','Лист']}] : [])],indexCursor:files.map(file=>({versionId:file.versionId,readerVersion:'dwg-fixture-v1',
+      aliases:['Архитектурные решения','Лист','Лист 1']}] : [])],indexCursor:files.map(file=>({versionId:file.versionId,readerVersion:'dwg-fixture-v1',
       contract:3,processedUnits:3}))};
   const frame={width:240,height:170};
   const unit=(id,space)=>({id,label:id,...frame,locator:{coverage:'partial',space,candidateCount:5,entityCount:125,
@@ -269,6 +273,7 @@ test('the ordinary request reserves a catalog name ahead of the isolated stamp a
   assert.match(named[0],/^P[a-f0-9]{24}$/u);
   const source=selected.lines.find(line=>line.id===named[0]);
   assert.deepEqual(JSON.parse(source.anchor).drawingText.parts,[['C1','C1'],['C2','C2'],['C3','C3']]);
+  assert.deepEqual(selected.sheetReading.drawings[0].phrases.find(phrase=>phrase.display==='Лист 1')?.catalogKeys,[]);
   assert.deepEqual(selected.sheetReading.drawings[0].phrases.find(phrase=>phrase.display.includes('см. раздел АР'))?.catalogKeys,[]);
   assert.ok(prompt.lines.findIndex(row=>row[0]===named[0]) < prompt.lines.findIndex(row=>row[3]==='Плитка под кирпич'));
   const prior=await build(fixture.source.requirements.slice(0,1));

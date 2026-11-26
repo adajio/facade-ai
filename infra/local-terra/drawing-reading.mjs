@@ -51,7 +51,7 @@ const catalogWords = text => fold(text).replace(/[^\p{L}\p{N}]+/gu,' ').trim();
 function drawingCatalog(requirements) {
   const labels=(requirements ?? []).flatMap(({key,part,aliases,equivalents})=>{
     const values=[part,...(aliases ?? []),...(equivalents ?? [])].filter(value=>typeof value==='string').map(catalogWords);
-    return [...new Set(values)].filter(value=>value.split(' ').length>1).map(value=>({key,value:' '+value+' '}));
+    return [...new Set(values)].filter(value=>(value.match(/\p{L}{2,}/gu) ?? []).length>1).map(value=>({key,value:' '+value+' '}));
   });
   return text=>{
     // A reference names a destination. It should not outrank the actual inscription.
@@ -116,11 +116,15 @@ export function groupDrawingPhrases(lines,catalog=()=>[]) {
         // Standalone DXF spaces can carry an inflated box. Use the insertion point and
         // require close visible glyphs on both sides of this single marker.
         const right=next ? next.box.x-part.box.x : Infinity;
-        if (previous && !previous.space && next && !next.space && group.length<maxPhraseParts-1
-          && gap>=-height*.32 && gap<=height*1.04 && right>0 && right<=Math.min(height,next.box.height)*.62) {
-          group.push(part);
-          display+=' ';
-        }
+        if (!previous || previous.space || !next || next.space || group.length>=maxPhraseParts-1
+          || gap< -height*.32 || gap>height*1.04 || right<=0 || right>Math.min(height,next.box.height)*.62) continue;
+        const originalHeight=Math.min(previous.box.height,next.box.height);
+        const originalGap=gap+right;
+        const wordSpacing=next.characters>1 || previous.characters>1 ? .24 : .36;
+        const spaced=/\s$/u.test(previous.display) || /^\s/u.test(next.display) || originalGap>originalHeight*wordSpacing;
+        if (originalGap<=originalHeight*1.04 && spaced) continue;
+        group.push(part);
+        display+=' ';
         continue;
       }
       if (previous?.display===part.display && Math.abs(part.box.x-previous.box.x)<height*.16) continue;
