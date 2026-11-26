@@ -654,3 +654,108 @@ test('an R alias cannot reuse a reconstructed label as an independent assignment
   const justified=run(prepare([fact,independent]),true);
   assert.equal(justified.analysis.properties.find(item=>item.key==='assignment').status,'confirmed');
 });
+
+test('a stage record remains confirmed as an observation without satisfying a section requirement',async()=>{
+  const {validate}=await import('../infra/local-terra/producer.mjs');
+  const {correctIncidentalMetadata}=await import('../infra/local-terra/fact-applicability.mjs');
+  const requirement={key:'doc.architecture',part:'Раздел АР',aliases:['Архитектурные решения','АР']};
+  const stamp=source(JSON.stringify({unitId:'layout-1',readerVersion:'fixture-v1',address:{unitId:'layout-1'}}),'Стадия Р');
+  const printed=element('Стадия Р');
+  const stage=rawProperty({...rawScope(printed,printed,stamp),basis:'literal'},[stamp],
+    {key:'stage_stamp_record',label:'Стадия'});
+  const identified=element('Архитектурные решения');
+  const section=source('heading','Архитектурные решения.');
+  const heading=rawProperty({...rawScope(identified,identified,section),basis:'literal'},[section],
+    {key:'section_identity',label:'Раздел АР'});
+  const stillUnknown=rawProperty({...rawScope(identified,printed,stamp),kind:'undetermined'},[stamp],{
+    key:'section_identity',label:'Идентификация раздела АР',status:'insufficient',finding:'Прямое указание раздела не найдено.',
+  });
+  const run=(required,properties,primary=stamp)=>validate({
+    reviewContract:2,factScopeVersion:1,requirements:[required],inventory:[stamp],
+    lines:[stamp,section].map(item=>({...item,id:item.anchor,text:item.quote})),scopeNote:'Синтетический комплект.',
+  },{rows:[{key:required.key,status:'partial',finding:'Раздел найден частично.',citations:[cite(primary)],analysis:rawAnalysis(properties)}]});
+  const {rows:[architecture],draftText}=run(requirement,[stage,stillUnknown]);
+  assert.equal(architecture.status,'unassessed');
+  assert.equal(architecture.analysis.properties[0].status,'confirmed');
+  assert.equal(architecture.analysis.properties[0].sources[0].quote,stamp.quote);
+  assert.equal(architecture.analysis.properties[1].scope.kind,'undetermined');
+  assert.match(architecture.finding,/Прочитанные реквизиты сохранены/iu);
+  assert.match(draftText,/Вопросы пока не сформированы/u);
+
+  const printedSection=run(requirement,[stage,heading],section).rows[0];
+  assert.equal(printedSection.status,'partial');
+  assert.match(printedSection.finding,/Архитектурные решения/u);
+  const stageRequirement={key:'doc.stage',part:'Стадия проектирования'};
+  assert.equal(run(stageRequirement,[stage]).rows[0].status,'partial');
+
+  const saved={...architecture,status:'partial',finding:'Указана стадия Р.'};
+  const corrected=correctIncidentalMetadata(saved,requirement);
+  assert.equal(corrected.status,'unassessed');
+  assert.strictEqual(corrected.analysis,saved.analysis);
+  assert.strictEqual(corrected.sources,saved.sources);
+  assert.strictEqual(correctIncidentalMetadata(corrected,requirement),corrected);
+  assert.strictEqual(correctIncidentalMetadata(saved,stageRequirement),saved);
+  assert.strictEqual(correctIncidentalMetadata(printedSection,requirement),printedSection);
+});
+
+test('common stamp fields contribute only to requirements about the same field',()=>{
+  const cases=[
+    ['Стадия Р','Стадия проектирования','Раздел КЖ'],
+    ['Лист 4 из 12','Номер листа','Фасады'],
+    ['Редакция №2','Редакция документации','Разрезы'],
+    ['Дата выпуска 01.02.2025','Дата выпуска чертежа','Узлы АР'],
+    ['Масштаб 1:20','Масштаб чертежа','Сведения об облицовке'],
+  ];
+  for (const [printed,title,other] of cases) {
+    const note=reconstructed(printed,printed);
+    const field=element(printed);
+    const analysis=makeRow([rawProperty({...rawScope(field,field,note),basis:'literal'},[note])],[note]).analysis;
+    const appearance={key:'catalog.other',status:'partial',finding:'Реквизит прочитан.',sources:[note],analysis};
+    assert.equal(applyFactApplicability({...appearance,title},{requirement:{part:title}}).status,'partial',printed);
+    const incidental=applyFactApplicability({...appearance,title:other},{requirement:{part:other}});
+    assert.equal(incidental.status,'unassessed',printed);
+    assert.equal(incidental.analysis.properties[0].status,'confirmed',printed);
+    assert.equal(incidental.analysis.properties[0].sources[0].quote,printed);
+  }
+});
+
+test('facade or material designations remain partial beside a title-block field',()=>{
+  const stage=reconstructed('stage','Стадия Р');
+  const field=element('Стадия');
+  const requisites=rawProperty({...rawScope(field,field,stage),basis:'literal'},[stage],{key:'stage_details'});
+  for (const [quote,subject,title] of [
+    ['Фасад в осях А–В','Фасад','Фасады'],
+    ['Керамогранит 600×1200','Керамогранит','Сведения об облицовке'],
+  ]) {
+    const detail=reconstructed('main',quote);
+    const part=element(subject);
+    const matter=rawProperty({...rawScope(part,part,detail),basis:'literal'},[detail],{key:'matter'});
+    const input=makeRow([requisites,matter],[stage,detail]);
+    const result=applyFactApplicability({...input,title});
+    assert.equal(result.status,'partial');
+    assert.equal(result.analysis.properties.filter(property=>property.status==='confirmed').length,2);
+    assert.ok(result.finding.includes(quote));
+  }
+});
+
+test('the complete catalog criterion classifies a requested stamp field through publication and continuity',async()=>{
+  const {validatedPartial}=await import('../infra/local-terra/partial-result.mjs');
+  const {reconcilePreliminaryReview}=await import('../infra/local-terra/review-continuity.mjs');
+  const note=source('native-stamp','Стадия Р');
+  const stage=element('Стадия');
+  const property=rawProperty({...rawScope(stage,stage,note),basis:'literal'},[note],{key:'stage'});
+  const needed={key:'project.fields',part:'Реквизиты проекта',
+    evidenceRule:{allOf:[{anyOf:[{property:'Стадия проектирования'}]}]}};
+  const incidental={key:'doc.architecture',part:'Раздел АР'};
+  const snapshot={reviewContract:2,factScopeVersion:1,requirements:[needed,incidental],
+    lines:[{...note,id:note.anchor,text:note.quote}],inventory:[note],scopeNote:'Синтетический комплект.'};
+  const raw={rows:snapshot.requirements.map(requirement=>({key:requirement.key,status:'partial',finding:'Указана стадия.',
+    citations:[cite(note)],analysis:rawAnalysis([property])}))};
+  const publication=validatedPartial(snapshot,raw);
+  assert.deepEqual(publication.rows.map(row=>row.status),['partial','unassessed']);
+  const saved=publication.rows.map(row=>({...row,status:'partial'}));
+  const continued=reconcilePreliminaryReview(publication,saved);
+  assert.deepEqual(continued.rows.map(row=>row.status),['partial','unassessed']);
+  assert.deepEqual(continued.rows.map(row=>row.analysis.properties[0].status),['confirmed','confirmed']);
+  assert.equal(continued.draftText,publication.draftText);
+});

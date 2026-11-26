@@ -1,4 +1,4 @@
-import {applyFactApplicability, canPreserveScopedProperty, factScopeSources, hasFactScopeDifference, sameFactScopeTarget,
+import {applyFactApplicability, canPreserveScopedProperty, correctIncidentalMetadata, factScopeSources, hasFactScopeDifference, sameFactScopeTarget,
   sameFactSourcePlace, sheetPreviewSources, sourceDescribesFactScope} from './fact-applicability.mjs';
 import {analysisSources, mergeSources, renderQuestions} from './review-analysis.mjs';
 
@@ -231,6 +231,7 @@ export function reconcilePreliminaryReview(input, previousRows = [], admittedVer
   const inInventory = source => originals.get(source.versionId) === source.originalSha256 &&
     (!admittedVersions || admittedVersions.has(source.versionId));
   const previousByKey = new Map(previousRows.map(row => [row.key,row]));
+  const catalog = new Map((input.requirements ?? []).map(requirement=>[requirement.key,requirement]));
   const rows = input.rows.map(row => {
     const previous = previousByKey.get(row.key);
     if (!row.analysis) return row;
@@ -268,7 +269,7 @@ export function reconcilePreliminaryReview(input, previousRows = [], admittedVer
     const keepEarlierFinding = retained && retained.sources.every(inInventory) &&
       (row.status === 'unassessed' || !currentSupportsRetained && retained.finding !== row.finding);
     return {...row,analysis,...(keepEarlierFinding && {retained})};
-  });
+  }).map(row=>catalog.has(row.key) ? correctIncidentalMetadata(row,catalog.get(row.key)) : row);
   if (admittedVersions && rows.every((row,index) => row === input.rows[index])) return input;
   return {...input,rows,draftText:renderQuestions(rows)};
 }

@@ -361,11 +361,12 @@ export function validate(snapshot, result) {
   const rows = result.rows.map(row=>{
     assert(byKey.has(row?.key) && !seen.has(row.key), 'unknown_or_duplicate_key'); seen.add(row.key);
     assert(['present','partial','unassessed'].includes(row.status) && validText(row.finding,structured ? 800 : 4000), 'invalid_row');
-    const options={requireFactScope:snapshot.factScopeVersion===1};
+    const requirement = byKey.get(row.key);
+    const options = {requireFactScope:snapshot.factScopeVersion===1,requirement};
     const analysis = structured ? readAnalysis(row.analysis,resolve,assert,options) : undefined;
     const sources = resolve(row.citations);
     assert(row.status === 'unassessed' || sources.length > 0, 'missing_citation');
-    const part = byKey.get(row.key).part;
+    const {part} = requirement;
     return applyFactApplicability({key:row.key,...(structured && typeof part === 'string' ? {title:part} : {}),status:row.status,finding:row.finding,sources,
       ...(analysis && {analysis})},options);
   });
@@ -373,7 +374,8 @@ export function validate(snapshot, result) {
   const draftText = structured ? renderQuestions(rows) : result.draftText;
   assert(draftText.length <= 30000, 'result_too_large');
   return {projectId:snapshot.projectId,receiptId:snapshot.receiptId,catalogVersionId:snapshot.catalogVersionId,
-    ...(snapshot.factScopeVersion && {factScopeVersion:snapshot.factScopeVersion}),model:MODEL,inventory:snapshot.inventory,scopeNote:snapshot.scopeNote,preparationId:snapshot.preparationId,rows,draftText};
+    ...(snapshot.factScopeVersion && {factScopeVersion:snapshot.factScopeVersion}),...(structured && {requirements}),
+    model:MODEL,inventory:snapshot.inventory,scopeNote:snapshot.scopeNote,preparationId:snapshot.preparationId,rows,draftText};
 }
 
 export async function readSnapshot(db, receiptId) {

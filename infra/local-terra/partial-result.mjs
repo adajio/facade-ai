@@ -10,7 +10,8 @@ export function validatedPartial(snapshot,result) {
   const input=availableRows(snapshot,result);
   input.rows=includeLayerEvidence(snapshot,input);
   if (snapshot.factScopeVersion===1) {
-    input.rows=input.rows.map(row=>applyFactApplicability(row,{requireFactScope:true}));
+    const requirements = new Map(snapshot.requirements.map(requirement=>[requirement.key,requirement]));
+    input.rows=input.rows.map(row=>applyFactApplicability(row,{requireFactScope:true,requirement:requirements.get(row.key)}));
     input.draftText=renderQuestions(input.rows);
   }
   return publishSheetObservations(snapshot,input,result);

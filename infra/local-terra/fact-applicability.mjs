@@ -275,7 +275,63 @@ function scopedSummary(properties) {
     ? summary + '  ' + text : summary, first);
 }
 
-export function applyFactApplicability(row, {requireFactScope = false} = {}) {
+// A title-block field can be read correctly while saying nothing about the subject of a catalog row.
+const documentMetadata = [
+  {
+    field:/^(?:(?:стадия|этап)(?: проектирования)?|(?:design |project )?stage)(?:\s*[:=–—-]\s*[\p{L}\p{N}][\p{L}\p{N} .-]{0,40}|\s+[\p{L}\p{N}]{1,8})?$/u,
+    requirement:/^(?:(?:стадия|этап)(?: проектирования| разработки| проекта)?|(?:design |project )?stage)(?![\p{L}\p{N}])/u,
+  },
+  {
+    field:/^(?:номер (?:листа|страницы)|(?:число|количество) листов|лист(?:ов)?|страница|(?:sheet|page)(?: no\.?| number| count)?)(?:\s*[:№]?\s*\d+(?:\s*(?:\/|из|of)\s*\d+)?)?$/u,
+    requirement:/^(?:нумерация|номер|число|количество|перечень) (?:лист\p{L}*|страниц\p{L}*)|^(?:sheet|page) (?:number|count)(?![\p{L}\p{N}])/u,
+  },
+  {
+    field:/^(?:редакция|изменение|изм\.?|версия|ревизия|revision|rev\.?|issue)(?:\s*[:№-]?\s*(?:[\p{L}]{1,3}|\d+(?:[.-]\d+)*))?$/u,
+    requirement:/^(?:номер (?:изменения|редакции)|редакция|изменение|версия|ревизия|revision|issue number)(?![\p{L}\p{N}])/u,
+  },
+  {
+    field:/^(?:дата(?: выпуска| изменения| оформления| подготовки| утверждения)?|(?:issue )?date)(?:\s*[:–—-]?\s*\d{1,4}(?:[.\/-]\d{1,4}){1,2})?$/u,
+    requirement:/^(?:дата(?: выпуска| изменения| оформления| подготовки| утверждения)?|(?:issue )?date)(?![\p{L}\p{N}])/u,
+  },
+  {
+    field:/^(?:масштаб|scale)(?:\s*[:=]?\s*\d+\s*[:/]\s*\d+)?$/u,
+    requirement:/^(?:масштаб|scale)(?![\p{L}\p{N}])/u,
+  },
+  {
+    field:/^(?:номер заказа|шифр проекта|код проекта|project (?:code|number))(?:\s*[:№-]?\s*[\p{L}\p{N}]+(?:[-./][\p{L}\p{N}]+)*)?$/u,
+    requirement:/^(?:номер заказа|шифр проекта|код проекта|project (?:code|number))(?![\p{L}\p{N}])/u,
+  },
+];
+
+const metadataText = text => phrases(text).replace(/[.!]+$/u,'');
+const propertyMetadata = property => {
+  const labels = [property.scope?.observed?.element,property.scope?.target?.element]
+    .filter(text=>typeof text==='string').map(metadataText);
+  const quotations = property.sources.filter(located).map(source=>metadataText(source.quote));
+  return documentMetadata.find(metadata=>labels.some(label=>metadata.field.test(label)) ||
+    quotations.length && quotations.every(quote=>metadata.field.test(quote)));
+};
+
+export function correctIncidentalMetadata(row, requirement) {
+  if (!['present','partial'].includes(row.status) || !row.analysis || row.analysis.applicability.kind==='excluded') return row;
+  const subjects = [requirement?.part,row.title,...(requirement?.aliases ?? []),
+    ...(requirement?.evidenceRule?.allOf ?? []).flatMap(group=>(group.anyOf ?? [])
+      .flatMap(({subject,property,attribute})=>[subject,property,attribute]))]
+    .filter(text=>typeof text==='string').map(metadataText);
+  if (!subjects.length) return row;
+  const positives = row.analysis.properties.filter(property=>
+    (!property.scope || property.scope.kind==='applicable') &&
+    (property.status==='confirmed' && property.sources.some(located) || property.status==='conflicting' &&
+      row.analysis.tensions.some(tension=>tension.propertyKey===property.key && tension.status==='open')));
+  if (!positives.length || !positives.every(property=>{
+    const metadata = propertyMetadata(property);
+    return metadata && !subjects.some(subject=>metadata.requirement.test(subject));
+  })) return row;
+  return {...row,status:'unassessed',finding:'Предмет требования требует адресной сверки. Прочитанные реквизиты сохранены по свойствам.'};
+}
+
+export function applyFactApplicability(row, {requireFactScope = false,requirement} = {}) {
+  const corrected = row => requirement ? correctIncidentalMetadata(row,requirement) : row;
   const onlyLiteral = row.sources.some(isLiteralFactSource) &&
     !row.sources.some(source=>located(source) && !isLiteralFactSource(source));
   const pending = 'Область применения прочитанной записи требует подтверждения.';
@@ -306,7 +362,7 @@ export function applyFactApplicability(row, {requireFactScope = false} = {}) {
       ...scoped.flatMap(propertyEvidence)],100);
     const hasPartial = material.length || scoped.length && (row.status==='partial' || !requireFactScope && positiveRow);
     const status = hasPartial ? 'partial' : 'unassessed';
-    return {...row,analysis,status,sources,finding:rowFinding};
+    return corrected({...row,analysis,status,sources,finding:rowFinding});
   }
   if (scoped.length && analysis.applicability.kind !== 'excluded') {
     const sources = unionSources([...sheetPreviewSources(row.sources),...analysis.applicability.sources,
@@ -316,7 +372,7 @@ export function applyFactApplicability(row, {requireFactScope = false} = {}) {
       analysis.properties.every(property=>property.status==='confirmed');
     const status = row.status==='present' && !complete ? (material.length ? 'partial' : 'unassessed')
       : row.status==='unassessed' && material.length ? 'partial' : row.status;
-    return {...row,analysis,status,sources,finding:scopedSummary(scoped)};
+    return corrected({...row,analysis,status,sources,finding:scopedSummary(scoped)});
   }
-  return onlyLiteral ? {...row,analysis} : row;
+  return corrected(onlyLiteral ? {...row,analysis} : row);
 }

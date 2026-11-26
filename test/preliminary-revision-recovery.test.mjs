@@ -427,3 +427,28 @@ test('rebasing a partial revision cannot activate a rejected proposal through an
   const stored=await read((await resultPaths())[0]);
   assert(stored.rejectedProposals.some(item=>item.key==='R2'));
 });
+
+test('a saved generic stamp can be corrected once without another reader call',async t=>{
+  const {r,state,run,fact}=await fixture(t);
+  const excerpt={versionId:fact.versionId,originalSha256:hash,anchor:JSON.stringify({unitId:'drawing-1'}),quote:'Стадия Р'};
+  const target={element:'Стадия Р'};
+  const prop={key:'stage',status:'confirmed',label:'Стадия',finding:'В штампе указано «Стадия Р».',sources:[excerpt],
+    scope:{kind:'applicable',basis:'literal',target,observed:target,reason:'Запись в штампе.',sources:[excerpt]},
+    letter:{kind:'omit',text:'Запись прочитана.'}};
+  const analysis={applicability:{kind:'undetermined',reason:'Назначение требует сверки.',sources:[]},
+    tensions:[],properties:[]};
+  state.r={...r,rows:[
+    {...r.rows[0],title:'Ведомость',status:'partial',sources:[excerpt],analysis:{...analysis,properties:[prop]}},
+    {...r.rows[1],title:'Крепления',status:'unassessed',sources:[],analysis},
+  ]};
+  state.facts=[];
+  const audit=[];
+  const options={recordActivity:async (_db,event)=>audit.push(event)};
+  await run(options);
+  await run(options);
+  assert.equal(state.r.rows[0].status,'unassessed');
+  assert.equal(state.r.rows[0].analysis.properties[0].sources[0].quote,excerpt.quote);
+  assert.equal(state.modelCalls,0);
+  assert.equal(state.publishCalls,1);
+  assert.ok(audit.some(event=>event.reason==='metadata_scope_checked' && event.fields.calls===0));
+});

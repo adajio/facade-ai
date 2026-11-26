@@ -6,7 +6,7 @@ import { atomicWrite, claim } from './producer.mjs';
 import { duration, emitActivity, measureRequest, messageEntryBytes, modelFailure, prioritizeEvidence,
   remainingRequestBytes, responseUsage } from './request-budget.mjs';
 
-import {applyAnalysisFactApplicability, applyFactApplicability, canPreserveScopedProperty, factApplicabilityInstruction,
+import {applyAnalysisFactApplicability, applyFactApplicability, canPreserveScopedProperty, correctIncidentalMetadata, factApplicabilityInstruction,
   hasUnverifiedFactScope, sameFactScopeTarget} from './fact-applicability.mjs';
 import {analysisFields, analysisSources, checkAnalysis, mergeSources, readProperty, readTension,
   record, renderQuestions} from './review-analysis.mjs';
@@ -331,7 +331,7 @@ function applyStructuredRevision(s, result) {
     const sources = mergeSources(row.sources,cited);
     check(sources.length <= 100,'revision_source_limit');
     const next = applyFactApplicability({...row,analysis:assessed,sources,status:edit.status,finding:edit.finding.trim()},
-      {requireFactScope});
+      {requireFactScope,requirement:s.requirements?.find(item=>item.key===edit.key)});
     if (requireFactScope && hasUnverifiedFactScope(next)) delete next.retained;
     checkAnalysis(next.analysis,check);
     rows.set(edit.key,next);
@@ -626,6 +626,18 @@ export async function reviseReceipt({db,receiptId,stateDir,admitClaim,modelCall,
   const pendingPath = join(dir, 'pending.json');
   const cursor = await read(cursorPath) ?? {seen:[],at:0};
   let pending = await read(pendingPath);
+  if (!pending && r.rows.every(row=>row.analysis)) {
+    const byKey=new Map(r.requirements.map(item=>[item.key,item]));
+    const rows=r.rows.map(row=>correctIncidentalMetadata(row,byKey.get(row.key)));
+    const changed=rows.filter((row,index)=>row!==r.rows[index]).length;
+    if (changed) {
+      const revisionKey=sha(['requirement-metadata-scope-v1',r.reportId]);
+      const result=await publish(db,{...r,model,rows,draftText:renderQuestions(rows),
+        previousReportId:r.reportId,revisionKey});
+      await notify(r,'published',revisionKey,{reviewId:result.id,changedRows:changed,calls:0},'metadata_scope_checked');
+      return 'published';
+    }
+  }
   if (!pending || preDispatchReviewRejection(pending)) {
     if (Date.now() - cursor.at < settleMs) return 'published';
     const {facts,totalFacts} = await nextFacts(db, r, cursor.seen);
