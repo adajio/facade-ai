@@ -69,10 +69,15 @@ function vocabulary(requirements) {
   const index = new Map();
   for (const [criterion, row] of requirements.entries()) {
     const weights = new Map();
-    for (const field of [row.evidenceRule,row.completenessCriterion,row.applicability]) {
+    const rule = row.evidenceRule;
+    const subjects = Array.isArray(rule?.allOf)
+      ? rule.allOf.flatMap(group => Array.isArray(group?.anyOf)
+        ? group.anyOf.map(option => option?.subject).filter(subject => typeof subject === 'string') : [])
+      : [];
+    for (const field of [typeof rule === 'string' ? rule : '',row.completenessCriterion,row.applicability]) {
       for (const term of terms(field)) weights.set(term, 1);
     }
-    for (const field of [row.part,row.aliases,row.equivalents]) {
+    for (const field of [row.part,row.aliases,row.equivalents,...subjects]) {
       for (const term of terms(field)) weights.set(term, 4);
     }
     for (const [term, weight] of weights) {

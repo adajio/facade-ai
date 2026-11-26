@@ -273,3 +273,17 @@ test('adapter start failure, provider rejection and late unknown outcomes are di
   await writeFile(script,'import sys\nprint("internal diagnostic", file=sys.stderr)\nsys.exit(1)\n');
   await assert.rejects(invokeModel(script,{}),{message:'adapter_failed_after_start',state:'unknown'});
 });
+
+test('retrieval ranks subjects from catalog alternatives and ignores schema field names', async () => {
+  const {prioritizeEvidence} = await import('../infra/local-terra/request-budget.mjs');
+  const items = [{text:'object drawing presence'}, {text:'Герметизация наружного шва'},
+    {text:'Прочность бетона'}];
+  const describe = item => ({source:'sheet', text:item.text, label:''});
+  const rule = {allOf:[{anyOf:[{subject:'Герметизация',sourceRole:'drawing',mode:'value'}]},
+    {anyOf:[{subject:'Прочность',sourceRole:'design',mode:'value'}]}]};
+  const current = prioritizeEvidence(items,[{part:'Сведения',evidenceRule:rule}],describe);
+  assert.deepEqual(current.map(x=>x.text),[items[1].text,items[2].text,items[0].text]);
+  assert.equal(prioritizeEvidence(items,[{evidenceRule:'Прочность'}],describe)[0],items[2]);
+  assert.deepEqual(prioritizeEvidence(items,[{evidenceRule:{allOf:[null,{anyOf:[null]}]}}],describe),items);
+  assert.deepEqual(prioritizeEvidence(items,[{evidenceRule:{allOf:[{anyOf:[{mode:'presence',sourceRole:'drawing'}]}]}}],describe),items);
+});
