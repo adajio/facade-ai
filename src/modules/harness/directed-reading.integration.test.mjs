@@ -3,13 +3,14 @@ import { createHash, randomUUID } from 'node:crypto';
 import test from 'node:test';
 import pg from 'pg';
 import { readSnapshot } from '../../../infra/local-terra/producer.mjs';
-import { directedReadingPlanSql, directedWindowAllowed } from '../../../dist/src/modules/harness/directed-reading.js';
+import { directedReadingPlanSql, directedWindowAllowed, readProductionDirectedReadingPlan } from '../../../dist/src/modules/harness/directed-reading.js';
 import { jobSchema } from '../../../dist/src/modules/harness/contracts.js';
 import { initialMessages } from '../../../dist/src/modules/harness/openrouter.js';
 import { packageStructure } from '../../../dist/src/modules/harness/package-walk.js';
 import { dispatchPackagePair } from '../../../dist/src/modules/harness/package-dispatch.js';
 import { readTerraReading } from '../../../dist/src/modules/assessment/terra-reading.js';
 import { WorkQueue } from '../../../dist/src/modules/gateway/queue.js';
+import { admittedDeepReceipts, chooseDeepWindow, currentDeepReceipt, deepReadingActivity, deepReadingWork, installDeepLedger } from '../../../infra/local-terra/transport/deep-reading.mjs';
 
 const url = process.env.DIRECTED_READING_TEST_DATABASE_URL;
 const hash = text => createHash('sha256').update(text).digest('hex');
@@ -95,6 +96,29 @@ test('held-out directed reading preserves an open gap and stops after the select
   await report(0,[rows[0],{key:'R2',status:'unassessed',sources:[]},rows[2]]);
   const plan = async()=> (await db.query(directedReadingPlanSql('$1::uuid'),[project])).rows[0];
   assert.equal((await plan()).mode,'waiting_index');
+  const target = {projectId:project,receiptId:receipt,preparationId:manifest,catalogVersionId:catalog,stage};
+  const future = {activatedAt:'2999-01-01T00:00:00.000000Z',grants:[]};
+  const past = {activatedAt:'2000-01-01T00:00:00.000000Z',grants:[]};
+  assert.deepEqual(await admittedDeepReceipts(db,null),[]);
+  assert.deepEqual(await admittedDeepReceipts(db,future),[]);
+  assert.deepEqual(await admittedDeepReceipts(db,{...future,grants:[{...target,preparationId:randomUUID()}]}),[]);
+  assert.deepEqual(await admittedDeepReceipts(db,{...future,grants:[target]}),[target]);
+  assert.deepEqual(await admittedDeepReceipts(db,past),[target]);
+  assert.equal(await currentDeepReceipt(db,{...target,receiptId:randomUUID()}),false);
+  const production = await readProductionDirectedReadingPlan(db,project);
+  assert.equal(production.mode,'directed');
+  assert.deepEqual(production.windowIds,[windowIds[0]]);
+  const candidate = await chooseDeepWindow(db,target,production);
+  assert.equal(candidate.requiresVisual,true);
+  await db.query(`CREATE TABLE local_terra_calls (id uuid PRIMARY KEY,job_id uuid,project_id uuid,state text,
+    created_at timestamptz DEFAULT clock_timestamp(),finished_at timestamptz)`);
+  await installDeepLedger(db,'local_terra_production_research');
+  await installDeepLedger(db,'local_terra_production_research');
+  const summary = await deepReadingWork(db,target,'local_terra_production_research');
+  assert.deepEqual(summary,{started:0,active:0,completed:0,lastFinishedAt:null,unknown:null});
+  assert.equal(await deepReadingActivity(db,target,'running',null,{started:1}),true);
+  assert.equal(await deepReadingActivity(db,target,'running',null,{started:1}),false);
+  assert.deepEqual(await admittedDeepReceipts(db,past),[target]);
   assert.equal((await readTerraReading(db,project)).progress.directed.indexPendingUnits,31);
   for (let i=1;i<book.length;i++) await indexPage(i);
   assert.equal((await readSnapshot(db,receipt)).indexCoverage.pendingVersions,0);
@@ -162,6 +186,8 @@ test('held-out directed reading preserves an open gap and stops after the select
     nextPoll=await readTerraReading(db,project,db);
   }
   assert.equal(nextPoll.progress.directed.mode,'enough_evidence');
+  assert.equal(await deepReadingActivity(db,target,'completed','enough_evidence',{started:1,openRequirements:0}),true);
+  assert.deepEqual(await admittedDeepReceipts(db,past),[]);
 
   await db.query("INSERT INTO intake_receipts(project_id,source,created_by) VALUES($1,'upload',$2)",[project,user]);
   assert.equal((await plan()).mode,'waiting_report');

@@ -308,6 +308,8 @@ export function initialMessages(job: ResearchJob): Message[] {
     if (job.packageWindow.directedRequirements?.length) {
       instructions.push('Уточните свойства назначенных требований в пределах указанного места. Откройте графику или текст в этом месте, чтобы подтвердить буквальную опору либо зафиксировать ограничение. Отсутствие наблюдения в этом месте не доказывает отсутствие в комплекте.');
       if (job.packageWindow.walkProtocol) instructions.push('Начните с inspect_structure и списка directedFocus.');
+      if (job.packageWindow.productionReview) instructions.push(
+        'На это окно отведено не более восьми действий. Для графического источника откройте survey, затем при необходимости один zoom или OCR. Сначала сохраните одну полезную точную опору или адресное ограничение. Завершите finish_reading, когда независимое уточнение выполнено или осталось адресное ограничение.');
     } else if(job.packageWindow.profileInspection&&!job.packageWindow.followup) instructions.push('На первом обзоре проверьте возможный перечень, обозначения и типы фасадов. Начните с inspect_structure. Если указаны profileInspectionLines, сами выберите и откройте соответствующие места. Отсутствие указателей оставляет это окно на обычном обзоре.');
     if(profileScan(job)) {
       const plan=job.packageWindow.followup?.discovery;

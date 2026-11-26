@@ -122,6 +122,13 @@ export async function readTerraReading(tx: PoolClient, projectId: string, planBa
           SELECT count(*)::int FROM windows w WHERE w.id=ANY($6::uuid[])
             AND NOT EXISTS (SELECT 1 FROM jobs assigned WHERE assigned.id=w.id)
        )) AS directed FROM jobs`, [projectId, receipt.receiptId, model, route, JSON.stringify(directed),applicableWindows]);
+  const { rows: [deep] } = await tx.query<{ status: string; reason: string | null; started: number; limit: number }>(
+    `SELECT a.status,a.reason,(a.fields->>'started')::int AS started,(a.fields->>'limit')::int AS "limit"
+     FROM project_reading_activity a JOIN projects p ON p.id=a.project_id
+     JOIN intake_package_preparation_current cur ON cur.project_id=a.project_id AND cur.receipt_id=a.receipt_id AND cur.manifest_id=a.preparation_id
+     WHERE a.project_id=$1 AND a.receipt_id=$2 AND a.stage='deep_reading'
+       AND a.fields->>'catalogVersionId'=p.catalog_version_id::text AND a.fields->>'projectStage'=p.project_stage
+     ORDER BY a.event_time DESC,a.id DESC LIMIT 1`, [projectId,receipt.receiptId]);
   const { rows: activity } = await tx.query(`WITH accepted AS (
        SELECT DISTINCT ON (o.version_id) o.version_id,v.document_id,o.relative_path AS label
        FROM intake_occurrences o JOIN intake_document_versions v ON v.id=o.version_id AND v.project_id=o.project_id
@@ -139,5 +146,5 @@ export async function readTerraReading(tx: PoolClient, projectId: string, planBa
          WHERE f.root_job_id=j.id AND f.job_id=o.run_id AND f.window_id=w.id AND f.branch='A'))
      WHERE ${visibleReadingWindow} AND (nullif(o.payload->>'quote','') IS NOT NULL OR nullif(o.payload->>'value','') IS NOT NULL OR nullif(o.payload->>'limitation','') IS NOT NULL)
      ORDER BY o.created_at DESC,o.id DESC LIMIT 20`, [projectId, receipt.receiptId, model, route]);
-  return { enabled: true, receipt, report: report ?? null, progress, activity };
+  return { enabled: true, receipt, report: report ?? null, progress: {...progress,deep:deep ?? null}, activity };
 }

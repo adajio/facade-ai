@@ -1,6 +1,13 @@
 import { readdir, readFile } from 'node:fs/promises';
 import { join } from 'node:path';
 
+const preDispatchReasons = new Set(['mac_terra_busy','mac_terra_paused','mac_terra_budget_exhausted','mac_terra_not_started']);
+
+export function preDispatchReviewRejection(entry) {
+  const reason = entry?.error ?? entry?.reason;
+  return entry?.state === 'rejected' && entry.response === undefined && entry.result === undefined && preDispatchReasons.has(reason);
+}
+
 async function names(path) {
   try { return await readdir(path); }
   catch(error) { if (error.code==='ENOENT') return []; throw error; }

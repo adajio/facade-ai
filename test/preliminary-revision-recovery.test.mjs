@@ -107,6 +107,26 @@ test('known provider rejection preserves exact pending batch across restart', as
   assert.equal(pending.state,'rejected');
 });
 
+test('addressed revision rechecks admission and resumes a Mac busy rejection', async t => {
+  const {run,pendingPath,state} = await fixture(t);
+  const events=[];
+  const recordActivity=async (_db,event)=>events.push(event);
+  assert.equal(await run({recordActivity,modelCall:async ()=>{
+    throw new ModelTransportError('rejected','mac_terra_busy');
+  }}),'waiting');
+  const saved=await read(pendingPath);
+  assert.equal(saved.error,'mac_terra_busy');
+  assert.equal(await run({admitClaim:async()=> 'held_terra_mac_unavailable',modelCall:assert.fail}),'held_terra_mac_unavailable');
+  assert.deepEqual(await read(pendingPath),saved);
+  assert.equal(await run({recordActivity}),'published');
+  assert.equal(state.modelCalls,1);
+  assert.equal(state.publishCalls,1);
+  assert.deepEqual(events.map(({status,reason})=>[status,reason]),[
+    ['sending',undefined],['waiting','mac_terra_busy'],['sending',undefined],['completed',undefined],['published',undefined],
+  ]);
+  await assert.rejects(read(pendingPath),{code:'ENOENT'});
+});
+
 test('known invalid answer is retained with its reason and releases the next batch', async (t) => {
   const {state,run,resultPaths,pendingPath,reopen,fact} = await fixture(t);
   const bad = {model:'gpt-6.1-terra'};
@@ -202,7 +222,7 @@ test('reviews resolve short observation addresses within the immutable inventory
 });
 
 const databaseUrl = process.env.PRELIMINARY_TEST_DATABASE_URL;
-test('PostgreSQL revision selection cannot import another project through a manifest window', {skip: !databaseUrl}, async (t) => {
+test('PostgreSQL selects normal terminal production facts for the pinned scope only', {skip: !databaseUrl}, async (t) => {
   const parsed = new URL(databaseUrl);
   assert.ok(['localhost','127.0.0.1','::1','[::1]'].includes(parsed.hostname) && /^\/facade_test_[a-z0-9_]+$/.test(parsed.pathname));
   const {Pool} = (await import('pg')).default;
@@ -227,7 +247,7 @@ test('PostgreSQL revision selection cannot import another project through a mani
   await db.query("INSERT INTO users(id,organization_id,login) VALUES($1,$2,'revision-fixture')",[user,org]);
   await db.query("INSERT INTO catalog_versions(id,organization_id,catalog_key,revision,name,requirements,created_by) VALUES($1,$2,'fixture',1,'Fixture',$3,$4)",
     [catalog,org,JSON.stringify(requirements),user]);
-  async function projectFixture(quote) {
+  async function projectFixture(quote,format = 'docx') {
     const [project,receipt,original,document,version,generation,window,job,manifest,evidence,observation] =
       Array.from({length:11},randomUUID);
     const source = {projectId:project,documentId:document,versionId:version,sha256:hash};
@@ -243,7 +263,7 @@ test('PostgreSQL revision selection cannot import another project through a mani
     await db.query('INSERT INTO gateway_projects(project_id) VALUES($1)',[project]);
     await db.query('INSERT INTO gateway_generations(project_id,scope_id,generation_id) VALUES($1,NULL,$2)',[project,generation]);
     await db.query('INSERT INTO harness_package_projects(project_id,generation_id) VALUES($1,$2)',[project,generation]);
-    await db.query("INSERT INTO harness_package_maps(project_id,version_id,fingerprint,format) VALUES($1,$2,'active','pdf')",[project,version]);
+    await db.query("INSERT INTO harness_package_maps(project_id,version_id,fingerprint,format) VALUES($1,$2,'active',$3)",[project,version,format]);
     await db.query("INSERT INTO harness_package_windows(id,project_id,version_id,map_fingerprint,ordinal,place) VALUES($1,$2,$3,'active',1,$4)",
       [window,project,version,JSON.stringify({source,unitId:'p1',page:1})]);
     await db.query("INSERT INTO gateway_primary(generation_id,id,branch,place) VALUES($1,'a','A','p1')",[generation]);
@@ -263,23 +283,49 @@ test('PostgreSQL revision selection cannot import another project through a mani
     await db.query(`INSERT INTO preliminary_package_reviews(project_id,receipt_id,catalog_version_id,model,stage,input_generation,inventory,scope_note,rows,draft_text,content_hash,preparation_id)
       VALUES($1,$2,$3,'gpt-6.1-terra','РД',0,$4,'Обзор',$5,'Передайте ведомость.',$6,$7)`,
       [project,receipt,catalog,JSON.stringify(inventory),JSON.stringify([row('R1','Ведомость не установлена.')]),hash,manifest]);
-    return {project,receipt,window,manifest,version};
+    return {project,receipt,window,manifest,version,job,quote};
   }
   const selected = await projectFixture('Ведомость 1');
   const foreign = await projectFixture('Посторонний источник');
+  const visual = await projectFixture('Извлечение текста DWG без графического просмотра','dwg');
   // The manifest/window FK alone accepts this mismatched project relation.
   await db.query('INSERT INTO intake_package_preparation_windows(manifest_id,project_id,window_id) VALUES($1,$2,$3)',
     [selected.manifest,selected.project,foreign.window]);
-  assert.equal(await reviseReceipt({
-    db,receiptId:selected.receipt,stateDir,admitClaim:async (_snapshot,reserve)=>await reserve()?'claimed':'claimed_elsewhere',
+  const run = (overrides,target=selected) => reviseReceipt({
+    db,receiptId:target.receipt,stateDir,admitClaim:async (_snapshot,reserve)=>await reserve()?'claimed':'claimed_elsewhere',
     modelCall: async (request) => {
-      assert.deepEqual(JSON.parse(request.messages[1].content).facts.map(({quote})=>quote),['Ведомость 1']);
+      assert.deepEqual(JSON.parse(request.messages[1].content).facts.map(({quote})=>quote),[target.quote]);
       return response(proposal());
     },
     publish: async (_db,input) => {
-      assert.equal(input.projectId,selected.project);
-      assert.deepEqual(input.rows[0].sources.map(({versionId})=>versionId),[selected.version]);
+      assert.equal(input.projectId,target.project);
+      assert.deepEqual(input.rows[0].sources.map(({versionId})=>versionId),[target.version]);
       return {id:randomUUID()};
     },
-  }), 'published');
+    ...overrides,
+  });
+  const payload = (target,overrides) => ({packageWindow:{preparationId:target.manifest,productionReview:{
+    catalogVersionId:catalog,stage:'РД',requiresVisual:false,...overrides,
+  }}});
+  const update = (state,reason,context,target=selected) => db.query(`UPDATE gateway_jobs SET kind='local_terra_production_research',state=$2,reason=$3,payload=$4 WHERE id=$1`,
+    [target.job,state,reason,JSON.stringify(payload(target,context))]);
+  for (const [state,reason] of [['ready','mac_terra_busy'],['held','mac_terra_busy'],['held','subscription_outcome_unknown'],['held','local_assignment_denied']]) {
+    await update(state,reason);
+    assert.equal(await run({modelCall:assert.fail,publish:assert.fail}),'published');
+  }
+  await update('held','repeated_rejected_action',{catalogVersionId:randomUUID()});
+  assert.equal(await run({modelCall:assert.fail,publish:assert.fail}),'published');
+  for (const reason of ['turn_limit_final','repeated_rejected_action']) {
+    await update('held',reason,{requiresVisual:true},visual);
+    assert.equal(await run({modelCall:assert.fail,publish:assert.fail},visual),'published');
+  }
+  await update('held','turn_limit_final',{requiresVisual:false},visual);
+  assert.equal(await run({modelCall:assert.fail,publish:assert.fail},visual),'published');
+  await update('done',null,{requiresVisual:true},visual);
+  await db.query(`UPDATE gateway_jobs SET result='{"kind":"partial"}' WHERE id=$1`,[visual.job]);
+  assert.equal(await run({},visual),'published');
+  await update('held','turn_limit_final',{requiresVisual:undefined});
+  assert.equal(await run({modelCall:assert.fail,publish:assert.fail}),'published');
+  await update('held','repeated_rejected_action');
+  assert.equal(await run(),'published');
 });

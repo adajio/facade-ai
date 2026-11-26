@@ -1,8 +1,12 @@
-# Производственный предварительный разбор через Terra на Mac
+# Обзор и углублённое чтение новых поступлений через Terra на Mac
 
 Профиль рассчитан на `facade.ftbd.dev`. Producer читает подготовленную опись и адресные фрагменты на VPS. Он отправляет подготовленный запрос по обратному SSH Unix-сокету на Mac. Mac запускает один `gpt-6.1-terra` с effort `high` через локальный Codex. Профиль хранит на Mac хэш допущенного запроса и счётчик при установленном ограничении.
 
 Локальная сборка использует [синтетические тесты транспорта](../../../test/local-terra-production-transport.test.mjs). Тесты проверяют автоматический допуск новых запечатанных поступлений, сохранение первой границы запуска, явный допуск по редакции исторической описи, отказ по старому незавершённому вызову, неизвестный исход после доставки, восстановление SSH и завершение начатого вызова при паузе.
+
+После загрузки сервер распаковывает архивы, обрабатывает доступные документы и сохраняет подготовленную опись. Служба `preliminary` публикует первые 16 оценок и черновик письма. Служба `deep` выбирает адреса для открытых вопросов и ведёт многоходовое чтение на Mac через закрытый `/v1/research`. Источники и результаты инструментов остаются привязаны к редакции документа и поступлению. Новые подтверждённые наблюдения поступают в адресную ревизию матрицы и письма. Текущий предел — четыре участка на поступление и восемь ходов на участок. Обработчик может закончить раньше, а при неизвестном исходе останавливает повторную отправку. Обзор и ревизия учитываются отдельно от этого предела.
+
+Штатный worker готовит документы и индексы. Режим `FACADE_HARNESS_REPLAY_ONLY=1` в нём относится к другим маршрутам модели. Живые запросы новых поступлений проходят через отдельные службы `preliminary` и `deep`. У каждой свой файл активации. Исторический допуск для обзора сам по себе не запускает углублённое чтение.
 
 ## 1. Выпуск API и закрытого producer
 
@@ -61,9 +65,9 @@ if test -n "$(stack ps -q preliminary)"; then
 fi
 
 docker compose stop -t "$grace" worker
-stack up -d --no-deps worker
+stack up -d --no-deps api worker
 status --require-no-active
-stack up -d --no-deps preliminary
+stack up -d --no-deps preliminary deep
 stack ps
 ```
 
@@ -103,7 +107,7 @@ LaunchAgent транспорта поднимает обратный SSH Unix-с
 test -S terra/transport/model.sock
 stack exec -T preliminary node -e '
  const h=require("node:http");
- h.get({socketPath:process.env.FACADE_TERRA_PRODUCTION_SOCKET,path:"/health"},r=>{
+ for (const path of ["/health", "/health/research"]) h.get({socketPath:process.env.FACADE_TERRA_PRODUCTION_SOCKET,path},r=>{
    let text=""; r.on("data",c=>text+=c); r.on("end",()=>{
      const result=JSON.parse(text);
      if(r.statusCode!==200 || result.ready!==true || result.busy!==false) process.exitCode=1;
@@ -121,6 +125,7 @@ stack exec -T preliminary node -e '
 
 ```sh
 test -s terra/state/state/production-activation
+test -s terra/state/state/production-research-activation
 cat terra/state/state/production-activation
 rm terra/config/paused
 ```
@@ -152,15 +157,15 @@ mv "$tmp" "$mac_controls/limit.json"
 
 ## 4. Пауза и откат
 
-1. Установите общую паузу на VPS командой `: > terra/config/paused` и на Mac командой `: > "$HOME/.local/share/facade-terra/production/controls/paused"`. Дождитесь `busy:false` у bridge и урегулируйте `sending` в журнале. Опубликованные версии и сохранённые ответы остаются в тех же БД и каталогах. Для возобновления обычного чтения снимите эти временные паузы.
+1. Установите общую паузу на VPS командой `: > terra/config/paused` и на Mac командой `: > "$HOME/.local/share/facade-terra/production/controls/paused"`. Проверьте `/health/research` через тот же Unix-сокет. Дождитесь `busy:false` у bridge и урегулируйте `sending` в журнале. Опубликованные версии и сохранённые ответы остаются в тех же БД и каталогах. Для возобновления обычного чтения снимите эти временные паузы.
 2. Сверьте агрегаты producer по команде ниже. `responded` означает, что ответ уже сохранён и служба ещё завершает публикацию. `unknown` означает, что исход остаётся на сверке.
-3. После дренирования остановите только producer командой `stack stop -t 300 preliminary`. Затем остановите LaunchAgent туннеля и bridge. При повторном выпуске сохраните `terra/state` и Mac ledger.
+3. После дренирования остановите только producer командой `stack stop -t 300 preliminary deep`. Затем остановите LaunchAgent туннеля и bridge. При повторном выпуске сохраните `terra/state` и Mac ledger.
 4. Если владелец отдельно возвращает прежние маршруты модели, восстановите прежний worker из базового Compose после сверки обоих журналов. Это снова разрешит прежние production-вызовы. Для восстановления только web/API используйте закреплённый предыдущий образ и штатный откат оператора. Миграции, новые заключения и оригиналы остаются на месте.
 
 ```sh
 stack exec -T preliminary node --input-type=module - \
   --terra-state /var/lib/facade-terra/state --require-no-active < "$status_script"
-stack stop -t 300 preliminary
+stack stop -t 300 preliminary deep
 curl -fsS https://facade.ftbd.dev/readyz
 ```
 
