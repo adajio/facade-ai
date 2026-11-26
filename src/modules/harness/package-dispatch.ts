@@ -75,6 +75,7 @@ export async function preparePackageMap(
        raster_recovery text,predecessor_versions text[],predecessor_before timestamptz)
        ON expected.media=v.media_type AND expected.extension IS NOT DISTINCT FROM source.extension
      LEFT JOIN harness_package_maps m ON m.version_id=j.version_id AND m.active
+     LEFT JOIN harness_package_map_retries retry ON retry.version_id=j.version_id
      LEFT JOIN reader_maps old_dwg ON old_dwg.project_id=j.project_id AND old_dwg.document_id=j.document_id
        AND old_dwg.version_id=j.version_id AND old_dwg.original_sha256=o.sha256 AND old_dwg.reader_version=expected.version
        AND old_dwg.format='dwg' AND jsonb_array_length(old_dwg.units)=1
@@ -96,8 +97,9 @@ export async function preparePackageMap(
        AND NOT COALESCE(${pinnedDwgPredecessorSql('m','expected.predecessor_versions','expected.predecessor_before')},false)
        AND (m.version_id IS NULL OR m.requested_reader_version IS DISTINCT FROM effective.version
          OR m.physical_basis_id IS NULL AND m.physical_limitation IS NULL)
-       AND NOT EXISTS (SELECT 1 FROM harness_package_map_retries r WHERE r.version_id=j.version_id AND r.retry_at>clock_timestamp())
-     ORDER BY j.created_at,j.id LIMIT 1`, [JSON.stringify(versions), [...packageProjects], JSON.stringify(legacyDxfGroupHold), dxfRecoveryVersionPatterns, rasterDimensionLimit, JSON.stringify(legacyDxfEncodingHold)]);
+       AND (retry.retry_at IS NULL OR retry.retry_at<=clock_timestamp())
+     ORDER BY (m.version_id IS NOT NULL OR retry.version_id IS NOT NULL),
+       coalesce(retry.retry_at,j.created_at),j.created_at,j.id LIMIT 1`, [JSON.stringify(versions), [...packageProjects], JSON.stringify(legacyDxfGroupHold), dxfRecoveryVersionPatterns, rasterDimensionLimit, JSON.stringify(legacyDxfEncodingHold)]);
   if (!job) return false;
   let map;
   let requested = job.requested;
