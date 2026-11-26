@@ -222,7 +222,7 @@ test('reviews resolve short observation addresses within the immutable inventory
 });
 
 const databaseUrl = process.env.PRELIMINARY_TEST_DATABASE_URL;
-test('PostgreSQL selects normal terminal production facts for the pinned scope only', {skip: !databaseUrl}, async (t) => {
+test('PostgreSQL revises only committed terminal Terra facts from the pinned scope', {skip: !databaseUrl}, async (t) => {
   const parsed = new URL(databaseUrl);
   assert.ok(['localhost','127.0.0.1','::1','[::1]'].includes(parsed.hostname) && /^\/facade_test_[a-z0-9_]+$/.test(parsed.pathname));
   const {Pool} = (await import('pg')).default;
@@ -247,12 +247,16 @@ test('PostgreSQL selects normal terminal production facts for the pinned scope o
   await db.query("INSERT INTO users(id,organization_id,login) VALUES($1,$2,'revision-fixture')",[user,org]);
   await db.query("INSERT INTO catalog_versions(id,organization_id,catalog_key,revision,name,requirements,created_by) VALUES($1,$2,'fixture',1,'Fixture',$3,$4)",
     [catalog,org,JSON.stringify(requirements),user]);
-  async function projectFixture(quote,format = 'docx') {
+  async function projectFixture(quote,format = 'docx',structured = false) {
     const [project,receipt,original,document,version,generation,window,job,manifest,evidence,observation] =
       Array.from({length:11},randomUUID);
     const source = {projectId:project,documentId:document,versionId:version,sha256:hash};
     const address = {unitId:'p1',locator:{page:1}};
     const inventory = [{versionId:version,originalSha256:hash}];
+    const reviewRow = row('R1','Ведомость не установлена.');
+    if (structured) reviewRow.analysis = {
+      applicability:{kind:'undetermined',reason:'Нужна сверка.',sources:[]},properties:[],tensions:[],
+    };
     await db.query("INSERT INTO projects(id,organization_id,name,catalog_version_id,project_stage) VALUES($1,$2,'Fixture',$3,'РД')",[project,org,catalog]);
     await db.query("INSERT INTO intake_receipts(id,project_id,source,created_by,sealed_at) VALUES($1,$2,'upload',$3,now())",[receipt,project,user]);
     await db.query('INSERT INTO intake_originals(id,project_id,object_key,size,sha256) VALUES($1,$2,$3,1,$4)',[original,project,original,hash]);
@@ -282,7 +286,7 @@ test('PostgreSQL selects normal terminal production facts for the pinned scope o
     await db.query('INSERT INTO intake_package_preparation_windows(manifest_id,project_id,window_id) VALUES($1,$2,$3)',[manifest,project,window]);
     await db.query(`INSERT INTO preliminary_package_reviews(project_id,receipt_id,catalog_version_id,model,stage,input_generation,inventory,scope_note,rows,draft_text,content_hash,preparation_id)
       VALUES($1,$2,$3,'gpt-6.1-terra','РД',0,$4,'Обзор',$5,'Передайте ведомость.',$6,$7)`,
-      [project,receipt,catalog,JSON.stringify(inventory),JSON.stringify([row('R1','Ведомость не установлена.')]),hash,manifest]);
+      [project,receipt,catalog,JSON.stringify(inventory),JSON.stringify([reviewRow]),hash,manifest]);
     return {project,receipt,window,manifest,version,job,quote,source,address,evidence,observation};
   }
   const selected = await projectFixture('Ведомость 1');
@@ -304,11 +308,23 @@ test('PostgreSQL selects normal terminal production facts for the pinned scope o
     },
     ...overrides,
   });
+  assert.equal(await run({},foreign),'published', 'the existing managed done path remains eligible');
   const payload = (target,overrides) => ({packageWindow:{preparationId:target.manifest,productionReview:{
     catalogVersionId:catalog,stage:'РД',requiresVisual:false,...overrides,
   }}});
-  const update = (state,reason,context,target=selected) => db.query(`UPDATE gateway_jobs SET kind='local_terra_production_research',state=$2,reason=$3,payload=$4 WHERE id=$1`,
-    [target.job,state,reason,JSON.stringify(payload(target,context))]);
+  const move = (target,kind,state,reason,jobPayload) => db.query(`
+    WITH moved AS (UPDATE gateway_jobs SET kind=$2,state=$3,reason=$4,payload=$5,lease_epoch=lease_epoch+1,
+      worker_id=CASE WHEN $3='leased' THEN 'fixture' END,
+      lease_until=CASE WHEN $3='leased' THEN clock_timestamp()+interval '1 minute' END
+      WHERE id=$1 RETURNING id,lease_epoch),
+    cursor AS (UPDATE gateway_outbox_sequence SET cursor=cursor+1 WHERE $3='held' RETURNING cursor)
+    INSERT INTO gateway_outbox(cursor,job_id,lease_epoch,event_type)
+    SELECT cursor,moved.id,moved.lease_epoch,'suspended' FROM moved,cursor`,
+    [target.job,kind,state,reason,JSON.stringify(jobPayload)]);
+  const update = (state,reason,context,target=selected) =>
+    move(target,'local_terra_production_research',state,reason,payload(target,context));
+  const moveLocal = (target,state,reason,preparationId=target.manifest) =>
+    move(target,'local_terra_research',state,reason,{packageWindow:{id:target.window,readerVersion:'fixture',preparationId}});
   for (const [state,reason] of [['ready','mac_terra_busy'],['held','mac_terra_busy'],['held','subscription_outcome_unknown'],['held','local_assignment_denied']]) {
     await update(state,reason);
     assert.equal(await run({modelCall:assert.fail,publish:assert.fail}),'published');
@@ -326,20 +342,20 @@ test('PostgreSQL selects normal terminal production facts for the pinned scope o
   assert.equal(await run({},visual),'published');
   await update('held','turn_limit_final',{requiresVisual:undefined});
   assert.equal(await run({modelCall:assert.fail,publish:assert.fail}),'published');
-  async function savedReceipt(target,{kind='native',parts=0}={}) {
+  async function savedReceipt(target,{kind='native',parts=0,limitation}={}) {
     const {source,address,job,evidence,observation}=target;
     await db.query("UPDATE harness_package_maps SET reader_version='fixture' WHERE version_id=$1",[target.version]);
     await db.query('UPDATE reader_evidence SET payload=$2 WHERE id=$1',[evidence,JSON.stringify({
       source,address,representation:kind,sha256:hash,...(kind==='render' && {mediaType:'image/png'}),
     })]);
-    const pin={source,address,quote:target.quote,grounding:kind==='render'?'visual':'text',
-      ...(kind==='native' && {lineId:'row1'})};
+    const pin={source,address,quote:target.quote,grounding:kind==='render'?'visual':'text',readerVersion:'fixture',
+      ...(kind==='native' && {lineId:'row1'}),...(limitation && {limitation})};
     await db.query('UPDATE reader_observations SET payload=$2 WHERE id=$1',[observation,JSON.stringify(pin)]);
     const events=[
       ...(kind==='render' ? [{kind:'tool',reply:{readKind:'zoom',evidence:{evidenceId:evidence,sha256:hash},image:{data:'iVBORw0KGgo'}}},
         ...Array.from({length:parts},(_,index)=>({kind:'model',inputRefs:[evidence],
           visualReceipts:[{evidenceId:evidence,part:index+1,total:2}]}))] : []),
-      {kind:'tool',reply:{observation:{id:observation,qualified:true}}},
+      {kind:'tool',reply:{observation:{id:observation,qualified:!limitation}}},
     ];
     for (const [index,event] of events.entries()) await db.query(
       'INSERT INTO harness_research_events(job_id,sequence,event) VALUES($1,$2,$3)',[job,index+1,JSON.stringify(event)]);
@@ -351,7 +367,20 @@ test('PostgreSQL selects normal terminal production facts for the pinned scope o
   const pinned = await projectFixture('Нативная надпись у оси Б','dwg');
   await savedReceipt(pinned);
   await update('held','subscription_outcome_unknown',{requiresVisual:true},pinned);
-  assert.equal(await run({},pinned),'published');
+  assert.equal(await run({
+    modelCall:async request=>{
+      assert.equal(JSON.parse(request.messages[1].content).facts[0].evidence,'literal');
+      return response(proposal());
+    },
+    publish:async (_db,input)=>{
+      assert.equal(input.rows[0].status,'unassessed');
+      assert.equal(input.rows[0].finding,'Ведомость не установлена.');
+      assert.equal(input.draftText,'Передайте ведомость.');
+      assert.equal(input.rows[0].sources[0].quote,pinned.quote);
+      assert.equal(JSON.parse(input.rows[0].sources[0].anchor).evidenceMode,'literal');
+      return {id:randomUUID()};
+    },
+  },pinned),'published');
 
   const incomplete = await projectFixture('Открыта только первая плитка','dwg');
   await savedReceipt(incomplete,{kind:'render',parts:1});
@@ -362,6 +391,69 @@ test('PostgreSQL selects normal terminal production facts for the pinned scope o
   await savedReceipt(complete,{kind:'render',parts:2});
   await update('held','subscription_outcome_unknown',{requiresVisual:true},complete);
   assert.equal(await run({},complete),'published');
+
+  const inscription = await projectFixture('Облицовочная панель','dwg',true);
+  await savedReceipt(inscription);
+  await moveLocal(inscription,'held','subscription_outcome_unknown');
+  let localPublications = 0;
+  assert.equal(await run({
+    modelCall:async request=>{
+      const {facts} = JSON.parse(request.messages[1].content);
+      assert.deepEqual(facts.map(({quote,evidence})=>({quote,evidence})),
+        [{quote:inscription.quote,evidence:'literal'}]);
+      const target = {element:inscription.quote};
+      return response({changes:[{key:'R1',status:'present',finding:'Панель применяется на всём фасаде.',ids:['O1'],
+        analysis:{applicability:null,tensions:[],properties:[{
+          key:'inscription',label:'Подпись',status:'confirmed',finding:'Панель применяется на всём фасаде.',ids:['O1'],
+          scope:{kind:'applicable',basis:'literal',target,observed:target,reason:'Дословная надпись.',ids:['O1']},
+          letter:{kind:'omit',text:'Подпись зафиксирована.'},
+        }]}}]});
+    },
+    publish:async (_db,input)=>{
+      localPublications++;
+      const [saved] = input.rows;
+      assert.equal(saved.status,'partial');
+      assert.equal(saved.analysis.properties[0].finding,'В источнике указано: «Облицовочная панель».');
+      assert.equal(JSON.parse(saved.analysis.properties[0].sources[0].anchor).evidenceMode,'literal');
+      assert.doesNotMatch(saved.finding,/всём фасаде/u);
+      return {id:randomUUID()};
+    },
+  },inscription),'published');
+  assert.equal(localPublications,1);
+
+  const localVisual = await projectFixture('Подпись на полностью доставленном виде','dwg');
+  await savedReceipt(localVisual,{kind:'render',parts:2});
+  const noRevision = {modelCall:assert.fail,publish:assert.fail};
+  const priorPreparation = randomUUID();
+  await db.query('UPDATE intake_package_preparations SET revision=2 WHERE id=$1',[localVisual.manifest]);
+  await db.query("INSERT INTO intake_package_preparations(id,project_id,receipt_id,revision,snapshot_hash,manifest) VALUES($1,$2,$3,1,$4,'{}')",
+    [priorPreparation,localVisual.project,localVisual.receipt,'b'.repeat(64)]);
+  await db.query("INSERT INTO intake_package_preparation_items(manifest_id,project_id,version_id,map_fingerprint) VALUES($1,$2,$3,'active')",
+    [priorPreparation,localVisual.project,localVisual.version]);
+  await db.query('INSERT INTO intake_package_preparation_windows(manifest_id,project_id,window_id) VALUES($1,$2,$3)',
+    [priorPreparation,localVisual.project,localVisual.window]);
+  for (const state of ['ready','leased','done','held']) {
+    const preparation = state==='done' || state==='held' ? priorPreparation : localVisual.manifest;
+    await moveLocal(localVisual,state,state==='held' ? 'turn_limit' : null,preparation);
+    assert.equal(await run(noRevision,localVisual),'published');
+  }
+  await moveLocal(localVisual,'held','turn_limit');
+  assert.equal(await run({publish:async (_db,input)=>{
+    localPublications++;
+    assert.equal(input.rows[0].sources[0].quote,localVisual.quote);
+    return {id:randomUUID()};
+  }},localVisual),'published');
+  assert.equal(localPublications,2);
+
+  const partialImage = await projectFixture('Одна визуальная плитка с ограничением','dwg');
+  await savedReceipt(partialImage,{kind:'render',parts:1,limitation:'Сохранено без полной визуальной выдачи.'});
+  await moveLocal(partialImage,'held','turn_limit');
+  assert.equal(await run(noRevision,partialImage),'published');
+
+  const late = await projectFixture('Событие фиксации после остановки');
+  await moveLocal(late,'held','subscription_outcome_unknown');
+  await savedReceipt(late);
+  assert.equal(await run(noRevision,late),'published');
 });
 
 test('an independent proposal survives an unsupported sibling and its refusal is journaled',async t=>{
