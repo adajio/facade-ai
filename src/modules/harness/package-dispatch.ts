@@ -20,7 +20,8 @@ import { researchKind } from './runner.js';
 import { memoryVersion } from '../project-memory/contracts.js';
 import { profileHintLines,profileHintPatterns } from './facade-profile-hints.js';
 import { dxfEncodingRecoveryVersion, dxfGroupRecoveryVersion, dxfRecoveryVersionPatterns, legacyDxfEncodingHold, legacyDxfGroupHold } from '../formats/dwg-profile.js';
-import { readDirectedReadingPlans, currentDirectedWindow } from './directed-reading.js';
+import { admitBackgroundCall } from './reading-stop.js';
+import { readDirectedReadingPlans, currentDirectedWindow, addressedWindowCurrent } from './directed-reading.js';
 import { largeJpegRecoveryVersion, rasterDimensionLimit } from '../formats/raster-profile.js';
 
 const branches = ['A', 'B'] as const;
@@ -375,6 +376,7 @@ export async function dispatchPackagePair(db: Pool, queue: WorkQueue, profile: R
           packageWindow: { id: next.windowId, readerVersion: next.readerVersion, routeRevision: revision, packageReadingVersion: 2,
             ...(preparationId ? {preparationId} : {}),
             ...(directed.requirements?.length ? {directedRequirements:directed.requirements} : {}),
+            ...(directed.goals?.length ? {directedGoals:directed.goals,goalReportId:directed.reportId,goalCatalogId:directed.goalCatalogId,goalStage:directed.goalStage} : {}),
             ...(walk ? { walkProtocol: 1 as const,profileInspection:{lineIds:next.inspectionLines} } : {}) } };
         jobId = await queue.enqueue({ ...ref, key: 'package:' + key + ':' + branch, kind: researchKind,
           ...(walk&&next.firstAssignment&&next.firstLook.includes(branch)?{priority:next.inspectionLines.length?2:1}:{}),
@@ -466,6 +468,16 @@ export function packageModelAdmission(enabled: boolean, packageProjects: readonl
       [work.projectId, place.source.versionId, packageWindow.readerVersion, work.lease.jobId, branch, input.inputRefs]);
     if (evidence.rowCount !== new Set(input.inputRefs).size) return { deny: 'analysis_input_denied' };
     if (!await paidPackageEffectsAllowed()) return { dispatchBlock: 'analysis_replay_only' };
+    if (packageWindow.preparationId) {
+      const {rows:[target]}=await tx.query<{receipt:string}>(`SELECT receipt_id AS receipt FROM intake_package_preparations
+        WHERE project_id=$1 AND id=$2`,[work.projectId,packageWindow.preparationId]);
+      if (!target) return {dispatchBlock:'preparation_changed'};
+      const effect=hash([work.projectId,work.scopeId,work.generationId,work.key,input.effectKey]);
+      const stop=await admitBackgroundCall(tx,work.projectId,target.receipt,packageWindow.preparationId,effect);
+      if (stop) return {dispatchBlock:stop};
+      if (packageWindow.directedRequirements?.length && !await addressedWindowCurrent(tx,work.projectId,target.receipt,packageWindow))
+        return {dispatchBlock:'no_addressed_goal'};
+    }
     if (packageWindow.preparationId) {
       // Existing started work and replay retain their original effect. An unstarted job
       // must still belong to the currently verified manifest at the final gate.

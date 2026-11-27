@@ -38,6 +38,7 @@
   let now = $state(Date.now());
   $effect(() => { const timer = setInterval(() => now = Date.now(), 1000); return () => clearInterval(timer); });
   const files = $derived(slice?.files);
+  const documents = $derived(files?.documents ?? files?.accepted ?? 0);
   const assessment = $derived(slice?.assessment);
   const inventoryClosed = $derived(Boolean(slice?.totals.all && !slice.totals.open));
 
@@ -57,9 +58,16 @@
     <div>
       <h2>Файлы и подготовка</h2>
       {#if files?.accepted}
-        <progress aria-label="Файлы с готовой картой среди принятых" value={files.prepared} max={files.accepted}></progress>
-        <p>Подготовлено {count(files.prepared)} из {count(files.accepted)} принятых файлов
-          {#if inventoryClosed} · описи закрыты{:else} · состав уточняется{/if}</p>
+        {#if documents}
+          <progress aria-label="Подготовка документов проекта" value={files.prepared} max={documents}></progress>
+          <p>Подготовлено {count(files.prepared)} из {count(documents)} документов
+            {#if inventoryClosed} · описи закрыты{:else} · состав уточняется{/if}</p>
+        {:else}
+          <p>В описи пока нет документов для чтения.</p>
+        {/if}
+        {#if files.archives || files.technical}
+          <p>{#if files.archives}Архивов в описи · {count(files.archives)}. {/if}{#if files.technical}Служебных файлов · {count(files.technical)}.{/if}</p>
+        {/if}
       {:else if slice}
         <p>{slice.acceptedOccurrences ? 'Принято вхождений · ' + count(slice.acceptedOccurrences) : 'Ожидаются файлы'}</p>
       {:else}
@@ -133,7 +141,7 @@
       <dl class="details">
         <dt>Передача</dt><dd>{bytes(slice.confirmedBytes)} подтверждено</dd>
         <dt>Опись</dt><dd>{count(slice.acceptedOccurrences)} принятых вхождений · {count(slice.totals.open)} открытых описей</dd>
-        <dt>Карта оригиналов</dt><dd>{files ? count(files.prepared) + ' из ' + count(files.accepted) : 'Данные этой проверки отсутствуют'}</dd>
+        <dt>Карта оригиналов</dt><dd>{files ? count(files.prepared) + ' из ' + count(documents) : 'Данные этой проверки отсутствуют'}</dd>
         <dt>Ветвь A</dt><dd>{tasks('A')}</dd>
         <dt>Ветвь B</dt><dd>{tasks('B')}</dd>
         <dt>Сверки</dt><dd>{tasks(null)}</dd>

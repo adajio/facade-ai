@@ -1,3 +1,4 @@
+import { readReceiptReadingActivity } from './receipt-reading-activity.js';
 import type { Pool, PoolClient } from 'pg';
 import { inventoryOpen } from '../intake/receipts.js';
 import { readDirectedReadingPlan, type DirectedReading } from '../harness/directed-reading.js';
@@ -71,13 +72,17 @@ export async function readTerraReading(tx: PoolClient, projectId: string, planBa
        count(*) FILTER (WHERE o.parent_occurrence_id IN (SELECT id FROM office_parents))::int AS "officeParts"
      FROM latest r LEFT JOIN occurrences o ON true GROUP BY r.id,r.number,r.inventory_open`, [projectId]);
   if (!receipt) return { enabled: true, receipt: null, report: null, progress: null, activity: [] };
-  const { rows: [report] } = await tx.query<{ id: string; createdAt: Date; summary: unknown; draftAvailable: boolean }>(
+  const { rows: [report] } = await tx.query<{ id: string; createdAt: Date; summary: unknown; draftAvailable: boolean; hasQuestions: boolean | null }>(
     `SELECT r.id,r.created_at AS "createdAt", jsonb_build_object(
        'present',count(*) FILTER (WHERE item->>'status'='present'),
        'partial',count(*) FILTER (WHERE item->>'status'='partial'),
        'notFound',count(*) FILTER (WHERE item->>'status'='not_found'),
        'unassessed',count(*) FILTER (WHERE item->>'status'='unassessed')) AS summary,
-       length(btrim(r.draft_text))>0 AS "draftAvailable"
+       length(btrim(r.draft_text))>0 AS "draftAvailable",
+       CASE WHEN bool_and(item ? 'analysis') THEN EXISTS (
+         SELECT 1 FROM jsonb_array_elements(r.rows) rr CROSS JOIN LATERAL jsonb_array_elements(rr#>'{analysis,properties}') prop
+         WHERE prop#>>'{letter,kind}'='ask' AND (NOT prop ? 'scope' OR prop#>>'{scope,kind}'='applicable')
+       ) END AS "hasQuestions"
      FROM preliminary_package_reviews r JOIN projects p ON p.id=r.project_id
      LEFT JOIN intake_project_generations g ON g.project_id=p.id
      LEFT JOIN LATERAL jsonb_array_elements(r.rows) item ON true
@@ -128,7 +133,8 @@ export async function readTerraReading(tx: PoolClient, projectId: string, planBa
      JOIN intake_package_preparation_current cur ON cur.project_id=a.project_id AND cur.receipt_id=a.receipt_id AND cur.manifest_id=a.preparation_id
      WHERE a.project_id=$1 AND a.receipt_id=$2 AND a.stage='deep_reading'
        AND a.fields->>'catalogVersionId'=p.catalog_version_id::text AND a.fields->>'projectStage'=p.project_stage
-     ORDER BY a.event_time DESC,a.id DESC LIMIT 1`, [projectId,receipt.receiptId]);
+       AND (a.reason IS DISTINCT FROM 'no_addressed_goal' OR a.fields->>'reportId'=$3::text)
+     ORDER BY a.event_time DESC,a.id DESC LIMIT 1`, [projectId,receipt.receiptId,report?.id??null]);
   const { rows: activity } = await tx.query(`WITH accepted AS (
        SELECT DISTINCT ON (o.version_id) o.version_id,v.document_id,o.relative_path AS label
        FROM intake_occurrences o JOIN intake_document_versions v ON v.id=o.version_id AND v.project_id=o.project_id
@@ -146,5 +152,12 @@ export async function readTerraReading(tx: PoolClient, projectId: string, planBa
          WHERE f.root_job_id=j.id AND f.job_id=o.run_id AND f.window_id=w.id AND f.branch='A'))
      WHERE ${visibleReadingWindow} AND (nullif(o.payload->>'quote','') IS NOT NULL OR nullif(o.payload->>'value','') IS NOT NULL OR nullif(o.payload->>'limitation','') IS NOT NULL)
      ORDER BY o.created_at DESC,o.id DESC LIMIT 20`, [projectId, receipt.receiptId, model, route]);
-  return { enabled: true, receipt, report: report ?? null, progress: {...progress,deep:deep ?? null}, activity };
+  const { rows: [prepared] } = await tx.query<{ id: string; counts: { available: number; total: number; archives: number; technical: number } }>(
+    `SELECT p.id,p.manifest->'counts' AS counts FROM intake_package_preparation_current c
+      JOIN intake_package_preparations p ON p.project_id=c.project_id AND p.id=c.manifest_id
+      WHERE c.project_id=$1 AND c.receipt_id=$2`, [projectId, receipt.receiptId]);
+  const primary = prepared && await readReceiptReadingActivity(tx, { projectId, receiptId: receipt.receiptId,
+    preparationId: prepared.id, reviewId: report?.id ?? null, cutoff: null });
+  return { enabled: true, receipt: { ...receipt, preparation: prepared?.counts ?? null,
+    primaryRequest: primary?.request ?? null }, report: report ?? null, progress: {...progress,deep:deep ?? null}, activity };
 }

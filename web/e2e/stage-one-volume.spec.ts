@@ -156,7 +156,7 @@ test('Стадия 1: 23 прямых PDF, 25 PDF в ZIP, опись, карты
       slice = await workSlice();
       return { files: slice.files, open: slice.totals.open, occurrences: slice.acceptedOccurrences, transport: slice.readingService?.enabled };
     }, { timeout: 120_000, intervals: [1_000, 2_000, 5_000], message: 'Карты всех PDF с активным локальным worker и выключенным транспортом' })
-      .toEqual({ files: { accepted: versionCount, prepared: pdfCount }, open: 0, occurrences: versionCount, transport: false });
+      .toEqual({ files: { accepted: versionCount, documents: pdfCount, archives: 1, technical: 0, prepared: pdfCount }, open: 0, occurrences: versionCount, transport: false });
   } finally {
     if (slice) await evidence(info, 'work-slice', slice);
   }
@@ -187,7 +187,7 @@ test('Стадия 1: 23 прямых PDF, 25 PDF в ZIP, опись, карты
 
   await page.goto(projectPath + '/overview');
   const progress = page.getByRole('region', { name: 'Ход обработки проекта' });
-  await expect(progress.getByText('Подготовлено 48 из 49 принятых файлов · описи закрыты')).toBeVisible();
+  await expect(progress.getByText('Подготовлено 48 из 48 документов · описи закрыты')).toBeVisible();
   await expect(progress.getByText('Проверено 0 из 16 требований')).toBeVisible();
   await expect(progress.getByRole('status')).toContainText('Автоматическое чтение отключено');
   await page.screenshot({ path: info.outputPath('overview.png') });
@@ -226,5 +226,5 @@ test('Стадия 1: 23 прямых PDF, 25 PDF в ZIP, опись, карты
   expect(after.acceptedOccurrences).toBe(versionCount + 1);
   expect(after.assessment).toMatchObject({ total: 16, checked: 0 });
   expect.soft(repeated!.versionId, 'Повтор тех же байтов имеет ту же редакцию').toBe(original.versionId);
-  expect.soft(after.files, 'Два вхождения используют одну редакцию и её карту').toEqual({ accepted: versionCount, prepared: pdfCount });
+  expect.soft(after.files, 'Два вхождения используют одну редакцию и её карту').toEqual({ accepted: versionCount, documents: pdfCount, archives: 1, technical: 0, prepared: pdfCount });
 });

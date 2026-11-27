@@ -64,6 +64,52 @@ test('uncertain request survives restart for same fingerprint',async()=>{
     assert.equal(called,false); assert.equal(JSON.parse(await readFile(path)).state,'sending');
   } finally { await rm(dir,{recursive:true,force:true}); }
 });
+test('lost first overview leaves a durable unknown attempt and a catalogue for independent windows',async t=>{
+  const stateDir=await mkdtemp(join(tmpdir(),'lost-overview-'));
+  t.after(()=>rm(stateDir,{recursive:true,force:true}));
+  const requirements=Array.from({length:16},(_,i)=>({key:String(i+1),part:'Раздел '+(i+1)}));
+  const db=fakeDb({requirements});
+  const events=[];
+  let calls=0, publicInput, publications=0;
+  const options={db,receiptId:'r',stateDir,reviewContract:2,admitClaim,recordActivity:async (_db,event)=>events.push(event),
+    modelCall:async()=>{ calls++; throw new ModelTransportError('unknown','timeout'); },
+    publish:async (_db,input)=>{
+      publications++;
+      publicInput=input;
+      const stored={...input,stage:'RD',id:'review1',publishedAt:new Date(),receiptCreatedAt:new Date()};
+      db.setPublished(stored);
+      return {id:stored.id};
+    }};
+  assert.equal(await processReceipt(options),'published');
+  assert.equal(publicInput.rows.length,16);
+  assert(publicInput.rows.every(row=>row.status==='unassessed' && !row.sources.length));
+  assert.match(publicInput.scopeNote,/неизвестен/);
+  assert.match(publicInput.draftText,/Вопросы пока не сформированы/);
+  assert.equal(await processReceipt(options),'published');
+  assert.equal(calls,1);
+  assert.equal(publications,1);
+  assert(!events.some(event=>event.status==='completed' || event.status==='published'));
+  const journal=JSON.parse(await readFile(statePath(stateDir, {...publicInput,stage:'RD'}),'utf8'));
+  assert.equal(journal.state,'unknown');
+  const {unsettledReview}=await import('../infra/local-terra/review-admission.mjs');
+  assert.equal(await unsettledReview(stateDir,journal.snapshot),true);
+  assert.equal(await unsettledReview(stateDir,{...journal.snapshot,reportId:'review1',facts:[{id:'independent'}]}),false);
+});
+test('a timed-out drawing batch isolates only its own versions',async t=>{
+  const dir=await mkdtemp(join(tmpdir(),'uncertain-drawing-batch-'));
+  t.after(()=>rm(dir,{recursive:true,force:true}));
+  const {unsettledReview}=await import('../infra/local-terra/review-admission.mjs');
+  const scope={projectId:'p',receiptId:'r',preparationId:'m',catalogVersionId:'c',stage:'1'};
+  const snapshot={...scope,drawingBatchVersions:['one','two']};
+  const path=join(dir,'r-batch.json');
+  await writeFile(path,JSON.stringify({state:'unknown',snapshot}));
+  assert.equal(await unsettledReview(dir,{...scope,drawingBatchVersions:['three']}),false);
+  assert.equal(await unsettledReview(dir,{...scope,drawingBatchVersions:['two','three']}),true);
+  assert.equal(await unsettledReview(dir,{...scope,reportId:'fresh',facts:[{versionId:'three'}]}),false);
+  assert.equal(await unsettledReview(dir,{...scope,reportId:'fresh',facts:[{versionId:'two'}]}),true);
+  await writeFile(path,JSON.stringify({state:'sending',snapshot}));
+  assert.equal(await unsettledReview(dir,{...scope,drawingBatchVersions:['three']}),true);
+});
 test('preliminary review resumes after verified Mac rejections and keeps late uncertainty held',async t=>{
   const stateDir=await mkdtemp(join(tmpdir(),'prelim-mac-'));
   t.after(()=>rm(stateDir,{recursive:true,force:true}));

@@ -392,6 +392,15 @@ test('automatic admission resumes after restart with the first exact PostgreSQL 
   }};
   assert.equal(await restart.hold(tx,{...snapshot,receiptId:historical.id}),'held_terra_production_admission');
   assert.equal(await restart.hold(tx,{...snapshot,receiptId:fresh.id}),null);
+  const restored = {query:async (sql,params)=>{
+    assert.match(sql,/restored\.project_id=\$1 AND restored\.receipt_id=\$2/);
+    assert.deepEqual(params.slice(0,2),[snapshot.projectId,fresh.id]);
+    return {rows:[{automatic:true,held:false,restored:true}]};
+  }};
+  assert.equal(await restart.hold(restored,{...snapshot,receiptId:fresh.id}),'held_terra_saved_review');
+  await restart.activate({query:async()=>({rows:[{time:cutoffTime}]})},stateDir,{research:true});
+  assert.equal(await restart.hold(restored,{...snapshot,receiptId:fresh.id},{research:true}),'held_terra_saved_review');
+
   await writeFile(join(root,'paused'),'');
   assert.deepEqual(await restart.receipts(rows,stateDir),[]);
   assert.equal(await restart.hold({query:assert.fail},{...snapshot,receiptId:fresh.id}),'held_terra_production_paused');

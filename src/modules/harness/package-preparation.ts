@@ -97,6 +97,8 @@ export function packagePreparationSweep(db: Pool, reader: PreparationReader) {
     const { rows: [target] } = await db.query<Receipt>(`SELECT r.id AS "receiptId",r.project_id AS "projectId" FROM intake_receipts r
       JOIN projects p ON p.id=r.project_id WHERE ($1::uuid IS NULL OR r.id>$1)
       AND (p.intake_mode OR EXISTS (SELECT 1 FROM harness_package_projects h WHERE h.project_id=r.project_id))
+      AND NOT EXISTS (SELECT 1 FROM project_reading_activity a WHERE a.project_id=r.project_id AND a.receipt_id=r.id
+        AND a.stage='saved_review' AND a.status='restored')
       ORDER BY r.id LIMIT 1`,[after]);
     if (!target) { after=null; restartAfter=Date.now()+5_000; return false; }
     after=target.receiptId;

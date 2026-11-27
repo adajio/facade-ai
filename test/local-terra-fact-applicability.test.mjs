@@ -446,3 +446,369 @@ test('an already answered dimension does not widen an earlier scoped question or
     if (expected===1) assert.doesNotMatch(report.draftText,/Какова толщина/);
   }
 });
+
+test('a primary review salvages a legend entry and an addressed question from a malformed row',async()=>{
+  const {validatedPartial}=await import('../infra/local-terra/partial-result.mjs');
+  const catalog=JSON.parse(await (await import('node:fs/promises')).readFile(
+    new URL('../infra/catalogs/intake-stage-1.json',import.meta.url)));
+  const legend=source('note','Облицовка: фиброцементная панель, RAL 7015.');
+  const elevation=source('elevation','Фасад 4 — маркировка шва Ш3.');
+  const color=element('фиброцементная панель');
+  const joint=element('шва Ш3',{zone:'Фасад 4'});
+  const legendRecord=rawProperty({...rawScope(color,color,legend),basis:'literal'},[legend],{
+    key:'legend_finish',label:'Запись облицовки',finding:'Все фасады выполнены из указанной панели.',
+  });
+  const falseAssignment=rawProperty(rawScope({...color,zone:'Фасад 4'},color,legend),[legend],{
+    key:'assigned_finish',label:'Назначение отделки',finding:'Фасаду 4 назначен RAL 7015.',
+  });
+  const question=rawProperty(rawScope(joint,joint,elevation),[elevation],{
+    key:'joint_dimension',label:'Неуточнённый размер шва',status:'insufficient',finding:'В обозначении размер шва не указан.',
+    letter:{kind:'ask',text:'Укажите ширину шва Ш3 фасада 4.'},
+  });
+  const bogus=rawProperty(undefined,[source('invented','Произвольный текст.')],{key:'fabricated'});
+  const snapshot={reviewContract:2,factScopeVersion:1,requirements:catalog.requirements,scopeNote:'Синтетический обзор.',
+    lines:[legend,elevation].map(item=>({...item,id:item.anchor,text:item.quote})),inventory:[legend]};
+  const cases=catalog.requirements.map(({key},index)=>({key,status:index?'unassessed':'present',
+    finding:'Материалы рассматриваются.',citations:index?[]:[{id:'invented',quote:'Произвольный текст.'}],
+    analysis:rawAnalysis(index===0?[legendRecord,falseAssignment,question,bogus]:index===1?[question]:[])}));
+  const published=validatedPartial(snapshot,{rows:cases});
+  assert.equal(published.rows.length,16);
+  assert.equal(published.rows[0].status,'partial');
+  const properties=published.rows[0].analysis.properties;
+  assert.deepEqual(properties.map(property=>[property.key,property.status]),[
+    ['legend_finish','confirmed'],['assigned_finish','insufficient'],['joint_dimension','insufficient'],
+  ]);
+  assert.match(properties[0].finding,/В источнике указано: «Облицовка/);
+  assert.doesNotMatch(published.rows[0].finding,/Все фасады|Фасаду 4 назначен/);
+  assert.equal(properties[1].scope.sources[0].quote,legend.quote);
+  assert.equal(published.rows[1].status,'unassessed');
+  assert.match(published.draftText,/Укажите ширину шва Ш3 фасада 4/);
+  assert.equal(published.draftText.match(/Укажите ширину/g).length,1);
+  assert.equal(published.rows[1].analysis.properties[0].sources[0].quote,elevation.quote);
+});
+
+test('numbered literal legend entries survive a revision without confirming application or generating a question',async()=>{
+  const {applyRevision,prepareRevisionSnapshot}=await import('../infra/local-terra/revise.mjs');
+  const versionId='sheet', address={unitId:'detail'};
+  const quote='2. Кронштейны К-2 в цвете RAL 7015.';
+  const fact={id:'legend',versionId,originalSha256:'a'.repeat(64),address,quote,grounding:'text'};
+  const row={key:'bracket',title:'Кронштейны',status:'unassessed',finding:'Требуется сверка.',sources:[],
+    analysis:{applicability:{kind:'included',reason:'Область работ.',sources:[]},properties:[],tensions:[]}};
+  const {snapshot}=prepareRevisionSnapshot({factScopeVersion:1,rows:[row],inventory:[fact],
+    requirements:[{key:'bracket',part:'Кронштейны'}],scopeNote:'Синтетическая проверка.'},[fact],1);
+  const ids=['O1'];
+  const scope=(target,observed)=>({kind:'applicable',target,observed,ids,reason:'Цитата из легенды.'});
+  const literal=(key,element)=>({key,label:'Строка легенды',status:'confirmed',finding:'Прочитана строка легенды.',ids,
+    scope:{...scope({element},{element}),basis:'literal'},
+    letter:{kind:'omit',text:'Достаточно дословной записи для внутренней сверки.'}});
+  const proposed=[
+    literal('record',quote),
+    literal('prefix','2. Кронштейны К-2'),
+    {key:'installed',label:'Цвет кронштейнов на фасаде Б',status:'confirmed',finding:'На фасаде Б установлен RAL 7015.',ids,
+      scope:scope({element:'Кронштейны К-2',zone:'фасад Б'},{element:'Кронштейны К-2'}),
+      letter:{kind:'omit',text:'Цвет установлен.'}},
+  ];
+  const review=applyRevision(snapshot,{changes:[{key:'bracket',status:'partial',finding:'Прочитана легенда.',ids,
+    analysis:{applicability:null,properties:proposed,tensions:[]}}]});
+  const [record,prefix,installed]=review.rows[0].analysis.properties;
+  for (const literal of [record,prefix]) {
+    assert.equal(literal.status,'confirmed');
+    assert.equal(literal.finding,`В источнике указано: «${quote}».`);
+    assert.equal(literal.sources[0].quote,quote);
+  }
+  assert.equal(installed.scope.kind,'undetermined');
+  assert.equal(installed.status,'insufficient');
+  assert.equal(installed.scope.sources[0].quote,quote);
+  assert.equal(review.draftText,noOpenQuestions);
+});
+
+test('a bad letter suggestion retains independently checked scoped evidence',()=>{
+  const observation=source('sheet','Кронштейны К-2 из стали.');
+  const target={element:'Кронштейны К-2'};
+  const scope=rawScope(target,target,observation);
+  const ask={kind:'ask',text:'Представьте данные о кронштейнах.'};
+  const confirmed=rawProperty({...scope,basis:'literal'},[observation],{key:'record',letter:ask});
+  const omitted=rawProperty(scope,[observation],{key:'thickness',status:'not_mentioned',
+    finding:'В просмотренной строке толщина не указана.',letter:ask});
+  const review=makeRow([confirmed,omitted],[observation]);
+  const [record,thickness]=review.analysis.properties;
+  assert.equal(record.status,'confirmed');
+  assert.equal(record.letter.kind,'omit');
+  assert.equal(thickness.status,'not_mentioned');
+  assert.equal(thickness.letter.kind,'omit');
+  assert.match(thickness.letter.text,/внутренн/iu);
+  assert.equal(renderQuestions([review]),noOpenQuestions);
+});
+
+test('a literal quotation stays local and cannot change an earlier engineering property',async()=>{
+  const observed=source('color','Цвет RAL 7015 для панели А.');
+  const area=element('панели А');
+  const original=rawProperty(rawScope(area,area,observed),[observed],{finding:'Цвет панели А — RAL 7015.'});
+  const prior=makeRow([original],[observed]);
+  const relabelled=makeRow([{...original,scope:{...original.scope,basis:'literal'}}],[observed]);
+  const {reconcilePreliminaryReview}=await import('../infra/local-terra/review-continuity.mjs');
+  const held=reconcilePreliminaryReview({rows:[relabelled],inventory:[observed],factScopeVersion:1},[prior]);
+  assert.equal(relabelled.status,'partial');
+  assert.equal(held.rows[0].analysis.properties[0].scope.basis,undefined);
+  assert.equal(held.rows[0].analysis.properties[0].finding,original.finding);
+});
+
+test('present requires a verified material finding and closed properties',async()=>{
+  const {validate}=await import('../infra/local-terra/producer.mjs');
+  const evidence=source('sheet','Кронштейн К2, вылет 120 мм.');
+  const target=element('Кронштейн К2');
+  const scope=rawScope(target,target,evidence);
+  const snapshot={reviewContract:2,factScopeVersion:1,requirements:[{key:'bracket',part:'Кронштейн'}],
+    lines:[{...evidence,id:evidence.anchor,text:evidence.quote}],inventory:[evidence],scopeNote:'Синтетический обзор.'};
+  const gap=rawProperty(scope,[evidence],{key:'gap',status:'insufficient',
+    finding:'Применение кронштейна требует внутренней сверки.'});
+  const present=rawProperty(scope,[evidence],{key:'reach',finding:'Подтверждён вылет 120 мм.'});
+  const publish=properties=>validate(snapshot,{rows:[{key:'bracket',status:'present',finding:'Требование выполнено.',
+    citations:[cite(evidence)],analysis:rawAnalysis(properties)}]});
+  const onlyOpen=publish([gap]);
+  assert.equal(onlyOpen.rows[0].status,'unassessed');
+  assert.match(onlyOpen.draftText,/Вопросы пока не сформированы/u);
+  const mixed=publish([gap,present]);
+  assert.equal(mixed.rows[0].status,'partial');
+  assert.match(mixed.rows[0].finding,/120 мм/u);
+  assert.match(mixed.draftText,/Вопросы пока не сформированы/u);
+  assert.equal(publish([present]).rows[0].status,'present');
+  assert.match(publish([present]).draftText,/открытых адресных вопросов для письма нет/u);
+});
+
+test('a saved native quotation from a held visual reading can only confirm a literal record',async()=>{
+  const {applyRevision,prepareRevisionSnapshot}=await import('../infra/local-terra/revise.mjs');
+  const addr={unitId:'drawing',locator:{page:1}};
+  const quote='Панель П2 из стали.';
+  const observed={element:'Панель П2'};
+  const priorRow={key:'req',title:'Панели',status:'unassessed',finding:'Нужна сверка.',sources:[],
+    analysis:{applicability:{kind:'included',reason:'Область работ.',sources:[]},properties:[],tensions:[]}};
+  const fact={id:'fact-native',versionId:'native',originalSha256:'a'.repeat(64),address:addr,quote,
+    lineId:'1',grounding:'text',evidenceMode:'literal',label:'Фасад.pdf'};
+  const previous={rows:[priorRow],inventory:[fact],requirements:[{key:'req',part:'Панели'}],scopeNote:'Синтетическая проверка.'};
+  const {snapshot,request}=prepareRevisionSnapshot(previous,[fact],1);
+  assert.equal(JSON.parse(request.messages[1].content).facts[0].evidence,'literal');
+  const property={key:'panel',label:'Панель П2',finding:'На всём фасаде установлены панели П2.',
+    ids:['O1'],status:'confirmed',letter:{kind:'omit',text:'Сведения установлены.'},
+    scope:{kind:'applicable',observed,target:observed,reason:'Дословной записи достаточно.',ids:['O1']}};
+  const run=property=>applyRevision(snapshot,{changes:[{key:'req',status:'present',finding:property.finding,ids:['O1'],
+    analysis:{applicability:null,properties:[property],tensions:[]}}]}).rows[0];
+  const held=run(property);
+  assert.equal(held.status,'unassessed');
+  assert.equal(held.analysis.properties[0].status,'insufficient');
+  const verified=run({...property,scope:{...property.scope,basis:'literal'}});
+  assert.equal(verified.status,'partial');
+  assert.equal(verified.analysis.properties[0].status,'confirmed');
+  assert.match(verified.finding,/Панель П2 из стали/u);
+  assert.doesNotMatch(verified.finding,/всём фасаде/u);
+});
+
+const reconstructed = (id,quote) => source(JSON.stringify({unitId:'model',lineId:id,evidenceMode:'literal',
+  address:{unitId:'model',box:{x:20,y:30,width:120,height:12},locator:{handles:['E2','E3']}}}),quote);
+const pendingBinding=(scope,sources)=>rawProperty(scope,sources,{key:'binding',status:'insufficient',
+  finding:'Панель назначена всем зонам.',
+  letter:{kind:'ask',text:'Назовите толщину назначенной всем фасадам панели.'}});
+
+test('primary CAD evidence can establish only the inscription and a neutral binding question',async()=>{
+  const {validate}=await import('../infra/local-terra/producer.mjs');
+  const p=reconstructed('p-a','Панель П2, фасад А. Не применяется покрытие.');
+  const footer=source('native-footer','Лист 1.');
+  const subject=element('Панель П2');
+  const scope=rawScope(subject,subject,p);
+  const literal=rawProperty({...scope,basis:'literal'},[p],{key:'inscription',label:'Все фасады из П2'});
+  const forced=rawProperty(scope,[p],{key:'assignment',finding:'П2 назначена фасаду А.'});
+  const unscoped=rawProperty(undefined,[p],{key:'legacy'});
+  const binding=pendingBinding(scope,[p]);
+  const markedAsUnanswered={...binding,key:'claimed_absence',status:'unanswered'};
+  const snapshot={reviewContract:2,factScopeVersion:1,requirements:[{key:'panel',part:'Панель'}],
+    lines:[p,footer].map(line=>({...line,id:line.anchor,text:line.quote})),scopeNote:'Синтетический чертёж.',inventory:[p]};
+  const publish=(analysis)=>validate(snapshot,{rows:[{key:'panel',status:'present',finding:'Панель фасада.',
+    citations:[cite(p)],analysis}]});
+  const primary=publish(rawAnalysis([literal,forced,unscoped,binding,markedAsUnanswered]));
+  assert.equal(primary.rows[0].status,'partial');
+  const accepted=primary.rows[0].analysis.properties;
+  assert.deepEqual(accepted.map(property=>[property.key,property.status]),[
+    ['inscription','confirmed'],['assignment','insufficient'],['legacy','insufficient'],['binding','insufficient'],
+    ['claimed_absence','insufficient'],
+  ]);
+  assert.equal(accepted[0].label,subject.element);
+  assert.ok(accepted[0].finding.includes(p.quote));
+  assert.match(primary.draftText,/к какому элементу и участку относится запись «Панель П2»/u);
+  assert.doesNotMatch(primary.draftText,/толщину|назначенной/u);
+  assert.throws(()=>publish({...rawAnalysis([]),applicability:{kind:'excluded',reason:'Прочитано исключение.',citations:[cite(p)]}}),
+    /exclusion_without_evidence/);
+  assert.throws(()=>publish({...rawAnalysis([]),applicability:{kind:'included',reason:'Прочитано назначение.',citations:[cite(p)]}}),
+    /inclusion_without_independent_evidence/);
+  for (const kind of ['included','excluded']) {
+    assert.throws(()=>publish({...rawAnalysis([]),applicability:{kind,reason:'Панель П2 не применяется.',
+      citations:[cite(p),cite(footer)]}}),/clusion_without/u);
+  }
+  const missing=publish({...rawAnalysis([]),applicability:{kind:'excluded',reason:'Панель П2 не применяется.',
+    citations:[cite(footer)]}});
+  assert.equal(missing.rows[0].status,'unassessed');
+  assert.equal(missing.rows[0].analysis.applicability.kind,'undetermined');
+  assert.doesNotMatch(missing.rows[0].finding,/Панель П2 не применяется/u);
+});
+
+test('reconstructed CAD evidence cannot bridge scopes or act as a contradiction side',()=>{
+  const target=element('Панель П2',{zone:'фасад А'});
+  const observed=element('Панель П2',{zone:'фасад Б'});
+  const measured=source('native','Панель П2 фасад Б — 100 мм.');
+  const relation=reconstructed('p-link','Панель П2 фасада Б применяется на фасаде А.');
+  const independent=source('other','Панель П2 фасада Б применяется на фасаде А.');
+  const footer=source('footer','Лист 1.');
+  const property=(...witnesses)=>rawProperty(rawScope(target,observed,measured,...witnesses),[measured],{finding:'Указано 100 мм.'});
+  const mixed=[measured,relation,footer];
+  assert.equal(makeRow([property(relation,footer)],mixed).analysis.properties[0].scope.kind,'undetermined');
+  assert.equal(makeRow([property(independent)],[measured,independent]).analysis.properties[0].status,'confirmed');
+  assert.equal(makeRow([pendingBinding(rawScope(target,observed,measured,relation),[measured])],
+    [measured,relation]).analysis.properties[0].letter.kind,'omit');
+
+  const conflicting=reconstructed('p-dim','Панель П2 фасад Б — 120 мм.');
+  const tension={key:'conflict',propertyKey:'subject',status:'open',finding:'Две разные толщины.',
+    sides:[{text:'100 мм',citations:[cite(measured)]},{text:'120 мм',citations:[cite(conflicting)]}],resolutionCitations:[]};
+  const proposal=rawProperty(rawScope(observed,observed,measured,conflicting),[measured],{
+    status:'conflicting',letter:{kind:'ask',text:'Какую толщину применять?'},
+  });
+  const output=makeRow([proposal],[measured,conflicting],[tension]);
+  assert.equal(output.analysis.properties[0].status,'insufficient');
+  assert.equal(output.analysis.tensions.length,0);
+  assert.doesNotMatch(renderQuestions([output]),/Какую толщину/u);
+});
+
+test('an R alias cannot reuse a reconstructed label as an independent assignment witness',async()=>{
+  const {applyRevision,prepareRevisionSnapshot}=await import('../infra/local-terra/revise.mjs');
+  const target=element('Панель П2',{zone:'фасад А'});
+  const observed=element('Панель П2',{zone:'фасад Б'});
+  const relation=reconstructed('p-a','Панель П2 фасада Б применяется на фасаде А.');
+  const printed=element('Панель П2');
+  const prior=makeRow([rawProperty({...rawScope(printed,printed,relation),basis:'literal'},[relation],{key:'inscription'})],
+    [relation]);
+  const fact={id:'direct',versionId:'synthetic',originalSha256:'a'.repeat(64),label:'План.pdf',grounding:'text',
+    address:{unitId:'model',locator:{page:1}},lineId:'line-1',quote:'Панель П2 фасад Б — 100 мм.'};
+  const independent={...fact,id:'connection',lineId:'line-2',quote:relation.quote};
+  const prepare=candidates=>prepareRevisionSnapshot({rows:[prior],inventory:[relation],requirements:[{key:prior.key,part:'Панель'}],
+    scopeNote:'Закреплённая первичная цитата.'},candidates,candidates.length);
+  const run=(prepared,witness)=>{
+    const user=JSON.parse(prepared.request.messages[1].content);
+    const sourceId=user.facts.find(item=>item.quote===fact.quote).id;
+    const aliases=user.rows[0].priorSources;
+    const priorId=aliases.find(item=>item.quote===relation.quote).id;
+    const witnessId=witness ? user.facts.find(item=>item.quote===independent.quote).id : priorId;
+    const property={key:'assignment',label:'Толщина панели',status:'confirmed',finding:'Применяется 100 мм.',ids:[sourceId],
+      scope:{kind:'applicable',target,observed,reason:'Привязка подтверждена.',ids:[sourceId,witnessId]},
+      letter:{kind:'omit',text:'Толщина установлена.'}};
+    return applyRevision(prepared.snapshot,{changes:[{key:prior.key,status:'partial',finding:'Толщина установлена.',
+      ids:[sourceId],analysis:{applicability:null,properties:[property],tensions:[]}}]}).rows[0];
+  };
+  const held=run(prepare([fact]),false);
+  assert.equal(held.analysis.properties.find(item=>item.key==='assignment').status,'insufficient');
+  assert.equal(held.analysis.properties.find(item=>item.key==='inscription').status,'confirmed');
+  const justified=run(prepare([fact,independent]),true);
+  assert.equal(justified.analysis.properties.find(item=>item.key==='assignment').status,'confirmed');
+});
+
+test('a stage record remains confirmed as an observation without satisfying a section requirement',async()=>{
+  const {validate}=await import('../infra/local-terra/producer.mjs');
+  const {correctIncidentalMetadata}=await import('../infra/local-terra/fact-applicability.mjs');
+  const requirement={key:'doc.architecture',part:'Раздел АР',aliases:['Архитектурные решения','АР']};
+  const stamp=source(JSON.stringify({unitId:'layout-1',readerVersion:'fixture-v1',address:{unitId:'layout-1'}}),'Стадия Р');
+  const printed=element('Стадия Р');
+  const stage=rawProperty({...rawScope(printed,printed,stamp),basis:'literal'},[stamp],
+    {key:'stage_stamp_record',label:'Стадия'});
+  const identified=element('Архитектурные решения');
+  const section=source('heading','Архитектурные решения.');
+  const heading=rawProperty({...rawScope(identified,identified,section),basis:'literal'},[section],
+    {key:'section_identity',label:'Раздел АР'});
+  const stillUnknown=rawProperty({...rawScope(identified,printed,stamp),kind:'undetermined'},[stamp],{
+    key:'section_identity',label:'Идентификация раздела АР',status:'insufficient',finding:'Прямое указание раздела не найдено.',
+  });
+  const run=(required,properties,primary=stamp)=>validate({
+    reviewContract:2,factScopeVersion:1,requirements:[required],inventory:[stamp],
+    lines:[stamp,section].map(item=>({...item,id:item.anchor,text:item.quote})),scopeNote:'Синтетический комплект.',
+  },{rows:[{key:required.key,status:'partial',finding:'Раздел найден частично.',citations:[cite(primary)],analysis:rawAnalysis(properties)}]});
+  const {rows:[architecture],draftText}=run(requirement,[stage,stillUnknown]);
+  assert.equal(architecture.status,'unassessed');
+  assert.equal(architecture.analysis.properties[0].status,'confirmed');
+  assert.equal(architecture.analysis.properties[0].sources[0].quote,stamp.quote);
+  assert.equal(architecture.analysis.properties[1].scope.kind,'undetermined');
+  assert.match(architecture.finding,/Прочитанные реквизиты сохранены/iu);
+  assert.match(draftText,/Вопросы пока не сформированы/u);
+
+  const printedSection=run(requirement,[stage,heading],section).rows[0];
+  assert.equal(printedSection.status,'partial');
+  assert.match(printedSection.finding,/Архитектурные решения/u);
+  const stageRequirement={key:'doc.stage',part:'Стадия проектирования'};
+  assert.equal(run(stageRequirement,[stage]).rows[0].status,'partial');
+
+  const saved={...architecture,status:'partial',finding:'Указана стадия Р.'};
+  const corrected=correctIncidentalMetadata(saved,requirement);
+  assert.equal(corrected.status,'unassessed');
+  assert.strictEqual(corrected.analysis,saved.analysis);
+  assert.strictEqual(corrected.sources,saved.sources);
+  assert.strictEqual(correctIncidentalMetadata(corrected,requirement),corrected);
+  assert.strictEqual(correctIncidentalMetadata(saved,stageRequirement),saved);
+  assert.strictEqual(correctIncidentalMetadata(printedSection,requirement),printedSection);
+});
+
+test('common stamp fields contribute only to requirements about the same field',()=>{
+  const cases=[
+    ['Стадия Р','Стадия проектирования','Раздел КЖ'],
+    ['Лист 4 из 12','Номер листа','Фасады'],
+    ['Редакция №2','Редакция документации','Разрезы'],
+    ['Дата выпуска 01.02.2025','Дата выпуска чертежа','Узлы АР'],
+    ['Масштаб 1:20','Масштаб чертежа','Сведения об облицовке'],
+  ];
+  for (const [printed,title,other] of cases) {
+    const note=reconstructed(printed,printed);
+    const field=element(printed);
+    const analysis=makeRow([rawProperty({...rawScope(field,field,note),basis:'literal'},[note])],[note]).analysis;
+    const appearance={key:'catalog.other',status:'partial',finding:'Реквизит прочитан.',sources:[note],analysis};
+    assert.equal(applyFactApplicability({...appearance,title},{requirement:{part:title}}).status,'partial',printed);
+    const incidental=applyFactApplicability({...appearance,title:other},{requirement:{part:other}});
+    assert.equal(incidental.status,'unassessed',printed);
+    assert.equal(incidental.analysis.properties[0].status,'confirmed',printed);
+    assert.equal(incidental.analysis.properties[0].sources[0].quote,printed);
+  }
+});
+
+test('facade or material designations remain partial beside a title-block field',()=>{
+  const stage=reconstructed('stage','Стадия Р');
+  const field=element('Стадия');
+  const requisites=rawProperty({...rawScope(field,field,stage),basis:'literal'},[stage],{key:'stage_details'});
+  for (const [quote,subject,title] of [
+    ['Фасад в осях А–В','Фасад','Фасады'],
+    ['Керамогранит 600×1200','Керамогранит','Сведения об облицовке'],
+  ]) {
+    const detail=reconstructed('main',quote);
+    const part=element(subject);
+    const matter=rawProperty({...rawScope(part,part,detail),basis:'literal'},[detail],{key:'matter'});
+    const input=makeRow([requisites,matter],[stage,detail]);
+    const result=applyFactApplicability({...input,title});
+    assert.equal(result.status,'partial');
+    assert.equal(result.analysis.properties.filter(property=>property.status==='confirmed').length,2);
+    assert.ok(result.finding.includes(quote));
+  }
+});
+
+test('the complete catalog criterion classifies a requested stamp field through publication and continuity',async()=>{
+  const {validatedPartial}=await import('../infra/local-terra/partial-result.mjs');
+  const {reconcilePreliminaryReview}=await import('../infra/local-terra/review-continuity.mjs');
+  const note=source('native-stamp','Стадия Р');
+  const stage=element('Стадия');
+  const property=rawProperty({...rawScope(stage,stage,note),basis:'literal'},[note],{key:'stage'});
+  const needed={key:'project.fields',part:'Реквизиты проекта',
+    evidenceRule:{allOf:[{anyOf:[{property:'Стадия проектирования'}]}]}};
+  const incidental={key:'doc.architecture',part:'Раздел АР'};
+  const snapshot={reviewContract:2,factScopeVersion:1,requirements:[needed,incidental],
+    lines:[{...note,id:note.anchor,text:note.quote}],inventory:[note],scopeNote:'Синтетический комплект.'};
+  const raw={rows:snapshot.requirements.map(requirement=>({key:requirement.key,status:'partial',finding:'Указана стадия.',
+    citations:[cite(note)],analysis:rawAnalysis([property])}))};
+  const publication=validatedPartial(snapshot,raw);
+  assert.deepEqual(publication.rows.map(row=>row.status),['partial','unassessed']);
+  const saved=publication.rows.map(row=>({...row,status:'partial'}));
+  const continued=reconcilePreliminaryReview(publication,saved);
+  assert.deepEqual(continued.rows.map(row=>row.status),['partial','unassessed']);
+  assert.deepEqual(continued.rows.map(row=>row.analysis.properties[0].status),['confirmed','confirmed']);
+  assert.equal(continued.draftText,publication.draftText);
+});

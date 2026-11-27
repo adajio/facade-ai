@@ -1,10 +1,15 @@
 import { readSheetEvidence } from './sheet-reading.mjs';
+import { drawingTextVersion, readDrawingEvidence } from './drawing-reading.mjs';
+import { drawingAttachments } from './drawing-attachments.mjs';
 
 export async function attachReadingSkills(db,reader,sourceRoot,snapshot) {
-  const reading=await readSheetEvidence(db,snapshot,{sourceRoot});
+  const genericFiles=snapshot.files.filter(file=>file.format!=='dwg' && !/\.dwg$/iu.test(file.path));
+  const drawing=await readDrawingEvidence(db,reader,snapshot);
+  const reading=genericFiles.length ? await readSheetEvidence(db,{...snapshot,files:genericFiles},{sourceRoot,excludeDwg:true})
+    : {lines:[],images:[],candidates:[],limitations:[]};
   const inventory=new Map(snapshot.inventory.map(item=>[item.versionId,item.originalSha256]));
   const images=[];
-  for (const image of reading.images) {
+  for (const image of [...drawing.images,...reading.images]) {
     if (image.projectId!==snapshot.projectId || image.receiptId!==snapshot.receiptId ||
         image.preparationId!==snapshot.preparationId || inventory.get(image.versionId)!==image.originalSha256) {
       throw Error('sheet_source_mismatch');
@@ -18,13 +23,18 @@ export async function attachReadingSkills(db,reader,sourceRoot,snapshot) {
   }
   const ids=new Set(images.map(image=>image.id));
   const candidates=reading.candidates.map(({imageId,...item})=>({...item,...(ids.has(imageId) && {imageId})}));
-  const scopeNote=snapshot.scopeNote+` Отобрано участков листов: ${candidates.length}. Передано графических фрагментов: ${images.length}.`+
+  for (const item of drawing.drawings) {
+    for (const key of ['overviewIds','detailIds']) item[key]=item[key].filter(id=>ids.has(id));
+    item.limitations.push(...reading.limitations.filter(limit=>limit.versionId===item.versionId));
+  }
+  const scopeNote=snapshot.scopeNote+
     (reading.limitations.length?' Ограничения чтения листов: '+[...new Set(reading.limitations.map(item=>item.reason))].join(', ')+'.':'');
-  return {...snapshot,scopeNote,factScopeVersion:1,lines:[...snapshot.lines,...reading.lines],
-    sheetReading:{images,candidates,limitations:reading.limitations}};
+  const attachments=drawing.drawings.length ? await drawingAttachments(drawing.drawings,images) : undefined;
+  return {...snapshot,scopeNote,factScopeVersion:1,...(drawing.drawings.length && {drawingTextVersion}),lines:[...snapshot.lines,...reading.lines,...drawing.lines],
+    sheetReading:{images,candidates,drawings:drawing.drawings,limitations:reading.limitations,...(attachments && {attachments})}};
 }
 
-export const inspectSheetsInstruction='Изображения в пользовательском сообщении переданы в порядке sheetImages. Для каждого укажи inspections с его id, ключом связанного требования и коротким наблюдением. Для неприменимого фрагмента оставь requirementKey пустым. observed означает, что графика различима. Заголовок и штамп сами по себе не подтверждают состав или применимость. Опиши штриховку, обозначение и связь с элементом, когда они видны. При сомнении укажи inconclusive или unreadable. Для инженерного вывода приведи дословные строки по адресу и проверь область применения.';
+export const inspectSheetsInstruction='sheetImages задаёт изображения. Объекты соответствуют порядку вложений. Массивы: [id, вид, название, участок, номер вложения, рамка панели x/y/ширина/высота в пикселях или null]. Файл указан через id изображения в drawingCoverage или sheetTitles. Для каждой панели укажи inspections с его id, ключом связанного требования и коротким наблюдением. Для неприменимого фрагмента оставь requirementKey пустым. observed означает, что графика различима. Заголовок и штамп сами по себе не подтверждают состав или применимость. Опиши штриховку, обозначение и связь с элементом, когда они видны. При сомнении укажи inconclusive или unreadable. Для инженерного вывода приведи дословные строки по адресу и проверь область применения.';
 export function inspectionSchema(images) {
   return {type:'array',maxItems:images.length,items:{type:'object',additionalProperties:false,
     required:['imageId','requirementKey','outcome','observation'],properties:{
@@ -47,7 +57,7 @@ export function publishSheetObservations(snapshot,input,result) {
     inspected++;
     if (!row) continue;
     const anchor=JSON.stringify({unitId:image.address.unitId,address:image.address,readerVersion:image.readerVersion,
-      sheetPreview:{sha256:image.sha256,title:image.title,state:item.outcome,observation:item.observation}});
+      sheetPreview:{id:image.id,sha256:image.sha256,title:image.title,state:item.outcome,observation:item.observation}});
     if (anchor.length<=4000 && row.sources.length<100) row.sources.push({versionId:image.versionId,
       originalSha256:image.originalSha256,anchor});
   }

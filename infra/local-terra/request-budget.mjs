@@ -4,7 +4,7 @@ export const maxInputTokens = 65_536;
 export const maxRequestBytes = 60_000;
 export const maxWireBytes = 6 * 1024 ** 2;
 export const maxImageBytes = 4 * 1024 ** 2;
-export const maxImageCount = 4;
+export const maxImageCount = 24;
 const imageTokens = 2048;
 const pngDataPrefix = 'data:image/png;base64,';
 const base64 = /^[A-Za-z0-9+/]+={0,2}(?![\s\S])/u;

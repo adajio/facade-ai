@@ -183,6 +183,24 @@ test('preliminary review publication and receipt-scoped reading progress', { ski
     assert.equal(current.rows[0].analysis.properties[0].response.sources[0].documentId,nextDocument);
     assert.equal(current.draftText,'Document — Блеск покрытия. Уточните блеск покрытия.');
     assert.equal(current.changes.letter.removed[0],revision.draftText);
+    const printed={element:'RAL 7035'};
+    const literal={key:'printed_color',label:'Дословное обозначение цвета',status:'confirmed',
+      finding:'В источнике указано: «'+nextCitation.quote+'».',sources:[nextCitation],
+      scope:{kind:'applicable',basis:'literal',target:printed,observed:printed,reason:'Дословное обозначение.',sources:[nextCitation]},
+      letter:{kind:'omit',text:'Обозначение прочитано.'}};
+    const repeated={...property,key:'same_gloss',letter:{kind:'ask',text:' Уточните  блеск покрытия? '}};
+    const structured={...nextInput,previousReportId:nextReport.id,revisionKey:'7'.repeat(64),rows:[{
+      ...nextRow,analysis:{...nextRow.analysis,properties:[literal,property,repeated]},
+    }]};
+    await assert.rejects(publishPreliminaryPackageReview(db,{...structured,rows:[{
+      ...nextRow,analysis:{...nextRow.analysis,properties:[{...literal,finding:'Применяется на всех участках.'}]},
+    }]}));
+    const persisted=await publishPreliminaryPackageReview(db,structured);
+    const stored=(await readPreliminaryPackageReviews(db,project)).items.find(row=>row.id===persisted.id);
+    assert.equal(stored.rows[0].analysis.properties[0].scope.basis,'literal');
+    assert.equal(stored.rows[0].analysis.properties[0].sources[0].documentId,nextDocument);
+    assert.equal(stored.draftText,'Document — Блеск покрытия. Уточните блеск покрытия.');
+    await db.query('DELETE FROM preliminary_package_reviews WHERE id=$1',[persisted.id]);
     await db.query('DELETE FROM preliminary_package_reviews WHERE id=$1',[nextReport.id]);
     await db.query('DELETE FROM intake_occurrences WHERE id=$1',[nextOccurrence]);
     await db.query('DELETE FROM intake_receipts WHERE id=$1',[nextReceipt]);

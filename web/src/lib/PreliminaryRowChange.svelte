@@ -47,7 +47,7 @@
       {#if change.previousAnalysis}
         <details>
           <summary>{earlierReceipt ? 'Свойства и вопросы предыдущего поступления' : 'Свойства и вопросы первоначального разбора'}</summary>
-          <PreliminaryRequirementAnalysis analysis={change.previousAnalysis} />
+          <PreliminaryRequirementAnalysis previousAnalysis={change.previousAnalysis} />
         </details>
       {:else}
         <p>В этой редакции добавлен разбор свойств и вопросов.</p>

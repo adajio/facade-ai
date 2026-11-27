@@ -8,7 +8,7 @@ export type PreliminarySource = {
 export type PreliminaryPropertyStatus = 'confirmed' | 'unanswered' | 'not_mentioned' | 'insufficient' | 'conflicting';
 export type PreliminaryScopeSide = { element: string; zone?: string; purpose?: string; variant?: string };
 export type PreliminaryFactScope = {
-  kind: 'applicable' | 'unrelated' | 'undetermined'; target: PreliminaryScopeSide; observed?: PreliminaryScopeSide;
+  basis?: 'literal'; kind: 'applicable' | 'unrelated' | 'undetermined'; target: PreliminaryScopeSide; observed?: PreliminaryScopeSide;
   reason: string; sources: PreliminarySource[];
 };
 export type PreliminaryAnalysis = {
@@ -47,19 +47,51 @@ export type PreliminaryReview = {
 export const preliminaryStatusLabels: Record<PreliminaryStatus, string> = {
   present: 'Представлено', partial: 'Частично', not_found: 'Не найдено', unassessed: 'Не оценено',
 };
+export function preliminaryLetterQuestion(property: PreliminaryAnalysis['properties'][number]) {
+  return property.letter.kind === 'ask' && (!property.scope || property.scope.kind === 'applicable')
+    ? property.letter.text : undefined;
+}
+
+export function preliminaryNextAction(row: PreliminaryRow) {
+  const analysis = row.analysis;
+  if (analysis?.applicability.kind === 'excluded') return analysis.applicability.reason;
+  const question = analysis?.properties.map(preliminaryLetterQuestion).find(Boolean);
+  if (question) return question;
+  if (analysis?.applicability.kind === 'undetermined') return analysis.applicability.reason;
+  const unresolved = analysis?.properties.find(property => property.status !== 'confirmed');
+  if (unresolved) {
+    const action = unresolved.scope && unresolved.scope.kind !== 'applicable'
+      ? unresolved.scope.reason : unresolved.letter.kind === 'omit' ? unresolved.letter.text : unresolved.finding;
+    return unresolved.label + ' · ' + action;
+  }
+  if (row.status === 'present' && analysis?.properties.length) return 'Открытых уточнений по сохранённому разбору нет.';
+  return 'Адресный вопрос пока не сформирован.';
+}
+
 export function preliminaryQuestions(rows: PreliminaryRow[]) {
   const unique = (sources: PreliminarySource[]) => [...new Map(sources.map(source => [
     JSON.stringify([source.versionId,source.anchor,source.quote,source.limitation]), source,
   ])).values()];
-  return rows.flatMap(row => row.analysis?.properties.flatMap(property => property.letter.kind === 'ask' &&
-      (!property.scope || property.scope.kind === 'applicable') ? [{
-    key: `${row.key}/${property.key}`, requirement: row.title, property: property.label, text: property.letter.text,
-    sources: unique([
-      ...property.sources, ...(property.response?.sources ?? []), ...(property.scope?.sources ?? []),
-      ...(row.analysis?.tensions.filter(tension => tension.propertyKey === property.key)
-        .flatMap(tension => tension.sides.flatMap(side => side.sources)) ?? []),
-    ]),
-  }] : []) ?? []);
+  const normalize = (text: string) => text.normalize('NFC').toLocaleLowerCase('ru')
+    .replaceAll('ё','е').replace(/\s+/gu,' ').trim().replace(/[.!?]+$/u,'');
+  const questions = new Map<string, { key: string; subjects: Set<string>; property: string; text: string; sources: PreliminarySource[] }>();
+  for (const row of rows) {
+    for (const property of row.analysis?.properties ?? []) {
+      const text = preliminaryLetterQuestion(property);
+      if (!text) continue;
+      const target = property.scope?.target;
+      const identity = JSON.stringify([normalize(text),target
+        ? [target.element,target.zone,target.purpose,target.variant].map(value => normalize(value ?? ''))
+        : normalize(property.label)]);
+      const question = questions.get(identity) ?? { key: identity, subjects: new Set<string>(), property: property.label, text, sources: [] };
+      question.subjects.add(row.title + ' · ' + property.label);
+      question.sources = unique([...question.sources, ...property.sources, ...(property.response?.sources ?? []),
+        ...(property.scope?.sources ?? []), ...(row.analysis?.tensions.filter(tension => tension.propertyKey === property.key)
+          .flatMap(tension => tension.sides.flatMap(side => side.sources)) ?? [])]);
+      questions.set(identity,question);
+    }
+  }
+  return [...questions.values()];
 }
 
 type ParsedPlace = {label: string; page?: number};
@@ -73,20 +105,24 @@ export function preliminarySourcePlace(source: PreliminarySource): ParsedPlace {
       const at = address?.locator ?? {};
       const page = Number(at.page);
       const validPage = Number.isSafeInteger(page) && page > 0;
+      const drawing = typeof at.space === 'string' && typeof at.derivativeSha256 === 'string';
+      const drawingText = drawing && anchor.drawingText?.origin === 'dwg_native_geometry';
       const parts = [
+        drawingText && 'Надпись на чертеже',
         validPage && `Стр. ${page}`,
         (at.sheet ?? at.sheetName) && `Лист ${at.sheet ?? at.sheetName}`,
         at.cell && `Ячейка ${at.cell}`, at.range && `Диапазон ${at.range}`,
         at.row && `Строка ${at.row}`, at.paragraph && `Абзац ${at.paragraph}`, at.table && `Таблица ${at.table}`,
-        at.layout && `Лист чертежа ${at.layout}`, at.layer && `Слой ${at.layer}`,
+        (at.layout || drawing) && (at.space === 'Model' && !at.layout ? 'Пространство модели' : `Лист чертежа ${at.layout ?? at.space}`), at.layer && `Слой ${at.layer}`,
       ].filter(Boolean);
       const unitId = address?.unitId ?? anchor?.unitId;
-      if (!parts.length && typeof unitId === 'string') parts.push(unitId);
-      if (typeof anchor?.lineId === 'string' && anchor.lineId.length <= 40) parts.push(`Строка ${anchor.lineId}`);
+      if (drawingText && (at.part !== undefined || unitId)) parts.push(at.part !== undefined ? `Участок ${at.part}` : `Участок ${unitId}`);
+      else if (!parts.length && typeof unitId === 'string') parts.push(unitId);
+      if (!drawingText && typeof anchor?.lineId === 'string' && anchor.lineId.length <= 40) parts.push(`Строка ${anchor.lineId}`);
       if (address?.box) {
         const { x, y, width, height } = address.box;
         const coordinates = [x, y, width, height];
-        if (coordinates.every(Number.isFinite)) parts.push(`Область ${coordinates.map((value) => Math.round(value * 100) / 100).join(', ')} пт`);
+        if (coordinates.every(Number.isFinite)) parts.push(`Область ${coordinates.map((value) => Math.round(value * 100) / 100).join(', ')}${drawing ? ' ед. чертежа' : ' пт'}`);
       }
       if (parts.length) return {label:parts.join(' · '), page:validPage ? page : undefined};
     } catch { /* Plain-text addresses from previous reviews remain readable. */ }

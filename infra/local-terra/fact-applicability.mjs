@@ -2,8 +2,9 @@ export const factScopeKinds = ['applicable', 'unrelated', 'undetermined'];
 export const factScopeFields = ['element', 'zone', 'purpose', 'variant'];
 export const factScopeLabelLimit = 120;
 export const factScopeReasonLimit = 420;
+export const literalFactBasis = 'literal';
 
-export const factApplicabilityInstruction = `Для каждого инженерного свойства проверь применимость конкретного свидетельства до оценки. В scope.target назови элемент текущего вопроса и, когда они различают решения, зону, назначение и исполнение. В scope.observed укажи элемент, зону, назначение и исполнение, которые описаны в конкретной опоре. Указывай для каждой стороны наиболее точные обозначения. Сохраняй различия, которые влияют на применение. Для совпадающих областей используй одинаковые дословные обозначения. Приведи адресные дословные фрагменты с ними в scope, включая фрагмент, связывающий обозначение с самим значением. Для переноса между отличающимися областями нужна отдельная явная положительная запись о применении из источника с обоими обозначениями. Название файла, сходный термин или значение, соседняя строка, вариант или редакция сами по себе не связывают записи. Если явно описан другой предмет, зона, функция или вариант, выбери unrelated. Если связь не установлена, выбери undetermined. Объясни причину, оставь вывод на внутреннюю сверку (insufficient, letter omit). Не используй такие наблюдения в сводном выводе, статусе present, противоречии, ответе на вопрос или тексте письма. Любое инженерное утверждение в сводном выводе представь отдельным свойством с проверенной областью. Для present и partial нужна хотя бы одна такая адресная опора. Для прямо исключённого требования действуют правила applicability. Проверяй каждую сторону противоречия и разрешение по той же области. Применимость требования целиком (applicability) и применимость свидетельства к свойству (scope) оценивай отдельно.`;
+export const factApplicabilityInstruction = `Для каждого инженерного свойства проверь применимость конкретного свидетельства до оценки. В scope.target назови элемент текущего вопроса и, когда они различают решения, зону, назначение и исполнение. В scope.observed укажи элемент, зону, назначение и исполнение, которые описаны в конкретной опоре. Указывай для каждой стороны наиболее точные обозначения. Сохраняй различия, которые влияют на применение. Для совпадающих областей используй одинаковые дословные обозначения. Приведи адресные дословные фрагменты с ними в scope, включая фрагмент, связывающий обозначение с самим значением. Для переноса между отличающимися областями нужна отдельная явная положительная запись о применении из источника с обоими обозначениями. Название файла, сходный термин или значение, соседняя строка, вариант или редакция сами по себе не связывают записи. Если явно описан другой предмет, зона, функция или вариант, выбери unrelated. Если связь не установлена, выбери undetermined. Объясни причину, оставь вывод на внутреннюю сверку (insufficient, letter omit). Не используй такие наблюдения в сводном выводе, статусе present, противоречии, ответе на вопрос или тексте письма. Любое инженерное утверждение в сводном выводе представь отдельным свойством с проверенной областью. Для present и partial нужна хотя бы одна такая адресная опора. Для прямо исключённого требования действуют правила applicability. Проверяй каждую сторону противоречия и разрешение по той же области. Применимость требования целиком (applicability) и применимость свидетельства к свойству (scope) оценивай отдельно. Разнеси подпись, материал, параметр, назначение конкретной зоне и недостаток подтверждения по отдельным свойствам. Для дословной записи или подписи, в том числе строки легенды или штампа, используй scope.basis=literal, совпадающие target и observed, одну прямую цитату свойства и ту же опору области. Такой факт подтверждает только наличие записи в источнике. Само назначение элемента или цвета зоне проверяй отдельным свойством. Для открытого вопроса допускается insufficient с ask и прямой опорой, именующей его предмет. Для unanswered нужна явная постановка вопроса в источнике. Восстановленная подпись CAD и источник с evidence=literal допустимы как дословная запись или для вопроса о её привязке. Для физического назначения, исключения, ответа или стороны противоречия приведи отдельную независимую опору.`;
 
 const undeterminedReason = 'Связь приведённого свидетельства с элементом, зоной, назначением и исполнением текущего вопроса не установлена.';
 const unrelatedReason = 'Адресный источник относится к другой области или другому элементу, назначению либо исполнению.';
@@ -47,8 +48,7 @@ function sameLabel(left,right) {
   const a=tokens(left), b=tokens(right);
   return a.length===b.length && a.length>0 && startsWithTokens(a,b);
 }
-function mentions(text, label) {
-  const phrase = phrases(label);
+function containsLiteral(text, phrase) {
   if (!phrase) return false;
   let index = text.indexOf(phrase);
   while (index !== -1) {
@@ -57,6 +57,11 @@ function mentions(text, label) {
     if (!signed && !word.test(text[index - 1] ?? '') && !word.test(text[end] ?? '')) return true;
     index = text.indexOf(phrase, index + 1);
   }
+  return false;
+}
+function mentions(text, label) {
+  const phrase = phrases(label);
+  if (containsLiteral(text,phrase)) return true;
   const a=tokens(text), b=tokens(phrase);
   return b.length>0 && a.some((_,i)=>startsWithTokens(a,b,i));
 }
@@ -150,9 +155,38 @@ export function missingFactScope(label) {
   return {kind:'undetermined',target:{element},reason:undeterminedReason,sources:[]};
 }
 
+function verifyLiteralProperty(property, tensions) {
+  const {scope} = property;
+  if (property.status !== 'confirmed' || property.letter.kind !== 'omit' || property.response || tensions.length ||
+      property.sources.length !== 1 || !scope.observed || hasFactScopeDifference(scope)) return;
+  const [source] = property.sources;
+  if (!located(source) || source.quote.trim().length > 480) return;
+  // A literal label may include punctuation such as a list number.
+  // Sentence boundaries still apply when a citation must support engineering scope.
+  const literalLabel = Object.keys(scope.observed).length === 1 &&
+    containsLiteral(phrases(source.quote),phrases(scope.observed.element));
+  if (!(literalLabel || sourceDescribesFactScope(source,scope.observed)) ||
+      !scope.sources.some(witness=>located(witness) && sameFactSourcePlace(witness,source)
+        && phrases(witness.quote).includes(phrases(source.quote)))) return;
+  return {...property,...(isLiteralFactSource(source) && {label:scope.target.element,
+    scope:{...scope,reason:'Дословная цитата подтверждает наличие записи в источнике.'}}),
+    finding:'В источнике указано: «' + source.quote.trim() + '».'};
+}
+
+export function isLiteralFactSource(source) {
+  try { return JSON.parse(source.anchor)?.evidenceMode === literalFactBasis; }
+  catch { return false; }
+}
+
+export function literalBindingQuestion(target) {
+  return target.zone ? `Уточните, относится ли запись «${target.element}» к участку «${target.zone}».`
+    : `Уточните, к какому элементу и участку относится запись «${target.element}».`;
+}
+
 function verifyScope(property, tensions) {
   const scope = property.scope;
-  const witnesses = scope.sources.filter(located);
+  const availableWitnesses = scope.sources.filter(located);
+  const independentWitnesses = availableWitnesses.filter(source=>!isLiteralFactSource(source));
   const primary = property.sources.filter(located);
   const support = [
     ...primary,
@@ -161,20 +195,32 @@ function verifyScope(property, tensions) {
   ];
   const observed = scope.observed;
   const affirmative = ['confirmed','conflicting'].includes(property.status);
+  const bindingQuestion = property.status==='insufficient' && property.letter.kind==='ask' && !property.response && !tensions.length;
+  const witnesses = bindingQuestion ? availableWitnesses : independentWitnesses;
   const different = observed && differing(scope.target, observed);
-  const linked = different && witnesses.some(source => explicitAssignment(source, scope.target, observed));
+  const linked = different && independentWitnesses.some(source => explicitAssignment(source, scope.target, observed));
   const hasObserved = observed && support.some(source => supportsScope(source, observed, witnesses));
   if (scope.kind === 'unrelated' && different && hasObserved && !linked)
     return {...scope,reason:unrelatedReason};
   const describedValues = affirmative ? measuredValues(property.finding) : [];
   const citedValues = support.flatMap(source=>measuredValues(source.quote));
   if (scope.kind === 'applicable' && hasObserved && !incomplete(scope.target, observed)
+      && (bindingQuestion || !support.some(isLiteralFactSource))
       && (!different || linked) && describedValues.every(value=>citedValues.includes(value))
       && support.every(source => supportsScope(source, observed, witnesses, affirmative)
         || linked && supportsScope(source, scope.target, witnesses, affirmative))
       && witnesses.some(source => sourceDescribesFactScope(source,observed)))
     return scope;
   return {...scope,kind:'undetermined',reason:undeterminedReason};
+}
+
+function validateScopedLetter(property) {
+  if (!property.scope || property.letter.kind !== 'ask') return property;
+  if (property.status === 'confirmed')
+    return {...property,letter:{kind:'omit',text:'Подтверждённое свойство не требует вопроса.'}};
+  if (property.status === 'not_mentioned' && property.response?.state !== 'received')
+    return {...property,letter:{kind:'omit',text:'Упоминание свойства требует внутренней сверки доступных источников.'}};
+  return property;
 }
 
 export function applyAnalysisFactApplicability(analysis) {
@@ -185,25 +231,39 @@ export function applyAnalysisFactApplicability(analysis) {
     byProperty.set(tension.propertyKey, tensions);
   }
   const blocked = new Set();
-  const properties = analysis.properties.map(property => {
-    if (!property.scope) return property;
+  const properties = analysis.properties.map(proposal => {
+    const input = validateScopedLetter(proposal);
+    const tensions = byProperty.get(input.key) ?? [];
+    const candidates = [...input.sources,...(input.response?.sources ?? []),...tensions.flatMap(tension =>
+      [...tension.sides.flatMap(side=>side.sources),...tension.resolutionSources])];
+    if (!input.scope && !candidates.some(isLiteralFactSource)) return input;
+    const property = input.scope ? input : {...input,scope:missingFactScope(input.label)};
     const alreadyHeld = property.scope.kind !== 'applicable' && property.status === 'insufficient'
       && property.finding === remit && property.letter.kind === 'omit' && !property.sources.length && !property.response;
-    const scope = alreadyHeld ? property.scope : verifyScope(property, byProperty.get(property.key) ?? []);
-    if (scope.kind === 'applicable') return property;
+    const literal = property.scope.basis === literalFactBasis;
+    const prepared = literal && property.scope.kind === 'applicable' && verifyLiteralProperty(property,tensions);
+    if (prepared) return prepared;
+    const scope = alreadyHeld ? property.scope
+      : literal ? {...property.scope,kind:'undetermined',reason:undeterminedReason}
+        : verifyScope(property,tensions);
+    if (scope.kind === 'applicable') {
+      const bindingQuestion = property.status==='insufficient' && property.letter.kind==='ask' &&
+        (property.sources.some(isLiteralFactSource) || scope.sources.some(isLiteralFactSource)
+          && !scope.sources.some(source=>located(source) && !isLiteralFactSource(source)));
+      return bindingQuestion ? {...property,label:scope.target.element,
+        finding:`Запись «${scope.target.element}» прочитана. Её привязка требует уточнения.`,
+        scope:{...scope,reason:'Подпись прочитана. Её применение к проектной области требует подтверждения.'},
+        letter:{kind:'ask',text:literalBindingQuestion(scope.target)}} : property;
+    }
     blocked.add(property.key);
     // Keep the addressed observation as context, and suppress every downstream use as evidence.
-    const candidates = [...scope.sources, ...property.sources, ...(property.response?.sources ?? []),
-      ...(byProperty.get(property.key) ?? []).flatMap(tension => [
-        ...tension.sides.flatMap(side => side.sources), ...tension.resolutionSources,
-      ])];
-    const sources = unionSources(candidates, 12);
+    const sources = unionSources([...scope.sources,...candidates], 12);
     const {response, ...remainder} = property;
     return {...remainder,scope:{...scope,sources},status:'insufficient',finding:remit,sources:[],
       letter:{kind:'omit',text:remit}};
   });
-  return blocked.size ? {...analysis,properties,tensions:analysis.tensions.filter(tension => !blocked.has(tension.propertyKey))}
-    : analysis;
+  return properties.some((property,index)=>property!==analysis.properties[index])
+    ? {...analysis,properties,tensions:analysis.tensions.filter(tension => !blocked.has(tension.propertyKey))} : analysis;
 }
 
 export function hasUnverifiedFactScope(row) {
@@ -234,12 +294,81 @@ function scopedSummary(properties) {
     ? summary + '  ' + text : summary, first);
 }
 
-export function applyFactApplicability(row, {requireFactScope = false} = {}) {
-  if (!row.analysis) return row;
+// A title-block field can be read correctly while saying nothing about the subject of a catalog row.
+const documentMetadata = [
+  {
+    field:/^(?:(?:стадия|этап)(?: проектирования)?|(?:design |project )?stage)(?:\s*[:=–—-]\s*[\p{L}\p{N}][\p{L}\p{N} .-]{0,40}|\s+[\p{L}\p{N}]{1,8})?$/u,
+    requirement:/^(?:(?:стадия|этап)(?: проектирования| разработки| проекта)?|(?:design |project )?stage)(?![\p{L}\p{N}])/u,
+  },
+  {
+    field:/^(?:номер (?:листа|страницы)|(?:число|количество) листов|лист(?:ов)?|страница|(?:sheet|page)(?: no\.?| number| count)?)(?:\s*[:№]?\s*\d+(?:\s*(?:\/|из|of)\s*\d+)?)?$/u,
+    requirement:/^(?:нумерация|номер|число|количество|перечень) (?:лист\p{L}*|страниц\p{L}*)|^(?:sheet|page) (?:number|count)(?![\p{L}\p{N}])/u,
+  },
+  {
+    field:/^(?:редакция|изменение|изм\.?|версия|ревизия|revision|rev\.?|issue)(?:\s*[:№-]?\s*(?:[\p{L}]{1,3}|\d+(?:[.-]\d+)*))?$/u,
+    requirement:/^(?:номер (?:изменения|редакции)|редакция|изменение|версия|ревизия|revision|issue number)(?![\p{L}\p{N}])/u,
+  },
+  {
+    field:/^(?:дата(?: выпуска| изменения| оформления| подготовки| утверждения)?|(?:issue )?date)(?:\s*[:–—-]?\s*\d{1,4}(?:[.\/-]\d{1,4}){1,2})?$/u,
+    requirement:/^(?:дата(?: выпуска| изменения| оформления| подготовки| утверждения)?|(?:issue )?date)(?![\p{L}\p{N}])/u,
+  },
+  {
+    field:/^(?:масштаб|scale)(?:\s*[:=]?\s*\d+\s*[:/]\s*\d+)?$/u,
+    requirement:/^(?:масштаб|scale)(?![\p{L}\p{N}])/u,
+  },
+  {
+    field:/^(?:номер заказа|шифр проекта|код проекта|project (?:code|number))(?:\s*[:№-]?\s*[\p{L}\p{N}]+(?:[-./][\p{L}\p{N}]+)*)?$/u,
+    requirement:/^(?:номер заказа|шифр проекта|код проекта|project (?:code|number))(?![\p{L}\p{N}])/u,
+  },
+];
+
+const metadataText = text => phrases(text).replace(/[.!]+$/u,'');
+const propertyMetadata = property => {
+  const labels = [property.scope?.observed?.element,property.scope?.target?.element]
+    .filter(text=>typeof text==='string').map(metadataText);
+  const quotations = property.sources.filter(located).map(source=>metadataText(source.quote));
+  return documentMetadata.find(metadata=>labels.some(label=>metadata.field.test(label)) ||
+    quotations.length && quotations.every(quote=>metadata.field.test(quote)));
+};
+
+export function correctIncidentalMetadata(row, requirement) {
+  if (!['present','partial'].includes(row.status) || !row.analysis || row.analysis.applicability.kind==='excluded') return row;
+  const subjects = [requirement?.part,row.title,...(requirement?.aliases ?? []),
+    ...(requirement?.evidenceRule?.allOf ?? []).flatMap(group=>(group.anyOf ?? [])
+      .flatMap(({subject,property,attribute})=>[subject,property,attribute]))]
+    .filter(text=>typeof text==='string').map(metadataText);
+  if (!subjects.length) return row;
+  const positives = row.analysis.properties.filter(property=>
+    (!property.scope || property.scope.kind==='applicable') &&
+    (property.status==='confirmed' && property.sources.some(located) || property.status==='conflicting' &&
+      row.analysis.tensions.some(tension=>tension.propertyKey===property.key && tension.status==='open')));
+  if (!positives.length || !positives.every(property=>{
+    const metadata = propertyMetadata(property);
+    return metadata && !subjects.some(subject=>metadata.requirement.test(subject));
+  })) return row;
+  return {...row,status:'unassessed',finding:'Предмет требования требует адресной сверки. Прочитанные реквизиты сохранены по свойствам.'};
+}
+
+export function applyFactApplicability(row, {requireFactScope = false,requirement} = {}) {
+  const corrected = row => requirement ? correctIncidentalMetadata(row,requirement) : row;
+  const onlyLiteral = row.sources.some(isLiteralFactSource) &&
+    !row.sources.some(source=>located(source) && !isLiteralFactSource(source));
+  const pending = 'Область применения прочитанной записи требует подтверждения.';
+  if (!row.analysis) return onlyLiteral ? {...row,status:'unassessed',finding:pending} : row;
   let analysis = applyAnalysisFactApplicability(row.analysis);
-  const scoped = analysis.properties.filter(property => property.scope?.kind === 'applicable' && property.sources.some(located));
+  if (onlyLiteral) {
+    const finding = pending;
+    row = {...row,finding,...(row.status==='not_found' && {status:'unassessed'})};
+    if (analysis.applicability.kind==='excluded')
+      analysis = {...analysis,applicability:{kind:'undetermined',reason:finding,sources:[]}};
+  }
+  const propertyEvidence = property => [...property.sources,...analysis.tensions
+    .filter(tension=>tension.propertyKey===property.key && tension.status==='open')
+    .flatMap(tension=>tension.sides.flatMap(side=>side.sources))];
+  const scoped = analysis.properties.filter(property=>property.scope?.kind==='applicable' && propertyEvidence(property).some(located));
+  const material = scoped.filter(property=>['confirmed','conflicting'].includes(property.status));
   const positiveRow = ['present','partial'].includes(row.status) && analysis.applicability.kind !== 'excluded';
-  if (requireFactScope && positiveRow && !scoped.length && !hasUnverifiedFactScope({...row,analysis})) {
+  if ((requireFactScope || row.sources.some(isLiteralFactSource)) && positiveRow && !scoped.length && !hasUnverifiedFactScope({...row,analysis})) {
     const label = missingFactScope(row.title ?? row.key).target.element;
     const property = {key:'scope_for_requirement',label,status:'insufficient',finding:remit,sources:[],
       scope:{...missingFactScope(label),sources:row.sources.slice(0,12)},letter:{kind:'omit',text:remit}};
@@ -249,14 +378,20 @@ export function applyFactApplicability(row, {requireFactScope = false} = {}) {
   }
   if (hasUnverifiedFactScope({...row,analysis})) {
     const sources = unionSources([...sheetPreviewSources(row.sources),...analysis.applicability.sources,
-      ...scoped.flatMap(property => property.sources)],100);
-    const status = scoped.length ? 'partial' : 'unassessed';
-    return {...row,analysis,status,sources,finding:rowFinding};
+      ...scoped.flatMap(propertyEvidence)],100);
+    const hasPartial = material.length || scoped.length && (row.status==='partial' || !requireFactScope && positiveRow);
+    const status = hasPartial ? 'partial' : 'unassessed';
+    return corrected({...row,analysis,status,sources,finding:rowFinding});
   }
   if (scoped.length && analysis.applicability.kind !== 'excluded') {
     const sources = unionSources([...sheetPreviewSources(row.sources),...analysis.applicability.sources,
-      ...scoped.flatMap(property => property.sources)],100);
-    return {...row,analysis,sources,finding:scopedSummary(scoped)};
+      ...scoped.flatMap(propertyEvidence)],100);
+    const assessed = material.some(property=>property.status==='confirmed' && property.scope.basis!==literalFactBasis);
+    const complete = assessed && analysis.applicability.kind==='included' &&
+      analysis.properties.every(property=>property.status==='confirmed');
+    const status = row.status==='present' && !complete ? (material.length ? 'partial' : 'unassessed')
+      : row.status==='unassessed' && material.length ? 'partial' : row.status;
+    return corrected({...row,analysis,status,sources,finding:scopedSummary(scoped)});
   }
-  return row;
+  return corrected(onlyLiteral ? {...row,analysis} : row);
 }

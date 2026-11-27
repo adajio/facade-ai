@@ -215,13 +215,9 @@ function adapter(format: Format): ReaderAdapter {
       throw new ReaderError("dwg_index_identity_changed", "Шрифты сохранённого DWG изменились", 409);
     }
     if (source && pinnedVersion && typeof expected === "string") {
-      const pin = { source, converter: pinnedVersion.converter, profile: pinnedVersion.profile, reserve: 0 };
+      const pin = { source, converter: pinnedVersion.converter, profile: pinnedVersion.profile, reserve: 0, derivative: expected };
       const cached = await openDwgIndex(pin, pinnedFonts);
-      if (cached?.identity.derivative === expected) return cached;
-      if (cached) {
-        await cached.close();
-        throw new ReaderError("dwg_index_identity_changed", "Производная DWG изменилась", 409);
-      }
+      if (cached) return cached;
       const file = await openStoredDwgFile(source, expected);
       if (file) {
         try { return await buildDwgIndex(file, expected, pin.converter, pin, pinnedFonts); }
@@ -233,18 +229,20 @@ function adapter(format: Format): ReaderAdapter {
     }
     const converter = await resolve();
     if (converter?.format !== "dwg" || (pinnedVersion && pinnedVersion.converter !== converter.identity)) throw new FormatHold("dwg_converter_unavailable");
-    const pin = source && { source, converter: converter.identity, reserve: converter.reserve };
-    const cached = pin && await openDwgIndex(pin, fonts);
-    if (cached) {
-      if (expected !== undefined && expected !== cached.identity.derivative) { await cached.close(); throw new ReaderError("dwg_index_identity_changed", "Производная DWG изменилась", 409); }
-      if (!path || !source || await verifyDwgFile(source, cached.identity.derivative)) return cached;
-      expected = cached.identity.derivative;
-      await cached.close();
+    if (source && !pinnedVersion && typeof expected === "string") {
+      const saved = await openStoredDwgFile(source, expected);
+      if (saved) {
+        const pin = { source, converter: converter.identity, reserve: converter.reserve, derivative: expected };
+        try { return await openDwgIndex(pin, fonts) ?? await buildDwgIndex(saved, expected, converter.identity, pin, fonts); }
+        finally { await saved.close(); }
+      }
     }
     if (!path) return;
     return withDwgDerivative(path, converter, async (file, sha) => {
       if (expected !== undefined && expected !== sha) throw new ReaderError("dwg_index_identity_changed", "Повторная конвертация вернула другую производную DWG", 409);
-      const built = await buildDwgIndex(file, sha, converter.identity, pin, fonts);
+      const pin = source && { source, converter: converter.identity, reserve: converter.reserve, derivative: sha };
+      const cached = pin && await openDwgIndex(pin, fonts);
+      const built = cached ?? await buildDwgIndex(file, sha, converter.identity, pin, fonts);
       try { if (source) await persistDwgFile(source, file, sha); }
       catch (error) { await built.close(); throw error; }
       return built;
@@ -262,15 +260,17 @@ function adapter(format: Format): ReaderAdapter {
     }
     const { unit, digest } = index.read(selected);
     const current = pinned(index, unit, digest);
-    return rawOutput({ units: [], converter: index.identity.converter, representationSha256: index.identity.derivative },
+    const result = rawOutput({ units: [], converter: index.identity.converter, representationSha256: index.identity.derivative },
       current, request, block => index.definition(block),
       index.identity.fonts === emptyDwgFontAssets.identity ? emptyDwgFontAssets : fonts);
+    const drawingFrame = request.representation === "native" ? cadFrame(current) : undefined;
+    return drawingFrame ? { ...result, drawingFrame } : result;
   }
 
-  async function inspectDwg(path: string, source?: SourceRef): Promise<ReaderUnit[]> {
+  async function inspectDwg(path: string, source?: SourceRef, expectedDerivative?: string): Promise<ReaderUnit[]> {
     let units: ReaderUnit[];
     try {
-      const stored = (await index(path, source))!;
+      const stored = (await index(path, source, expectedDerivative))!;
       try {
         units = Array.from(stored.units(), ({ unit, digest }) => mapUnit(pinned(stored, unit, digest)));
       } finally {
@@ -329,8 +329,8 @@ function adapter(format: Format): ReaderAdapter {
       const stored = await verifyDwgFile(source, sha);
       return stored && { storageKey: stored.storageKey, sha256: sha, size: stored.size, format: kind, converter };
     } } : {}),
-    async inspect(path, source) {
-      if (format === "dwg") return inspectDwg(path, source);
+    async inspect(path, source, expectedDerivative) {
+      if (format === "dwg") return inspectDwg(path, source, expectedDerivative);
       const parsed = await parse(path, true);
       return stampPhysicalInventory(parsed.units.map(mapUnit), parsed, format, await version());
     },

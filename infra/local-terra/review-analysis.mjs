@@ -1,13 +1,15 @@
 import {
   applyAnalysisFactApplicability, factScopeFields, factScopeKinds, factScopeLabelLimit,
-  factScopeReasonLimit, factScopeSources, missingFactScope,
+  factScopeReasonLimit, factScopeSources, isLiteralFactSource, literalFactBasis, missingFactScope,
 } from './fact-applicability.mjs';
 
 export const applicabilityKinds = ['included', 'excluded', 'undetermined'];
 export const propertyStatuses = ['confirmed', 'unanswered', 'not_mentioned', 'insufficient', 'conflicting'];
 export const responseStates = ['received', 'not_received'];
 export const tensionStatuses = ['open', 'resolved'];
-export const noOpenQuestions = 'По доступным основаниям адресных вопросов для письма не установлено.';
+export const noOpenQuestions = 'Вопросы пока не сформированы. Для адресных вопросов недостаточно проверенных сведений.';
+export const reviewDecisionInstruction = 'Разделяй дословную запись и открытое свойство. Для omit укажи, что сверить и по какому адресу. Для ask нужен точный вопрос с адресной причиной: явный запрос, прямая отсылка, проверенное противоречие или привязка конкретной записи, требующая внешнего уточнения. Пробел чтения или отсутствие упоминания сами по себе требуют внутренней сверки. Полученное повторно не запрашивай.';
+const noRemainingQuestions = 'По результатам проверки открытых адресных вопросов для письма нет.';
 export const validText = (value, max) => typeof value === 'string' && value.trim().length > 0 && value.length <= max;
 const textSchema = maxLength => ({type:'string',minLength:1,maxLength});
 const enumSchema = values => ({type:'string',enum:values});
@@ -21,7 +23,7 @@ export function analysisFields(references, {requireFactScope = false} = {}) {
   const scopeSide = record(Object.fromEntries(factScopeFields.map(field => [field,textSchema(factScopeLabelLimit)])),
     factScopeFields.slice(1));
   const scope = record({kind:enumSchema(factScopeKinds),target:scopeSide,observed:scopeSide,
-    reason:textSchema(factScopeReasonLimit),...references},['observed']);
+    reason:textSchema(factScopeReasonLimit),basis:enumSchema([literalFactBasis]),...references},['observed','basis']);
   const applicability = record({kind:enumSchema(applicabilityKinds),reason:textSchema(420),...references});
   const properties = arraySchema(record({
     key:keySchema,label:textSchema(120),status:enumSchema(propertyStatuses),finding:textSchema(550),
@@ -40,11 +42,15 @@ const keyOk = value => typeof value === 'string' && /^[a-z][a-z0-9_-]{0,49}$/.te
 const list = (value, max, min=0) => Array.isArray(value) && value.length >= min && value.length <= max;
 const sourcePlace = source => JSON.stringify([source.versionId,source.anchor]);
 const located = sources => sources.filter(source => validText(source.quote,4000) && !source.limitation);
+const independent = sources => located(sources).filter(source=>!isLiteralFactSource(source));
 
 export function checkAnalysis(analysis, check) {
   const {applicability,properties,tensions} = analysis ?? {};
   check(applicabilityKinds.includes(applicability?.kind) && validText(applicability.reason,420), 'invalid_review_applicability');
-  check(applicability.kind !== 'excluded' || located(applicability.sources).length > 0, 'exclusion_without_evidence');
+  check(applicability.kind !== 'excluded' || independent(applicability.sources).length > 0
+    && !applicability.sources.some(isLiteralFactSource), 'exclusion_without_evidence');
+  check(applicability.kind !== 'included' || !applicability.sources.some(isLiteralFactSource),
+    'inclusion_without_independent_evidence');
   check(list(properties,16) && list(tensions,12), 'invalid_review_analysis');
   const byProperty = new Map(), tensionKeys = new Set(), open = new Set();
   for (const property of properties) {
@@ -53,7 +59,8 @@ export function checkAnalysis(analysis, check) {
     const supported = located(property.sources).length > 0;
     const response = property.response;
     if (response) {
-      check(responseStates.includes(response.state) && validText(response.finding,350) && located(response.sources).length > 0,
+      check(responseStates.includes(response.state) && validText(response.finding,350) && independent(response.sources).length > 0
+        && !response.sources.some(isLiteralFactSource),
         'response_without_evidence');
       check(response.state !== 'received' || property.status !== 'unanswered','received_response_marked_unanswered');
       check(response.state !== 'not_received' || property.status !== 'not_mentioned','unreceived_response_marked_unmentioned');
@@ -69,11 +76,11 @@ export function checkAnalysis(analysis, check) {
       && tensionStatuses.includes(tension.status) && validText(tension.finding,550) && list(tension.sides,4,2), 'invalid_review_tension');
     const distinct = new Set();
     for (const side of tension.sides) {
-      const places = located(side.sources).map(sourcePlace);
-      check(validText(side.text,350) && places.length > 0 && places.every(place => !distinct.has(place)), 'tension_without_distinct_sides');
+      const places = independent(side.sources).map(sourcePlace);
+      check(validText(side.text,350) && places.length > 0 && !side.sources.some(isLiteralFactSource) && places.every(place => !distinct.has(place)), 'tension_without_distinct_sides');
       for (const place of places) distinct.add(place);
     }
-    check(tension.status !== 'resolved' || located(tension.resolutionSources).length > 0, 'tension_without_resolution');
+    check(tension.status !== 'resolved' || independent(tension.resolutionSources).length > 0 && !tension.resolutionSources.some(isLiteralFactSource), 'tension_without_resolution');
     check(tension.status !== 'open' || tension.resolutionSources.length === 0, 'open_tension_with_resolution');
     if (tension.status === 'open') open.add(tension.propertyKey);
     tensionKeys.add(tension.key);
@@ -103,9 +110,11 @@ function readScopeSide(value, check) {
 }
 
 function readScope(raw, resolve, check) {
-  const {kind,target,observed,reason} = raw;
+  const {kind,target,observed,reason,basis} = raw;
   check(factScopeKinds.includes(kind) && validText(reason,factScopeReasonLimit), 'invalid_fact_scope');
+  check(basis === undefined || basis === literalFactBasis,'invalid_fact_scope_basis');
   return {kind,target:readScopeSide(target,check),...(observed && {observed:readScopeSide(observed,check)}),
+    ...(basis && {basis}),
     reason,sources:resolve(raw.citations ?? raw.ids)};
 }
 
@@ -144,8 +153,24 @@ export function mergeSources(...groups) {
   ])).values()];
 }
 
+const normalizeQuestion = value => value.normalize('NFC').toLocaleLowerCase('ru').replaceAll('ё','е')
+  .replace(/\s+/gu,' ').trim().replace(/[.!?]+$/u,'');
+
+export function questionIdentity(property) {
+  const target = property.scope?.target;
+  return JSON.stringify([normalizeQuestion(property.letter.text),target
+    ? factScopeFields.map(field=>normalizeQuestion(target[field] ?? '')) : normalizeQuestion(property.label)]);
+}
+
 export function renderQuestions(rows) {
-  const questions = rows.flatMap(row => (row.analysis?.properties ?? []).flatMap(property =>
-    property.letter.kind === 'ask' && (!property.scope || property.scope.kind === 'applicable') ? [`${row.title ?? row.key} — ${property.label}. ${property.letter.text.trim()}`] : []));
-  return questions.join('\n\n') || noOpenQuestions;
+  const seen = new Set();
+  return rows.flatMap(row => (row.analysis?.properties ?? []).flatMap(property => {
+    if (property.letter.kind !== 'ask' || property.scope && property.scope.kind !== 'applicable') return [];
+    const identity = questionIdentity(property);
+    if (seen.has(identity)) return [];
+    seen.add(identity);
+    return [`${row.title ?? row.key} — ${property.label}. ${property.letter.text.trim()}`];
+  })).join('\n\n') || (!rows.length || rows.some(row=>row.analysis?.applicability.kind!=='excluded' &&
+    (['partial','unassessed'].includes(row.status) || row.analysis?.applicability.kind==='undetermined' ||
+      row.analysis?.properties.some(property=>property.status!=='confirmed'))) ? noOpenQuestions : noRemainingQuestions);
 }

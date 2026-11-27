@@ -71,12 +71,40 @@ test('DWG durable derivative: historical map recovery, restart, permissions and 
     // Simulate a pre-upgrade map/index with no full derivative: changed conversion must not be accepted.
     const {findStoredDwgDerivative}=await load('pdf/dwg-derivative.js');
     const existing=await findStoredDwgDerivative(db,source,map.readerVersion);
+    await db.query('DELETE FROM dwg_derivatives WHERE version_id=$1',[version]);
+    output=Buffer.concat([expected,Buffer.from('\n')]);
+    assert.deepEqual((await reader.map(source)).units,map.units);
+    assert.equal(calls,1);
+    assert.equal((await pdf.verifyStoredDwgDerivative(db,source,map.readerVersion)).derivativeSha256,hash(expected));
     await db.query('DELETE FROM dwg_derivatives WHERE version_id=$1',[version]); await rm(existing.path);
     await db.query(`UPDATE reader_maps SET units=(SELECT jsonb_agg(jsonb_set(item,'{locator}',(item->'locator') - 'derivativeFormat' - 'converterIdentity')) FROM jsonb_array_elements(units) item) WHERE version_id=$1`, [version]);
     output=Buffer.concat([expected,Buffer.from('\n')]);
     await assert.rejects(reader.map(source),{code:'dwg_index_identity_changed'});
     assert.equal((await db.query('SELECT count(*)::int AS n FROM dwg_derivatives')).rows[0].n,0);
     output=expected; await reader.map(source); assert.equal(calls,3);
+    // The same bytes under a new document and version must use the verified prior derivative.
+    const [duplicateDoc,duplicateVersion,duplicateOccurrence]=Array.from({length:3},randomUUID);
+    await db.query("INSERT INTO intake_documents(id,project_id) VALUES($1,$2)",[duplicateDoc,project]);
+    await db.query("INSERT INTO intake_document_versions(id,project_id,document_id,original_id,media_type) VALUES($1,$2,$3,$4,'application/octet-stream')",
+      [duplicateVersion,project,duplicateDoc,orig]);
+    await db.query("INSERT INTO intake_occurrences(id,project_id,receipt_id,relative_path,declared_media_type,version_id,state) VALUES($1,$2,$3,'duplicate.dwg','application/octet-stream',$4,'accepted')",
+      [duplicateOccurrence,project,receipt,duplicateVersion]);
+    await db.query("INSERT INTO intake_reader_jobs(project_id,receipt_id,document_id,version_id,original_id) VALUES($1,$2,$3,$4,$5)",
+      [project,receipt,duplicateDoc,duplicateVersion,orig]);
+    const duplicate={...source,documentId:duplicateDoc,versionId:duplicateVersion};
+    output=Buffer.concat([expected,Buffer.from('\n')]);
+    const duplicateMap=await reader.map(duplicate);
+    assert.equal(calls,3);
+    assert.deepEqual(duplicateMap.units,map.units);
+    assert.equal(duplicateMap.source.versionId,duplicateVersion);
+    const duplicateDxf=await findStoredDwgDerivative(db,duplicate,map.readerVersion);
+    assert.equal(duplicateDxf.derivativeSha256,hash(expected));
+    assert.notEqual(duplicateDxf.path,existing.path);
+    assert.deepEqual(await readFile(duplicateDxf.path),expected);
+    const duplicateRead=await reader.previewDwg(duplicate,{readerVersion:map.readerVersion,representation:'native',
+      address:{unitId:map.units[0].id}});
+    assert.equal(duplicateRead.address.unitId,map.units[0].id);
+    output=expected;
     // A database failure cannot publish a ready map without its derivative metadata.
     const [orig2,doc2,version2,occ2]=Array.from({length:4},randomUUID);
     const original2=Buffer.from('AC1015B'); storedObjects.set('fixture2',{bytes:original2,sha256:hash(original2)});

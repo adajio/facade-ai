@@ -76,7 +76,15 @@ async function fixture(page: Page, editable: boolean, comparable = false, struct
       applicability:{kind:'excluded',reason:'КЖ исключён из области заказа.',sources:[excluded]},properties:[],tensions:[],
     } : {
       applicability:{kind:'included',reason:'Проверяемое свойство включено в задание.',sources:[]},
-      properties:index ? [] : [
+      properties:index === 2 ? [
+        {key:'joint-sign',label:'Надпись о шве',status:'confirmed',finding:'В источнике указано: «ДШ-1».',
+          scope:{basis:'literal',kind:'applicable',target:{element:'Шов'},observed:{element:'Шов'},
+            reason:'Прочитана маркировка.',sources:[{...added,quote:'ДШ-1'}]},
+          sources:[{...added,quote:'ДШ-1'}],letter:{kind:'omit',text:'Маркировка прочитана.'}},
+        {key:'joints',label:'Деформационные швы',status:'insufficient',finding:'Подпись найдена, её привязка требует сверки.',
+          scope:{kind:'undetermined',target:{element:'Шов',zone:'Ось Б'},reason:'На листе ось не подписана.',sources:[added]},
+          sources:[],letter:{kind:'omit',text:'Сначала сверить область.'}},
+      ] : index ? [] : [
         {key:'coating',label:'Толщина покрытия',status:'unanswered',finding:'Результат по запросу №7 не поступил.',
           sources:[waiting],response:{state:'not_received',finding:'В журнале отмечено неполучение.',sources:[waiting]},
           letter:{kind:'omit',text:'Запрос №7 уже направлен.'}},
@@ -302,8 +310,14 @@ test('Свойства различают получение ответа, по�
   await fixture(page,true,false,true);
   await page.goto(base);
   const matrix = page.getByRole('region',{name:'Комплектность по требованиям'});
+  await expect(matrix.getByText('Дальше', { exact: true })).toHaveCount(16);
   await matrix.getByRole('link',{name:'Сверить и решить · Требование 1',exact:true}).click();
   const requirement = matrix.getByRole('region',{name:'Требование 1',exact:true});
+  const firstRow = matrix.getByRole('row').filter({ has: page.getByRole('link', { name: 'Требование 1', exact: true }) });
+  await expect(firstRow).toContainText('Уточните блеск покрытия.');
+  for (const title of ['Что установлено', 'Что остаётся выяснить', 'Где проверить']) {
+    await expect(requirement.getByRole('heading', { name: title, exact: true })).toBeVisible();
+  }
   await expect(requirement.getByRole('region',{name:'Толщина покрытия'})).toContainText('Ответ заказчика не получен');
   const gloss = requirement.getByRole('region',{name:'Блеск покрытия'});
   await expect(gloss).toContainText('Ответ получен, свойство в нём не упомянуто');
@@ -317,6 +331,23 @@ test('Свойства различают получение ответа, по�
   await expect(outside).toContainText('КЖ исключён из области заказа.');
   await expect(outside).toContainText('Запрос по этому требованию в письмо не включён.');
   await expect(outside.getByRole('list',{name:'Основания применимости'})).toContainText('Крепление к стальной раме');
+  const thirdRow = matrix.getByRole('row').filter({ has: page.getByRole('link', { name: 'Требование 3', exact: true }) });
+  await expect(thirdRow).toContainText('На листе ось не подписана.');
+  await matrix.getByRole('link',{name:'Сверить и решить · Требование 3',exact:true}).click();
+  const scope = matrix.getByRole('region',{name:'Требование 3',exact:true});
+  const literal = scope.getByRole('region', {name:'Надпись о шве'});
+  await expect(literal).toContainText('Подтверждена надпись');
+  await expect(literal).toContainText('«ДШ-1»');
+  await expect(literal).not.toContainText('Вопрос для письма');
+  await expect(scope).toContainText('На листе ось не подписана.');
+  await expect(scope).toContainText('Сначала сверить область.');
+  await expect(scope.getByRole('list',{name:'Адреса проверки области по свойству «Деформационные швы»'})).toBeVisible();
+  await matrix.getByRole('link',{name:'Сверить и решить · Требование 16',exact:true}).click();
+  const unassessed = matrix.getByRole('region',{name:'Требование 16',exact:true});
+  await expect(unassessed).toContainText('Адресный вопрос пока не сформирован.');
+  await expect(unassessed).toContainText('Адресные источники по требованию отсутствуют.');
+  await expect(unassessed.getByRole('link',{name:'Открыть опись поступления'})).toHaveAttribute(
+    'href', `/projects/${projectId}/receipts/${receiptId}`);
   await page.goto(`/projects/${projectId}/letters`);
   const letter = page.getByRole('region',{name:'Черновик письма по результатам проверки'});
   await expect(letter).toContainText('Проект письма изменился после предыдущего поступления');
@@ -324,7 +355,7 @@ test('Свойства различают получение ответа, по�
   const basis = letter.getByRole('list',{name:'Основания вопроса по свойству «Блеск покрытия»'});
   await expect(basis.getByRole('link',{name:'Синтетический.pdf'})).toHaveAttribute('href',
     `/api/documents/${documentId}/versions/${versionId}/content#page=5`);
-  await expect(letter.getByLabel('Текст предварительного черновика')).not.toHaveValue(/КЖ|Толщина покрытия/);
+  await expect(letter.getByLabel('Текст предварительного черновика')).not.toHaveValue(/КЖ|Толщина покрытия|ДШ-1/);
 });
 
 
@@ -351,4 +382,120 @@ test('Адресное основание открывает сохранённ�
   await popup.waitForURL(`**${path}`);
   await expect(popup.locator('img')).toBeVisible();
   await popup.close();
+});
+
+
+test('Обзор объясняет остановку чтения и ведёт к сохранённым требованиям и черновику', async ({ page }) => {
+  await fixture(page, false);
+  const stopped = {
+    no_useful_change: 'Новые участки не изменили выводы по требованиям и состав вопросов письма.',
+    receipt_call_limit: 'Достигнут лимит запросов на поступление.',
+    no_addressed_goal: 'В сохранённом разборе нет адресной цели для продолжения.',
+    operator_stopped: 'Углублённое чтение остановлено по решению оператора.',
+  };
+  let readingMode: keyof typeof stopped = 'no_useful_change';
+  await page.route('**/api/projects/*/work-slices/current', route => route.fulfill({ json: {
+    projectId, workSliceId: 'slice', assessment: { contextId },
+  } }));
+  await page.route('**/api/v1/projects/*/terra-reading', route => route.fulfill({ json: {
+    enabled: true,
+    receipt: { receiptId, receiptNumber: 17, inventoryOpen: false, acceptedVersions: 1, rootFiles: 1,
+      rootArchives: 0, directChildren: 0, deeperChildren: 0, officeParts: 0 },
+    report: { id: 'review', createdAt: '2026-11-26T00:00:00Z', summary: { present: 0, partial: 4, notFound: 0, unassessed: 12 },
+      draftAvailable: true, hasQuestions: false },
+    progress: { totalWindows: 15, mappedVersions: 1, completed: 4, covered: 0, noMatch: 4, refused: 0, held: 0,
+      reading: 0, queued: 0, unassigned: 11, heldReasons: [], observations: 4,
+      deep: { status: 'running', reason: null, started: 4, limit: 20 },
+      directed: { mode: readingMode, openRequirements: 12, indexPendingVersions: 1, indexCompleteVersions: 0,
+        indexPendingUnits: 11, indexUnknownVersions: 0, pendingTargets: 0, callCount: 8, callLimit: 8, stagnantWindows: 3 } },
+    activity: [],
+  } }));
+  await page.goto(`/projects/${projectId}/overview`);
+  const card = page.getByRole('region', { name: 'Комплектность поступления' });
+  await expect(card.getByText(stopped.no_useful_change, { exact: true })).toBeVisible();
+  await expect(card).toContainText('Запросов к системе чтения · 8 из 8');
+  await expect(card).toContainText('Участков подряд без таких изменений · 3');
+  const matrix = card.getByRole('link', { name: 'Открыть требования и источники' });
+  await expect(matrix).toHaveAttribute('href', base + '?context=' + contextId);
+  const draft = card.getByRole('link', { name: 'Посмотреть, почему в письме пока нет вопросов' });
+  await expect(draft).toHaveAttribute('href', `/projects/${projectId}/letters`);
+  await draft.focus();
+  for (const mode of ['receipt_call_limit', 'no_addressed_goal', 'operator_stopped'] as const) {
+    readingMode = mode;
+    await page.evaluate(() => document.dispatchEvent(new Event('visibilitychange')));
+    await expect(card.getByText(stopped[mode], { exact: true })).toBeVisible();
+    await expect(draft).toBeFocused();
+    await expect(page.getByText('Есть адресные участки, ожидающие чтения.')).toHaveCount(0);
+    await expect(page.getByText(/Начато адресное чтение./)).toHaveCount(0);
+  }
+  await matrix.click();
+  await expect(page.getByRole('region', { name: 'Комплектность по требованиям' })).toBeVisible();
+  await page.goBack();
+  await draft.click();
+  await expect(page.getByRole('region', { name: 'Черновик письма по результатам проверки' })).toBeVisible();
+});
+
+test('Черновик показывает причину остановки чтения именно для выбранного разбора', async ({ page }) => {
+  const { publishDetailed } = await fixture(page, false, false, true);
+  const reasons = {
+    no_useful_change: 'Новые участки не изменили выводы по требованиям и состав вопросов письма.',
+    receipt_call_limit: 'Достигнут лимит запросов на поступление.',
+    operator_stopped: 'Углублённое чтение остановлено по решению оператора.',
+    no_addressed_goal: 'В сохранённом разборе нет адресной цели для продолжения.',
+  };
+  let mode: keyof typeof reasons = 'no_useful_change';
+  let savedStop: { status: string; reason: string; started: number; limit: number } | undefined;
+  let reportId = 'structured';
+  await page.route('**/api/v1/projects/*/terra-reading', route => route.fulfill({ json: {
+    enabled: true,
+    receipt: { receiptId },
+    report: { id: reportId },
+    progress: { directed: { mode }, deep: savedStop },
+  } }));
+
+  const lettersUrl = `/projects/${projectId}/letters`;
+  const letter = page.getByRole('region', { name: 'Черновик письма по результатам проверки' });
+  const stop = letter.getByRole('status').filter({ hasText: 'Черновик по частично прочитанному пакету.' });
+  const draft = letter.getByLabel('Текст предварительного черновика');
+  const draftText = 'Требование 1 — Блеск покрытия. Уточните блеск покрытия.';
+
+  await page.goto(lettersUrl);
+  await expect(stop).toContainText(reasons.no_useful_change);
+  await expect(stop).toContainText('Откройте комплектность, чтобы сверить выводы и открытые пункты по источникам.');
+  await expect(letter.getByRole('link', { name: 'Сверить требования и источники' })).toHaveAttribute('href', base);
+  await expect(draft).toHaveValue(draftText);
+  await letter.getByText('Основания вопросов письма', { exact: true }).click();
+  await expect(letter.getByRole('list', { name: 'Основания вопроса по свойству «Блеск покрытия»' })
+    .getByRole('link', { name: 'Синтетический.pdf' })).toHaveAttribute('href',
+    `/api/documents/${documentId}/versions/${versionId}/content#page=5`);
+
+  await draft.focus();
+  mode = 'receipt_call_limit';
+  publishDetailed();
+  await expect(stop).toContainText(reasons.receipt_call_limit);
+  await expect(draft).toHaveValue(draftText);
+  await expect(draft).toBeFocused();
+
+  for (const next of ['operator_stopped', 'no_addressed_goal'] as const) {
+    mode = next;
+    await page.reload();
+    await expect(stop).toContainText(reasons[next]);
+    await expect(draft).toHaveValue(draftText);
+  }
+
+  savedStop = { status: 'partial', reason: 'target_limit', started: 4, limit: 4 };
+  await page.reload();
+  await expect(stop).toContainText('Достигнут лимит участков углублённого чтения.');
+  await expect(draft).toHaveValue(draftText);
+
+  await letter.getByLabel('Разбор').selectOption('review');
+  await expect(draft).toHaveValue('Синтетический черновик');
+  await expect(stop).toHaveCount(0);
+
+  reportId = 'other-review';
+  const reading = page.waitForResponse(response => new URL(response.url()).pathname.endsWith('/terra-reading'));
+  await page.reload();
+  expect(await (await reading).json()).toMatchObject({ report: { id: reportId } });
+  await expect(draft).toHaveValue(draftText);
+  await expect(stop).toHaveCount(0);
 });
