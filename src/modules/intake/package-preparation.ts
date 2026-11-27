@@ -213,8 +213,20 @@ async function evaluate(tx: PoolClient, input: PreparationInput) {
   return { manifest, reasons, hash, parents: new Map(rows.map(row => [row.occurrenceId,row.parentId])) };
 }
 
+// A restored review refers to the original reader profile. Keep its manifest pinned across deployments.
+async function restoredPreparation(tx: PoolClient, {projectId,receiptId}: PreparationInput) {
+  const {rows:[saved]}=await tx.query<{id:string;revision:number;manifest:PreparationManifest}>(`SELECT p.id,p.revision,p.manifest
+    FROM intake_package_preparation_current c JOIN intake_package_preparations p ON p.id=c.manifest_id
+    WHERE c.project_id=$1 AND c.receipt_id=$2 AND EXISTS (SELECT 1 FROM project_reading_activity a
+      WHERE a.project_id=c.project_id AND a.receipt_id=c.receipt_id AND a.preparation_id=c.manifest_id
+        AND a.stage='saved_review' AND a.status='restored')`,[projectId,receiptId]);
+  return saved;
+}
+
 /** Read-only projection; no old manifest is advertised while current input differs. */
 export async function readPackagePreparation(tx: PoolClient, input: PreparationInput): Promise<PreparationView> {
+  const saved=await restoredPreparation(tx,input);
+  if (saved) return {...saved.manifest,state:'ready',manifestId:saved.id,revision:saved.revision,reasons:[]};
   const result = await evaluate(tx, input);
   const { rows: [current] } = await tx.query<{ id: string; revision: number; hash: string }>(
     `SELECT p.id,p.revision,p.snapshot_hash AS hash FROM intake_package_preparation_current c
@@ -234,6 +246,8 @@ export async function readPackagePreparation(tx: PoolClient, input: PreparationI
 /** Call inside a transaction and repeat immediately before new admissions under the same lock. */
 export async function capturePackagePreparation(tx: PoolClient, input: PreparationInput) {
   await lockIntakeProject(tx, input.projectId);
+  const saved=await restoredPreparation(tx,input);
+  if (saved) return {state:'restored' as const,manifestId:saved.id,revision:saved.revision,manifest:saved.manifest};
   const result = await evaluate(tx, input);
   if (result.reasons.length) {
     await tx.query('DELETE FROM intake_package_preparation_current WHERE project_id=$1 AND receipt_id=$2', [input.projectId,input.receiptId]);

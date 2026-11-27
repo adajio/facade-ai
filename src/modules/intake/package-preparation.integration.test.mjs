@@ -98,6 +98,14 @@ test('receipt preparation is atomic, replayable and admits only current readable
   assert.equal((await view(client,input)).manifestId, ready.manifestId);
   assert.equal((await client.query('SELECT count(*)::int AS n FROM intake_package_preparation_items WHERE manifest_id=$1 AND (version_id,map_fingerprint) IN (($2,$3),($4,$5))',[ready.manifestId,pdf.version,pdfFp,dwg.version,dwgFp])).rows[0].n,2);
   input.expectedReaderVersions[pdf.version] = 'pdf-v2';
+  await client.query('BEGIN');
+  try {
+    await client.query(`INSERT INTO project_reading_activity(project_id,receipt_id,preparation_id,stage,status,attempt_key)
+      VALUES($1,$2,$3,'saved_review','restored','restored-fixture')`,[owner.project,owner.receipt,ready.manifestId]);
+    assert.equal((await capture(client,input)).state,'restored');
+    assert.equal((await view(client,input)).manifestId,ready.manifestId);
+    assert.equal((await client.query('SELECT manifest_id FROM intake_package_preparation_current WHERE receipt_id=$1',[owner.receipt])).rows[0].manifest_id,ready.manifestId);
+  } finally {await client.query('ROLLBACK');}
   assert.equal((await view(client,input)).manifestId,null);
   assert.equal((await tx(() => capture(client,input))).state,'waiting');
   assert.equal((await client.query('SELECT count(*)::int AS n FROM intake_package_preparation_current')).rows[0].n,0);
