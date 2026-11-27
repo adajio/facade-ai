@@ -435,11 +435,13 @@ test('Обзор объясняет остановку чтения и ведё�
   await expect(page.getByRole('region', { name: 'Черновик письма по результатам проверки' })).toBeVisible();
 });
 
-test('Черновик показывает автоматическую остановку чтения именно для выбранного разбора', async ({ page }) => {
+test('Черновик показывает причину остановки чтения именно для выбранного разбора', async ({ page }) => {
   const { publishDetailed } = await fixture(page, false, false, true);
   const reasons = {
     no_useful_change: 'Новые участки не изменили выводы по требованиям и состав вопросов письма.',
     receipt_call_limit: 'Достигнут лимит запросов на поступление.',
+    operator_stopped: 'Углублённое чтение остановлено по решению оператора.',
+    no_addressed_goal: 'В сохранённом разборе нет адресной цели для продолжения.',
   };
   let mode: keyof typeof reasons = 'no_useful_change';
   let reportId = 'structured';
@@ -458,7 +460,7 @@ test('Черновик показывает автоматическую ост�
 
   await page.goto(lettersUrl);
   await expect(stop).toContainText(reasons.no_useful_change);
-  await expect(stop).toContainText('Перед отправкой сверьте оставшиеся адресные вопросы по источникам.');
+  await expect(stop).toContainText('Откройте комплектность, чтобы сверить выводы и открытые пункты по источникам.');
   await expect(letter.getByRole('link', { name: 'Сверить требования и источники' })).toHaveAttribute('href', base);
   await expect(draft).toHaveValue(draftText);
   await letter.getByText('Основания вопросов письма', { exact: true }).click();
@@ -472,6 +474,13 @@ test('Черновик показывает автоматическую ост�
   await expect(stop).toContainText(reasons.receipt_call_limit);
   await expect(draft).toHaveValue(draftText);
   await expect(draft).toBeFocused();
+
+  for (const next of ['operator_stopped', 'no_addressed_goal'] as const) {
+    mode = next;
+    await page.reload();
+    await expect(stop).toContainText(reasons[next]);
+    await expect(draft).toHaveValue(draftText);
+  }
 
   await letter.getByLabel('Разбор').selectOption('review');
   await expect(draft).toHaveValue('Синтетический черновик');

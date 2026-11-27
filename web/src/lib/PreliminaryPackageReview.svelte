@@ -31,8 +31,7 @@
     const data = letterReading?.data;
     if (!letterReviewId || letterReading?.project !== projectId || !data?.enabled ||
         data.report?.id !== letterReviewId || data.receipt?.receiptId !== selected?.receiptId) return;
-    const reason = readingStopReason(data.progress);
-    if (reason === 'receipt_call_limit' || reason === 'no_useful_change') return reason;
+    return readingStopReason(data.progress);
   });
   let questions = $derived(selected ? preliminaryQuestions(selected.rows) : []);
   let counts = $derived(selected ? (Object.keys(preliminaryStatusLabels) as PreliminaryStatus[]).map((status) => ({
@@ -189,7 +188,7 @@
           <div role="status">
             <p><strong>Черновик по частично прочитанному пакету.</strong></p>
             <p>{readingStopMessages[letterStop]}</p>
-            <p>Перед отправкой сверьте оставшиеся адресные вопросы по источникам.</p>
+            <p>Откройте комплектность, чтобы сверить выводы и открытые пункты по источникам.</p>
           </div>
           <a href={scopedUrl(projectId, 'completeness', {})}>Сверить требования и источники</a>
         </div>
