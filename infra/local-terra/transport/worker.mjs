@@ -34,7 +34,8 @@ const [{ readConfig }, { openPool }, { WorkQueue }, { transaction, hash }, { cre
 
 const { packagePreparationSweep, preparedPackageWindow, preparedManifestForWindow, preflightPackageWindow, packagePreparationInput, verifyCurrentPreparation } =
   await load('src/modules/harness/package-preparation.js');
-const { readDirectedReadingPlans, currentDirectedWindow, readProductionDirectedReadingPlan, productionDeepReading, receiptReadingStopped } = await load('src/modules/harness/directed-reading.js');
+const { readDirectedReadingPlans, currentDirectedWindow, addressedWindowCurrent, readProductionDirectedReadingPlan, productionDeepReading } = await load('src/modules/harness/directed-reading.js');
+const {admitBackgroundCall,confirmReadingStop}=await load('src/modules/harness/reading-stop.js');
 const config = readConfig();
 const db = openPool(config.databaseUrl);
 const queue = new WorkQueue(db);
@@ -141,7 +142,11 @@ try {
       }
       if (p.packageWindow.preparationId && (!preparation || !await verifyCurrentPreparation(
         tx,preparation,p.packageWindow.preparationId,p.packageWindow.id))) return {denied:true};
-      if (pending && await receiptReadingStopped(tx,pending.projectId,pending.receiptId)) return {held:'operator_stopped'};
+      if (pending) {
+        const stop=await admitBackgroundCall(tx,pending.projectId,pending.receiptId,pending.preparationId);
+        if (stop) return {held:stop};
+        if (!await addressedWindowCurrent(tx,pending.projectId,pending.receiptId,p.packageWindow,Boolean(production))) return {held:'no_addressed_goal'};
+      }
       if (signal.aborted) return {denied:true};
       if (production) {
         if (!pending || !await currentDeepReceipt(tx,pending)) return {denied:true};
@@ -192,8 +197,12 @@ try {
       const scheduled = await transaction(db,async tx => {
         const plan = await readProductionDirectedReadingPlan(tx,target.projectId);
         if (plan.receiptId !== target.receiptId || plan.preparationId !== target.preparationId) return false;
+        if (plan.mode==='no_useful_change' || plan.mode==='receipt_call_limit') {
+          if (!plan.provisional && !plan.stopRecorded) await confirmReadingStop(tx,target.projectId,target.receiptId,target.preparationId);
+          return false;
+        }
         const status = await deepReadingWork(tx,target,localKind);
-        const counters = {started:status.started,completed:status.completed,openRequirements:plan.openRequirements,
+        const counters = {started:status.started,completed:status.completed,openRequirements:plan.openRequirements,reportId:plan.reportId,
           limit:productionDeepReading.targetsPerReceipt};
         const note = async (state,reason) => {
           if (!await deepReadingActivity(tx,target,state,reason,counters)) return false;
@@ -209,6 +218,7 @@ try {
         const w = await chooseDeepWindow(tx,target,plan);
         if (!w) {
           if (plan.indexPendingVersions > 0) return false;
+          if (plan.mode==='no_addressed_goal') return note('partial','no_addressed_goal');
           if (status.unknown) return note('held',unknownOutcome);
           return note('partial',status.started ? 'no_new_targets' : 'no_readable_windows');
         }
@@ -223,7 +233,7 @@ try {
         const key = hash([w.id,target.preparationId,target.catalogVersionId,target.stage,profileHash]);
         await queue.declarePrimary(ref,{id:key+':A',branch:'A',place:key},tx);
         const payload = {mode:'primary',branch:'A',settings,place:w.place,observationProtocol:2,
-          packageWindow:{id:w.id,directedRequirements:plan.requirementsByWindow[w.id],readerVersion:w.reader_version,
+          packageWindow:{id:w.id,directedRequirements:plan.requirementsByWindow[w.id],goalReportId:plan.reportId,goalCatalogId:plan.goalCatalogId,goalStage:plan.goalStage,directedGoals:plan.goalsByWindow[w.id].filter(g=>plan.requirementsByWindow[w.id].includes(g.requirement)).slice(0,24),readerVersion:w.reader_version,
             preparationId:target.preparationId,routeRevision:revision,packageReadingVersion:2,walkProtocol:1,
             productionReview:{catalogVersionId:target.catalogVersionId,stage:target.stage,requiresVisual:w.requiresVisual}}};
         const jobId = await queue.enqueue({...ref,key:'local-terra:'+key,kind:localKind,subjectId:w.version_id,
@@ -242,6 +252,10 @@ try {
   async function schedule() {
     return transaction(db, async tx => {
       const plans=await readDirectedReadingPlans(tx,true,db);
+      for(const plan of plans) {
+        if(!plan.provisional && !plan.stopRecorded && (plan.mode==='no_useful_change' || plan.mode==='receipt_call_limit'))
+          await confirmReadingStop(tx,plan.projectId,plan.receiptId,plan.preparationId);
+      }
       const { rows:[w] } = await tx.query(`SELECT w.id,w.project_id,w.version_id,w.place,m.reader_version,p.generation_id,directed."receiptId" AS "directedReceiptId"
         FROM harness_package_windows w JOIN harness_package_maps m ON m.version_id=w.version_id AND m.fingerprint=w.map_fingerprint AND m.active
         JOIN harness_package_projects p ON p.project_id=w.project_id JOIN projects project ON project.id=p.project_id
@@ -268,7 +282,7 @@ try {
       const key = hash([w.id,profileHash]);
       await queue.declarePrimary(ref,{id:key+':A',branch:'A',place:key},tx);
       const payload = {mode:'primary',branch:'A',settings,place:w.place,observationProtocol:2,
-        packageWindow:{id:w.id,directedRequirements:selected.requirements,readerVersion:w.reader_version,preparationId,routeRevision:revision,packageReadingVersion:2,walkProtocol:1,profileInspection:{lineIds:[]}}};
+        packageWindow:{id:w.id,directedRequirements:selected.requirements,directedGoals:selected.goals,goalReportId:selected.reportId,goalCatalogId:selected.goalCatalogId,goalStage:selected.goalStage,readerVersion:w.reader_version,preparationId,routeRevision:revision,packageReadingVersion:2,walkProtocol:1,profileInspection:{lineIds:[]}}};
       const jobId = await queue.enqueue({...ref,key:'local-terra:'+key,kind:localKind,subjectId:w.version_id,
         obligationId:key+':A',purpose:'primary_a',payload},tx);
       await tx.query(`INSERT INTO harness_package_branches(window_id,branch,profile_hash,route_revision,settings,job_id)

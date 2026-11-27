@@ -1,13 +1,19 @@
 import type { Pool, PoolClient } from 'pg';
 import { inventoryOpen } from '../intake/receipts.js';
+import { receiptStopState, type StopState } from './reading-stop.js';
 import { memoryVersion } from '../project-memory/contracts.js';
 
 export type DirectedReading = {
-  mode: 'ordinary' | 'waiting_report' | 'waiting_index' | 'planning' | 'enough_evidence' | 'no_new_targets' | 'operator_stopped' | 'directed';
+  mode: 'ordinary' | 'waiting_report' | 'waiting_index' | 'planning' | 'enough_evidence' | 'no_new_targets' | 'operator_stopped' | 'receipt_call_limit' | 'no_useful_change' | 'no_addressed_goal' | 'directed';
   windowIds: string[];
   receiptId: string | null;
   preparationId: string | null;
   requirementsByWindow: Record<string,string[]>;
+  reportId?:string; goalCatalogId?:string; goalStage?:string; provisional?:boolean; stopRecorded?:boolean;
+  goalsByWindow?: Record<string,{requirement:string; question:string}[]>;
+  callCount?: number;
+  callLimit?: number;
+  stagnantWindows?: number;
   openRequirements: number;
   indexPendingVersions: number;
   indexCompleteVersions: number;
@@ -79,7 +85,9 @@ const scopeStamp = `md5(jsonb_build_array((SELECT manifest_id FROM intake),(SELE
 export function directedReadingPlanSql(project: string, research = false) {
   return String.raw`${directedReadingScopeSql(project,research)}, open AS MATERIALIZED (
     SELECT req->>'key' AS requirement,coalesce(property->>'key','') AS property_key,req,
-      property->>'label' AS property_label,CASE
+      property->>'label' AS property_label,
+      left(coalesce(CASE WHEN property#>>'{letter,kind}'='ask' THEN nullif(btrim(property#>>'{letter,text}'),'') END,
+        nullif(btrim(property->>'label'),''),nullif(btrim(req->>'completenessCriterion'),''),nullif(btrim(req->>'part'),'')),600) AS question,CASE
         WHEN property#>>'{scope,kind}'='undetermined' AND property->'sources'='[]'::jsonb THEN property#>'{scope,sources}'
         ELSE coalesce(property->'sources',review->'sources') END AS sources
     FROM intake i CROSS JOIN report rp
@@ -159,7 +167,7 @@ export function directedReadingPlanSql(project: string, research = false) {
     FROM place_index p JOIN label_hits h ON h.version_id=p.version_id WHERE p.visual
     UNION ALL SELECT DISTINCT p.id,p.version_id,p.ordinal,p.unit,o.requirement,o.property_key,24,true
     FROM open o CROSS JOIN LATERAL jsonb_array_elements(o.sources) s
-    JOIN place_index p ON p.visual AND s->>'versionId'=p.version_id::text
+    JOIN place_index p ON (p.visual OR p.can_open_image) AND s->>'versionId'=p.version_id::text
       AND strpos(s->>'anchor','"unitId":'||to_json(p.unit)::text)>0
   ), candidates AS MATERIALIZED (
     SELECT id,version_id,ordinal,requirement,property_key,sum(weight)+CASE WHEN bool_or(visual) THEN 2 ELSE 0 END AS score
@@ -182,44 +190,33 @@ export function directedReadingPlanSql(project: string, research = false) {
     SELECT shortlist.id,shortlist.rank,shortlist.score,(array_agg(requirement ORDER BY requirement))[1:${targetsPerReceipt}] AS keys
     FROM shortlist JOIN per_requirement ON per_requirement.id=shortlist.id
     WHERE per_requirement.rank<=${targetsPerRequirement} GROUP BY shortlist.id,shortlist.rank,shortlist.score
-  ), ordered AS (
-    SELECT id,rank,score,keys,1 AS lane FROM goals
-    ${research ? `UNION ALL
-      SELECT choice.id,0,0,keys.value,0 FROM LATERAL (
-        SELECT p.id FROM place_index p
-        LEFT JOIN goals matched ON matched.id=p.id
-        WHERE EXISTS (SELECT 1 FROM open)
-          AND NOT EXISTS (SELECT 1 FROM harness_package_branches branch WHERE branch.window_id=p.id AND branch.branch='A' AND branch.active)
-          AND NOT EXISTS (SELECT 1 FROM intake i JOIN intake_package_preparations pin ON pin.project_id=i.project_id AND pin.receipt_id=i.id
-            JOIN gateway_jobs job ON job.project_id=i.project_id AND job.payload#>>'{packageWindow,preparationId}'=pin.id::text
-            WHERE job.kind='${productionDeepReading.kind}')
-          AND (p.can_open_image OR NOT EXISTS (SELECT 1 FROM goals))
-        ORDER BY p.can_open_image DESC NULLS LAST,matched.score DESC NULLS LAST,
-          p.ordinal,p.version_id,p.id LIMIT 1
-      ) choice CROSS JOIN LATERAL (
-        SELECT coalesce((SELECT keys FROM goals WHERE id=choice.id),ARRAY(
-          SELECT DISTINCT requirement FROM open ORDER BY requirement LIMIT 4)) AS value
-      ) keys` : ''}
-  ), distinct_ordered AS (
-    SELECT DISTINCT ON (id) id,rank,score,keys,lane FROM ordered ORDER BY id,lane
+  ), questions AS (
+    SELECT g.id,jsonb_agg(DISTINCT jsonb_build_object('requirement',o.requirement,'question',o.question)
+      ORDER BY jsonb_build_object('requirement',o.requirement,'question',o.question)) AS items
+    FROM goals g JOIN ranked r ON r.id=g.id AND r.requirement=ANY(g.keys) AND r.per_property<=${targetsPerRequirement}
+    JOIN open o ON o.requirement=r.requirement AND o.property_key=r.property_key
+    WHERE o.question IS NOT NULL GROUP BY g.id
   ), planned AS (
-    SELECT coalesce(array_agg(id ORDER BY lane,rank,score DESC,id),'{}'::uuid[]) AS ids,
-      coalesce(jsonb_object_agg(id,keys),'{}'::jsonb) AS requirements FROM distinct_ordered
+    SELECT coalesce(array_agg(g.id ORDER BY g.rank,g.score DESC,g.id),'{}'::uuid[]) AS ids,
+      coalesce(jsonb_object_agg(g.id,g.keys),'{}'::jsonb) AS requirements,
+      coalesce(jsonb_object_agg(g.id,q.items),'{}'::jsonb) AS questions
+    FROM goals g JOIN questions q ON q.id=g.id
   )
   SELECT ${scopeStamp} AS stamp,CASE WHEN NOT EXISTS (SELECT 1 FROM report) THEN CASE WHEN EXISTS (
       SELECT 1 FROM preliminary_package_reviews saved WHERE saved.project_id=${project} AND saved.model='gpt-6.1-terra'
     ) THEN 'waiting_report' ELSE 'ordinary' END
     WHEN NOT EXISTS (SELECT 1 FROM open) THEN 'enough_evidence'
     WHEN ix.pending>0 AND cardinality(planned.ids)=0 THEN 'waiting_index'
-    WHEN cardinality(planned.ids)=0 THEN 'no_new_targets' ELSE 'directed' END AS mode,
+    WHEN cardinality(planned.ids)=0 THEN 'no_addressed_goal' ELSE 'directed' END AS mode,
     planned.ids AS "windowIds",(SELECT id FROM intake) AS "receiptId",(SELECT manifest_id FROM intake) AS "preparationId",
-    planned.requirements AS "requirementsByWindow",(SELECT count(DISTINCT requirement)::int FROM open) AS "openRequirements",
+    (SELECT id FROM report) AS "reportId",(SELECT catalog_version_id FROM intake) AS "goalCatalogId",(SELECT project_stage FROM intake) AS "goalStage",
+    planned.requirements AS "requirementsByWindow",planned.questions AS "goalsByWindow",(SELECT count(DISTINCT requirement)::int FROM open) AS "openRequirements",
     ix.pending AS "indexPendingVersions",ix.complete AS "indexCompleteVersions",
     ix.units AS "indexPendingUnits",ix.unknown AS "indexUnknownVersions"
   FROM index_status ix CROSS JOIN planned`;
 }
 
-type DirectedState = { stamp: string; report: string | null; receiptId: string | null; earlierReview: boolean; stopped: boolean;
+type DirectedState = { stamp: string; report: string | null; receiptId: string | null; earlierReview: boolean; stopped: boolean; preparation: string|null; savedStop: StopState|null;
   indexPendingVersions: number; indexCompleteVersions: number; indexPendingUnits: number; indexUnknownVersions: number };
 
 const cache = new Map<string, { stamp: string; plan: DirectedReading; expires?: number }>();
@@ -238,6 +235,11 @@ export async function receiptReadingStopped(tx: PoolClient, projectId: string, r
 const scopeStateSql = (research: boolean) => `${directedReadingScopeSql('$1::uuid',research)}
   SELECT (SELECT id FROM intake) AS "receiptId",(SELECT id FROM report) AS report,
     ${stoppedReceiptSql('$1::uuid','(SELECT id FROM intake)')} AS stopped,
+    (SELECT manifest_id FROM intake) AS preparation,
+    (SELECT jsonb_build_object('reason',a.reason,'callCount',a.fields->'callCount','callLimit',a.fields->'callLimit','stagnantWindows',a.fields->'stagnantWindows')
+      FROM intake i JOIN project_reading_activity a ON a.project_id=i.project_id AND a.receipt_id=i.id AND a.preparation_id=i.manifest_id
+      WHERE a.stage='deep_reading' AND a.status='partial' AND a.reason IN ('no_useful_change','receipt_call_limit')
+        AND a.fields->>'catalogVersionId'=i.catalog_version_id::text AND a.fields->>'projectStage'=i.project_stage ORDER BY a.id DESC LIMIT 1) AS "savedStop",
     EXISTS (SELECT 1 FROM preliminary_package_reviews saved WHERE saved.project_id=$1 AND saved.model='gpt-6.1-terra') AS "earlierReview",
     ix.pending AS "indexPendingVersions",ix.complete AS "indexCompleteVersions",
     ix.units AS "indexPendingUnits",ix.unknown AS "indexUnknownVersions",
@@ -254,10 +256,15 @@ export async function readProductionDirectedReadingPlan(tx: PoolClient, projectI
 }
 
 async function readPlan(tx: PoolClient, projectId: string, research: boolean, background?: Pool): Promise<DirectedReading> {
-  const { rows: [{ stamp, report, earlierReview, stopped, ...state }] } = await tx.query<DirectedState>(scopeStateSql(research), [projectId]);
+  const { rows: [{ stamp, report, earlierReview, stopped, preparation, savedStop, ...state }] } = await tx.query<DirectedState>(scopeStateSql(research), [projectId]);
   if (stopped) return { ...state, mode:'operator_stopped', windowIds:[], requirementsByWindow:{}, preparationId:null, openRequirements:0 };
   if (!report) return { ...state, mode: earlierReview ? 'waiting_report' : 'ordinary',
     windowIds:[], requirementsByWindow:{}, preparationId:null, openRequirements:0 };
+  const policy = savedStop ?? (state.receiptId && preparation ? await receiptStopState(tx,projectId,state.receiptId,preparation) : null);
+  if (policy?.reason && policy.provisional) return {...state, mode:'planning', windowIds:[], requirementsByWindow:{},
+    preparationId:null, openRequirements:0, callCount:policy.callCount, callLimit:policy.callLimit, provisional:true};
+  if (policy?.reason) return {...state, mode:policy.reason, windowIds:[], requirementsByWindow:{}, preparationId:preparation,
+    openRequirements:0, callCount:policy.callCount, callLimit:policy.callLimit, stagnantWindows:policy.stagnantWindows, provisional:policy.provisional, stopRecorded:Boolean(savedStop)};
   const cacheKey = research ? projectId + ':production' : projectId;
   // A competing branch can become active independently of the index.
   const saved = cache.get(cacheKey);
@@ -336,8 +343,8 @@ export async function readDirectedReadingPlans(tx: PoolClient, requireReport: bo
       WHERE saved.project_id=project.project_id AND saved.model='gpt-6.1-terra')`,[requireReport]);
   const plans = [];
   for (const {projectId} of rows) {
-    const {mode,receiptId,windowIds,requirementsByWindow} = await readDirectedReadingPlan(tx,projectId,background);
-    plans.push({projectId,mode,receiptId,windowIds,requirementsByWindow});
+    const {mode,receiptId,preparationId,provisional,stopRecorded,callCount,callLimit,stagnantWindows,windowIds,requirementsByWindow} = await readDirectedReadingPlan(tx,projectId,background);
+    plans.push({projectId,mode,receiptId,preparationId,provisional,stopRecorded,callCount,callLimit,stagnantWindows,windowIds,requirementsByWindow});
   }
   return plans;
 }
@@ -349,7 +356,7 @@ export async function currentDirectedWindow(tx: PoolClient, projectId: string, w
   return {
     allowed: !receiptId && plan.mode==='ordinary' && !requireReport ||
       (!receiptId || plan.receiptId===receiptId) && Boolean(requirements),
-    requirements,
+    requirements, reportId:plan.reportId, goalCatalogId:plan.goalCatalogId, goalStage:plan.goalStage, goals:plan.goalsByWindow?.[windowId]?.filter(g=>requirements?.includes(g.requirement)).slice(0,24),
     preparationId: requirements ? plan.preparationId : null,
   };
 }
@@ -357,4 +364,27 @@ export async function currentDirectedWindow(tx: PoolClient, projectId: string, w
 export async function directedWindowAllowed(tx: PoolClient, projectId: string, windowId: string,
   requireReport: boolean, receiptId?: string | null) {
   return (await currentDirectedWindow(tx,projectId,windowId,requireReport,receiptId)).allowed;
+}
+
+/** Reuse an immutable addressed assignment only while its report, stage and pins are current.
+ * Jobs created before questions were persisted must qualify against today's plan at the same place. */
+export async function addressedWindowCurrent(tx:PoolClient,project:string,receipt:string,job:{
+  id:string; preparationId?:string; goalReportId?:string; goalCatalogId?:string; goalStage?:string;
+  directedGoals?:{requirement:string;question:string}[]; directedRequirements?:string[];
+},production=false) {
+  if (job.goalReportId && job.directedGoals?.some(g=>g.question.trim() && job.directedRequirements?.includes(g.requirement))) {
+    const {rows:[current]}=await tx.query(`SELECT r.id FROM projects p JOIN intake_package_preparation_current prep
+      ON prep.project_id=p.id AND prep.receipt_id=$2 AND prep.manifest_id=$3
+      JOIN preliminary_package_reviews r ON r.preparation_id=prep.manifest_id AND r.receipt_id=prep.receipt_id
+        AND r.catalog_version_id=p.catalog_version_id AND r.stage=p.project_stage
+      LEFT JOIN intake_project_generations gen ON gen.project_id=p.id
+      WHERE p.id=$1 AND r.input_generation=coalesce(gen.generation,0)
+        AND p.catalog_version_id=$4 AND p.project_stage=$5
+      ORDER BY r.created_at DESC,r.id DESC LIMIT 1`,[project,receipt,job.preparationId,job.goalCatalogId,job.goalStage]);
+    if (current?.id===job.goalReportId) return true;
+  }
+  const plan=await readPlan(tx,project,production);
+  return plan.receiptId===receipt && plan.preparationId===job.preparationId &&
+    Boolean(plan.goalsByWindow?.[job.id]?.some(g=>job.directedRequirements?.includes(g.requirement)
+      && plan.requirementsByWindow[job.id]?.includes(g.requirement)));
 }

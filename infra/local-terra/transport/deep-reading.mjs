@@ -38,7 +38,11 @@ export async function admittedDeepReceipts(tx, access) {
           AND report.input_generation=coalesce(gen.generation,0) AND report.model='gpt-6.1-terra')
       AND NOT EXISTS (SELECT 1 FROM project_reading_activity a WHERE a.project_id=p.id AND a.receipt_id=r.id
         AND a.preparation_id=cur.manifest_id AND a.stage='deep_reading' AND a.status IN ('completed','partial')
-        AND a.fields->>'catalogVersionId'=p.catalog_version_id::text AND a.fields->>'projectStage'=p.project_stage)
+        AND a.fields->>'catalogVersionId'=p.catalog_version_id::text AND a.fields->>'projectStage'=p.project_stage
+        AND (a.reason IS DISTINCT FROM 'no_addressed_goal' OR a.fields->>'reportId'=(
+          SELECT rp.id::text FROM preliminary_package_reviews rp WHERE rp.project_id=p.id AND rp.receipt_id=r.id
+            AND rp.preparation_id=cur.manifest_id AND rp.catalog_version_id=p.catalog_version_id AND rp.stage=p.project_stage
+          ORDER BY rp.created_at DESC,rp.id DESC LIMIT 1)))
     ORDER BY r.created_at,r.id`, [access.activatedAt,JSON.stringify(access.grants)]);
   return rows;
 }
@@ -99,7 +103,7 @@ export async function deepReadingActivity(tx,target,status,reason,counters) {
     VALUES($1,$2,$3,'deep_reading',$4,$5,$6,$7) ON CONFLICT DO NOTHING`,
   [target.projectId,target.receiptId,target.preparationId,status,reason,{
     ...counters,catalogVersionId:target.catalogVersionId,projectStage:target.stage,
-  }, [target.preparationId,target.catalogVersionId,target.stage,counters.started ?? 0].join(':')]);
+  }, [target.preparationId,target.catalogVersionId,target.stage,counters.started ?? 0,...(reason==='no_addressed_goal'?[counters.reportId]:[])].join(':')]);
   return rowCount > 0;
 }
 

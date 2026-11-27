@@ -487,6 +487,59 @@ test('a primary review salvages a legend entry and an addressed question from a 
   assert.equal(published.rows[1].analysis.properties[0].sources[0].quote,elevation.quote);
 });
 
+test('numbered literal legend entries survive a revision without confirming application or generating a question',async()=>{
+  const {applyRevision,prepareRevisionSnapshot}=await import('../infra/local-terra/revise.mjs');
+  const versionId='sheet', address={unitId:'detail'};
+  const quote='2. Кронштейны К-2 в цвете RAL 7015.';
+  const fact={id:'legend',versionId,originalSha256:'a'.repeat(64),address,quote,grounding:'text'};
+  const row={key:'bracket',title:'Кронштейны',status:'unassessed',finding:'Требуется сверка.',sources:[],
+    analysis:{applicability:{kind:'included',reason:'Область работ.',sources:[]},properties:[],tensions:[]}};
+  const {snapshot}=prepareRevisionSnapshot({factScopeVersion:1,rows:[row],inventory:[fact],
+    requirements:[{key:'bracket',part:'Кронштейны'}],scopeNote:'Синтетическая проверка.'},[fact],1);
+  const ids=['O1'];
+  const scope=(target,observed)=>({kind:'applicable',target,observed,ids,reason:'Цитата из легенды.'});
+  const literal=(key,element)=>({key,label:'Строка легенды',status:'confirmed',finding:'Прочитана строка легенды.',ids,
+    scope:{...scope({element},{element}),basis:'literal'},
+    letter:{kind:'omit',text:'Достаточно дословной записи для внутренней сверки.'}});
+  const proposed=[
+    literal('record',quote),
+    literal('prefix','2. Кронштейны К-2'),
+    {key:'installed',label:'Цвет кронштейнов на фасаде Б',status:'confirmed',finding:'На фасаде Б установлен RAL 7015.',ids,
+      scope:scope({element:'Кронштейны К-2',zone:'фасад Б'},{element:'Кронштейны К-2'}),
+      letter:{kind:'omit',text:'Цвет установлен.'}},
+  ];
+  const review=applyRevision(snapshot,{changes:[{key:'bracket',status:'partial',finding:'Прочитана легенда.',ids,
+    analysis:{applicability:null,properties:proposed,tensions:[]}}]});
+  const [record,prefix,installed]=review.rows[0].analysis.properties;
+  for (const literal of [record,prefix]) {
+    assert.equal(literal.status,'confirmed');
+    assert.equal(literal.finding,`В источнике указано: «${quote}».`);
+    assert.equal(literal.sources[0].quote,quote);
+  }
+  assert.equal(installed.scope.kind,'undetermined');
+  assert.equal(installed.status,'insufficient');
+  assert.equal(installed.scope.sources[0].quote,quote);
+  assert.equal(review.draftText,noOpenQuestions);
+});
+
+test('a bad letter suggestion retains independently checked scoped evidence',()=>{
+  const observation=source('sheet','Кронштейны К-2 из стали.');
+  const target={element:'Кронштейны К-2'};
+  const scope=rawScope(target,target,observation);
+  const ask={kind:'ask',text:'Представьте данные о кронштейнах.'};
+  const confirmed=rawProperty({...scope,basis:'literal'},[observation],{key:'record',letter:ask});
+  const omitted=rawProperty(scope,[observation],{key:'thickness',status:'not_mentioned',
+    finding:'В просмотренной строке толщина не указана.',letter:ask});
+  const review=makeRow([confirmed,omitted],[observation]);
+  const [record,thickness]=review.analysis.properties;
+  assert.equal(record.status,'confirmed');
+  assert.equal(record.letter.kind,'omit');
+  assert.equal(thickness.status,'not_mentioned');
+  assert.equal(thickness.letter.kind,'omit');
+  assert.match(thickness.letter.text,/внутренн/iu);
+  assert.equal(renderQuestions([review]),noOpenQuestions);
+});
+
 test('a literal quotation stays local and cannot change an earlier engineering property',async()=>{
   const observed=source('color','Цвет RAL 7015 для панели А.');
   const area=element('панели А');

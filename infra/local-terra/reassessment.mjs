@@ -255,7 +255,7 @@ export async function runReassessment(run,scope,reason) {
         drawingBatch ? 'drawing_batch_limit' : 'primary_request_limit');
       return 'rejected';
     }
-    const admission=await admitRecordedClaim(admitClaim,stateDir,snapshot,()=>claim(path,{...snapshot,startedAt,parentId:report.reportId},saved));
+    const admission=await admitRecordedClaim(admitClaim,stateDir,snapshot,()=>claim(path,{...snapshot,startedAt,parentId:report.reportId},saved),key);
     if (admission!=='claimed') {
       if (drawingBatch) await notify('waiting',snapshot,snapshot.budget,admission);
       return admission;

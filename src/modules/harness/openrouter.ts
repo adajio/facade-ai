@@ -322,6 +322,7 @@ export function initialMessages(job: ResearchJob): Message[] {
   }
   const assignment = job.mode === 'primary'
     ? { mode: job.mode, place: job.place, question: job.question, ...(job.packageWindow ? { objective: job.packageWindow.followup?'package_followup':'package_primary',
+      ...(job.packageWindow.directedGoals ? {questionsAtThisAddress:job.packageWindow.directedGoals} : {}),
       ...(job.packageWindow.directedRequirements ? {directedRequirements:job.packageWindow.directedRequirements} : {}),
       ...(!job.packageWindow.followup&&job.packageWindow.profileInspection?.lineIds.length?{profileInspectionLines:job.packageWindow.profileInspection.lineIds}:{}),
       ...(job.packageWindow.followup?{ blocks:job.packageWindow.followup.blocks,

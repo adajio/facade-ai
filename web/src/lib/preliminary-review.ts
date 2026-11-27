@@ -47,6 +47,27 @@ export type PreliminaryReview = {
 export const preliminaryStatusLabels: Record<PreliminaryStatus, string> = {
   present: 'Представлено', partial: 'Частично', not_found: 'Не найдено', unassessed: 'Не оценено',
 };
+export function preliminaryLetterQuestion(property: PreliminaryAnalysis['properties'][number]) {
+  return property.letter.kind === 'ask' && (!property.scope || property.scope.kind === 'applicable')
+    ? property.letter.text : undefined;
+}
+
+export function preliminaryNextAction(row: PreliminaryRow) {
+  const analysis = row.analysis;
+  if (analysis?.applicability.kind === 'excluded') return analysis.applicability.reason;
+  const question = analysis?.properties.map(preliminaryLetterQuestion).find(Boolean);
+  if (question) return question;
+  if (analysis?.applicability.kind === 'undetermined') return analysis.applicability.reason;
+  const unresolved = analysis?.properties.find(property => property.status !== 'confirmed');
+  if (unresolved) {
+    const action = unresolved.scope && unresolved.scope.kind !== 'applicable'
+      ? unresolved.scope.reason : unresolved.letter.kind === 'omit' ? unresolved.letter.text : unresolved.finding;
+    return unresolved.label + ' · ' + action;
+  }
+  if (row.status === 'present' && analysis?.properties.length) return 'Открытых уточнений по сохранённому разбору нет.';
+  return 'Адресный вопрос пока не сформирован.';
+}
+
 export function preliminaryQuestions(rows: PreliminaryRow[]) {
   const unique = (sources: PreliminarySource[]) => [...new Map(sources.map(source => [
     JSON.stringify([source.versionId,source.anchor,source.quote,source.limitation]), source,
@@ -56,12 +77,13 @@ export function preliminaryQuestions(rows: PreliminaryRow[]) {
   const questions = new Map<string, { key: string; subjects: Set<string>; property: string; text: string; sources: PreliminarySource[] }>();
   for (const row of rows) {
     for (const property of row.analysis?.properties ?? []) {
-      if (property.letter.kind !== 'ask' || property.scope && property.scope.kind !== 'applicable') continue;
+      const text = preliminaryLetterQuestion(property);
+      if (!text) continue;
       const target = property.scope?.target;
-      const identity = JSON.stringify([normalize(property.letter.text),target
+      const identity = JSON.stringify([normalize(text),target
         ? [target.element,target.zone,target.purpose,target.variant].map(value => normalize(value ?? ''))
         : normalize(property.label)]);
-      const question = questions.get(identity) ?? { key: identity, subjects: new Set<string>(), property: property.label, text: property.letter.text, sources: [] };
+      const question = questions.get(identity) ?? { key: identity, subjects: new Set<string>(), property: property.label, text, sources: [] };
       question.subjects.add(row.title + ' · ' + property.label);
       question.sources = unique([...question.sources, ...property.sources, ...(property.response?.sources ?? []),
         ...(property.scope?.sources ?? []), ...(row.analysis?.tensions.filter(tension => tension.propertyKey === property.key)

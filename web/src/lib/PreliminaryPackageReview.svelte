@@ -2,13 +2,15 @@
   import { preliminaryQuestions, preliminaryStatusLabels, type PreliminaryReview, type PreliminaryStatus } from './preliminary-review';
   import { date } from './format';
   import { denied, describe, id, interrupted, type Api } from './http';
-  import { projectV1 } from './workspace';
+  import { projectV1, scopedUrl } from './workspace';
+  import { readingStopMessages, readingStopReason } from './reading-stop';
   import Notice from './Notice.svelte';
   import PreliminaryRequirementAnalysis from './PreliminaryRequirementAnalysis.svelte';
   import PreliminaryRowChange from './PreliminaryRowChange.svelte';
   import PreliminarySources from './PreliminarySources.svelte';
   import PreliminaryStatusBadge from './PreliminaryStatusBadge.svelte';
   import ReceiptEvidenceChain from './ReceiptEvidenceChain.svelte';
+  import type { TerraReading } from './TerraReadingProgress.svelte';
 
   type ReadingProgress = { totalWindows: number; mappedVersions: number; acceptedVersions: number;
     completed: number; covered: number; partial?: number; noMatch: number; refused: number; held: number; reading: number };
@@ -21,8 +23,17 @@
   let progress = $state<ReadingProgress>();
   let progressError = $state('');
   let textArea = $state<HTMLTextAreaElement>();
+  let letterReading = $state<{ project: string; data: Pick<TerraReading, 'enabled' | 'receipt' | 'report' | 'progress'> }>();
   let selected = $derived(reviews.find((item) => item.id === selectedId));
   let progressReviewId = $derived(mode === 'review' && selected?.isCurrent ? selected.id : undefined);
+  const letterReviewId = $derived(mode === 'letter' && selected?.isCurrent ? selected.id : undefined);
+  const letterStop = $derived.by(() => {
+    const data = letterReading?.data;
+    if (!letterReviewId || letterReading?.project !== projectId || !data?.enabled ||
+        data.report?.id !== letterReviewId || data.receipt?.receiptId !== selected?.receiptId) return;
+    const reason = readingStopReason(data.progress);
+    if (reason === 'receipt_call_limit' || reason === 'no_useful_change') return reason;
+  });
   let questions = $derived(selected ? preliminaryQuestions(selected.rows) : []);
   let counts = $derived(selected ? (Object.keys(preliminaryStatusLabels) as PreliminaryStatus[]).map((status) => ({
     status, count: selected!.rows.filter((row) => row.status === status).length,
@@ -87,6 +98,21 @@
     return () => { controller.abort(); if (timer) clearTimeout(timer); };
   });
 
+  $effect(() => {
+    const project = projectId;
+    void refreshKey;
+    if (!letterReviewId) return;
+    const controller = new AbortController();
+    void api.json<NonNullable<typeof letterReading>['data']>(projectV1(project) + '/terra-reading', { signal: controller.signal })
+      .then(data => {
+        if (!controller.signal.aborted) letterReading = { project, data };
+      })
+      .catch(failure => {
+        if (!controller.signal.aborted && denied(failure)) letterReading = undefined;
+      });
+    return () => controller.abort();
+  });
+
   async function copyDraft() {
     if (!selected) return;
     try {
@@ -147,19 +173,27 @@
       <p class="meta">Всего позиций: {selected.rows.length}</p>
       <details><summary>Все выводы и источники</summary>
       <div class="table-wrap"><table>
-        <thead><tr><th>Позиция</th><th>Состояние</th><th>Предварительный разбор и источники</th></tr></thead>
+        <thead><tr><th>Позиция</th><th>Предварительный разбор и источники</th></tr></thead>
         <tbody>
           {#each selected.rows as row (row.key)}
-            <tr><td>{row.title}</td><td><PreliminaryStatusBadge status={row.status} /></td><td>
-              <p>{row.finding}</p>
-              {#if row.sources.length}<PreliminarySources sources={row.sources} />{/if}
-              <PreliminaryRequirementAnalysis analysis={row.analysis} retained={row.retained} />
+            <tr><td>{row.title}</td><td>
+              <PreliminaryRequirementAnalysis {row} />
               <PreliminaryRowChange {row} changes={selected.changes} />
             </td></tr>
           {/each}
         </tbody>
       </table></div></details>
     {:else}
+      {#if letterStop}
+        <div class="notice letter-reading-stop">
+          <div role="status">
+            <p><strong>Черновик по частично прочитанному пакету.</strong></p>
+            <p>{readingStopMessages[letterStop]}</p>
+            <p>Перед отправкой сверьте оставшиеся адресные вопросы по источникам.</p>
+          </div>
+          <a href={scopedUrl(projectId, 'completeness', {})}>Сверить требования и источники</a>
+        </div>
+      {/if}
       {#if !selected.changes}
         <p class="meta">Нет данных для сравнения с первоначальным проектом письма.</p>
       {:else if selected.changes.baselineId === null}
@@ -217,6 +251,7 @@
 
 <style>
   textarea { width: 100%; min-height: 18em; field-sizing: content; }
+  .letter-reading-stop p { margin: 0 0 .35rem; }
   .letter-sources { margin-block-start: .85rem; }
   .letter-sources li + li { margin-block-start: .7rem; }
   .letter-sources p { margin: .35rem 0; }

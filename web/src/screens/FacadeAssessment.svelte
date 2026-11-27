@@ -6,8 +6,7 @@
   import PreliminaryStatusBadge from '../lib/PreliminaryStatusBadge.svelte';
   import PreliminaryRequirementAnalysis from '../lib/PreliminaryRequirementAnalysis.svelte';
   import PreliminaryRowChange from '../lib/PreliminaryRowChange.svelte';
-  import PreliminarySources from '../lib/PreliminarySources.svelte';
-  import type { PreliminaryStatus, PreliminaryReview } from '../lib/preliminary-review';
+  import { preliminaryNextAction, type PreliminaryStatus, type PreliminaryReview } from '../lib/preliminary-review';
   import { evidenceCounts, hasRemainder, localFinding, matchesSelection, requirementChecked, requirementTitle, triageCounts, type Triage } from '../lib/triage';
   import { conflictMessage, conflictVersion } from '../lib/conflict';
   import { date, label } from '../lib/format';
@@ -426,15 +425,15 @@
         <div class="requirement-evidence">
           <h3>Что нашла система</h3>
         {#if reportRow}
-          <p><PreliminaryStatusBadge status={reportRow.status} /> · {reportRow.finding}</p>
-          <h4>Где проверить</h4>
-          {#if reportRow.sources.length}
-            <PreliminarySources sources={reportRow.sources} label="Основания вывода" />
-          {:else}<p>В разборе нет ссылки на конкретный лист. <a href={receiptLink(preliminary!.receiptId)}>Открыть опись поступления</a></p>{/if}
-          <PreliminaryRequirementAnalysis analysis={reportRow.analysis} retained={reportRow.retained} />
+          <PreliminaryRequirementAnalysis row={reportRow} receiptHref={receiptLink(preliminary!.receiptId)} />
           <PreliminaryRowChange row={reportRow} changes={preliminary?.changes} />
         {:else}
+          <h4>Что установлено</h4>
           <p>{machineResult(active)}</p>
+          <h4>Что остаётся выяснить</h4>
+          <p>Адресный вопрос пока не сформирован в предварительном разборе.</p>
+          <h4>Где проверить</h4>
+          {#if !active.machine.citations.length}<p>Адресные источники по требованию отсутствуют.</p>{/if}
         {/if}
         {#if active.machine.citations.length}
           <EvidenceButtons citations={active.machine.citations} {open} compare={active.machine.outcome === 'confirmed_conflict'}
@@ -608,9 +607,10 @@
                 <td>{#if reportRow}
                   <PreliminaryStatusBadge status={reportRow.status} />
                   <span class="finding-preview">{reportRow.finding}</span>
+                  <p class="next-action"><strong>Дальше</strong> · {preliminaryNextAction(reportRow)}</p>
                   {#if reportRow.retained}<small class="meta">В карточке есть основания из предыдущего разбора</small>{/if}
                   <PreliminaryRowChange row={reportRow} changes={preliminary?.changes} compact />
-                {:else}Нет текущего разбора по позиции{/if}</td>
+                {:else}Нет текущего разбора по позиции. Адресный вопрос пока не сформирован.{/if}</td>
                 {:else}
                 <td>{machineResult(question)}</td>
                 <td>{question.semanticRemainder
@@ -888,6 +888,7 @@
   .status-counts { display: flex; flex-wrap: wrap; align-items: center; gap: .5rem; margin-block: .5rem; }
   .decision-link { display: inline-block; padding-block: .3rem; white-space: nowrap; }
   .verification-details { margin-block-start: 1rem; border-block-start: 1px solid var(--line); padding-block-start: .75rem; }
+  .next-action { font-size: .9rem; margin: .35rem 0; overflow-wrap: anywhere; }
   .finding-preview { display: -webkit-box; line-clamp: 2; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; color: var(--muted); font-size: .9rem; }
   .criterion-rule { border-inline-start: 2px solid var(--line); padding-inline-start: .6rem; }
   @media (max-width: 700px) {

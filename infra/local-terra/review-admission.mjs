@@ -41,11 +41,11 @@ export async function unsettledReview(stateDir,scope) {
 }
 // The admission callback executes under the project's intake lock. A saved reply may still be
 // validated and published locally while a separate dispatched request has an unknown outcome.
-export async function admitRecordedClaim(admit,stateDir,scope,reserve) {
+export async function admitRecordedClaim(admit,stateDir,scope,reserve,backgroundAttempt) {
   let held=false;
   const result=await admit(scope,async()=>{
     held=await unsettledReview(stateDir,scope);
     return held ? false : reserve();
-  });
+  },backgroundAttempt);
   return held ? 'held_scope_outcome_unknown' : result;
 }

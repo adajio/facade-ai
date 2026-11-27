@@ -20,7 +20,7 @@ import { pathToFileURL } from 'node:url';
 import { compactCatalog, duration, emitActivity, measureRequest, messageEntryBytes, ModelTransportError, modelFailure,
   prioritizeEvidence, remainingRequestBytes, responseUsage } from './request-budget.mjs';
 
-import { analysisFields, citationSchema, readAnalysis, record as reviewRecord, renderQuestions, validText } from './review-analysis.mjs';
+import { analysisFields, citationSchema, readAnalysis, record as reviewRecord, renderQuestions, reviewDecisionInstruction, validText } from './review-analysis.mjs';
 import { recoverPreparationFindings } from './review-continuity.mjs';
 export { reconcilePreliminaryReview, recoverPreparationFindings } from './review-continuity.mjs';
 
@@ -359,7 +359,7 @@ export function makeRequest(snapshot) {
   const attachments=snapshot.sheetReading?.attachments ?? images;
   const content=attachments.length ? [{type:'text',text:prompt},...attachments
     .map(image=>({type:'image_url',image_url:{url:'data:image/png;base64,'+image.pngBase64}}))] : prompt;
-  return {model:MODEL,messages:[{role:'system',content:[instruction,requireFactScope && factApplicabilityInstruction,drawingInstruction,images.length && inspectSheetsInstruction].filter(Boolean).join('\n')},{role:'user',content}],
+  return {model:MODEL,messages:[{role:'system',content:[instruction,requireFactScope && factApplicabilityInstruction,requireFactScope && reviewDecisionInstruction,drawingInstruction,images.length && inspectSheetsInstruction].filter(Boolean).join('\n')},{role:'user',content}],
     tools:[{type:'function',function:{name:'submit_preliminary_review',description:'Сохранить разбор, свойства, противоречия и решения по письму с адресными цитатами.',parameters:schema}}],tool_choice:'required'};
 }
 
@@ -735,6 +735,7 @@ async function main() {
   const [{readConfig},{createRuntimePdfService},{transaction},{packagePreparationInput,verifyCurrentPreparation}] = await Promise.all([
     built('src/platform/config.js'),built('src/modules/pdf/index.js'),built('src/modules/gateway/types.js'),built('src/modules/harness/package-preparation.js')]);
   const {receiptReadingStopped}=await built('src/modules/harness/directed-reading.js');
+  const {admitBackgroundCall,recordReviewedObservations}=await built('src/modules/harness/reading-stop.js');
   if (process.argv[2]==='--stop-receipt') {
     try {
       const receiptId=process.argv[3];
@@ -763,7 +764,7 @@ async function main() {
   const reader=createRuntimePdfService(db,readConfig());
   const shutdown=new AbortController();
   const stop=()=>shutdown.abort();
-  const admitClaim=async (snapshot,reserve) => {
+  const admitClaim=async (snapshot,reserve,backgroundAttempt) => {
     if (shutdown.signal.aborted) return 'waiting';
     const target={projectId:snapshot.projectId,receiptId:snapshot.receiptId};
     const input=await transaction(db,tx=>packagePreparationInput(tx,target,reader));
@@ -776,7 +777,15 @@ async function main() {
       const held=await production?.hold(tx,snapshot);
       if (held) return held;
       if (shutdown.signal.aborted) return 'waiting';
-      return await reserve() ? 'claimed' : 'claimed_elsewhere';
+      if (backgroundAttempt) {
+        const stopped=await admitBackgroundCall(tx,target.projectId,target.receiptId,snapshot.preparationId);
+        if (stopped) return stopped;
+      }
+      if (!await reserve()) return 'claimed_elsewhere';
+      if (backgroundAttempt) await tx.query(`INSERT INTO project_reading_activity
+        (project_id,receipt_id,preparation_id,stage,status,attempt_key) VALUES($1,$2,$3,'revision_reservation','reserved',$4)
+        ON CONFLICT DO NOTHING`,[target.projectId,target.receiptId,snapshot.preparationId,backgroundAttempt]);
+      return 'claimed';
     });
   };
   const stateDir=join(base,'state'); await mkdir(stateDir,{recursive:true,mode:0o700});
@@ -805,7 +814,7 @@ async function main() {
       const selected=production ? await production.receipts(rows,stateDir) : rows;
       for(const {id} of selected) {
         if (shutdown.signal.aborted) break;
-        try { const run={db,receiptId:id,stateDir,admitClaim,withSkills:snapshot=>attachReadingSkills(db,reader,source,snapshot),modelCall:r=>production ? production.call(r) : invokeModel(adapter,r),publish:publishPreliminaryPackageReview};
+        try { const run={db,receiptId:id,stateDir,admitClaim,recordReviewed:recordReviewedObservations,withSkills:snapshot=>attachReadingSkills(db,reader,source,snapshot),modelCall:r=>production ? production.call(r) : invokeModel(adapter,r),publish:publishPreliminaryPackageReview};
           let scope;
           let status=await processReceipt({...run,reviewContract:2,onPublished:async (published,snapshot)=>{
             scope=published;

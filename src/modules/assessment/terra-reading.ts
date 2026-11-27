@@ -133,7 +133,8 @@ export async function readTerraReading(tx: PoolClient, projectId: string, planBa
      JOIN intake_package_preparation_current cur ON cur.project_id=a.project_id AND cur.receipt_id=a.receipt_id AND cur.manifest_id=a.preparation_id
      WHERE a.project_id=$1 AND a.receipt_id=$2 AND a.stage='deep_reading'
        AND a.fields->>'catalogVersionId'=p.catalog_version_id::text AND a.fields->>'projectStage'=p.project_stage
-     ORDER BY a.event_time DESC,a.id DESC LIMIT 1`, [projectId,receipt.receiptId]);
+       AND (a.reason IS DISTINCT FROM 'no_addressed_goal' OR a.fields->>'reportId'=$3::text)
+     ORDER BY a.event_time DESC,a.id DESC LIMIT 1`, [projectId,receipt.receiptId,report?.id??null]);
   const { rows: activity } = await tx.query(`WITH accepted AS (
        SELECT DISTINCT ON (o.version_id) o.version_id,v.document_id,o.relative_path AS label
        FROM intake_occurrences o JOIN intake_document_versions v ON v.id=o.version_id AND v.project_id=o.project_id

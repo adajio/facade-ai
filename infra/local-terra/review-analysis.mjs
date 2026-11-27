@@ -8,6 +8,7 @@ export const propertyStatuses = ['confirmed', 'unanswered', 'not_mentioned', 'in
 export const responseStates = ['received', 'not_received'];
 export const tensionStatuses = ['open', 'resolved'];
 export const noOpenQuestions = 'Вопросы пока не сформированы. Для адресных вопросов недостаточно проверенных сведений.';
+export const reviewDecisionInstruction = 'Разделяй дословную запись и открытое свойство. Для omit укажи, что сверить и по какому адресу. Для ask нужен точный вопрос с адресной причиной: явный запрос, прямая отсылка, проверенное противоречие или привязка конкретной записи, требующая внешнего уточнения. Пробел чтения или отсутствие упоминания сами по себе требуют внутренней сверки. Полученное повторно не запрашивай.';
 const noRemainingQuestions = 'По результатам проверки открытых адресных вопросов для письма нет.';
 export const validText = (value, max) => typeof value === 'string' && value.trim().length > 0 && value.length <= max;
 const textSchema = maxLength => ({type:'string',minLength:1,maxLength});

@@ -80,6 +80,8 @@ export const jobSchema = z.discriminatedUnion('mode', [
       packageReadingVersion: z.literal(2).optional(),
       preparationId: id.optional(),
       productionReview: z.strictObject({catalogVersionId:id,stage:text,requiresVisual:z.boolean()}).optional(),
+      goalReportId:id.optional(), goalCatalogId:id.optional(), goalStage:text.optional(),
+      directedGoals: z.array(z.strictObject({requirement:z.string().min(1).max(200),question:z.string().min(1).max(600)})).min(1).max(24).optional(),
       directedRequirements: z.array(z.string().trim().min(1).max(200)).min(1).max(24).optional(),
       profileInspection: z.strictObject({ lineIds: z.array(text).max(8) }).optional(),
       walkProtocol: z.literal(1).optional(), followup: z.strictObject({ rootJobId: id,

@@ -32,11 +32,12 @@ test('production worker opens the real PDF, keeps immutable source pins and stop
   assert.equal(new URL(url).pathname,'/test_facade_terra_deep_works');
   const sourceRoot = fileURLToPath(new URL('../',import.meta.url));
   const [{ WorkQueue }, { preparePackageMap }, { refreshReceiptPreparation }, { scanPackageStructure },
-    { createIntakeStorage }, { createRuntimePdfService }, { transaction }, { indexNextProjectMemory }] = await Promise.all([
+    { createIntakeStorage }, { createRuntimePdfService }, { transaction }, { indexNextProjectMemory },
+    { readProductionDirectedReadingPlan }] = await Promise.all([
     import('../dist/src/modules/gateway/queue.js'),import('../dist/src/modules/harness/package-dispatch.js'),
     import('../dist/src/modules/harness/package-preparation.js'),import('../dist/src/modules/harness/package-walk.js'),
     import('../dist/src/modules/intake/blob.js'),import('../dist/src/modules/pdf/index.js'),import('../dist/src/modules/gateway/types.js'),
-    import('../dist/src/modules/project-memory/index.js'),
+    import('../dist/src/modules/project-memory/index.js'),import('../dist/src/modules/harness/directed-reading.js'),
   ]);
   const root = await mkdtemp('/tmp/facade-deep-worker-');
   const db = new pg.Pool({connectionString:url});
@@ -162,7 +163,8 @@ test('production worker opens the real PDF, keeps immutable source pins and stop
   assert.equal((await db.query('SELECT count(*)::int AS count FROM projects')).rows[0].count,0);
   const [org,user,catalog]=Array.from({length:3},randomUUID);
   const stage = 'Стадия 1';
-  const requirements = [{key:'R1',part:'Ведомость облицовки',completenessCriterion:'Листы облицовки'}];
+  const question = 'Состав ведомости облицовки';
+  const requirements = [{key:'R1',part:'Ведомость облицовки',completenessCriterion:question}];
   await db.query("INSERT INTO organizations(id,name) VALUES($1,'Fixture')",[org]);
   await db.query("INSERT INTO users(id,organization_id,login) VALUES($1,$2,$3)",[user,org,user]);
   await db.query("INSERT INTO catalog_versions(id,organization_id,catalog_key,revision,name,requirements,created_by) VALUES($1,$2,'fixture',1,'fixture',$3,$4)",
@@ -186,11 +188,29 @@ test('production worker opens the real PDF, keeps immutable source pins and stop
     const prepared=await transaction(db,tx=>refreshReceiptPreparation(tx,target,reader));
     assert.equal(prepared.state,'ready',JSON.stringify(prepared.reasons));
     const {manifestId}=prepared;
-    await db.query(`INSERT INTO preliminary_package_reviews(project_id,receipt_id,catalog_version_id,model,stage,input_generation,inventory,scope_note,rows,draft_text,content_hash,preparation_id)
+    const { rows:[{place}] } = await db.query(`SELECT w.place FROM intake_package_preparation_windows pin
+      JOIN harness_package_windows w ON w.id=pin.window_id AND w.project_id=pin.project_id
+      WHERE pin.project_id=$1 AND pin.manifest_id=$2 AND w.version_id=$3 ORDER BY w.ordinal LIMIT 1`,
+    [projectId,manifestId,versionId]);
+    assert.equal(place.page,1);
+    const row={key:'R1',status:'unassessed',sources:[]};
+    const saveReview = rows => db.query(`INSERT INTO preliminary_package_reviews(project_id,receipt_id,catalog_version_id,model,stage,input_generation,inventory,scope_note,rows,draft_text,content_hash,preparation_id)
       VALUES($1,$2,$3,'gpt-6.1-terra',$4,coalesce((SELECT generation FROM intake_project_generations WHERE project_id=$1),0),
       $5,'Опись синтетическая',$6,'Черновик',$7,$8)`,[projectId,receiptId,catalog,stage,JSON.stringify([{versionId,originalSha256:digest}]),
-      JSON.stringify([{key:'R1',status:'unassessed',sources:[]}]),hash(manifestId),manifestId]);
-    return {...target,manifestId,versionId};
+      JSON.stringify(rows),hash(JSON.stringify([manifestId,rows])),manifestId]);
+    await saveReview([row]);
+    const waiting=await transaction(db,tx=>readProductionDirectedReadingPlan(tx,projectId));
+    assert.equal(waiting.mode,'waiting_index');
+    assert.deepEqual(waiting.windowIds,[]);
+    const limitation='Чтение закреплённого участка ещё не выполнено.';
+    const address={unitId:place.unitId,locator:{page:place.page}};
+    const source={versionId,originalSha256:digest,anchor:JSON.stringify({unitId:place.unitId,address}),limitation};
+    await saveReview([{...row,analysis:{applicability:{kind:'included',reason:'Требование каталога.',sources:[]},
+      properties:[{key:'cladding_schedule',label:question,status:'insufficient',finding:limitation,sources:[],
+        letter:{kind:'omit',text:'Сверить состав по указанному участку.'},
+        scope:{kind:'undetermined',target:{element:'Ведомость облицовки'},reason:limitation,sources:[source]}}],
+      tensions:[]}}]);
+    return {...target,manifestId,versionId,unitId:place.unitId};
   }
   const old = await prepare(true);
   const fresh = await prepare(false);
@@ -198,6 +218,8 @@ test('production worker opens the real PDF, keeps immutable source pins and stop
   const job = await until(async()=> (await db.query(`SELECT id,payload FROM gateway_jobs
     WHERE kind='local_terra_production_research' AND project_id=$1`,[fresh.projectId])).rows[0],'new receipt assignment');
   assert.equal(job.payload.packageWindow.preparationId,fresh.manifestId);
+  assert.equal(job.payload.place.unitId,fresh.unitId);
+  assert.deepEqual(job.payload.packageWindow.directedGoals,[{requirement:'R1',question}]);
   assert.equal(job.payload.settings.maxTurns,8);
   assert.equal(await scanPackageStructure(db,reader),true);
   const done = await until(async()=> (await db.query("SELECT result FROM gateway_jobs WHERE id=$1 AND state='done'",[job.id])).rows[0],'addressed partial outcome');

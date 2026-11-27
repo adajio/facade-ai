@@ -48,8 +48,7 @@ function sameLabel(left,right) {
   const a=tokens(left), b=tokens(right);
   return a.length===b.length && a.length>0 && startsWithTokens(a,b);
 }
-function mentions(text, label) {
-  const phrase = phrases(label);
+function containsLiteral(text, phrase) {
   if (!phrase) return false;
   let index = text.indexOf(phrase);
   while (index !== -1) {
@@ -58,6 +57,11 @@ function mentions(text, label) {
     if (!signed && !word.test(text[index - 1] ?? '') && !word.test(text[end] ?? '')) return true;
     index = text.indexOf(phrase, index + 1);
   }
+  return false;
+}
+function mentions(text, label) {
+  const phrase = phrases(label);
+  if (containsLiteral(text,phrase)) return true;
   const a=tokens(text), b=tokens(phrase);
   return b.length>0 && a.some((_,i)=>startsWithTokens(a,b,i));
 }
@@ -156,7 +160,12 @@ function verifyLiteralProperty(property, tensions) {
   if (property.status !== 'confirmed' || property.letter.kind !== 'omit' || property.response || tensions.length ||
       property.sources.length !== 1 || !scope.observed || hasFactScopeDifference(scope)) return;
   const [source] = property.sources;
-  if (!located(source) || source.quote.trim().length > 480 || !sourceDescribesFactScope(source,scope.observed) ||
+  if (!located(source) || source.quote.trim().length > 480) return;
+  // A literal label may include punctuation such as a list number.
+  // Sentence boundaries still apply when a citation must support engineering scope.
+  const literalLabel = Object.keys(scope.observed).length === 1 &&
+    containsLiteral(phrases(source.quote),phrases(scope.observed.element));
+  if (!(literalLabel || sourceDescribesFactScope(source,scope.observed)) ||
       !scope.sources.some(witness=>located(witness) && sameFactSourcePlace(witness,source)
         && phrases(witness.quote).includes(phrases(source.quote)))) return;
   return {...property,...(isLiteralFactSource(source) && {label:scope.target.element,
@@ -205,6 +214,15 @@ function verifyScope(property, tensions) {
   return {...scope,kind:'undetermined',reason:undeterminedReason};
 }
 
+function validateScopedLetter(property) {
+  if (!property.scope || property.letter.kind !== 'ask') return property;
+  if (property.status === 'confirmed')
+    return {...property,letter:{kind:'omit',text:'Подтверждённое свойство не требует вопроса.'}};
+  if (property.status === 'not_mentioned' && property.response?.state !== 'received')
+    return {...property,letter:{kind:'omit',text:'Упоминание свойства требует внутренней сверки доступных источников.'}};
+  return property;
+}
+
 export function applyAnalysisFactApplicability(analysis) {
   const byProperty = new Map();
   for (const tension of analysis.tensions) {
@@ -213,7 +231,8 @@ export function applyAnalysisFactApplicability(analysis) {
     byProperty.set(tension.propertyKey, tensions);
   }
   const blocked = new Set();
-  const properties = analysis.properties.map(input => {
+  const properties = analysis.properties.map(proposal => {
+    const input = validateScopedLetter(proposal);
     const tensions = byProperty.get(input.key) ?? [];
     const candidates = [...input.sources,...(input.response?.sources ?? []),...tensions.flatMap(tension =>
       [...tension.sides.flatMap(side=>side.sources),...tension.resolutionSources])];

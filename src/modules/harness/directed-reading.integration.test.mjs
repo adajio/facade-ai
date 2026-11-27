@@ -4,6 +4,7 @@ import test from 'node:test';
 import pg from 'pg';
 import { readSnapshot } from '../../../infra/local-terra/producer.mjs';
 import { directedReadingPlanSql, directedWindowAllowed, readDirectedReadingPlan, readProductionDirectedReadingPlan, receiptReadingStopped } from '../../../dist/src/modules/harness/directed-reading.js';
+import {receiptStopState,admitBackgroundCall,recordReviewedObservations,backgroundCallLimits} from '../../../dist/src/modules/harness/reading-stop.js';
 import { jobSchema } from '../../../dist/src/modules/harness/contracts.js';
 import { initialMessages } from '../../../dist/src/modules/harness/openrouter.js';
 import { packageStructure } from '../../../dist/src/modules/harness/package-walk.js';
@@ -106,10 +107,8 @@ test('held-out directed reading preserves an open gap and stops after the select
   assert.deepEqual(await admittedDeepReceipts(db,past),[target]);
   assert.equal(await currentDeepReceipt(db,{...target,receiptId:randomUUID()}),false);
   const production = await readProductionDirectedReadingPlan(db,project);
-  assert.equal(production.mode,'directed');
-  assert.deepEqual(production.windowIds,[windowIds[0]]);
-  const candidate = await chooseDeepWindow(db,target,production);
-  assert.equal(candidate.requiresVisual,true);
+  assert.equal(production.mode,'waiting_index');
+  assert.equal(await chooseDeepWindow(db,target,production),undefined,'an unaddressed first page cannot trigger an external call');
   await db.query(`CREATE TABLE local_terra_calls (id uuid PRIMARY KEY,job_id uuid,project_id uuid,state text,
     created_at timestamptz DEFAULT clock_timestamp(),finished_at timestamptz)`);
   await installDeepLedger(db,'local_terra_production_research');
@@ -124,6 +123,8 @@ test('held-out directed reading preserves an open gap and stops after the select
   assert.equal((await readSnapshot(db,receipt)).indexCoverage.pendingVersions,0);
   await report(1,rows);
   const selected=await plan();
+  assert.equal((await chooseDeepWindow(db,target,await readProductionDirectedReadingPlan(db,project))).requiresVisual,true);
+  assert.ok(selected.goalsByWindow[windowIds[25]].some(g=>g.requirement==='R2' && g.question));
   assert.equal(selected.openRequirements,2);
   assert.equal(selected.mode,'directed');
   assert.deepEqual(new Set(selected.windowIds),new Set([windowIds[14],windowIds[25]]));
@@ -167,7 +168,7 @@ test('held-out directed reading preserves an open gap and stops after the select
   assert.equal(await dispatchPackagePair(db,queue,profile,true),false);
 
   await report(3,[rows[0],{key:'R2',status:'present',sources:[ref(25)]},rows[2]]);
-  assert.equal((await plan()).mode,'no_new_targets');
+  assert.equal((await plan()).mode,'no_addressed_goal');
   assert.equal((await plan()).openRequirements,1);
   await report(4,[rows[0],{key:'R2',status:'present',sources:[ref(25)]},{key:'R3',status:'present',sources:[ref(30)]}]);
   assert.equal((await plan()).mode,'enough_evidence');
@@ -209,6 +210,42 @@ test('held-out directed reading preserves an open gap and stops after the select
   await report(8,openRows);
   assert.equal((await readDirectedReadingPlan(db,project)).mode,'directed');
   assert.equal(await receiptReadingStopped(db,project,receipt),false);
+  await report(9,openRows.map(row=>({...row,analysis:{properties:[],tensions:[],applicability:{kind:'undetermined'}}})));
+  const tx=await db.connect();
+  try {
+    await tx.query('BEGIN');
+    // Both jobs already have a pinned catalog, stage, address, and an explicit gap.
+    for(const job of scheduled) {
+      await tx.query(`UPDATE gateway_jobs SET state='done',result='{"kind":"reviewed_no_match"}' WHERE id=$1`,[job.id]);
+      await tx.query(`INSERT INTO gateway_outbox(cursor,job_id,lease_epoch,event_type)
+        SELECT (SELECT coalesce(max(cursor),0)+1 FROM gateway_outbox),id,lease_epoch,'finished' FROM gateway_jobs WHERE id=$1
+        ON CONFLICT DO NOTHING`,[job.id]);
+    }
+    assert.equal((await receiptStopState(tx,project,receipt,manifest)).reason,'no_useful_change');
+    const observation=randomUUID(), evidence=randomUUID(), sampled=scheduled[0];
+    await tx.query(`INSERT INTO reader_evidence(id,project_id,version_id,reader_version,run_id,branch,operation_key,request_sha256,payload)
+      VALUES($1,$2,$3,$4,$5,'A','source',$6,'{}')`,[evidence,project,version,reader,sampled.id,originalHash]);
+    await tx.query(`INSERT INTO reader_observations(id,project_id,version_id,run_id,branch,operation_key,request_sha256,evidence_id,payload)
+      VALUES($1,$2,$3,$4,'A','read',$5,$6,'{}')`,[observation,project,version,sampled.id,originalHash,evidence]);
+    await tx.query(`INSERT INTO harness_package_facts(id,project_id,window_id,job_id,source_role,revision_status,basis,materials)
+      VALUES($1,$2,$3,$4,'drawing','current','{}','[]')`,[observation,project,sampled.payload.packageWindow.id,sampled.id]);
+    assert.equal((await receiptStopState(tx,project,receipt,manifest)).reason,null,'a written observation is not yet an assessed result');
+    const {rows:[last]}=await tx.query('SELECT id FROM preliminary_package_reviews WHERE receipt_id=$1 ORDER BY created_at DESC LIMIT 1',[receipt]);
+    await recordReviewedObservations(tx,target,last.id,last.id,[observation]);
+    assert.equal((await receiptStopState(tx,project,receipt,manifest)).reason,'no_useful_change','the exact accepted review completes this window');
+    await tx.query("UPDATE gateway_jobs SET state='held' WHERE id=$1",[scheduled[0].id]);
+    assert.equal((await receiptStopState(tx,project,receipt,manifest)).reason,null,'interrupted windows are inconclusive');
+    const limit=backgroundCallLimits.compact;
+    await tx.query(`INSERT INTO project_reading_activity(project_id,receipt_id,preparation_id,stage,status,attempt_key)
+      SELECT $1,$2,$3,'revision_reservation','reserved','sample-'||i FROM generate_series(1,$4) i`,[project,receipt,manifest,limit-1]);
+    await tx.query(`INSERT INTO project_reading_activity(project_id,receipt_id,preparation_id,stage,status,attempt_key)
+      SELECT $1,$2,$3,'revision','sending','sample-'||i FROM generate_series(1,$4) i`,[project,receipt,manifest,limit-1]);
+    assert.equal((await receiptStopState(tx,project,receipt,manifest)).callCount,limit-1,'do not double count reservation + send');
+    await tx.query(`INSERT INTO local_terra_calls(id,job_id,project_id,state) VALUES($1,$2,$3,'unknown')`,[randomUUID(),scheduled[0].id,project]);
+    assert.equal(await admitBackgroundCall(tx,project,receipt,manifest),'receipt_call_limit');
+    assert.equal((await readDirectedReadingPlan(tx,project)).mode,'receipt_call_limit');
+    assert.equal(await admitBackgroundCall(tx,project,receipt,manifest),'receipt_call_limit','stop survives another reservation');
+  } finally {await tx.query('ROLLBACK');tx.release();}
   await deepReadingActivity(db,target,'partial','operator_stopped',{started:2});
   assert.equal(await receiptReadingStopped(db,project,receipt),true);
   assert.equal((await readDirectedReadingPlan(db,project)).mode,'operator_stopped');
