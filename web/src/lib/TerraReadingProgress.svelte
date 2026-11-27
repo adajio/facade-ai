@@ -38,7 +38,10 @@
     turn_limit_final: 'Исчерпан лимит шагов по участку',
     repeated_rejected_action: 'Действие модели требует проверки',
     package_structure_pending: 'Готовится карта документа',
-    subscription_outcome_unknown: 'Требуется сверить ответ провайдера'
+    subscription_outcome_unknown: 'Требуется сверить ответ провайдера',
+    held_openrouter_terra_billing: 'OpenRouter удержал чтение из-за оплаты',
+    openrouter_terra_rejected_402: 'OpenRouter ожидает пополнения рабочего баланса',
+    scenario_two_previous_provider: 'Сохранено задание предыдущего маршрута'
   };
 </script>
 {#snippet readingStop()}

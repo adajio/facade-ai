@@ -63,7 +63,10 @@ export function messageEntryBytes(value) {
 export function responseUsage(response) {
   const {prompt_tokens:inputTokens,completion_tokens:outputTokens} = response?.usage ?? {};
   const count = value => Number.isSafeInteger(value) && value >= 0;
-  return {...(count(inputTokens) && {inputTokens}), ...(count(outputTokens) && {outputTokens})};
+  const costNanos = Math.round(response?.usage?.cost * 1_000_000_000);
+  return {...(count(inputTokens) && {inputTokens}), ...(count(outputTokens) && {outputTokens}),
+    ...(response?.transport === 'openrouter' && {modelTransport:'openrouter',providerResponseId:response.id,
+      ...(count(costNanos) && {costNanos})})};
 }
 
 export async function emitActivity(record, db, snapshot, stage, status, attemptKey, fields, reason) {

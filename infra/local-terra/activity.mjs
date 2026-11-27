@@ -7,6 +7,8 @@ export async function recordPrimaryActivity(db, event) {
   const safe = {};
   for (const [key,value] of Object.entries(fields)) {
     if (/^[a-zA-Z][a-zA-Z0-9]{0,63}$/.test(key) && (typeof value === 'boolean' || Number.isSafeInteger(value) && value >= 0)) safe[key]=value;
+    if (key==='modelTransport' && value==='openrouter') safe[key]=value;
+    if (key==='providerResponseId' && typeof value==='string' && /^[a-zA-Z0-9_-]{1,180}$/u.test(value)) safe[key]=value;
     if (key==='reviewId' && typeof value==='string' && /^[0-9a-f-]{36}$/i.test(value)) safe[key]=value;
   }
   const code = reason && /^[a-z0-9_.:-]{1,120}$/i.test(reason) ? reason : null;

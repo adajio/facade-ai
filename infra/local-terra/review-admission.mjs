@@ -1,7 +1,7 @@
 import { readdir, readFile } from 'node:fs/promises';
 import { join } from 'node:path';
 
-const preDispatchReasons = new Set(['mac_terra_busy','mac_terra_paused','mac_terra_budget_exhausted','mac_terra_not_started']);
+const preDispatchReasons = new Set(['mac_terra_busy','mac_terra_paused','mac_terra_budget_exhausted','mac_terra_not_started','openrouter_terra_rejected_402']);
 
 export function preDispatchReviewRejection(entry) {
   const reason = entry?.error ?? entry?.reason;

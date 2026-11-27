@@ -1,11 +1,11 @@
 import { ModelTransportError } from '../request-budget.mjs';
 
-// A confirmed rejection before Codex starts permits retry of the exact effect. A
+// A confirmed rejection before model dispatch permits retry of the exact effect. A
 // lost acknowledgement after dispatch leaves a durable reconciliation hold.
 const waiting = new Set([
   'mac_terra_busy', 'mac_terra_not_started', 'mac_terra_paused', 'adapter_unavailable',
   'held_terra_mac_busy', 'held_terra_mac_unavailable', 'held_terra_production_paused',
-  'held_terra_prior_provider_attempt',
+  'held_terra_prior_provider_attempt', 'held_openrouter_terra_billing', 'openrouter_terra_rejected_402',
 ]);
 export const retryableDeepReason = reason => waiting.has(reason);
 export function deepCallFailure(error) {

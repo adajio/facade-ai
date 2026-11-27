@@ -5,7 +5,7 @@ import { readDirectedReadingPlan, type DirectedReading } from '../harness/direct
 import { loadResearchProfile } from '../harness/profile.js';
 
 const model = 'gpt-6.1-terra';
-const route = 'codex-subscription-terra';
+const routes = ['codex-subscription-terra', 'openrouter-azure-terra'];
 // Count admitted windows and already assigned work; an absent snapshot never
 // implies that unassigned windows are ready for a new analysis.
 const visibleReadingWindow = `(EXISTS (SELECT 1 FROM intake_package_preparation_current cur
@@ -15,7 +15,7 @@ const visibleReadingWindow = `(EXISTS (SELECT 1 FROM intake_package_preparation_
  OR EXISTS (SELECT 1 FROM harness_package_branches old JOIN gateway_jobs job ON job.id=old.job_id
    JOIN gateway_generations generation ON generation.generation_id=job.generation_id AND generation.current
    WHERE old.window_id=w.id AND old.active AND old.branch='A' AND old.settings->>'model'=$3
-     AND old.settings->>'routeId'=$4 AND job.project_id=w.project_id AND job.purpose='primary_a'
+     AND old.settings->>'routeId'=ANY($4::text[]) AND job.project_id=w.project_id AND job.purpose='primary_a'
      AND (EXISTS (SELECT 1 FROM intake_package_preparations pin WHERE pin.project_id=w.project_id AND pin.receipt_id=$2
            AND pin.id::text=job.payload#>>'{packageWindow,preparationId}')
        OR (job.payload#>>'{packageWindow,preparationId}' IS NULL AND EXISTS (
@@ -26,12 +26,12 @@ export async function readTerraReading(tx: PoolClient, projectId: string, planBa
   let configured: { B?: unknown; lead?: unknown } | null = null;
   try { configured = JSON.parse(process.env.FACADE_HARNESS_PROFILE ?? 'null'); } catch { /* disabled */ }
   const explicitProfile = configured !== null && typeof configured === 'object' && !Array.isArray(configured)
-    && configured.B == null && configured.lead == null && profile.A?.model === model && profile.A.routeId === route;
+    && configured.B == null && configured.lead == null && profile.A?.model === model && routes.includes(profile.A.routeId);
   const { rows: [mode] } = await tx.query<{ enabled: boolean }>(`SELECT
     (p.intake_mode AND $2::boolean) OR EXISTS (SELECT 1 FROM preliminary_package_reviews r WHERE r.project_id=p.id AND r.model=$3)
     OR (EXISTS (SELECT 1 FROM harness_package_windows w JOIN harness_package_branches b ON b.window_id=w.id
       JOIN gateway_jobs j ON j.id=b.job_id AND j.project_id=p.id AND j.purpose='primary_a'
-      WHERE w.project_id=p.id AND b.branch='A' AND b.settings->>'model'=$3 AND b.settings->>'routeId'=$4)
+      WHERE w.project_id=p.id AND b.branch='A' AND b.settings->>'model'=$3 AND b.settings->>'routeId'=ANY($4::text[]))
       AND NOT EXISTS (SELECT 1 FROM harness_package_windows w JOIN harness_package_maps m
         ON m.version_id=w.version_id AND m.fingerprint=w.map_fingerprint AND m.active
         JOIN harness_package_branches b ON b.window_id=w.id AND b.active AND b.branch='B'
@@ -39,7 +39,7 @@ export async function readTerraReading(tx: PoolClient, projectId: string, planBa
         WHERE w.project_id=p.id AND j.project_id=p.id)
       AND NOT EXISTS (SELECT 1 FROM gateway_jobs j JOIN gateway_generations g ON g.generation_id=j.generation_id AND g.current
         WHERE j.project_id=p.id AND j.purpose='review' AND j.state IN ('ready','held','leased'))) AS enabled
-    FROM projects p WHERE p.id=$1`, [projectId, explicitProfile, model, route]);
+    FROM projects p WHERE p.id=$1`, [projectId, explicitProfile, model, routes]);
   if (!mode?.enabled) return { enabled: false, receipt: null, report: null, progress: null, activity: [] };
   const { rows: [receipt] } = await tx.query<{ receiptId: string; receiptNumber: number; inventoryOpen: boolean;
     acceptedVersions: number; rootFiles: number; rootArchives: number; directChildren: number; deeperChildren: number; officeParts: number }>(
@@ -104,7 +104,7 @@ export async function readTerraReading(tx: PoolClient, projectId: string, planBa
        SELECT w.id,w.version_id FROM maps m JOIN harness_package_windows w ON w.version_id=m.version_id AND w.map_fingerprint=m.fingerprint WHERE w.project_id=$1 AND ${visibleReadingWindow}
      ), jobs AS (
        SELECT w.id,w.version_id,j.id AS job_id,j.state,j.result,j.reason FROM windows w JOIN harness_package_branches b
-         ON b.window_id=w.id AND b.active AND b.branch='A' AND b.settings->>'model'=$3 AND b.settings->>'routeId'=$4
+         ON b.window_id=w.id AND b.active AND b.branch='A' AND b.settings->>'model'=$3 AND b.settings->>'routeId'=ANY($4::text[])
        JOIN gateway_jobs j ON j.id=b.job_id AND j.project_id=$1 AND j.purpose='primary_a'
        JOIN gateway_generations g ON g.generation_id=j.generation_id AND g.current
      ), reasons AS (SELECT reason,count(*)::int AS count FROM jobs WHERE state='held' GROUP BY reason ORDER BY count(*) DESC,reason LIMIT 8),
@@ -126,7 +126,7 @@ export async function readTerraReading(tx: PoolClient, projectId: string, planBa
        $5::jsonb || jsonb_build_object('pendingTargets',(
           SELECT count(*)::int FROM windows w WHERE w.id=ANY($6::uuid[])
             AND NOT EXISTS (SELECT 1 FROM jobs assigned WHERE assigned.id=w.id)
-       )) AS directed FROM jobs`, [projectId, receipt.receiptId, model, route, JSON.stringify(directed),applicableWindows]);
+       )) AS directed FROM jobs`, [projectId, receipt.receiptId, model, routes, JSON.stringify(directed),applicableWindows]);
   const { rows: [deep] } = await tx.query<{ status: string; reason: string | null; started: number; limit: number }>(
     `SELECT a.status,a.reason,(a.fields->>'started')::int AS started,(a.fields->>'limit')::int AS "limit"
      FROM project_reading_activity a JOIN projects p ON p.id=a.project_id
@@ -144,14 +144,14 @@ export async function readTerraReading(tx: PoolClient, projectId: string, planBa
        o.payload->>'unit' AS unit,o.payload->>'limitation' AS limitation,o.created_at AS "createdAt"
      FROM accepted a JOIN harness_package_maps m ON m.version_id=a.version_id AND m.project_id=$1 AND m.active
      JOIN harness_package_windows w ON w.version_id=m.version_id AND w.map_fingerprint=m.fingerprint AND w.project_id=$1
-     JOIN harness_package_branches b ON b.window_id=w.id AND b.active AND b.branch='A' AND b.settings->>'model'=$3 AND b.settings->>'routeId'=$4
+     JOIN harness_package_branches b ON b.window_id=w.id AND b.active AND b.branch='A' AND b.settings->>'model'=$3 AND b.settings->>'routeId'=ANY($4::text[])
      JOIN gateway_jobs j ON j.id=b.job_id AND j.project_id=$1 AND j.purpose='primary_a'
      JOIN gateway_generations g ON g.generation_id=j.generation_id AND g.current
      JOIN reader_observations o ON o.project_id=$1 AND o.version_id=a.version_id AND o.branch='A'
        AND (o.run_id=j.id OR EXISTS (SELECT 1 FROM harness_package_followups f
          WHERE f.root_job_id=j.id AND f.job_id=o.run_id AND f.window_id=w.id AND f.branch='A'))
      WHERE ${visibleReadingWindow} AND (nullif(o.payload->>'quote','') IS NOT NULL OR nullif(o.payload->>'value','') IS NOT NULL OR nullif(o.payload->>'limitation','') IS NOT NULL)
-     ORDER BY o.created_at DESC,o.id DESC LIMIT 20`, [projectId, receipt.receiptId, model, route]);
+     ORDER BY o.created_at DESC,o.id DESC LIMIT 20`, [projectId, receipt.receiptId, model, routes]);
   const { rows: [prepared] } = await tx.query<{ id: string; counts: { available: number; total: number; archives: number; technical: number } }>(
     `SELECT p.id,p.manifest->'counts' AS counts FROM intake_package_preparation_current c
       JOIN intake_package_preparations p ON p.project_id=c.project_id AND p.id=c.manifest_id
