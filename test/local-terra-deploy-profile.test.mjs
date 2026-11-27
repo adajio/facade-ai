@@ -41,7 +41,7 @@ test('stage uses the explicit host and checks the remote hostname before extract
     copyFileSync(join(production,file),join(root,'infra/local-terra/production',file));
   }
   writeFileSync(join(root,'infra/local-terra/producer.mjs'),'// Fixture.\n');
-  const transport = ['production','worker','deep-reading','codex-client'];
+  const transport = ['production','worker','deep-reading','codex-client','openrouter-terra'];
   for (const file of [...transport,'mac-bridge']) writeFileSync(join(root,'infra/local-terra/transport',file+'.mjs'),'// Fixture.\n');
   git('init','-q');
   git('add','infra');

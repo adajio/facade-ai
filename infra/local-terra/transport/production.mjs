@@ -3,6 +3,7 @@ import { randomUUID } from 'node:crypto';
 import { link, lstat, open, readFile, readdir, unlink } from 'node:fs/promises';
 import { dirname, isAbsolute, join } from 'node:path';
 import { ModelTransportError } from '../request-budget.mjs';
+import { openRouterTerraRevision, sendOpenRouterTerra } from './openrouter-terra.mjs';
 
 export const terraModel = 'gpt-6.1-terra';
 export const terraRequestBytes = 24 * 1024 * 1024;
@@ -206,12 +207,15 @@ async function entries(path) {
   catch (error) { if (error.code === 'ENOENT') return []; throw error; }
 }
 
-export function productionTerra(env = process.env) {
+export function productionTerra(env = process.env, fetchCall = fetch) {
   const socket = env.FACADE_TERRA_PRODUCTION_SOCKET;
   const admission = env.FACADE_TERRA_PRODUCTION_ADMISSION;
-  if (!socket && !admission) return null;
-  if (!socket || !admission || !isAbsolute(socket) || !isAbsolute(admission)) throw Error('invalid_production_terra_config');
-  let activatedAt, researchActivatedAt;
+  const openRouter = env.FACADE_TERRA_PRODUCTION_TRANSPORT === 'openrouter';
+  const apiKey = env.FACADE_TERRA_OPENROUTER_KEY?.trim();
+  if (!socket && !admission && !openRouter) return null;
+  if (!admission || !isAbsolute(admission) || (!openRouter && (!socket || !isAbsolute(socket))))
+    throw Error('invalid_production_terra_config');
+  let activatedAt, researchActivatedAt, billingRetryAt = 0;
   const pause = join(dirname(admission),'paused');
   async function admissions({research = false} = {}) {
     const cutoff = research ? researchActivatedAt : activatedAt;
@@ -220,6 +224,7 @@ export function productionTerra(env = process.env) {
     return {activatedAt:cutoff,grants:research ? [] : await readGrants(admission)};
   }
   return {
+    ...(openRouter && {revision:openRouterTerraRevision}),
     async activate(db,stateDir,{research = false} = {}) {
       const cutoff = await activationTime(db,stateDir,research ? 'production-research-activation' : 'production-activation');
       if (research) researchActivatedAt = cutoff;
@@ -254,6 +259,11 @@ export function productionTerra(env = process.env) {
       if (status?.restored) return 'held_terra_saved_review';
       if (!explicit && status?.automatic !== true) return 'held_terra_production_admission';
       if (status?.held !== false) return 'held_terra_prior_provider_attempt';
+      if (openRouter) {
+        if (!apiKey) return 'held_openrouter_terra_unavailable';
+        if (Date.now() < billingRetryAt) return 'held_openrouter_terra_billing';
+        return null;
+      }
       try {
         const health = await send(socket,'GET',research ? '/health/research' : '/health',undefined,2000);
         if (health.status === 200) {
@@ -271,6 +281,19 @@ export function productionTerra(env = process.env) {
       if (!kind) throw new ModelTransportError('rejected','invalid_mac_terra_request');
       const body = Buffer.from(JSON.stringify(request));
       if (body.length > terraRequestBytes) throw new ModelTransportError('rejected','adapter_input_too_large');
+      if (openRouter) {
+        if (Date.now() < billingRetryAt) throw new ModelTransportError('rejected','openrouter_terra_rejected_402');
+        let response;
+        try { response = await sendOpenRouterTerra(apiKey,request,kind,fetchCall); }
+        catch (error) {
+          if (error instanceof ModelTransportError && error.message === 'openrouter_terra_rejected_402')
+            billingRetryAt = Date.now() + 60_000;
+          throw error;
+        }
+        if (kind === 'research' && !allowedResearchResponse(response,request))
+          throw new ModelTransportError('rejected','openrouter_terra_invalid_research_response');
+        return response;
+      }
       const result = await send(socket,'POST',`/v1/${kind}`,body,270000);
       if (result.status !== 200) {
         const expectedStatus = preDispatchStatuses.get(result.type) ?? 502;

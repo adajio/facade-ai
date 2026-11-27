@@ -5,12 +5,13 @@ import { join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { callCodex } from './codex-client.mjs';
 import { productionTerra } from './production.mjs';
+import { openRouterTerraRoute } from './openrouter-terra.mjs';
 import {
   admittedDeepReceipts, chooseDeepWindow, currentDeepReceipt, deepCallFailure,
   deepReadingActivity, deepReadingWork, installDeepLedger, retryableDeepReason,
 } from './deep-reading.mjs';
 
-// Separate, single-reader subscription workflow. No USD ledger entries.
+// Separate, single-reader workflow with durable per-effect receipts.
 const root = process.env.FACADE_SOURCE_ROOT;
 const script = process.env.FACADE_CODEX_ADAPTER;
 const production = productionTerra();
@@ -43,11 +44,11 @@ const controller = new AbortController();
 const { signal } = controller;
 process.once('SIGINT', () => controller.abort());
 process.once('SIGTERM', () => controller.abort());
-const routeId = 'codex-subscription-terra';
-const revision = production ? 'codex-subscription-production-v1' : 'codex-subscription-v1';
+const routeId = production?.revision ? openRouterTerraRoute : 'codex-subscription-terra';
+const revision = production?.revision ?? (production ? 'codex-subscription-production-v1' : 'codex-subscription-v1');
 const localKind = production ? productionDeepReading.kind : 'local_terra_research';
 const unknownOutcome = 'subscription_outcome_unknown';
-const reconcileAttempt = 'Проверить состояние транспорта и сохранённую попытку подписки.';
+const reconcileAttempt = 'Проверить сохранённую попытку и её состояние у поставщика.';
 const settings = { routeId, model:'gpt-6.1-terra', dataClass:'customer', maxTokens:2048, maxTurns:production ? productionDeepReading.turnsPerWindow : 32, maxKnownRejections:1 };
 const profile = { A:settings, B:null, lead:null };
 const profileHash = hash([revision, settings]);
@@ -298,7 +299,7 @@ try {
     }
   }
   const workerId = randomUUID();
-  console.info('local-terra: single reader A; independent reader B and review are pending; subscription cost per call unknown');
+  console.info('Scenario 2: single Terra reader',routeId,revision);
   await Promise.all([
     ...(!production ? [
       startImports({db,config,signal,logger:console},{storage}),
@@ -312,6 +313,10 @@ try {
     poll('research',async()=>{
       const work = await queue.claim({workerId,kinds:[localKind],leaseMs:30000});
       if (!work) return false;
+      if (production?.revision && work.payload?.packageWindow?.routeRevision !== revision) {
+        await queue.suspend(work.lease,{reason:'scenario_two_previous_provider',nextAction:'Проверить сохранённое задание прежнего маршрута.'});
+        return true;
+      }
       if (work.payload?.settings?.routeId !== routeId || work.scopeId !== null || work.payload?.branch !== 'A' || !work.payload?.packageWindow ||
           (production && !work.payload.packageWindow.productionReview)) {
         await queue.suspend(work.lease,{reason:'local_route_denied',nextAction:'Использовать назначенный штатный worker.'}); return true;

@@ -98,6 +98,16 @@ test('preliminary review publication and receipt-scoped reading progress', { ski
     assert.equal(overview.progress.observations, 1);
     assert.equal(overview.activity[0].quote, 'Окно');
     assert.equal(overview.activity[0].anchor.locator.page, 1);
+    const precedingProfile = process.env.FACADE_HARNESS_PROFILE;
+    process.env.FACADE_HARNESS_PROFILE = precedingProfile.replace('codex-subscription-terra', 'openrouter-azure-terra');
+    try {
+      const afterProviderChange = await readTerraReading(db, project);
+      assert.equal(afterProviderChange.report.id, report.id);
+      assert.equal(afterProviderChange.progress.observations, 1);
+    } finally {
+      process.env.FACADE_HARNESS_PROFILE = precedingProfile;
+    }
+
     const { WorkQueue } = await import(pathToFileURL(resolve(
       process.env.ASSESSMENT_BUILD_ROOT ?? 'dist', 'src/modules/gateway/queue.js')).href);
     const { readPackageAnalysis } = await import(pathToFileURL(resolve(
