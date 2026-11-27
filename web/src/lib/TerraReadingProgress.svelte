@@ -45,6 +45,9 @@
   {#if stopReason}
     <div data-reading-stop>
       <p role="status">{#if stopReason !== 'operator_stopped'}<strong>Подробное чтение остановлено.</strong> {/if}<span>{readingStopMessages[stopReason]}</span></p>
+      {#if stopReason === 'target_limit' && deep?.limit != null}
+        <p class="meta">Выбрано участков · {count(deep.started)} из {count(deep.limit)} разрешённых.</p>
+      {/if}
       {#if directed?.callCount != null}
         <p class="meta">Запросов к системе чтения · {count(directed.callCount)}{directed.callLimit != null ? ' из ' + count(directed.callLimit) : ''}.</p>
       {/if}

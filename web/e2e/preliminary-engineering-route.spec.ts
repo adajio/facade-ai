@@ -444,12 +444,13 @@ test('Черновик показывает причину остановки ч
     no_addressed_goal: 'В сохранённом разборе нет адресной цели для продолжения.',
   };
   let mode: keyof typeof reasons = 'no_useful_change';
+  let savedStop: { status: string; reason: string; started: number; limit: number } | undefined;
   let reportId = 'structured';
   await page.route('**/api/v1/projects/*/terra-reading', route => route.fulfill({ json: {
     enabled: true,
     receipt: { receiptId },
     report: { id: reportId },
-    progress: { directed: { mode } },
+    progress: { directed: { mode }, deep: savedStop },
   } }));
 
   const lettersUrl = `/projects/${projectId}/letters`;
@@ -481,6 +482,11 @@ test('Черновик показывает причину остановки ч
     await expect(stop).toContainText(reasons[next]);
     await expect(draft).toHaveValue(draftText);
   }
+
+  savedStop = { status: 'partial', reason: 'target_limit', started: 4, limit: 4 };
+  await page.reload();
+  await expect(stop).toContainText('Достигнут лимит участков углублённого чтения.');
+  await expect(draft).toHaveValue(draftText);
 
   await letter.getByLabel('Разбор').selectOption('review');
   await expect(draft).toHaveValue('Синтетический черновик');
