@@ -5,6 +5,8 @@ import { attachReadingSkills, inspectionSchema, inspectSheetsInstruction } from 
 import { applyFactApplicability, factApplicabilityInstruction } from './fact-applicability.mjs';
 import { admitRecordedClaim, preDispatchReviewRejection } from './review-admission.mjs';
 import { productionTerra } from './transport/production.mjs';
+import { processScenarioOne } from './scenario-one.mjs';
+import { cheaperInferenceScenario } from './scenario-one-provider.mjs';
 import { queueReassessment,queuedReasons,runReassessment } from './reassessment.mjs';
 import { validatedPartial } from './partial-result.mjs';
 import { reviseReceipt, loadReport } from './revise.mjs';
@@ -22,6 +24,7 @@ import { compactCatalog, duration, emitActivity, measureRequest, messageEntryByt
 
 import { analysisFields, citationSchema, readAnalysis, record as reviewRecord, renderQuestions, reviewDecisionInstruction, validText } from './review-analysis.mjs';
 import { recoverPreparationFindings } from './review-continuity.mjs';
+import { recordPrimaryActivity as emitScenarioActivity } from './activity.mjs';
 export { reconcilePreliminaryReview, recoverPreparationFindings } from './review-continuity.mjs';
 
 const MODEL = 'gpt-6.1-terra';
@@ -402,20 +405,21 @@ export function validate(snapshot, result) {
     model:MODEL,inventory:snapshot.inventory,scopeNote:snapshot.scopeNote,preparationId:snapshot.preparationId,rows,draftText};
 }
 
-export async function readSnapshot(db, receiptId) {
+export async function readSnapshot(db, receiptId, {scenarioOne = false} = {}) {
   const client = await db.connect();
   try {
     await client.query('BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY');
-    const {rows:[r]} = await client.query(`SELECT r.id, r.project_id, r.created_at AS receipt_created_at, p.catalog_version_id, p.project_stage, c.requirements, prep.id AS preparation_id, prep.manifest,
+    const {rows:[r]} = await client.query(`SELECT r.id, r.project_id, r.created_at AS receipt_created_at, p.catalog_version_id, p.project_stage, c.requirements, prep.id AS preparation_id, prep.manifest, r.analysis_base_review_id, p.name AS object_name,
       r.sealed_at IS NOT NULL AND NOT EXISTS (SELECT 1 FROM intake_occurrences o WHERE o.receipt_id=r.id AND (o.state='declared' OR o.inventory_pending))
       AND NOT EXISTS (SELECT 1 FROM intake_imports i WHERE i.receipt_id=r.id AND i.state IN ('queued','running','paused')) AS ready
       FROM intake_receipts r JOIN projects p ON p.id=r.project_id LEFT JOIN catalog_versions c ON c.id=p.catalog_version_id
       JOIN intake_package_preparation_current cur ON cur.project_id=r.project_id AND cur.receipt_id=r.id
       JOIN intake_package_preparations prep ON prep.id=cur.manifest_id WHERE r.id=$1
+      AND r.analysis_scenario=$2
       AND NOT EXISTS (SELECT 1 FROM intake_package_preparation_items i WHERE i.manifest_id=cur.manifest_id
-        AND NOT EXISTS (SELECT 1 FROM harness_package_maps m WHERE m.version_id=i.version_id AND m.fingerprint=i.map_fingerprint AND m.active))`,[receiptId]);
-    if (!r?.ready || !r.preparation_id || !r.manifest?.counts?.available || !r.catalog_version_id || !r.project_stage || !Array.isArray(r.requirements) || !r.requirements.length) { await client.query('COMMIT'); return null; }
-    const {rows:inventory} = await client.query(`SELECT v.id AS "versionId", orig.sha256 AS "originalSha256", min(o.relative_path) AS path,
+        AND NOT EXISTS (SELECT 1 FROM harness_package_maps m WHERE m.version_id=i.version_id AND m.fingerprint=i.map_fingerprint AND m.active))`,[receiptId,scenarioOne ? 1 : 2]);
+    if (!r?.ready || !r.preparation_id || (!scenarioOne && !r.manifest?.counts?.available) || !r.catalog_version_id || !r.project_stage || !Array.isArray(r.requirements) || !r.requirements.length) { await client.query('COMMIT'); return null; }
+    const {rows:inventory} = await client.query(`SELECT v.id AS "versionId", orig.sha256 AS "originalSha256", min(o.relative_path) AS path, v.document_id AS "documentId",
       v.media_type AS "mediaType", bool_or(o.restriction IS NOT NULL) AS restricted,
       EXISTS (SELECT 1 FROM intake_reader_jobs j WHERE j.project_id=v.project_id AND j.version_id=v.id) AS "hasReaderJob"
       FROM intake_occurrences o JOIN intake_document_versions v ON v.project_id=o.project_id AND v.id=o.version_id
@@ -475,6 +479,29 @@ export async function readSnapshot(db, receiptId) {
     const files = inventory.filter(file=>preparedItems.get(file.versionId)?.kind==='document')
       .map(file=>({...file,format:preparedItems.get(file.versionId)?.format}));
     const indexed = new Set(indexedVersionIds);
+    if (scenarioOne) {
+      const {rows:[baseReview]} = r.analysis_base_review_id ? await client.query(`SELECT s.files,s.evidence,
+        s.coverage_complete AS "coverageComplete",
+        EXISTS (SELECT 1 FROM intake_scenario_one_letter_events e WHERE e.review_id=s.review_id AND e.kind='sent' AND e.body=base.draft_text) AS sent,
+        (SELECT coalesce(jsonb_agg(jsonb_build_object('key',e.request_key,'state',e.response_state) ORDER BY e.version DESC),'[]'::jsonb)
+          FROM intake_scenario_one_letter_events e WHERE e.review_id=s.review_id AND e.kind='response') AS responses,
+        s.requests FROM intake_scenario_one_results s
+        JOIN preliminary_package_reviews base ON base.id=s.review_id
+        WHERE s.review_id=$1 AND base.project_id=$2 AND base.catalog_version_id=$3 AND base.stage=$4`,
+        [r.analysis_base_review_id,r.project_id,r.catalog_version_id,r.project_stage]) : {rows:[]};
+      const {rows:replacements} = baseReview ? await client.query(`WITH RECURSIVE replaced AS (
+        SELECT v.replaces_version_id AS id FROM intake_document_versions v WHERE v.project_id=$1
+          AND v.id=ANY($2::uuid[]) AND v.replaces_version_id IS NOT NULL
+        UNION SELECT v.replaces_version_id FROM intake_document_versions v JOIN replaced prev ON prev.id=v.id
+          WHERE v.project_id=$1 AND v.replaces_version_id IS NOT NULL
+      ) SELECT id FROM replaced`,[r.project_id,inventory.map(file=>file.versionId)]) : {rows:[]};
+      await client.query('COMMIT');
+      if (r.analysis_base_review_id && !baseReview) return null;
+      return {projectId:r.project_id,receiptId:r.id,preparationId:r.preparation_id,catalogVersionId:r.catalog_version_id,
+        stage:r.project_stage,objectName:r.object_name,requirements:r.requirements,
+        inventory:inventory.map(({versionId,originalSha256})=>({versionId,originalSha256})),files,indexCoverage,indexCursor,
+        unread,baseReview,replacedVersions:replacements.map(row=>row.id)};
+    }
     const {lines,totalLines,retrieval} = await readEvidence(client,r.project_id,
       indexCursor.filter(cursor=>indexed.has(cursor.versionId)),r.requirements,files);
     await client.query('COMMIT');
@@ -563,7 +590,7 @@ export async function processReceipt({db,receiptId,stateDir,modelCall,publish,ad
     FROM preliminary_package_reviews pr
     JOIN projects p ON p.id=pr.project_id AND p.catalog_version_id=pr.catalog_version_id AND p.project_stage=pr.stage
     JOIN intake_receipts r ON r.id=pr.receipt_id AND r.project_id=pr.project_id
-    WHERE r.id=$1 AND r.sealed_at IS NOT NULL AND pr.previous_report_id IS NULL
+    WHERE r.id=$1 AND r.analysis_scenario=2 AND r.sealed_at IS NOT NULL AND pr.previous_report_id IS NULL
       AND (pr.preparation_id IS NULL OR EXISTS (SELECT 1 FROM intake_package_preparation_current cur
         WHERE cur.project_id=r.project_id AND cur.receipt_id=r.id AND cur.manifest_id=pr.preparation_id))
       AND NOT EXISTS (SELECT 1 FROM intake_occurrences o WHERE o.receipt_id=r.id AND (o.state='declared' OR o.inventory_pending))
@@ -794,7 +821,8 @@ async function main() {
       const receiptId=process.argv[3];
       if (!/^[a-f0-9-]{36}$/.test(receiptId ?? '')) throw Error('invalid_receipt');
       const scope=await loadReport(db,receiptId);
-      if (!scope) throw Error('current_report_required');
+      if (!scope || (await db.query('SELECT analysis_scenario FROM intake_receipts WHERE id=$1',[receiptId])).rows[0]?.analysis_scenario !== 2)
+        throw Error('current_terra_report_required');
       const selected=[...new Set(process.argv.slice(4))].sort();
       const partial=process.argv[2]==='--refresh-requirements';
       if (partial && (!selected.length || !scope.rows.every(row=>row.analysis) || selected.some(key=>!scope.requirements.some(item=>item.key===key)))) throw Error('unknown_target_or_unstructured_report');
@@ -802,16 +830,45 @@ async function main() {
     } finally { reader.close(); await db.end(); }
     return;
   }
+  const provider = await cheaperInferenceScenario().catch(() => {
+    console.warn('Scenario 1 CheaperInference credentials unavailable');
+    return null;
+  });
+  const {lockIntakeProject} = await built('src/modules/intake/gate.js');
+  const {scenarioOneEnabled} = await built('src/modules/intake/receipts.js');
   const lock=await db.connect();
   process.on('SIGTERM',stop); process.on('SIGINT',stop);
+  let scenarioWork = Promise.resolve(), classicBusy = false;
   try {
     const {rows:[l]}=await lock.query("SELECT pg_try_advisory_lock(hashtextextended('facade/preliminary-terra-single',0)) AS ok");
     assert(l.ok,'producer_already_running');
     if (production) console.info('Terra production activation',await production.activate(db,stateDir));
+    const scenarioPause = production && process.env.FACADE_TERRA_PRODUCTION_ADMISSION
+      ? join(process.env.FACADE_TERRA_PRODUCTION_ADMISSION,'..','paused') : undefined;
+    const scenarioPaused = () => scenarioPause ? access(scenarioPause).then(()=>true,error=>{
+      if (error.code==='ENOENT') return false;
+      throw error;
+    }) : false;
     while(!shutdown.signal.aborted) {
-      const {rows}=await db.query(`SELECT id, to_char(created_at AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS "createdAt"
-        FROM intake_receipts WHERE ($1::timestamptz IS NULL OR created_at >= $1::timestamptz) AND sealed_at IS NOT NULL ORDER BY created_at,id`,[since || null]);
-      const selected=production ? await production.receipts(rows,stateDir) : rows;
+      const {rows}=await db.query(`SELECT r.id, r.project_id AS "projectId", p.default_analysis_scenario AS "projectDefault", r.analysis_scenario AS scenario, to_char(r.created_at AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS "createdAt"
+        FROM intake_receipts r JOIN projects p ON p.id=r.project_id
+        WHERE ($1::timestamptz IS NULL OR r.created_at >= $1::timestamptz) AND r.sealed_at IS NOT NULL ORDER BY r.created_at,r.id`,[since || null]);
+      const terraRows = rows.filter(row=>row.scenario===2);
+      const selected=production ? await production.receipts(terraRows,stateDir) : terraRows;
+      if (!classicBusy) {
+        classicBusy = true;
+        scenarioWork = (async () => {
+          for (const {id,projectId,projectDefault} of rows.filter(row=>row.scenario===1)) {
+            if (shutdown.signal.aborted) break;
+            try {
+              await processScenarioOne({db,receiptId:id,reader,provider:scenarioOneEnabled(projectId,projectDefault) ? provider : null,transaction,lockIntakeProject,readSnapshot,
+                recordActivity:emitScenarioActivity,publish:publishPreliminaryPackageReview,isPaused:scenarioPaused,isStopped:()=>shutdown.signal.aborted});
+            } catch (error) {
+              console.warn('Scenario 1 processing:', id, error?.code ?? 'scenario_one_processing_failed');
+            }
+          }
+        })().finally(() => { classicBusy = false; });
+      }
       for(const {id} of selected) {
         if (shutdown.signal.aborted) break;
         try { const run={db,receiptId:id,stateDir,admitClaim,recordReviewed:recordReviewedObservations,withSkills:snapshot=>attachReadingSkills(db,reader,source,snapshot),modelCall:r=>production ? production.call(r) : invokeModel(adapter,r),publish:publishPreliminaryPackageReview};
@@ -836,6 +893,6 @@ async function main() {
         if (error.name!=='AbortError') throw error;
       });
     }
-  } finally { process.off('SIGTERM',stop); process.off('SIGINT',stop); lock.release(); reader.close(); await db.end(); }
+  } finally { shutdown.abort(); await scenarioWork; process.off('SIGTERM',stop); process.off('SIGINT',stop); lock.release(); reader.close(); await db.end(); }
 }
 if (process.argv[1] && import.meta.url===pathToFileURL(process.argv[1]).href) main().catch(e=>{console.error(e.message);process.exitCode=1;});

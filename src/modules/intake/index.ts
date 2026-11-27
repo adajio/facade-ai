@@ -11,7 +11,7 @@ import { IntakeError, invalid, notFound } from "./errors.js";
 import { checksum, parseMediaType, parsePath, parseScopeIds, parseSize, uuid } from "./inputs.js";
 import { parseExclusionReason, parseManifestItems, parseManifestMode, parseManifestVersion } from "./manifest.js";
 import { appendManifestItems, excludeManifestItem, retryManifestLink, startManifestUpload, storeManifestItems } from "./manifest-commands.js";
-import { createReceipt, getInventory, listReceipts, sealReceipt } from "./receipts.js";
+import { analysisOptions, createReceipt, getInventory, listReceipts, sealReceipt } from "./receipts.js";
 import { cleanIntakeUploads, declareOriginal, getUpload, prepareOriginal, publishPreparedOriginal, retireUpload, writePart } from "./uploads.js";
 
 export { createIntakeStorage } from "./blob.js";
@@ -90,9 +90,18 @@ async function registerRoutes(app: FastifyInstance, storage: () => IntakeStorage
     const projectId = uuid(parameters(request).projectId);
     await requireAccess(db, request, { projectId, action: "project:read" });
     const { partSize, ttlSeconds, diskGuardBytes } = storage();
+    const { scenarioOne, defaultAnalysisScenario } = await analysisOptions(db, projectId);
+    const { rows: analysisBases } = scenarioOne ? await db.query(`SELECT r.id, i.number::float8 AS number, r.created_at AS "createdAt"
+      FROM preliminary_package_reviews r JOIN intake_scenario_one_results s ON s.review_id=r.id
+      JOIN intake_receipts i ON i.project_id=r.project_id AND i.id=r.receipt_id
+      JOIN projects p ON p.id=r.project_id AND p.catalog_version_id=r.catalog_version_id AND p.project_stage=r.stage
+      WHERE r.project_id=$1 ORDER BY i.number DESC, r.created_at DESC LIMIT 50`,[projectId]) : {rows:[]};
     return {
       partSize, maxReceiptBytes: MAX_RECEIPT_BYTES, uploadTtlSeconds: ttlSeconds, diskGuardBytes,
       channels: ["upload"],
+      analysisScenarios: scenarioOne ? [1, 2] : [2],
+      defaultAnalysisScenario,
+      analysisBases,
     };
   });
 
@@ -102,12 +111,17 @@ async function registerRoutes(app: FastifyInstance, storage: () => IntakeStorage
     const mode = raw.mode === undefined && raw.items === undefined ? undefined : parseManifestMode(raw.mode);
     const items = mode ? parseManifestItems(raw.items) : undefined;
     const receiptId = mode && raw.receiptId != null ? uuid(raw.receiptId) : undefined;
+    const scenario = raw.analysisScenario;
+    const analysisBaseReviewId = raw.analysisBaseReviewId === undefined ? undefined : uuid(raw.analysisBaseReviewId);
+    if (scenario !== undefined && scenario !== 1 && scenario !== 2)
+      invalid("invalid_analysis_scenario", "Выберите Сценарий 1 или Сценарий 2.");
     const source = raw.source ?? (items?.every(item => item.kind === "link") ? "import" : "upload");
     if (source !== "upload" && source !== "import") invalid("invalid_receipt_source", "Unknown receipt source");
     const result = await executeCommand(db, request, {
-      operation: "intake.create_receipt", requirement: engineer(projectId), input: { source, mode, receiptId },
+      operation: "intake.create_receipt", requirement: engineer(projectId), input: { source, mode, receiptId, ...(scenario === undefined ? {} : { analysisScenario: scenario }),
+        ...(analysisBaseReviewId && { analysisBaseReviewId }) },
     }, async (tx, actor) => {
-      const body = await createReceipt(tx, { projectId, source, createdBy: actor.userId, receiptId, mode });
+      const body = await createReceipt(tx, { projectId, source, createdBy: actor.userId, receiptId, mode, analysisScenario: scenario, analysisBaseReviewId });
       if (items) await storeManifestItems(tx, { projectId, receiptId: body.receiptId, actorId: actor.userId },
         1, items, checkItemScopes(tx, request, projectId));
       return { body, status: 201, audit: { objectId: body.receiptId } };

@@ -15,6 +15,7 @@ export type Filter = typeof filters[number];
 export type ReceiptRow = {
   receiptId: string;
   number: number;
+  analysisScenario: 1 | 2;
   sealed: boolean;
   inventoryOpen: boolean;
   processing: boolean;
@@ -152,7 +153,7 @@ async function capture(tx: PoolClient, projectId: string, scopeId?: string) {
         WHERE u.project_id=$1 AND u.state='uploading' AND u.expires_at>statement_timestamp()
         GROUP BY u.receipt_id
       )
-      SELECT r.id AS "receiptId",r.number::float8 AS number,r.sealed_at IS NOT NULL AS sealed,
+      SELECT r.id AS "receiptId",r.number::float8 AS number,r.analysis_scenario AS "analysisScenario",r.sealed_at IS NOT NULL AS sealed,
         ${inventoryOpen} AS "inventoryOpen",
         p.receipt_id IS NOT NULL AS processing,r.source,r.created_at AS "createdAt",
         ${inventoryRevision} AS "inventoryRevision",

@@ -2,6 +2,7 @@ import { readReceiptEvidenceChain } from "./receipt-evidence-chain.js";
 import { readPackagePreparation } from "../intake/package-preparation.js";
 import { packagePreparationInput } from "../harness/package-preparation.js";
 import { createRuntimePdfService } from "../pdf/index.js";
+import { registerScenarioOneLetter } from "./scenario-one-letter.js";
 import { readTerraReading } from "./terra-reading.js";
 import { readPreliminaryPackageReviews, readPreliminaryReadingProgress } from "./preliminary-package-review.js";
 export { publishPreliminaryPackageReview, type PreliminaryPackageReviewInput } from "./preliminary-package-review.js";
@@ -78,6 +79,7 @@ export async function register(app: FastifyInstance): Promise<void> {
   app.addHook("onClose", async () => preparationReader?.close());
   for (const prefix of ["/api/v1", "/api"]) {
     registerRoutes(app, prefix, reader);
+    registerScenarioOneLetter(app, prefix);
   }
 }
 
