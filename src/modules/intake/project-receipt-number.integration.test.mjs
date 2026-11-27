@@ -32,6 +32,7 @@ test('existing and concurrent receipts are numbered within the project, includin
     const concurrent=await Promise.all([create(b),create(a),create(b),create(b)]);
     assert.equal(concurrent[1].number,'3');
     assert.deepEqual([concurrent[0],concurrent[2],concurrent[3]].map(r=>+r.number).sort(),[2,3,4]);
+    for (const name of files.filter(n=>n>migration)) await db.query(await readFile(directory+'/'+name,'utf8'));
     const {listReceipts}=await import('../../../dist/src/modules/intake/receipts.js');
     const older=await listReceipts(db,{projectId:a,uploading:false,before:Number(three.number)});
     assert.deepEqual(older.receipts.map(r=>r.receiptId),[one.id]);

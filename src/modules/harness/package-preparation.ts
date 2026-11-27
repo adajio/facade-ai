@@ -55,12 +55,14 @@ export async function refreshReceiptPreparation(tx: PoolClient, target: Receipt,
 // Only document versions in an immutable, currently admitted manifest may receive new work.
 export const preparedPackageWindow = `EXISTS (SELECT 1 FROM intake_package_preparation_windows i
   JOIN intake_package_preparation_current c ON c.manifest_id=i.manifest_id AND c.project_id=i.project_id
+  JOIN intake_receipts r ON r.project_id=c.project_id AND r.id=c.receipt_id AND r.analysis_scenario=2
   WHERE i.project_id=w.project_id AND i.window_id=w.id)`;
 
 /** Compute reader profiles and verify derivative bytes before taking the shared slot lock. */
 export async function preflightPackageWindow(tx: PoolClient, reader: PreparationReader, projectId: string, windowId: string) {
   const { rows } = await tx.query<{ receiptId: string }>(`SELECT c.receipt_id AS "receiptId" FROM intake_package_preparation_windows i
     JOIN intake_package_preparation_current c ON c.manifest_id=i.manifest_id AND c.project_id=i.project_id
+    JOIN intake_receipts r ON r.project_id=c.project_id AND r.id=c.receipt_id AND r.analysis_scenario=2
     WHERE i.project_id=$1 AND i.window_id=$2 ORDER BY c.receipt_id`, [projectId, windowId]);
   const inputs: PreparationInput[] = [];
   for (const row of rows) inputs.push(await packagePreparationInput(tx, { projectId, receiptId: row.receiptId }, reader));

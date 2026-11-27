@@ -491,7 +491,7 @@
             <Copilot {api} {context} {navigate} budget={copilotBudget} />
           {:else if section === 'letters'}
             {#if showPreliminary}
-              {#key project.id}<PreliminaryPackageReview {api} projectId={project.id} {refreshKey} mode="letter" />{/key}
+              {#key project.id}<PreliminaryPackageReview {api} projectId={project.id} {refreshKey} mode="letter" canEdit={context.canEdit} />{/key}
             {/if}
             <Letters {api} {context} {renew} open={openEvidence} />
           {:else if section === 'settings' && !project.scopeId}

@@ -4,6 +4,8 @@ import { type Commands } from './commands';
 import { type Api, id } from './http';
 
 export type Receipt = {
+  analysisScenario?: 1 | 2;
+  analysisBaseReviewId?: string | null;
   receiptId: string; number: number; sealed: boolean; inventoryOpen: boolean;
   source?: string; createdAt?: string;
 };
@@ -37,6 +39,9 @@ export type Inventory = Receipt & {
   imports: { importId: string; status: string; reason?: string }[];
 };
 export type Capabilities = {
+  analysisScenarios?: (1 | 2)[];
+  defaultAnalysisScenario?: 1 | 2;
+  analysisBases?: { id: string; number: number; createdAt: string }[];
   partSize?: number; maxReceiptBytes?: number; uploadTtlSeconds?: number;
   archiveFormats?: string[]; archiveIsolationConfigured?: boolean; channels?: string[];
 };

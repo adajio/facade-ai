@@ -16,7 +16,7 @@
   import Document from './Document.svelte';
   import IntakeHolds from './IntakeHolds.svelte';
 
-  type Declaration = { receiptId: string; version?: number; items: NewInput[]; mode: 'once' | 'open' };
+  type Declaration = { receiptId: string; version?: number; items: NewInput[]; mode: 'once' | 'open'; analysisScenario?: 1 | 2; analysisBaseReviewId?: string };
   type ReceiptList = { receipts: Receipt[]; nextCursor?: number | string | null };
   type ReceiptSelection = 'present' | 'filtered' | 'missing';
   type WorkReceiptList = ReceiptList & {
@@ -58,6 +58,9 @@
   let paging = $state(false);
   let technicalPaging = $state(false);
   let form = $state(false);
+  let analysisBaseReviewId = $state('');
+  let selectedAnalysisScenario = $state<1 | 2>();
+  let analysisScenario = $derived(selectedAnalysisScenario ?? capabilities?.defaultAnalysisScenario ?? 2);
   let leaveOpen = $state(false);
   let resumeItems = $state(false);
   let excludingItem = $state('');
@@ -509,6 +512,8 @@
     existing = '';
     resumeItems = false;
     leaveOpen = false;
+    selectedAnalysisScenario = context.params.get('analysisBase') ? 1 : undefined;
+    analysisBaseReviewId = context.params.get('analysisBase') ?? '';
     draft = undefined;
     linkUrl = '';
     declareScope = false;
@@ -564,6 +569,12 @@
     const sent = finished;
     const resume = resumeItems;
     const mode = leaveOpen ? 'open' : 'once';
+    if (!active && analysisScenario === 1 && !capabilities?.analysisScenarios?.includes(1)) {
+      operationError = 'Сценарий 1 сейчас недоступен.';
+      return;
+    }
+    const scenario = draft?.analysisScenario ?? selectedAnalysisScenario ?? capabilities?.defaultAnalysisScenario;
+    const analysisBase = scenario === 1 ? analysisBaseReviewId || undefined : undefined;
     let declaration = draft;
     let receiptId = startingReceipt;
     const managed = !supplement.letterId && !existingUpload && (!startingReceipt || Boolean(startingInventory?.manifest));
@@ -639,6 +650,8 @@
           receiptId: current?.receiptId ?? crypto.randomUUID(),
           version: current?.manifest?.version,
           mode,
+          analysisScenario: scenario,
+          analysisBaseReviewId: analysisBase,
           items: method === 'link'
             ? [{ itemId: crypto.randomUUID(), kind: 'link', url: sourceUrl, scopeIds }]
             : selected.map(({ file, sha256 }) => ({
@@ -652,6 +665,7 @@
           if (request.version === undefined) {
             await transferApi.mutate(projectApi(project) + '/receipts', 'POST', {
               receiptId: request.receiptId, mode: request.mode, items: request.items,
+              analysisScenario: request.analysisScenario, analysisBaseReviewId: request.analysisBaseReviewId,
             }, { key: request.receiptId }, signal);
           } else {
             await transferCommands.send(receiptPath(request.receiptId) + '/manifest', 'POST', {
@@ -698,6 +712,7 @@
       if (!receiptId) {
         const result = await transferCommands.send<Receipt>(projectApi(project) + '/receipts', 'POST', {
           source: method === 'link' ? 'import' : 'upload',
+          analysisScenario: scenario, analysisBaseReviewId: analysisBase,
         }, undefined, signal);
         showReceipt(result.receiptId);
       }
@@ -800,6 +815,23 @@
       </p>
     {/if}
     <form onsubmit={transfer} aria-label="Передача исходных данных">
+      {#if !active && !existing && !resumeItems && capabilities?.analysisScenarios?.includes(1)}
+        <label>Разбор поступления<select value={analysisScenario} onchange={(event) => {
+          selectedAnalysisScenario = event.currentTarget.value === '1' ? 1 : 2;
+          draft = undefined;
+        }} disabled={pending}>
+          <option value={1}>Сценарий 1 · Gemini и чек-лист</option>
+          <option value={2}>Сценарий 2 · Terra и адресное чтение</option>
+        </select></label>
+        {#if analysisScenario === 1 && capabilities.analysisBases?.length}
+          <label>Досылка к разбору<select bind:value={analysisBaseReviewId} onchange={() => draft = undefined} disabled={pending}>
+            <option value="">Новое поступление без предыдущих материалов</option>
+            {#each capabilities.analysisBases as base (base.id)}
+              <option value={base.id}>Поступление №{base.number} · {date(base.createdAt)}</option>
+            {/each}
+          </select></label>
+        {/if}
+      {/if}
       {#if !existing}
         <label>Способ передачи<select aria-label="Способ передачи" bind:value={channel} onchange={() => { draft = undefined; files = []; }} disabled={pending}>
           <option value="file">Файлы или архивы</option>
@@ -881,12 +913,13 @@
     </div>
     {#if list.length}
       <div class="table-wrap">
-        <table><thead><tr><th>Поступление</th><th>Канал</th><th>Опись</th><th>Принято</th></tr></thead>
+        <table><thead><tr><th>Поступление</th><th>Канал</th><th>Разбор</th><th>Опись</th><th>Принято</th></tr></thead>
           <tbody>
             {#each list as receipt (receipt.receiptId)}
               <tr>
                 <td><a class="row-link" href={url(receipt.receiptId)} aria-current={receipt.receiptId === activeReceipt ? 'true' : undefined}>Поступление №{receipt.number}</a></td>
                 <td>{receipt.source === 'import' ? 'Ссылка' : 'Файлы'}</td>
+                <td>Сценарий {receipt.analysisScenario ?? 2}</td>
                 <td>{receipt.inventoryOpen ? 'Открыта' : 'Зафиксирована'}</td>
                 <td>{date(receipt.createdAt)}</td>
               </tr>

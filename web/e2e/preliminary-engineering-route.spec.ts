@@ -10,7 +10,7 @@ const statuses = ['present', 'partial', 'not_found', 'unassessed'] as const;
 const labels = ['Представлено', 'Частично', 'Не найдено', 'Не оценено'];
 const base = `/projects/${projectId}/completeness`;
 
-async function fixture(page: Page, editable: boolean, comparable = false, structured = false, sheetPreviews = false) {
+async function fixture(page: Page, editable: boolean, comparable = false, structured = false, sheetPreviews = false, scenarioOne = false, scenarioDefault: 1 | 2 = 2) {
   const project = { id: projectId, name: 'Синтетический комплект', version: 1, intakeMode: true, scopes: [],
     stage: 'Стадия 1', actions: editable ? ['project:read', 'project:engineer'] : ['project:read'] };
   const questions = Array.from({ length: 16 }, (_, index) => ({
@@ -45,7 +45,7 @@ async function fixture(page: Page, editable: boolean, comparable = false, struct
     previewSource('Контроль CRLF', 'observed', 'Посторонняя ссылка', pngSha+'\n'),
     {...previewSource('Подменённая редакция', 'observed', 'Посторонняя ссылка'),versionId:versionId+'/../'},
   ] : [];
-  const review = { id: 'review', receiptId, catalogVersionId: 'catalog', model: 'synthetic-terra',
+  const review = { id: 'review', receiptId, catalogVersionId: 'catalog', model: scenarioOne ? 'gemini-3.8-flash' : 'synthetic-terra',
     createdAt: '2026-11-26T00:00:00Z', stage: 'Стадия 1', scopeNote: '', isCurrent: true, draftText: 'Синтетический черновик',
     rows: questions.map((question, index) => ({ key: question.requirement.positionId, title: question.requirement.part,
       status: statuses[index % statuses.length], finding: `Синтетический вывод ${index + 1}`,
@@ -95,6 +95,10 @@ async function fixture(page: Page, editable: boolean, comparable = false, struct
     }})),
   };
   let published = false;
+  const sent: {kind: string; version: number; body?: string}[] = [];
+  let letterText = 'Синтетический черновик';
+  let storedVersion = 0;
+  const history: {kind: string; version: number; body: string; createdAt: string}[] = [];
   let reviewRequests = 0;
   let chainUpdated = false;
   await page.route('**/api/**', async (route) => {
@@ -106,6 +110,19 @@ async function fixture(page: Page, editable: boolean, comparable = false, struct
     if (path.endsWith('/snapshot')) return route.fulfill({ json: { cursor: published ? '1' : '0', sliceId: '0', projectionVersion: '0' } });
     if (path.endsWith('/events')) return route.fulfill({ json: { events: published && url.searchParams.get('after') === '0'
       ? [{ cursor: '1', type: 'package-analysis.changed', payload: {} }] : [], cursor: published ? '1' : '0', hasMore: false } });
+    if (scenarioOne && path.endsWith('/scenario-one-letter')) {
+      if (request.method() === 'POST') {
+        const input = request.postDataJSON() as {kind: string; version: number; body?: string};
+        sent.push(input);
+        if (input.kind === 'draft') letterText = input.body ?? '';
+        storedVersion += 1;
+        history.unshift({kind:input.kind,version:storedVersion,body:input.body ?? letterText,createdAt:review.createdAt});
+      }
+      return route.fulfill({json:{version:storedVersion,text:letterText,history,requests:[]}});
+    }
+    if (scenarioOne && path.endsWith('/intake/capabilities')) return route.fulfill({json:{
+      analysisScenarios:[1,2],defaultAnalysisScenario:scenarioDefault,analysisBases:[{id:review.id,number:17,createdAt:review.createdAt}],
+    }});
     if (path.endsWith('/preliminary-package-reviews')) {
       reviewRequests += 1;
       return route.fulfill({ json: { items: structured ? [structuredReview, {...baseline,isCurrent:false}] : comparable ? published ? [detailed, { ...baseline, isCurrent: false }] : [baseline] : [review], nextCursor: null } });
@@ -140,7 +157,7 @@ async function fixture(page: Page, editable: boolean, comparable = false, struct
     }
     return route.fulfill({ status: 404, json: { code: 'not_found' } });
   });
-  return { submissions, changeChain: () => { chainUpdated = true; }, publishDetailed: () => { published = true; }, reviewRequests: () => reviewRequests };
+  return { submissions, sent, changeChain: () => { chainUpdated = true; }, publishDetailed: () => { published = true; }, reviewRequests: () => reviewRequests };
 }
 
 test('Комплектность показывает цвета и путь инженера до технических блоков, решение сохраняется и открывается снова', async ({ page }) => {
@@ -498,4 +515,33 @@ test('Черновик показывает причину остановки ч
   expect(await (await reading).json()).toMatchObject({ report: { id: reportId } });
   await expect(draft).toHaveValue(draftText);
   await expect(stop).toHaveCount(0);
+});
+
+
+test('Сценарий 1 сохраняет черновик и передачу, а ссылка подставляет исходный разбор в досылку', async ({page}) => {
+  const {sent} = await fixture(page,true,false,false,false,true);
+  await page.goto(`/projects/${projectId}/letters`);
+  const text = page.getByRole('textbox',{name:'Текст черновика'});
+  await expect(text).toHaveValue('Синтетический черновик');
+  await text.fill('Редакция инженера');
+  await expect(page.getByRole('button',{name:'Отметить внешнюю отправку'})).toBeDisabled();
+  await page.getByRole('button',{name:'Сохранить редакцию'}).click();
+  await expect(page.getByText('Редакция сохранена.')).toBeVisible();
+  await page.getByRole('button',{name:'Отметить внешнюю отправку'}).click();
+  await expect(page.getByText('Факт отправки сохранён.')).toBeVisible();
+  expect(sent).toEqual([{kind:'draft',version:0,body:'Редакция инженера'},{kind:'sent',version:1}]);
+  await page.getByRole('link',{name:'Загрузить досылку'}).click();
+  await expect(page.getByLabel('Разбор поступления')).toHaveValue('1');
+  await expect(page.getByLabel('Досылка к разбору')).toHaveValue('review');
+});
+
+
+test('Новый проект предлагает Сценарий 1 с возможностью выбрать Сценарий 2', async ({page}) => {
+  await fixture(page,true,false,false,false,true,1);
+  await page.goto(`/projects/${projectId}/receipts?upload=1`);
+  const select = page.getByLabel('Разбор поступления');
+  await expect(select).toHaveValue('1');
+  await select.selectOption('2');
+  await expect(select).toHaveValue('2');
+  await expect(page.getByLabel('Досылка к разбору')).toHaveCount(0);
 });

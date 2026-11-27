@@ -15,10 +15,26 @@ type Receipt = {
   created_at: Date;
   sealed_at: Date | null;
   manifest_mode: ManifestMode | null;
+  analysis_scenario: 1 | 2;
   manifest_version: number | null;
 };
 
 export type ReceiptContext = { projectId: string; receiptId: string };
+
+export function scenarioOneEnabled(projectId: string, defaultAnalysisScenario: number): boolean {
+  return process.env.FACADE_SCENARIO_ONE_ENABLED === "1" &&
+    (defaultAnalysisScenario === 1 ||
+      (process.env.FACADE_SCENARIO_ONE_PROJECT_IDS ?? "").split(",").some(id => id.trim().toLowerCase() === projectId.toLowerCase()));
+}
+
+export async function analysisOptions(db: Pick<PoolClient, "query">, projectId: string) {
+  const { rows: [project] } = await db.query<{ default_analysis_scenario: 1 | 2 }>(
+    "SELECT default_analysis_scenario FROM projects WHERE id=$1", [projectId],
+  );
+  if (!project) notFound();
+  const scenarioOne = scenarioOneEnabled(projectId, project.default_analysis_scenario);
+  return { scenarioOne, defaultAnalysisScenario: scenarioOne ? project.default_analysis_scenario : 2 as const };
+}
 
 export async function lockReceipt(tx: PoolClient, input: ReceiptContext): Promise<Receipt> {
   const { rows: [receipt] } = await tx.query<Receipt>(
@@ -30,17 +46,28 @@ export async function lockReceipt(tx: PoolClient, input: ReceiptContext): Promis
 }
 
 export async function createReceipt(tx: PoolClient, input: {
-  projectId: string; createdBy: string; source: Receipt["source"]; receiptId?: string; mode?: ManifestMode;
+  projectId: string; createdBy: string; source: Receipt["source"]; receiptId?: string; mode?: ManifestMode; analysisScenario?: 1 | 2; analysisBaseReviewId?: string;
 }) {
-  const { projectId, createdBy, source, receiptId, mode } = input;
+  const { projectId, createdBy, source, receiptId, mode, analysisScenario: requestedScenario, analysisBaseReviewId } = input;
   await lockIntakeProject(tx, projectId);
+  const options = await analysisOptions(tx, projectId);
+  const analysisScenario = requestedScenario ?? options.defaultAnalysisScenario;
+  if (analysisScenario === 1 && !options.scenarioOne)
+    invalid("analysis_scenario_unavailable", "Сценарий 1 сейчас недоступен.");
+  if (analysisBaseReviewId) {
+    const base = await tx.query(`SELECT 1 FROM preliminary_package_reviews r
+      JOIN intake_scenario_one_results s ON s.review_id=r.id
+      JOIN projects p ON p.id=r.project_id AND p.catalog_version_id=r.catalog_version_id AND p.project_stage=r.stage
+      WHERE r.id=$1 AND r.project_id=$2 AND r.model='gemini-3.8-flash'`, [analysisBaseReviewId, projectId]);
+    if (analysisScenario !== 1 || !base.rowCount) invalid("invalid_analysis_base", "Разбор для досылки недоступен.");
+  }
   const { rows: [receipt] } = await tx.query<Receipt>(
-    `INSERT INTO intake_receipts (id, project_id, created_by, source, manifest_mode, manifest_version)
-     VALUES (COALESCE($4,gen_random_uuid()), $1, $2, $3, $5, $6) ON CONFLICT (id) DO NOTHING RETURNING *`,
-    [projectId, createdBy, source, receiptId ?? null, mode ?? null, mode ? 1 : null],
+    `INSERT INTO intake_receipts (id, project_id, created_by, source, manifest_mode, manifest_version, analysis_scenario, analysis_base_review_id)
+     VALUES (COALESCE($4,gen_random_uuid()), $1, $2, $3, $5, $6, $7, $8) ON CONFLICT (id) DO NOTHING RETURNING *`,
+    [projectId, createdBy, source, receiptId ?? null, mode ?? null, mode ? 1 : null, analysisScenario, analysisBaseReviewId ?? null],
   );
   if (!receipt) conflict("receipt_id_in_use", "Идентификатор поступления уже занят.");
-  const result = { receiptId: receipt.id, number: Number(receipt.number), source, sealed: false, inventoryOpen: true };
+  const result = { receiptId: receipt.id, number: Number(receipt.number), source, sealed: false, inventoryOpen: true, analysisScenario };
   await appendIntakeEvent(tx, projectId, receipt.id, "intake.receipt_created", result);
   return result;
 }
@@ -195,7 +222,7 @@ export async function listReceipts(db: Pool, input: { projectId: string; uploadi
     receiptId: string; number: string; cursor: string; sealed: boolean; inventoryOpen: boolean; source: string; createdAt: Date;
   }>(
     `SELECT r.id AS "receiptId", r.number, r.server_sequence AS cursor, r.sealed_at IS NOT NULL AS sealed, ${inventoryOpen} AS "inventoryOpen",
-            source, created_at AS "createdAt"
+            source, created_at AS "createdAt", r.analysis_scenario AS "analysisScenario"
        FROM intake_receipts r WHERE project_id = $1 AND (NOT $2 OR ${inventoryOpen})
         AND ($3::bigint IS NULL OR r.number < coalesce(
           (SELECT marker.number FROM intake_receipts marker WHERE marker.project_id=$1 AND marker.server_sequence=$3),
@@ -210,7 +237,7 @@ export async function listReceipts(db: Pool, input: { projectId: string; uploadi
 export async function getInventory(db: Pool | PoolClient, input: ReceiptContext) {
   const { rows: [receipt] } = await db.query<{ number: string; sealed: boolean; inventoryOpen: boolean }>(
     `SELECT r.number, r.sealed_at IS NOT NULL AS sealed, ${inventoryOpen} AS "inventoryOpen",
-            r.project_id AS "projectId", ${manifestProjection} AS manifest,
+            r.project_id AS "projectId", r.analysis_scenario AS "analysisScenario", r.analysis_base_review_id AS "analysisBaseReviewId", ${manifestProjection} AS manifest,
             COALESCE((
                SELECT jsonb_agg(jsonb_build_object(
                  'uploadId', u.id, 'occurrenceId', u.occurrence_id, 'status', u.state,

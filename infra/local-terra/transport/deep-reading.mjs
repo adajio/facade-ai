@@ -30,7 +30,7 @@ export async function admittedDeepReceipts(tx, access) {
     FROM intake_receipts r JOIN projects p ON p.id=r.project_id AND p.intake_mode
     JOIN harness_package_projects package ON package.project_id=r.project_id
     JOIN intake_package_preparation_current cur ON cur.project_id=r.project_id AND cur.receipt_id=r.id
-    WHERE r.sealed_at IS NOT NULL AND ${admission} AND ${newest}
+    WHERE r.analysis_scenario=2 AND r.sealed_at IS NOT NULL AND ${admission} AND ${newest}
       AND EXISTS (SELECT 1 FROM preliminary_package_reviews report
         LEFT JOIN intake_project_generations gen ON gen.project_id=p.id
         WHERE report.project_id=p.id AND report.receipt_id=r.id AND report.preparation_id=cur.manifest_id
@@ -52,7 +52,7 @@ export async function currentDeepReceipt(tx, target) {
     JOIN projects p ON p.id=r.project_id AND p.intake_mode
     JOIN intake_package_preparation_current cur ON cur.project_id=r.project_id AND cur.receipt_id=r.id
     WHERE r.project_id=$1 AND r.id=$2 AND cur.manifest_id=$3 AND p.catalog_version_id=$4 AND p.project_stage=$5
-      AND r.sealed_at IS NOT NULL AND ${newest}`,
+      AND r.analysis_scenario=2 AND r.sealed_at IS NOT NULL AND ${newest}`,
   [target.projectId,target.receiptId,target.preparationId,target.catalogVersionId,target.stage]);
   return Boolean(result.rowCount);
 }

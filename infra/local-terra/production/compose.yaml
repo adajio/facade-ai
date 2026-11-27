@@ -11,7 +11,7 @@ x-terra-service: &terra-service
   security_opt: ["no-new-privileges:true"]
   networks: [core]
   mem_limit: 1536m
-  environment:
+  environment: &terra-environment
     NODE_EXTRA_CA_CERTS: /run/facade/data-ca.crt
     FACADE_DATA_DIR: /data/objects
     TMPDIR: /data/tmp
@@ -42,6 +42,9 @@ x-terra-service: &terra-service
 
 services:
   api:
+    env_file:
+      - path: ./scenario-one.settings
+        required: false
     environment:
       FACADE_HARNESS_PROFILE: *terra-profile
   worker:
@@ -50,6 +53,14 @@ services:
       FACADE_HARNESS_REPLAY_ONLY: "1"
   preliminary:
     <<: *terra-service
+    env_file:
+      - path: ./scenario-one.settings
+        required: false
+      - path: ./scenario-one.env
+        required: false
+    environment:
+      <<: *terra-environment
+      NODE_USE_ENV_PROXY: "1"
     command: ["infra/local-terra/producer.mjs"]
   deep:
     <<: *terra-service

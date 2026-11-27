@@ -5,6 +5,7 @@
   import { projectV1, scopedUrl } from './workspace';
   import { readingStopMessages, readingStopReason } from './reading-stop';
   import Notice from './Notice.svelte';
+  import ScenarioOneLetter from './ScenarioOneLetter.svelte';
   import PreliminaryRequirementAnalysis from './PreliminaryRequirementAnalysis.svelte';
   import PreliminaryRowChange from './PreliminaryRowChange.svelte';
   import PreliminarySources from './PreliminarySources.svelte';
@@ -14,7 +15,7 @@
 
   type ReadingProgress = { totalWindows: number; mappedVersions: number; acceptedVersions: number;
     completed: number; covered: number; partial?: number; noMatch: number; refused: number; held: number; reading: number };
-  let { api, projectId, refreshKey, mode }: { api: Api; projectId: string; refreshKey: number; mode: 'review' | 'letter' } = $props();
+  let { api, projectId, refreshKey, mode, canEdit = false }: { api: Api; projectId: string; refreshKey: number; canEdit?: boolean; mode: 'review' | 'letter' } = $props();
   let reviews = $state<PreliminaryReview[]>([]);
   let selectedId = $state('');
   let manuallySelected = $state(false);
@@ -25,8 +26,8 @@
   let textArea = $state<HTMLTextAreaElement>();
   let letterReading = $state<{ project: string; data: Pick<TerraReading, 'enabled' | 'receipt' | 'report' | 'progress'> }>();
   let selected = $derived(reviews.find((item) => item.id === selectedId));
-  let progressReviewId = $derived(mode === 'review' && selected?.isCurrent ? selected.id : undefined);
-  const letterReviewId = $derived(mode === 'letter' && selected?.isCurrent ? selected.id : undefined);
+  let progressReviewId = $derived(mode === 'review' && selected?.isCurrent && selected.model !== 'gemini-3.8-flash' ? selected.id : undefined);
+  const letterReviewId = $derived(mode === 'letter' && selected?.isCurrent && selected.model !== 'gemini-3.8-flash' ? selected.id : undefined);
   const letterStop = $derived.by(() => {
     const data = letterReading?.data;
     if (!letterReviewId || letterReading?.project !== projectId || !data?.enabled ||
@@ -143,9 +144,9 @@
       </label>
     {/if}
     <p title={selected.receiptId}><strong>{selected.isCurrent ? 'Актуальный разбор' : 'Исторический разбор'}</strong> · {date(selected.createdAt)}</p>
-    <p class="meta" title={'Версия каталога: ' + selected.catalogVersionId}>{selected.stage}</p>
+    <p class="meta" title={'Версия каталога: ' + selected.catalogVersionId}>{selected.stage} · Сценарий {selected.model === 'gemini-3.8-flash' ? 1 : 2}</p>
     {#if selected.scopeNote}<p>{selected.scopeNote}</p>{/if}
-    {#if mode === 'review' && selected.isCurrent}
+    {#if mode === 'review' && selected.isCurrent && selected.model !== 'gemini-3.8-flash'}
       {#if progressError}<p role="alert">Не удалось загрузить состояние постраничного чтения: {progressError}</p>{/if}
       {#if progress && !progressError}
         <p role="status" class="meta">Постраничное чтение:
@@ -221,10 +222,16 @@
           </details>
         {/if}
       {/if}
+      {#if selected.model === 'gemini-3.8-flash' && canEdit}
+        {#key selected.id}
+          <ScenarioOneLetter {api} {projectId} reviewId={selected.id} isCurrent={selected.isCurrent} />
+        {/key}
+      {:else}
       <label>Текст предварительного черновика
         <textarea bind:this={textArea} readonly rows="18" value={selected.draftText}></textarea>
       </label>
       <div class="actions"><button type="button" onclick={copyDraft}>Скопировать текст</button><span role="status">{copied}</span></div>
+      {/if}
       {#if questions.length}
         <details class="letter-sources">
           <summary>Основания вопросов письма</summary>

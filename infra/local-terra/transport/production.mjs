@@ -21,7 +21,8 @@ const automaticAdmission = `SELECT
   EXISTS (SELECT 1 FROM gateway_attempts a JOIN intake_receipts r ON r.id=$2 AND r.project_id=a.project_id
     WHERE a.project_id=$1 AND a.created_at>=r.created_at AND a.state IN ('reserved','prepared','sending','unknown')) AS held,
   EXISTS (SELECT 1 FROM intake_receipts WHERE project_id=$1 AND id=$2
-    AND sealed_at IS NOT NULL AND created_at > $3::timestamptz) AS automatic`;
+    AND analysis_scenario=2 AND sealed_at IS NOT NULL AND created_at > $3::timestamptz) AS automatic,
+  EXISTS (SELECT 1 FROM intake_receipts WHERE project_id=$1 AND id=$2 AND analysis_scenario=1) AS "otherScenario"`;
 const preciseTimestamp = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z$/u;
 
 async function readActivation(path) {
@@ -249,6 +250,7 @@ export function productionTerra(env = process.env) {
       const explicit = grants.some(grant => grant.projectId === snapshot.projectId && grant.receiptId === snapshot.receiptId &&
         grant.preparationId === snapshot.preparationId);
       const {rows:[status]} = await tx.query(automaticAdmission,[snapshot.projectId,snapshot.receiptId,activatedAt]);
+      if (status?.otherScenario) return 'held_other_analysis_scenario';
       if (status?.restored) return 'held_terra_saved_review';
       if (!explicit && status?.automatic !== true) return 'held_terra_production_admission';
       if (status?.held !== false) return 'held_terra_prior_provider_attempt';

@@ -486,8 +486,9 @@ export function packageModelAdmission(enabled: boolean, packageProjects: readonl
       if (!started.rowCount) {
         const service = reader?.();
         if (!service) return { dispatchBlock: 'preparation_verification_unavailable' };
-        const target = await tx.query<{ receiptId: string }>(`SELECT receipt_id AS "receiptId" FROM intake_package_preparations
-          WHERE project_id=$1 AND id=$2`, [work.projectId, packageWindow.preparationId]);
+        const target = await tx.query<{ receiptId: string }>(`SELECT prep.receipt_id AS "receiptId" FROM intake_package_preparations prep
+          JOIN intake_receipts r ON r.project_id=prep.project_id AND r.id=prep.receipt_id AND r.analysis_scenario=2
+          WHERE prep.project_id=$1 AND prep.id=$2`, [work.projectId, packageWindow.preparationId]);
         if (!target.rows[0]) return { dispatchBlock: 'preparation_changed' };
         const proof = await packagePreparationInput(tx,{projectId:work.projectId,receiptId:target.rows[0].receiptId},service);
         if (!await verifyCurrentPreparation(tx,proof,packageWindow.preparationId,packageWindow.id))
